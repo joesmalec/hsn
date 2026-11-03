@@ -1,0 +1,58 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # UTC; scheduled runs use the default branch only
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Each job is skipped (not queued forever) until the repository variable HSN_SELF_HOSTED_RUNNERS
+# (comma-separated runner labels, e.g. "rtx3060,m_series") names its runner. Listing runners through
+# the REST API would need an admin-scoped token, which GITHUB_TOKEN does not have.
+jobs:
+  rtx3060:
+    if: contains(vars.HSN_SELF_HOSTED_RUNNERS, 'rtx3060')
+    runs-on: [self-hosted, rtx3060]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.7"
+      - run: rustup toolchain install
+      - run: uv sync --locked --extra dev --extra cuda
+      - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
+      - run: uv run python scripts/build_kernels.py --target cuda --out build
+      - run: uv run pytest -q
+      - run: cargo test --workspace
+
+  dgx_spark:
+    if: contains(vars.HSN_SELF_HOSTED_RUNNERS, 'dgx_spark')
+    runs-on: [self-hosted, dgx_spark]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.7"
+      - run: rustup toolchain install
+      - run: uv sync --locked --extra dev --extra cuda
+      - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
+      - run: uv run python scripts/build_kernels.py --target cuda --out build
+      - run: uv run pytest -q
+      - run: cargo test --workspace
+
+  m_series:
+    if: contains(vars.HSN_SELF_HOSTED_RUNNERS, 'm_series')
+    runs-on: [self-hosted, m_series]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.7"
+      - run: rustup toolchain install
+      - run: uv sync --locked --extra dev
+      - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
+      - run: uv run python scripts/build_kernels.py --target metal --out build
+      - run: uv run pytest -q
+      - run: cargo test --workspace

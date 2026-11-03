@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["rust/*"]
+
+[workspace.package]
+version = "0.1.0" # must equal [project].version in pyproject.toml (enforced by tests/test_p0_1_smoke.py)
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/joesmalec/hsn"
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+blake3 = "1.8.7"
+pyo3 = "0.28.3"
+pyo3-build-config = "0.28.3"
+hsn-core = { path = "rust/hsn-core" }
+hsn-kernels = { path = "rust/hsn-kernels" }

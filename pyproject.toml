@@ -1,0 +1,57 @@
+[project]
+name = "hsn"
+version = "0.1.0" # single source of truth for hsn.__version__; hsn_rs.version() must equal it
+description = "Hierarchical Synaptic Network (HSN) - Python training side"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+  "torch==2.15.0",
+  "pydantic>=2",
+  "numpy",
+  "pyyaml",
+  "safetensors",
+  "pyarrow",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff==0.17.3", "mypy", "pre-commit", "maturin>=1.9.4,<2"]
+cuda = ["pynvml"]
+viz = ["matplotlib"]
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "python" # the package lives at python/hsn
+
+[tool.uv]
+required-version = ">=0.13.6"
+# Supported platforms only (Linux x86_64/aarch64, Apple silicon); keeps uv.lock small.
+environments = [
+  "sys_platform == 'linux'",
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "cuda: needs a CUDA device; skipped when absent",
+  "mps: needs an Apple MPS device; skipped when absent",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# The spec document is quoted material and stays byte-exact; ruff 0.17 formats Markdown code blocks.
+extend-exclude = ["HSN_Implementation_Plan.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["python/hsn"]

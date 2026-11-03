@@ -1,0 +1,21 @@
+[package]
+name = "hsn-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PyO3 bindings for HSN: the Python module hsn_rs"
+
+[lib]
+name = "hsn_rs" # must equal [tool.maturin].module-name in pyproject.toml and the #[pymodule] name
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+# No `extension-module` feature: PyO3 0.28 deprecates it (it disables linking for `cargo test`);
+# maturin >= 1.9.4 sets PYO3_BUILD_EXTENSION_MODULE itself when building the extension.
+pyo3.workspace = true
+hsn-kernels.workspace = true # default features only => "cpu"
+
+[build-dependencies]
+pyo3-build-config = { workspace = true, features = ["resolve-config"] }

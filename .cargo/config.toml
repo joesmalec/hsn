@@ -1,0 +1,5 @@
+# Build PyO3 against the project's uv-managed interpreter rather than whatever `python3` is on
+# PATH. `relative = true` resolves against the repository root. Default `force = false`, so an
+# explicit PYO3_PYTHON in the environment (maturin sets its own) still wins. Run `uv sync` first.
+[env]
+PYO3_PYTHON = { value = ".venv/bin/python", relative = true }

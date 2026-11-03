@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2.0"] # >= 1.9.4 sets PYO3_BUILD_EXTENSION_MODULE itself
+build-backend = "maturin"
+
+[project]
+name = "hsn-rs"
+dynamic = ["version"] # taken from Cargo.toml -> workspace version
+requires-python = ">=3.12"
+description = "PyO3 bindings for HSN (import name: hsn_rs)"
+
+[tool.maturin]
+module-name = "hsn_rs"
+bindings = "pyo3"

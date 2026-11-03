@@ -1,0 +1,10 @@
+[package]
+name = "hsn-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HSN tiered unit-weight streaming: shard loader (mmap), tiers, residency, prefetch"
+
+[dependencies]
+hsn-core.workspace = true

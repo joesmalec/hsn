@@ -1,0 +1,16 @@
+[package]
+name = "hsn-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HSN kernel backends: Backend trait, CPU oracle, CUDA/Metal hosts for the compiled binaries"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = []  # empty until P2.10; must stay off by default
+metal = [] # empty until P2.11; must stay off by default
+
+[dependencies]
+hsn-core.workspace = true

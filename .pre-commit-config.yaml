@@ -1,0 +1,40 @@
+minimum_pre_commit_version: "4.0.0"
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1500"] # uv.lock resolves the Linux CUDA wheel tree and is large
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      # mypy runs against the real project environment (torch, pydantic, ...) rather than the
+      # isolated mirrors-mypy venv, where --ignore-missing-imports would defeat --strict.
+      - id: mypy
+        name: mypy --strict (python/hsn)
+        entry: uv run --no-sync mypy --strict python/hsn
+        language: system
+        pass_filenames: false
+        files: ^(python/hsn/.*\.py|pyproject\.toml)$
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        files: \.rs$
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        files: ^(rust/.*|Cargo\.(toml|lock)|rust-toolchain\.toml|\.cargo/config\.toml)$
