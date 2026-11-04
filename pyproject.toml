@@ -14,6 +14,9 @@ dependencies = [
   "pyarrow",
 ]
 
+[project.scripts]
+hsn = "hsn.runner:main" # P0.8: hsn run | rerun | package
+
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov", "ruff==0.17.3", "mypy", "pre-commit", "maturin>=1.9.4,<2", "types-PyYAML"]
 cuda = ["pynvml"]
@@ -55,6 +58,10 @@ select = ["E", "F", "W", "I", "UP", "B"]
 python_version = "3.12"
 strict = true
 files = ["python/hsn"]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"] # ships no type information (P0.8 result store)
+ignore_missing_imports = true
 
 [tool.coverage.run]
 branch = true # P0.7 definition of done: 100 % branch coverage on python/hsn/eval/gates.py

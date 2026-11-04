@@ -50,6 +50,7 @@ data: # Appendix A.2
   manifest: null # split manifest with hashes (P0.4 / P4.1)
   tokenizer: bytes # only byte-level in this program
   tasks: [] # task names or stage ids
+  variants: [] # P0.8: in_range | out_of_range variants of the tasks to load; [] = every variant
   context_symbols: configs/data/context_symbols.yaml # id table
   split: train # train | dev | test (test only in gate scripts)
   align_docs: true # P0.5: every document starts at a window boundary (in_range = fits one window)
