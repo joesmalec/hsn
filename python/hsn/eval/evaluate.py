@@ -131,8 +131,9 @@ class MetricAccumulator:
                     f"got shape {tuple(values.shape)}"
                 )
             # The sums are kept in float64 on the host: MPS has no float64 (P1.7), and a CPU
-            # accumulation is the same on every backend.
-            values = values.detach().to(device="cpu", dtype=torch.float64)
+            # accumulation is the same on every backend. Move first, cast second: a combined
+            # ``.to(device, dtype)`` performs the cast on the source device, which MPS refuses.
+            values = values.detach().cpu().to(torch.float64)
             self._sums[name] += float(values.sum())
             if groups is not None:
                 per_group = torch.bincount(groups, weights=values, minlength=len(self.group_names))
