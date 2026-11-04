@@ -1,6 +1,7 @@
 """P1.5 tests: the dense PDG cell step, the scorer features, the HSN module, the parameter count
 against the P1.1 closed form, and a pure-Python reference of one step in fp64."""
 
+import copy
 import math
 from collections.abc import Sequence
 from pathlib import Path
@@ -913,8 +914,26 @@ def _first(tokens: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor]:
     return tokens[:, 0], ctx[:, 0]
 
 
+def _to_device(state: CellGraphState, device: torch.device) -> CellGraphState:
+    return CellGraphState(
+        h=state.h.to(device),
+        q=state.q.to(device),
+        age=state.age.to(device),
+        pos=state.pos.to(device),
+    )
+
+
 @pytest.mark.parametrize("device_type", [cuda_param, mps_param])
 def test_p1_5_runs_on_device(device_type: str) -> None:
+    """The forward on the device agrees with the CPU.
+
+    Two tolerances (P1.7, measured on MPS): every single position, started from the *same* input
+    state on both sides, must agree to 1e-4 (the device's one-step numerics; a broken kernel
+    shows here as an order-one error). Over the whole window the state is carried on each side
+    and fp32 rounding (accumulation order of the device's matmuls) compounds through six gated
+    recurrent steps of a perturbed model: MPS reached 0.0145 absolute on the logits, so the
+    carried comparison allows 5e-2, which is still far below what a wrong operation produces.
+    """
     device = _device(device_type)
     cfg, model = _model(REF_A1)
     _perturb(model, seed=29)
@@ -924,25 +943,42 @@ def test_p1_5_runs_on_device(device_type: str) -> None:
     reset[0, 3] = True
     state = _random_state(model, B, seed=31)
     logits_cpu, state_cpu, info_cpu = model(tokens, ctx, state, reset)
+    cpu_model = copy.deepcopy(model)
 
     on_device = model.to(device)
-    state_dev = CellGraphState(
-        h=state.h.to(device),
-        q=state.q.to(device),
-        age=state.age.to(device),
-        pos=state.pos.to(device),
-    )
+    state_dev = _to_device(state, device)
     logits_dev, state_out, info_dev = on_device(
         tokens.to(device), ctx.to(device), state_dev, reset.to(device)
     )
     assert logits_dev.device.type == device.type and state_out.device.type == device.type
-    torch.testing.assert_close(logits_dev.cpu(), logits_cpu, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(state_out.h.cpu(), state_cpu.h, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(state_out.q.cpu(), state_cpu.q, atol=1e-4, rtol=1e-4)
+    # one step at a time from the same input state: the device's own numerics
+    s_cpu = state
+    with torch.no_grad():
+        for t in range(T):
+            s_cpu = s_cpu.reset(reset[:, t])
+            out_cpu = cpu_model.step(tokens[:, t], ctx[:, t], s_cpu)
+            out_dev = on_device.step(
+                tokens[:, t].to(device), ctx[:, t].to(device), _to_device(s_cpu, device)
+            )
+            for name in ("z", "z_hat", "eps", "u", "logits"):
+                torch.testing.assert_close(
+                    getattr(out_dev, name).cpu(),
+                    getattr(out_cpu, name),
+                    atol=1e-4,
+                    rtol=1e-4,
+                    msg=lambda m, t=t, name=name: f"position {t}, {name}: {m}",
+                )
+            torch.testing.assert_close(out_dev.state.h.cpu(), out_cpu.state.h, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(out_dev.state.q.cpu(), out_cpu.state.q, atol=1e-4, rtol=1e-4)
+            s_cpu = out_cpu.state
+    # the whole window with the state carried on each side: accumulated fp32 rounding only
+    torch.testing.assert_close(logits_dev.cpu(), logits_cpu, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(state_out.h.cpu(), state_cpu.h, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(state_out.q.cpu(), state_cpu.q, atol=5e-2, rtol=5e-2)
     assert torch.equal(state_out.age.cpu(), state_cpu.age)
     assert torch.equal(state_out.pos.cpu(), state_cpu.pos)
     for key in ("z", "z_hat", "eps", "u", *AUX_KEYS):
-        torch.testing.assert_close(info_dev[key].cpu(), info_cpu[key], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(info_dev[key].cpu(), info_cpu[key], atol=5e-2, rtol=5e-2)
     assert on_device.param_report()["total"] == 1_820_361
     # backward on the device reaches the edge logits and the gate
     logits_dev.square().mean().backward()  # type: ignore[no-untyped-call]
