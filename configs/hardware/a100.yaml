@@ -1,0 +1,19 @@
+# profile:a100 -- NVIDIA A100 80 GB (compute capability 8.0) or H100 (9.0); confirmation runs and the
+# G4-G6 budgets (Plan §3.1). Appendix A.5 fields; values from Appendix E.1, §3.4, §3.7 and §3.8.
+name: a100
+device: cuda
+autocast_dtype: bf16
+master_dtype: fp32
+vram_bytes: 85899345920 # 80 GiB HBM nominal; the measured value is logged separately
+vram_cap_fraction: 1.0
+unified_memory: false
+pinned_memory: true
+compile_mode: none
+nvcc_arch: [sm_80]
+power_meter: nvml # §3.8: NVML is instantaneous on GA100
+recipe:
+  batch: 4
+  micro_batch: 4
+  unroll: 256
+  activation_checkpoint: none
+stream: {}
