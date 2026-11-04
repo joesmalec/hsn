@@ -1,0 +1,19 @@
+# profile:m_series -- Apple M-series, macOS 15 or newer, Metal through PyTorch MPS (Plan §3.1);
+# development, Metal kernels, parity tests. Appendix A.5 fields; values from Appendix E.1, §3.7 and §3.8.
+name: m_series
+device: mps
+autocast_dtype: fp16 # §3.7: fp16 autocast on MPS (bf16 autocast training on MPS is "verify before use")
+master_dtype: fp32
+vram_bytes: 17179869184 # 16 GiB nominal; unified memory is 8-192 GB by model, P0.3 measures the real limit
+vram_cap_fraction: 1.0
+unified_memory: true
+pinned_memory: false
+compile_mode: none
+nvcc_arch: []
+power_meter: powermetrics # §3.8: `sudo powermetrics --samplers gpu_power,cpu_power`
+recipe:
+  batch: 4
+  micro_batch: 4
+  unroll: 256
+  activation_checkpoint: none
+stream: {}

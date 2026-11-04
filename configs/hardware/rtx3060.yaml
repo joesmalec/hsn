@@ -1,0 +1,20 @@
+# profile:rtx3060 -- NVIDIA RTX 3060 12 GB (GA106, compute capability 8.6, PCIe 4.0 x16); the low-VRAM
+# reference and day-one development GPU (Plan §3.1). Appendix A.5 fields; values from Appendix E.1,
+# §3.4, §3.7 and §3.8.
+name: rtx3060
+device: cuda
+autocast_dtype: bf16 # §3.7: Ampere and newer autocast in bf16
+master_dtype: fp32
+vram_bytes: 12884901888 # 12 GiB nominal (~11.5 GiB usable); the measured value is logged separately
+vram_cap_fraction: 1.0
+unified_memory: false
+pinned_memory: true # PCIe 4.0 x16: pinned host->device ~20-25 GB/s (Appendix E.4)
+compile_mode: none # torch.compile stays off until P2.8
+nvcc_arch: [sm_86]
+power_meter: nvml # §3.8: NVML on GA106 is a 1 s average; cross-check against a wall meter
+recipe: # Appendix E.3 ref_a1 row (B=4, T=256); `hsn plan` (P4.3) refines it
+  batch: 4
+  micro_batch: 4
+  unroll: 256
+  activation_checkpoint: none
+stream: {}

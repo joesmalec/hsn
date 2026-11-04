@@ -1,0 +1,19 @@
+# profile:cpu -- any x86_64 or aarch64 host (Plan §3.1): numerical oracle, CI on every PR, fp64
+# gradient checks. Appendix A.5 fields; values from Appendix E.1 and §3.7/§3.8.
+name: cpu
+device: cpu
+autocast_dtype: fp32 # §3.7: no autocast on the CPU
+master_dtype: fp32
+vram_bytes: 0 # host RAM is the only memory; 0 = no fixed device memory, measured at run time (P0.3)
+vram_cap_fraction: 1.0 # simulated cap for tests (1.0 = none)
+unified_memory: true
+pinned_memory: false
+compile_mode: none
+nvcc_arch: []
+power_meter: none # §3.8: no meter on the CPU profile
+recipe: # recommended by `hsn plan` (P4.3); Appendix E.3 ref_a1 row until then
+  batch: 4
+  micro_batch: 4
+  unroll: 256
+  activation_checkpoint: none
+stream: {} # profile-level overrides of stream.* (none)
