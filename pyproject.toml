@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff==0.17.3", "mypy", "pre-commit", "maturin>=1.9.4,<2", "types-PyYAML"]
+dev = ["pytest", "pytest-cov", "ruff==0.17.3", "mypy", "pre-commit", "maturin>=1.9.4,<2", "types-PyYAML"]
 cuda = ["pynvml"]
 viz = ["matplotlib"]
 
@@ -55,3 +55,6 @@ select = ["E", "F", "W", "I", "UP", "B"]
 python_version = "3.12"
 strict = true
 files = ["python/hsn"]
+
+[tool.coverage.run]
+branch = true # P0.7 definition of done: 100 % branch coverage on python/hsn/eval/gates.py
