@@ -531,9 +531,12 @@ def test_p2_5_runs_on_all_backends(device_type: str) -> None:
 
 def test_p2_5_padded_slots_ignored() -> None:
     """Padded slots (``valid=False``) change nothing: the state equals the unpadded selection's
-    bit for bit whatever the padded slot holds (cell 0 beside a real cell 0, another cell, a unit,
-    an α), they carry no gradient, and the validation ignores them while refusing duplicated or
-    out-of-range valid slots."""
+    whatever the padded slot holds (cell 0 beside a real cell 0, another cell, a unit, an α), they
+    carry no gradient, and the validation ignores them while refusing duplicated or out-of-range
+    valid slots. The written values are compared within fp32 rounding (``atol`` 1e-5), not bit for
+    bit: a padded pair joins its unit's block in the grouped matmul, and on the hosted ubuntu
+    runner's BLAS a block of another height rounds the same rows differently (exact on Apple
+    silicon); the ages, the tick mask and the gradients stay exact."""
     cfg, model = _model(REF_A1, ["model.routing=topk"], perturb=41)
     cell = model.cell
     B, N = 4, cfg.model.n_cells
@@ -561,9 +564,10 @@ def test_p2_5_padded_slots_ignored() -> None:
         h_pad, info_pad = cell.step_sparse(u, eps, state, sel)
         pad_state = info_pad["state"]
         assert isinstance(pad_state, CellGraphState)
-        assert torch.equal(pad_state.h, base_state.h) and torch.equal(pad_state.q, base_state.q)
+        torch.testing.assert_close(pad_state.h, base_state.h, atol=1e-5, rtol=0)
+        torch.testing.assert_close(pad_state.q, base_state.q, atol=1e-5, rtol=0)
         assert torch.equal(pad_state.age, base_state.age)
-        assert torch.equal(h_pad[:, :2], h_base)
+        torch.testing.assert_close(h_pad[:, :2], h_base, atol=1e-5, rtol=0)
         assert torch.equal(h_pad[:, 2:], state.h[:, 0:1].expand(B, 2, cfg.model.d))  # cell 0, as is
         selected = info_pad["selected"]
         assert isinstance(selected, Tensor) and torch.equal(selected, info_base["selected"])
@@ -588,13 +592,11 @@ def test_p2_5_padded_slots_ignored() -> None:
     )
     state_s = info_s["state"]
     assert isinstance(state_s, CellGraphState)
-    assert torch.equal(state_s.h[[0, 2, 3]], base_state.h[[0, 2, 3]])
-    assert torch.equal(state_s.h[1, 9], state.h[1, 9]) and torch.equal(
-        state_s.h[1, 7], base_state.h[1, 7]
-    )
-    assert bool(state_s.age[1, 9] == state.age[1, 9]) and torch.equal(
-        h_s[:, :2][[0, 2, 3]], h_base[[0, 2, 3]]
-    )
+    torch.testing.assert_close(state_s.h[[0, 2, 3]], base_state.h[[0, 2, 3]], atol=1e-5, rtol=0)
+    assert torch.equal(state_s.h[1, 9], state.h[1, 9])  # the disabled cell is never written
+    torch.testing.assert_close(state_s.h[1, 7], base_state.h[1, 7], atol=1e-5, rtol=0)
+    assert bool(state_s.age[1, 9] == state.age[1, 9])
+    torch.testing.assert_close(h_s[:, :2][[0, 2, 3]], h_base[[0, 2, 3]], atol=1e-5, rtol=0)
     valid_eff = info_s["valid"]
     assert isinstance(valid_eff, Tensor) and not bool(valid_eff[1, 1]) and bool(valid_eff[1, 0])
 
