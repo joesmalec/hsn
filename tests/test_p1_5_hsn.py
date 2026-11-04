@@ -37,7 +37,9 @@ def _device(device_type: str) -> torch.device:
         pytest.skip("no cuda device on this machine")
     if device_type == "mps" and not torch.backends.mps.is_available():
         pytest.skip("no mps device on this machine")
-    return torch.device(device_type)
+    # The device as tensors report it (``cuda:0`` / ``mps:0``, with the index): a bare
+    # ``torch.device("mps")`` never compares equal to a tensor's device (found on MPS, P1.7).
+    return torch.empty(0, device=device_type).device
 
 
 def _model(path: Path, overrides: Sequence[str] = ()) -> tuple[RunConfig, HSN]:
