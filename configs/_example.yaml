@@ -37,6 +37,7 @@ model: # Appendix A.1
   budget: 1.0 # B_t as a fraction of the dense step cost
   lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
   deadline_ms: null # wall-clock deadline (serving)
+  cost_profile: null # P2.1: cost profile (P0.6 report + cost_profile block) for the router's cost table; null = uniform placeholder
   static_k: true # pad selection to fixed K (needed for graphs / compile)
   age_max: 64 # refresh-probe threshold
   halt_threshold: 0.5 # inference halting threshold

@@ -19,8 +19,9 @@ ignored. Models are frozen; a config never changes after it has been hashed.
 
 Keys beyond Appendix A, added by later chunks with the same conventions: ``baseline.*`` (P0.5, the
 sizes of the GRU and Transformer baselines), ``train.search_trials`` (P0.5, the hyperparameter
-search budget every method gets) and ``data.align_docs`` (P0.5, documents start at window
-boundaries when streams are built).
+search budget every method gets), ``data.align_docs`` (P0.5, documents start at window
+boundaries when streams are built) and ``model.cost_profile`` (P2.1, the cost profile the router's
+cost table is read from; ``null`` is the uniform placeholder).
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -173,6 +174,13 @@ class ModelConfig(_StrictModel):
     budget: float = Field(default=1.0, ge=0.0)  # B_t as a fraction of the dense step cost
     lambda_cost: float = Field(default=0.0, ge=0.0)  # lambda_cost in score = U - lambda * c
     deadline_ms: float | None = None  # wall-clock deadline (serving)
+    # --- P2.1: routing cost profile (python/hsn/kernels/costs.py, python/hsn/model/router.py) ---
+    # The cost profile (a P0.6 report with a `cost_profile` block, written by
+    # hsn.kernels.costs.profile_dense_costs) the router's cost table is read from; a relative
+    # path resolves against the repository root. null = the uniform placeholder table (not a
+    # measurement; fine for dense runs and tests). Never a parameter count.
+    cost_profile: Path | None = None
+    # --- end P2.1 ---
     static_k: bool = True  # pad selection to fixed K (needed for graphs / compile)
     age_max: int = Field(default=64, ge=1)  # refresh-probe threshold
     halt_threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # inference halting threshold
@@ -204,6 +212,20 @@ class ModelConfig(_StrictModel):
                 raise ValueError(f"model.{name} has cell ids outside [0, {self.n_cells}): {bad}")
         if self.routing == "fixed" and not self.fixed_route:
             raise ValueError("model.routing=fixed requires a non-empty model.fixed_route")
+        # --- P2.1: selection validation (Router.select enforces the same bounds at run time) ---
+        if len(set(self.fixed_route)) != len(self.fixed_route):
+            raise ValueError(f"model.fixed_route must list distinct cells, got {self.fixed_route}")
+        if self.routing == "fixed" and not self.k_min <= len(self.fixed_route) <= self.k_select:
+            raise ValueError(
+                f"model.routing=fixed selects exactly the {len(self.fixed_route)} cells of "
+                f"model.fixed_route, which must lie within [model.k_min, model.k_select] = "
+                f"[{self.k_min}, {self.k_select}]"
+            )
+        if self.routing == "greedy_budget" and self.budget <= 0.0:
+            raise ValueError(
+                f"model.routing=greedy_budget needs model.budget > 0, got {self.budget}"
+            )
+        # --- end P2.1 ---
         return self
 
 
