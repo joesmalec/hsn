@@ -163,6 +163,14 @@ class HSN(nn.Module):
         dev = self.device if device is None else torch.device(device)
         return CellGraphState.zeros(B, self.cfg.n_cells, self.cfg.d, dev, self.dtype)
 
+    def reset_state(self, state: CellGraphState, mask: Tensor) -> CellGraphState:
+        """The P0.5 :class:`~hsn.train.loop.SequenceModel` protocol (P1.7): the sessions where
+        ``mask [B]`` (bool) is True back to the zero state, the others untouched
+        (:meth:`CellGraphState.reset`). :meth:`forward` applies its own ``reset`` argument position
+        by position; the trainer never calls this itself."""
+        self._check_state(state)
+        return state.reset(mask)
+
     # -- one position -----------------------------------------------------------------------------
 
     def step(
@@ -192,14 +200,18 @@ class HSN(nn.Module):
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         eps = z - z_hat
         u = self.shared(torch.cat([z, q_prev, self.ctx_emb(ctx_t)], dim=-1))
+        # P1.7: under autocast E, P and S emit the autocast dtype (bf16 / fp16); the state path
+        # (scorer features, the softmax over units, the cell update and q) runs in the state's
+        # dtype, the fp32 master precision of §3.7. Without autocast these casts are no-ops.
+        u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)
 
         with self.cell.graph.step():
             feats = self.scorer.features(
-                u, eps, state, ctx_t, budget_frac=cfg.budget, round_idx=0, ema=None
+                u_s, eps_s, state, ctx_t, budget_frac=cfg.budget, round_idx=0, ema=None
             )
-            unit_logits = self.scorer(feats)  # [B, N, M]
+            unit_logits = self.scorer(feats).to(state.dtype)  # [B, N, M]
             alpha = torch.softmax(unit_logits, dim=-1)
-            h_new, _ = self.cell.step_dense(u, eps, state, alpha)
+            h_new, _ = self.cell.step_dense(u_s, eps_s, state, alpha)
 
         new_state = self._write_dense(state, h_new)
         logits = self.decoder(torch.cat([new_state.q, u], dim=-1))  # the updated q_t
