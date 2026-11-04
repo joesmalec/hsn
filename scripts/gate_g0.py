@@ -18,7 +18,8 @@ succeeds; leakage checks pass; primary metrics, quality tolerances and the G1 ta
    P0.6 profiling pass is part of every run.
 5. Rerun: the first seed of every configuration is retrained from its resolved configuration;
    exact on ``profile:cpu`` (every metric and the model hash), within ``--rerun-tolerance`` on the
-   primary metric (accuracy) on any other profile, where the tolerance is required.
+   overall dev accuracy (the primary metric) on any other profile, where the tolerance is required;
+   per-task accuracy and loss differences are recorded, not gated.
 6. Decision (PASS only if every check holds), written to ``<out>/decision.json`` and the result
    store, then the evidence package ``<out>/G0.zip``. Exit code 0 on PASS, 1 on FAIL.
 
@@ -158,7 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--rerun-tolerance",
         type=float,
-        help="metric tolerance for the rerun; 0 (exact) on cpu, required on other profiles",
+        help="rerun tolerance on the overall dev accuracy; 0 (exact) on cpu, required elsewhere",
     )
     parser.add_argument("--power", choices=("none", "profile"), default="none")
     parser.add_argument("--profile-steps", type=int, default=20)
@@ -282,6 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "original": v["original_run_id"],
                 "rerun": v["rerun_run_id"],
                 "tolerance": v["tolerance"],
+                "abs_diff_all": v["gated_abs_diff"],
                 "max_abs_diff": v["max_abs_diff"],
                 "max_abs_diff_loss": v["max_abs_diff_loss"],
                 "model_hash_equal": v["model_hash_equal"],
@@ -340,9 +342,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     for v in verdicts:
         print(
-            f"rerun {v['original_run_id']}: max |diff| accuracy {v['max_abs_diff']:.3g} "
-            f"loss {v['max_abs_diff_loss']:.3g} (tolerance {v['tolerance']:g} on accuracy), "
-            f"model hash equal {v['model_hash_equal']} -> "
+            f"rerun {v['original_run_id']}: overall |diff| accuracy {v['gated_abs_diff']:.3g} "
+            f"(tolerance {v['tolerance']:g}), largest per-task {v['max_abs_diff']:.3g}, "
+            f"loss {v['max_abs_diff_loss']:.3g}, model hash equal {v['model_hash_equal']} -> "
             f"{'PASS' if v['passed'] else 'FAIL'}"
         )
     print("timings (s): " + ", ".join(f"{k} {v:.1f}" for k, v in timings.items()))

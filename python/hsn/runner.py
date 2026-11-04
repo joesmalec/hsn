@@ -615,11 +615,14 @@ def rerun(
 
     With ``tolerance == 0`` every final dev metric (loss and accuracy, overall and per group) must
     agree exactly and the model hashes must be equal (exact on ``profile:cpu``). With a tolerance
-    (GPU profiles: cuDNN and MPS kernels are not bit-reproducible, P0.8 pitfalls) the primary
-    metric of the synthetic suites, accuracy (``metrics_freeze.json``), must agree within it
-    overall and per group; the loss differences (nats, another unit) are recorded alongside
-    (``max_abs_diff_loss``) but not gated. The verdict goes to ``<rerun dir>/rerun.json`` and the
-    result store; the rerun directory is returned.
+    (GPU profiles: cuDNN and MPS kernels are not bit-reproducible, P0.8 pitfalls) the overall dev
+    accuracy, the primary metric of the synthetic suites (``metrics_freeze.json``), must agree
+    within it (``gated_abs_diff``); the per-group accuracy differences (``max_abs_diff`` is the
+    largest, overall or per group) and the loss differences (nats, another unit;
+    ``max_abs_diff_loss``) are recorded alongside but not gated: on a steep part of a learning
+    curve a single task moves by more than the tolerance between two MPS runs of the same seed
+    (G0 measurements). The verdict goes to ``<rerun dir>/rerun.json`` and the result store; the
+    rerun directory is returned.
     """
     source = Path(run_dir)
     if tolerance < 0.0 or not math.isfinite(tolerance):
@@ -645,13 +648,14 @@ def rerun(
     )
     again = json.loads((new_dir / METRICS_FILE).read_text(encoding="utf-8"))
     diffs = _final_diffs(original.final, again["final"])
+    gated_abs_diff = diffs["all/accuracy"]
     max_abs_diff = max(value for key, value in diffs.items() if key.endswith("/accuracy"))
     max_abs_diff_loss = max(value for key, value in diffs.items() if key.endswith("/loss"))
     hashes_equal = bool(original.metrics["model_hash"] == again["model_hash"])
     if tolerance == 0.0:
         passed = max(diffs.values()) == 0.0 and hashes_equal
     else:
-        passed = max_abs_diff <= tolerance
+        passed = gated_abs_diff <= tolerance
     verdict = {
         "original_run_id": original.run_id,
         "original_dir": str(source),
@@ -662,6 +666,8 @@ def rerun(
         "tolerance": tolerance,
         "exact": tolerance == 0.0,
         "metric": "accuracy",
+        "gated": "everything" if tolerance == 0.0 else "all/accuracy",
+        "gated_abs_diff": gated_abs_diff,
         "diffs": diffs,
         "max_abs_diff": max_abs_diff,
         "max_abs_diff_loss": max_abs_diff_loss,
@@ -674,28 +680,29 @@ def rerun(
         "compared_at": _utc_now(),
     }
     _write_json(new_dir / RERUN_FILE, verdict)
-    ResultStore(target / STORE_FILE).append(
-        new_id,
-        {
-            "config_hash": again["config_hash"],
-            "model_name": again["model_name"],
-            "profile": cfg.profile,
-            "seed": cfg.seed,
-            "git_rev": again.get("git_rev"),
-            "step": again["steps"],
-            "is_rerun": True,
-            "split": "dev",
-            "group": "all",
-            "metric": "rerun_max_abs_diff",
-            "value": max_abs_diff,
-            "text": "PASS" if passed else "FAIL",
-        },
-    )
+    store = ResultStore(target / STORE_FILE)
+    row: dict[str, Any] = {
+        "config_hash": again["config_hash"],
+        "model_name": again["model_name"],
+        "profile": cfg.profile,
+        "seed": cfg.seed,
+        "git_rev": again.get("git_rev"),
+        "step": again["steps"],
+        "is_rerun": True,
+        "split": "dev",
+        "group": "all",
+        "text": "PASS" if passed else "FAIL",
+    }
+    store.append(new_id, {**row, "metric": "rerun_abs_diff_all", "value": gated_abs_diff})
+    store.append(new_id, {**row, "metric": "rerun_max_abs_diff", "value": max_abs_diff})
     logger.info(
-        "rerun of %s: max |diff| %.3g (tolerance %g), model hash equal %s -> %s",
+        "rerun of %s: overall |diff| accuracy %.3g (tolerance %g), largest per-task %.3g, "
+        "loss %.3g, model hash equal %s -> %s",
         original.run_id,
-        max_abs_diff,
+        gated_abs_diff,
         tolerance,
+        max_abs_diff,
+        max_abs_diff_loss,
         hashes_equal,
         "PASS" if passed else "FAIL",
     )
@@ -733,7 +740,12 @@ def _parser() -> argparse.ArgumentParser:
 
     again = sub.add_parser("rerun", help="retrain a run from its resolved config and compare")
     again.add_argument("run_dir", help="runs/<run_id>")
-    again.add_argument("--tolerance", type=float, default=0.0, help="0 = exact (cpu)")
+    again.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.0,
+        help="0 = exact (cpu); otherwise the overall dev accuracy must agree within it",
+    )
     again.add_argument("--out", help="parent of the rerun directory (default: next to run_dir)")
     again.add_argument("--profile-steps", type=int, default=20)
     again.add_argument("--power", choices=("none", "profile"), default="none")
@@ -781,9 +793,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         verdict = json.loads((new_dir / RERUN_FILE).read_text(encoding="utf-8"))
         print(
-            f"{new_dir}: {'PASS' if verdict['passed'] else 'FAIL'} max |diff| "
-            f"{verdict['max_abs_diff']:.3g} (loss {verdict['max_abs_diff_loss']:.3g}) tolerance "
-            f"{verdict['tolerance']:g} "
+            f"{new_dir}: {'PASS' if verdict['passed'] else 'FAIL'} overall |diff| accuracy "
+            f"{verdict['gated_abs_diff']:.3g} (tolerance {verdict['tolerance']:g}), largest "
+            f"per-task {verdict['max_abs_diff']:.3g}, loss {verdict['max_abs_diff_loss']:.3g}, "
             f"model hash equal {verdict['model_hash_equal']}"
         )
         return 0 if verdict["passed"] else 1

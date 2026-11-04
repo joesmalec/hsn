@@ -210,6 +210,7 @@ def test_p0_8_rerun_exact_on_cpu(runs: dict[str, Path], tmp_path: Path) -> None:
     verdict = read_json(copy.parent / f"{original.name}-rerun" / RERUN_FILE)
     assert verdict["passed"] is False and verdict["max_abs_diff"] == pytest.approx(0.1)
     assert verdict["max_abs_diff_loss"] == 0.0 and verdict["metric"] == "accuracy"
+    assert verdict["gated"] == "everything" and verdict["gated_abs_diff"] == pytest.approx(0.1)
     # a loss-only difference is reported but gated only at tolerance 0 (accuracy is the frozen
     # primary metric of the synthetic suites; the loss is in nats, another unit)
     loss_copy = tmp_path / "loss_edited" / original.name
@@ -221,6 +222,20 @@ def test_p0_8_rerun_exact_on_cpu(runs: dict[str, Path], tmp_path: Path) -> None:
     verdict = read_json(loss_copy.parent / f"{original.name}-rerun" / RERUN_FILE)
     assert verdict["max_abs_diff"] == 0.0 and verdict["max_abs_diff_loss"] == pytest.approx(0.05)
     assert main(["rerun", str(loss_copy), "--tolerance", "0", "--out", str(tmp_path / "l0")]) == 1
+    # a per-task-only accuracy difference is reported as the largest per-task difference but,
+    # with a tolerance, not gated: the gate is the overall dev accuracy (on MPS a single task on
+    # a steep part of its learning curve moves by more than the tolerance between two runs)
+    group_copy = tmp_path / "group_edited" / original.name
+    shutil.copytree(original, group_copy)
+    edited = read_json(group_copy / METRICS_FILE)
+    group = sorted(edited["final"]["per_group"])[0]
+    edited["final"]["per_group"][group]["accuracy"] += 0.05
+    (group_copy / METRICS_FILE).write_text(json.dumps(edited), encoding="utf-8")
+    assert main(["rerun", str(group_copy), "--tolerance", "0.01", "--profile-steps", "1"]) == 0
+    verdict = read_json(group_copy.parent / f"{original.name}-rerun" / RERUN_FILE)
+    assert verdict["gated"] == "all/accuracy" and verdict["gated_abs_diff"] == 0.0
+    assert verdict["max_abs_diff"] == pytest.approx(0.05) and verdict["passed"] is True
+    assert main(["rerun", str(group_copy), "--tolerance", "0", "--out", str(tmp_path / "g0")]) == 1
     # a tolerance covers it; a rerun of a rerun and a repeated rerun are refused
     assert main(["rerun", str(copy), "--tolerance", "0.2", "--out", str(tmp_path / "tol")]) == 0
     with pytest.raises(ValueError, match="itself a rerun"):
@@ -574,6 +589,7 @@ def test_p0_8_gate_g0_smoke(tmp_path: Path) -> None:
     assert len(decision["runs"]) == 4 and len(decision["reruns"]) == 2
     assert all(r["max_abs_diff"] == 0.0 and r["model_hash_equal"] for r in decision["reruns"])
     assert all(r["max_abs_diff_loss"] == 0.0 for r in decision["reruns"])
+    assert all(r["abs_diff_all"] == 0.0 for r in decision["reruns"])
     assert decision["freeze"]["g1_tasks"] == ["kv/in_range", "delayed/in_range"]
     leakage = read_json(tmp_path / "evidence" / "leakage.json")
     assert leakage["clean"] and set(leakage["live"]["pairs"]) == {"algorithmic/in_range"}
