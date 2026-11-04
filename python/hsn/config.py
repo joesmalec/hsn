@@ -17,6 +17,11 @@ defaults to 1.0 because ``L_pred`` is part of the base objective (Plan §2.6), n
 Unknown keys are rejected everywhere (``extra="forbid"``): a misspelt key raises instead of being
 ignored. Models are frozen; a config never changes after it has been hashed.
 
+Keys beyond Appendix A, added by later chunks with the same conventions: ``baseline.*`` (P0.5, the
+sizes of the GRU and Transformer baselines), ``train.search_trials`` (P0.5, the hyperparameter
+search budget every method gets) and ``data.align_docs`` (P0.5, documents start at window
+boundaries when streams are built).
+
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
 string ``Literal`` or a path, in which case the text is taken verbatim; pydantic then validates and
@@ -46,8 +51,10 @@ __all__ = [
     "MEASURED_KEYS",
     "PROFILES",
     "REPO_ROOT",
+    "BaselineConfig",
     "DataConfig",
     "FastConfig",
+    "GRUBaselineConfig",
     "GrowthConfig",
     "HardwareConfig",
     "ModelConfig",
@@ -61,6 +68,7 @@ __all__ = [
     "ServeLimitsConfig",
     "StreamConfig",
     "TrainConfig",
+    "TransformerBaselineConfig",
     "canonical_json",
     "config_hash",
     "dump_resolved",
@@ -213,6 +221,10 @@ class DataConfig(_StrictModel):
     tasks: list[str] = []  # task names or stage ids
     context_symbols: Path = Path("configs/data/context_symbols.yaml")  # id table
     split: Split = "train"  # guarded: test only in gate scripts
+    # P0.5: start every document at a window boundary when streams are built (the tail of its
+    # last window is padding). ``in_range`` (P0.4) means "the dependency fits one window", which
+    # only holds when documents are aligned; off, a document may straddle a window boundary.
+    align_docs: bool = True
 
 
 # --------------------------------------------------------------------------------------------------
@@ -276,6 +288,8 @@ class TrainConfig(_StrictModel):
     shared_lr_scale_on_conflict: float = Field(default=0.5, ge=0.0, le=1.0)
     activation_checkpoint: ActivationCheckpoint = "none"  # P4.3
     deterministic: bool = False  # deterministic kernels and backward
+    # P0.5: hyperparameter-search trials every method gets (paper §12: equal search budgets).
+    search_trials: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
@@ -401,6 +415,53 @@ class ServeConfig(_StrictModel):
 
 
 # --------------------------------------------------------------------------------------------------
+# baseline.*  (P0.5; not in Appendix A, which only describes HSN)
+# --------------------------------------------------------------------------------------------------
+
+
+class GRUBaselineConfig(_StrictModel):
+    """``baseline.gru.*``: the GRU byte-level language model of P0.5.
+
+    Defaults are the documented ≈2M-parameter setting for the reference data (``model.vocab_size``
+    256, ``model.n_context`` 16): 1,977,856 parameters as measured by ``GRUBaseline.param_report``.
+    """
+
+    d_model: int = Field(default=384, ge=1)  # embedding and hidden width
+    n_layers: int = Field(default=2, ge=1)  # stacked GRU layers
+    dropout: float = Field(default=0.0, ge=0.0, lt=1.0)  # on embeddings, between layers, on output
+
+
+class TransformerBaselineConfig(_StrictModel):
+    """``baseline.transformer.*``: the causal Transformer of P0.5 (context window ``train.unroll``).
+
+    Defaults are the documented ≈2M-parameter setting for the reference data and ``train.unroll``
+    256: 1,930,624 parameters as measured by ``TransformerBaseline.param_report``.
+    """
+
+    d_model: int = Field(default=192, ge=1)  # width; must be a multiple of n_heads
+    n_layers: int = Field(default=4, ge=1)  # pre-norm blocks
+    n_heads: int = Field(default=4, ge=1)  # attention heads
+    ffn_hidden: int = Field(default=768, ge=1)  # MLP hidden width (4 × d_model)
+    dropout: float = Field(default=0.0, ge=0.0, lt=1.0)  # embeddings, attention, residual branches
+
+    @model_validator(mode="after")
+    def _check_consistency(self) -> Self:
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"baseline.transformer.d_model={self.d_model} must be a multiple of "
+                f"n_heads={self.n_heads}"
+            )
+        return self
+
+
+class BaselineConfig(_StrictModel):
+    """``baseline.*``: sizes of the P0.5 baselines (``model_name`` selects which one runs)."""
+
+    gru: GRUBaselineConfig = GRUBaselineConfig()
+    transformer: TransformerBaselineConfig = TransformerBaselineConfig()
+
+
+# --------------------------------------------------------------------------------------------------
 # Appendix A.5  hardware profile file
 # --------------------------------------------------------------------------------------------------
 
@@ -465,6 +526,7 @@ class RunConfig(_StrictModel):
     san: SanConfig = SanConfig()
     stream: StreamConfig = StreamConfig()
     serve: ServeConfig = ServeConfig()
+    baseline: BaselineConfig = BaselineConfig()  # P0.5 baseline sizes (not in Appendix A)
     hardware: HardwareConfig  # resolved from `profile` by load_config, or given inline
     run_id: str = "default"
     seed: int = Field(default=0, ge=0)
