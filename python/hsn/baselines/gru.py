@@ -17,9 +17,12 @@ measured by :meth:`GRUBaseline.param_report`: the documented ≈2M-parameter bas
 parameter is read at every position, so *active* equals *stored* for this model; the two are
 reported separately because HSN and the sparse-expert baseline differ in them (paper §12).
 
-Under autocast the input and the carried state are cast to the autocast dtype explicitly: cuDNN's
-RNN kernels require the input, the hidden state and the (autocast-copied) weights to share one
-dtype, and the carried state otherwise keeps whatever dtype the previous window produced.
+Under autocast on CUDA the input and the carried state are cast to the autocast dtype explicitly:
+cuDNN's RNN kernels require the input, the hidden state and the (autocast-copied) weights to share
+one dtype. On every other device the input keeps the parameters' dtype (P1.7, found on MPS):
+:class:`torch.nn.GRU` checks the input dtype against its weights and does not count MPS autocast
+as autocast, so a cast input is refused, while the generic (non-cuDNN) kernel path runs its
+matmuls under autocast by itself. The carried state is brought to the input's dtype either way.
 """
 
 from __future__ import annotations
@@ -94,8 +97,8 @@ class GRUBaseline(nn.Module):
         self._check_state(state, B)
         x = self.drop(self.tok_emb(tokens) + self.ctx_emb(context))
         h = state
-        if torch.is_autocast_enabled(x.device.type):
-            dtype = torch.get_autocast_dtype(x.device.type)
+        if x.device.type == "cuda" and torch.is_autocast_enabled("cuda"):
+            dtype = torch.get_autocast_dtype("cuda")  # cuDNN: one dtype for input, state, weights
             x = x.to(dtype)
             h = h.to(dtype)
         elif h.dtype != x.dtype:
