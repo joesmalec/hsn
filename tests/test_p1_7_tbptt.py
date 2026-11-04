@@ -42,7 +42,7 @@ GROUPS_WITH_GRADS = {
     "predictor",
     "shared",
     "cell",
-    "scorer",
+    "router",  # P2.2: the router owns the scorer
     "decoder",
 }  # every top-level submodule but the halting head, which is not called while r_max = 1
 

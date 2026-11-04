@@ -24,7 +24,10 @@ boundaries when streams are built), ``train.ema_tau`` / ``train.variance_floor_g
 the EMA rate of the target encoder and the per-dimension standard-deviation floor on the batch
 that ``model.predictor_target=ema_encoder`` uses; a fixed-embedding target ignores both) and
 ``model.cost_profile`` (P2.1, the cost profile the router's cost table is read from; ``null`` is
-the uniform placeholder).
+the uniform placeholder) and ``train.reinforce_baseline_decay`` (P2.2, the EMA rate of the REINFORCE
+reward baseline; the P2.2 schedule keys ``gate_mode``, ``soft_until_step``, ``temperature_*``,
+``epsilon_*`` and ``p_dense`` are Appendix A.3 keys that P2.2 validates and reads through
+:class:`hsn.train.schedules.SelectionSchedule`).
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -327,9 +330,24 @@ class TrainConfig(_StrictModel):
     # dimension; 0.0 disables the term. Ignored with the fixed-embedding target.
     variance_floor_gamma: float = Field(default=1.0, ge=0.0)
     # ---- end P1.6 -------------------------------------------------------------------------------
+    # ---- P2.2: selection gradients (python/hsn/train/schedules.py, hsn.train.tbptt) -------------
+    # EMA rate of the REINFORCE reward baseline (gate_mode = reinforce): after every window
+    # b <- decay * b + (1 - decay) * R, R = -(task loss of the window). Other gate modes ignore it.
+    reinforce_baseline_decay: float = Field(default=0.9, ge=0.0, lt=1.0)
+    # ---- end P2.2 -------------------------------------------------------------------------------
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        # --- P2.2: a schedule whose end value can never be reached is refused, not ignored ---
+        for what in ("temperature", "epsilon"):
+            start, end = getattr(self, f"{what}_start"), getattr(self, f"{what}_end")
+            if getattr(self, f"{what}_steps") == 0 and start != end:
+                raise ValueError(
+                    f"train.{what}_steps=0 holds train.{what}_start={start} for the whole run, but "
+                    f"train.{what}_end={end} differs and would never be reached; give a step count "
+                    "or set the end equal to the start"
+                )
+        # --- end P2.2 ---
         unknown = [term for term in self.aux_enabled if term not in AUX_TERMS]
         if unknown:
             raise ValueError(f"train.aux_enabled names unknown terms {unknown}; known: {AUX_TERMS}")
@@ -581,6 +599,26 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
+        # --- P2.2: routing controls that would be silently ignored are refused ---
+        routing, train = self.model.routing, self.train
+        explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
+        if train.gate_mode == "reinforce" and routing != "topk":
+            raise ValueError(
+                f"train.gate_mode=reinforce samples cells by Gumbel-top-k and needs "
+                f"model.routing=topk, got model.routing={routing!r}"
+            )
+        if routing == "dense" and (explores or train.p_dense > 0.0):
+            raise ValueError(
+                "model.routing=dense has no selection to explore or fall back from; set "
+                "train.epsilon_start / train.epsilon_end / train.p_dense to 0 or choose a sparse "
+                "routing"
+            )
+        if routing in ("random", "fixed") and explores:
+            raise ValueError(
+                f"model.routing={routing!r} is a control and takes no exploration; set "
+                "train.epsilon_start and train.epsilon_end to 0"
+            )
+        # --- end P2.2 ---
         return self
 
 
