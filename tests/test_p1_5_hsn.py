@@ -597,7 +597,7 @@ def test_p1_5_shapes(device_type: str) -> None:
         assert (info_w["cost"] == 1.0).all()
         assert info_w["n_rounds"].shape == (T,) and info_w["n_rounds"].dtype == torch.int64
         assert (info_w["n_rounds"] == 1).all()
-        assert set(info_w) == {"z", "z_hat", "eps", "u", *AUX_KEYS, "cost", "n_rounds"}
+        assert set(info_w) == {"z", "z_hat", "z_target", "eps", "u", *AUX_KEYS, "cost", "n_rounds"}
         assert all(t.device.type == device.type for t in info_w.values())
 
     # P1.5 scope and input validation: errors over silence

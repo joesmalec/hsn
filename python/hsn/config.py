@@ -19,8 +19,10 @@ ignored. Models are frozen; a config never changes after it has been hashed.
 
 Keys beyond Appendix A, added by later chunks with the same conventions: ``baseline.*`` (P0.5, the
 sizes of the GRU and Transformer baselines), ``train.search_trials`` (P0.5, the hyperparameter
-search budget every method gets) and ``data.align_docs`` (P0.5, documents start at window
-boundaries when streams are built).
+search budget every method gets), ``data.align_docs`` (P0.5, documents start at window
+boundaries when streams are built), and ``train.ema_tau`` / ``train.variance_floor_gamma`` (P1.6,
+the EMA rate of the target encoder and the per-dimension standard-deviation floor on the batch
+that ``model.predictor_target=ema_encoder`` uses; a fixed-embedding target ignores both).
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -290,6 +292,14 @@ class TrainConfig(_StrictModel):
     deterministic: bool = False  # deterministic kernels and backward
     # P0.5: hyperparameter-search trials every method gets (paper §12: equal search budgets).
     search_trials: int = Field(default=1, ge=1)
+    # ---- P1.6: prediction loss with collapse protection (model.predictor_target = ema_encoder) --
+    # EMA rate of the target encoder, p_t <- tau * p_t + (1 - tau) * p_online after each optimiser
+    # step (1.0 freezes the target, 0.0 copies the online encoder every step).
+    ema_tau: float = Field(default=0.99, ge=0.0, le=1.0)
+    # Variance floor on the batch of online encodings: mean(relu(gamma - sqrt(var + eps))) per
+    # dimension; 0.0 disables the term. Ignored with the fixed-embedding target.
+    variance_floor_gamma: float = Field(default=1.0, ge=0.0)
+    # ---- end P1.6 -------------------------------------------------------------------------------
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:

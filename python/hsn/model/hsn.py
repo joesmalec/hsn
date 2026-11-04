@@ -6,6 +6,7 @@ For every position ``t`` (:meth:`HSN.step`; ``q = q_{t−1}`` is the carried sum
     reset (HSN.forward, before the step)
     ẑ_t   = P(q_{t−1})                         predict BEFORE encoding x_t (global rule 2)
     z_t   = E(emb(x_t))
+    z*_t  = emb(x_t).detach()  |  E_ema(emb(x_t))   the prediction target (P1.6; detached)
     ε_t   = z_t − ẑ_t
     u_t   = S([z_t ; q_{t−1} ; ctx_t])
     feats = scorer.features(u_t, ε_t, state, ctx_t, budget, round 0)   [B, N, 3d+8]
@@ -26,6 +27,14 @@ Two values the step needs live outside ``model.*``: the graph topology seed (``r
 and the normaliser of the position feature (``train.unroll``). Both are required keyword
 arguments of :class:`HSN`; :meth:`HSN.from_config` reads them from a :class:`~hsn.config.RunConfig`.
 
+P1.6: ``StepOutput.z_target`` is the target of the prediction loss (:mod:`hsn.losses`), chosen by
+``model.predictor_target``: the detached byte embedding of ``x_t`` (``fixed_embedding``) or the
+output of the stop-gradient EMA copy of ``E`` (``ema_encoder``,
+:class:`~hsn.model.encoder.EMATarget`, built only in that mode and updated by
+:meth:`HSN.update_target` after each optimiser step with ``train.ema_tau``, a third keyword that
+is required in that mode). The target is detached in both modes and never feeds the step; ``ẑ``
+still comes from ``q_{t−1}`` alone.
+
 Scope of P1.5: dense mode only (``mode="sparse"`` raises until P2.5), one round (the
 :class:`~hsn.model.halting.HaltingHead` is owned but not called until P2.7), no custom kernels,
 no ``torch.compile``. ``StepOutput.cost`` is the executed cost as a fraction of the dense step
@@ -44,7 +53,7 @@ from torch import Tensor, nn
 from hsn.config import ModelConfig, RunConfig
 from hsn.model.cell import PDGCell
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
-from hsn.model.encoder import Decoder, Encoder, Predictor, SharedTransform
+from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.halting import HaltingHead
 from hsn.model.router import Scorer
 from hsn.model.state import CellGraphState
@@ -75,14 +84,16 @@ PARAM_REPORT_ROWS: tuple[str, ...] = (
 @dataclass
 class StepOutput:
     """Everything one position produces: next-symbol ``logits [B, V]``, the encoded input ``z``,
-    the prediction ``z_hat`` made before encoding, the error ``eps = z − z_hat`` and the shared
-    features ``u`` (all ``[B, d]``), the updated ``state``, the executed ``cost`` (fraction of the
-    dense step), ``n_rounds`` and ``aux`` statistics (detached 0-dim tensors: ``state_abs_max``,
+    the prediction ``z_hat`` made before encoding, the detached prediction target ``z_target``
+    (P1.6, by ``model.predictor_target``), the error ``eps = z − z_hat`` and the shared features
+    ``u`` (all ``[B, d]``), the updated ``state``, the executed ``cost`` (fraction of the dense
+    step), ``n_rounds`` and ``aux`` statistics (detached 0-dim tensors: ``state_abs_max``,
     ``eps_abs_mean``, ``alpha_entropy``)."""
 
     logits: Tensor
     z: Tensor
     z_hat: Tensor
+    z_target: Tensor
     eps: Tensor
     u: Tensor
     state: CellGraphState
@@ -94,16 +105,34 @@ class StepOutput:
 class HSN(nn.Module):
     """The dense predictive cell model: embeddings, ``E``, ``P``, ``S``, the :class:`PDGCell`, the
     :class:`Scorer`, the :class:`HaltingHead` and ``D``, built from ``cfg`` (``model.*``) plus
-    ``seed`` (``run.seed``) and ``unroll`` (``train.unroll``)."""
+    ``seed`` (``run.seed``), ``unroll`` (``train.unroll``) and, when
+    ``model.predictor_target = ema_encoder``, ``ema_tau`` (``train.ema_tau``) for the
+    :class:`~hsn.model.encoder.EMATarget` copy of ``E`` (``ema_target``; ``None`` otherwise)."""
 
-    def __init__(self, cfg: ModelConfig, *, seed: int, unroll: int) -> None:
+    def __init__(
+        self, cfg: ModelConfig, *, seed: int, unroll: int, ema_tau: float | None = None
+    ) -> None:
         super().__init__()
         self.cfg = cfg
         self.seed = seed
         self.unroll = unroll
+        self.ema_tau = ema_tau
         self.byte_emb = ByteEmbedding.from_config(cfg)
         self.ctx_emb = ContextEmbedding.from_config(cfg)
         self.encoder = Encoder(cfg)
+        self.ema_target: EMATarget | None = None
+        if cfg.predictor_target == "ema_encoder":
+            if ema_tau is None:
+                raise ValueError(
+                    "model.predictor_target=ema_encoder needs train.ema_tau: pass ema_tau=... or "
+                    "build the model with HSN.from_config(run)"
+                )
+            self.ema_target = EMATarget(self.encoder, ema_tau)
+        elif cfg.predictor_target != "fixed_embedding":
+            raise ValueError(
+                f"model.predictor_target={cfg.predictor_target!r} is not implemented; known: "
+                "fixed_embedding, ema_encoder"
+            )
         self.predictor = Predictor(cfg)
         self.shared = SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
@@ -113,10 +142,10 @@ class HSN(nn.Module):
 
     @classmethod
     def from_config(cls, run: RunConfig) -> Self:
-        """``HSN(run.model, seed=run.seed, unroll=run.train.unroll)``."""
+        """``HSN(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau)``."""
         if not isinstance(run, RunConfig):
             raise TypeError(f"from_config needs a RunConfig, got {type(run).__name__}")
-        return cls(run.model, seed=run.seed, unroll=run.train.unroll)
+        return cls(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau)
 
     # -- placement --------------------------------------------------------------------------------
 
@@ -158,7 +187,9 @@ class HSN(nn.Module):
         q_prev = state.q
 
         z_hat = self.predictor(q_prev)  # before x_t is encoded
-        z = self.encoder(self.byte_emb(x_t))
+        emb = self.byte_emb(x_t)
+        z = self.encoder(emb)
+        z_target = self._prediction_target(emb)  # detached; a function of x_t only
         eps = z - z_hat
         u = self.shared(torch.cat([z, q_prev, self.ctx_emb(ctx_t)], dim=-1))
 
@@ -184,6 +215,7 @@ class HSN(nn.Module):
             logits=logits,
             z=z,
             z_hat=z_hat,
+            z_target=z_target,
             eps=eps,
             u=u,
             state=new_state,
@@ -191,6 +223,21 @@ class HSN(nn.Module):
             n_rounds=1,
             aux=aux,
         )
+
+    def _prediction_target(self, emb: Tensor) -> Tensor:
+        """``z_target [B, d]`` for the prediction loss, detached in both modes: the byte
+        embedding ``emb`` itself (``fixed_embedding``) or the EMA copy of ``E`` applied to it
+        (``ema_encoder``; the copy runs under ``no_grad``)."""
+        if self.ema_target is None:
+            return emb.detach()
+        target: Tensor = self.ema_target(emb.detach())
+        return target
+
+    def update_target(self) -> None:
+        """Move the EMA target encoder toward the online ``E`` (``train.ema_tau``); call it after
+        each optimiser step. A no-op with the fixed-embedding target."""
+        if self.ema_target is not None:
+            self.ema_target.update()
 
     def _write_dense(self, state: CellGraphState, h_new: Tensor) -> CellGraphState:
         """Write the dense round into the state: every enabled cell replaced (``q`` the exact mean,
@@ -211,13 +258,20 @@ class HSN(nn.Module):
 
         ``reset [B, T]`` (bool) zeroes a session's state *before* position ``t`` is processed (a
         document boundary at ``t``). Returns ``logits [B, T, V]``, the final state and ``info``:
-        the per-position stacks ``z``, ``z_hat``, ``eps``, ``u`` (``[B, T, d]``, autograd intact)
-        and the per-position statistics ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``,
-        ``cost`` (float) and ``n_rounds`` (int64), each ``[T]``.
+        the per-position stacks ``z``, ``z_hat``, ``z_target`` (detached), ``eps``, ``u``
+        (``[B, T, d]``, autograd intact except for the target) and the per-position statistics
+        ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``, ``cost`` (float) and ``n_rounds``
+        (int64), each ``[T]``.
         """
         _, T = self._check_window_inputs(tokens, ctx, state, reset)
         logits: list[Tensor] = []
-        stacks: dict[str, list[Tensor]] = {"z": [], "z_hat": [], "eps": [], "u": []}
+        stacks: dict[str, list[Tensor]] = {
+            "z": [],
+            "z_hat": [],
+            "z_target": [],
+            "eps": [],
+            "u": [],
+        }
         stats: dict[str, list[Tensor]] = {
             "state_abs_max": [],
             "eps_abs_mean": [],
@@ -280,7 +334,10 @@ class HSN(nn.Module):
         return report
 
     def extra_repr(self) -> str:
-        return f"seed={self.seed}, unroll={self.unroll}"
+        text = f"seed={self.seed}, unroll={self.unroll}"
+        if self.ema_target is not None:
+            text += f", ema_tau={self.ema_tau}"
+        return text
 
     # -- validation -------------------------------------------------------------------------------
 

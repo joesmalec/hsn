@@ -109,6 +109,8 @@ train: # Appendix A.3
   activation_checkpoint: none # none | per_round | per_window (P4.3)
   deterministic: false # deterministic kernels and backward
   search_trials: 1 # P0.5: hyperparameter-search trials every method gets (equal budgets, §12)
+  ema_tau: 0.99 # P1.6: EMA rate of the target encoder when model.predictor_target = ema_encoder
+  variance_floor_gamma: 1.0 # P1.6: per-dimension std floor on the batch of z (EMA mode); 0 disables
 
 replay: # Appendix A.4 (P3.1)
   path: null
