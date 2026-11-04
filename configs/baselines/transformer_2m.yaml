@@ -15,6 +15,7 @@ data:
   dataset: synthetic_v1
   manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
   tasks: [kv, delayed, brackets, arithmetic, algorithmic]
+  variants: [in_range] # P0.8: the G0 baselines train and evaluate on the in-range variants
   align_docs: true # every document starts at a window boundary (in_range = fits one window)
 
 train:
@@ -27,7 +28,7 @@ train:
   micro_batch: 4
   grad_clip: 1.0
   steps: 2000
-  eval_every: 200
+  eval_every: 1000 # P0.8: a full dev pass costs minutes on profile:cpu; two evals per run
   ckpt_every: 1000
   stats_every: 50
   search_trials: 1 # the same budget for every method in the ladder

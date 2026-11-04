@@ -17,9 +17,11 @@ measured by :meth:`GRUBaseline.param_report`: the documented ≈2M-parameter bas
 parameter is read at every position, so *active* equals *stored* for this model; the two are
 reported separately because HSN and the sparse-expert baseline differ in them (paper §12).
 
-Under autocast the input and the carried state are cast to the autocast dtype explicitly: cuDNN's
-RNN kernels require the input, the hidden state and the (autocast-copied) weights to share one
-dtype, and the carried state otherwise keeps whatever dtype the previous window produced.
+Under CUDA autocast the input and the carried state are cast to the autocast dtype explicitly:
+cuDNN's RNN kernels require the input, the hidden state and the (autocast-copied) weights to share
+one dtype, and the carried state otherwise keeps whatever dtype the previous window produced. MPS
+autocast does not cover ``nn.GRU`` (its weights stay fp32), so there the GRU runs in the master
+dtype and only the embeddings, LayerNorm and head follow autocast (P0.8, profile:m_series).
 """
 
 from __future__ import annotations
@@ -94,12 +96,19 @@ class GRUBaseline(nn.Module):
         self._check_state(state, B)
         x = self.drop(self.tok_emb(tokens) + self.ctx_emb(context))
         h = state
-        if torch.is_autocast_enabled(x.device.type):
+        if x.device.type == "cuda" and torch.is_autocast_enabled(x.device.type):
+            # cuDNN: autocast copies the RNN weights to the autocast dtype; input and state match it
             dtype = torch.get_autocast_dtype(x.device.type)
             x = x.to(dtype)
             h = h.to(dtype)
-        elif h.dtype != x.dtype:
-            h = h.to(x.dtype)
+        else:
+            # P0.8: MPS (and CPU) autocast does not cover nn.GRU, whose weights stay in the master
+            # dtype, so the input and the carried state must be that dtype
+            dtype = next(self.gru.parameters()).dtype
+            if x.dtype != dtype:
+                x = x.to(dtype)
+            if h.dtype != dtype:
+                h = h.to(dtype)
         # Maximal segments between the columns where any row resets; cuDNN runs on each segment
         # and the state is masked at the segment start (one host sync per window for `cols`).
         cols = reset.any(dim=0).nonzero().flatten().tolist()

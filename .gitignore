@@ -23,3 +23,6 @@ runs/
 
 # OS
 .DS_Store
+
+# Evidence packages (zips and their staging; never committed)
+evidence/

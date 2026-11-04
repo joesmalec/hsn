@@ -1,0 +1,80 @@
+{
+  "frozen_at": "2026-11-04T03:51:47+00:00",
+  "git_rev": "13725c3e29fb21dbb068291fbf5695c84085285e",
+  "primary_metrics": {
+    "state_update": "accuracy",
+    "delayed_relevance": "accuracy",
+    "sequence_structure": "accuracy",
+    "text_code_lm": "perplexity",
+    "code_functional": "pass_rate",
+    "continual_stream": "average_final_accuracy"
+  },
+  "quality_tolerance": {
+    "accuracy": 0.01,
+    "perplexity_relative": 0.02
+  },
+  "g1_tasks": [
+    {
+      "task": "kv",
+      "variant": "in_range",
+      "threshold": 0.95
+    },
+    {
+      "task": "delayed",
+      "variant": "in_range",
+      "threshold": 0.95
+    }
+  ],
+  "thresholds": {
+    "G1": {
+      "accuracy_min": 0.95,
+      "per_task": true,
+      "per_seed": true,
+      "n_seeds": 5,
+      "finite_gradients": true,
+      "correct_reset": true
+    },
+    "G2": {
+      "quality_tolerance": {
+        "accuracy": 0.01,
+        "perplexity_relative": 0.02
+      },
+      "improvement_min": 0.2,
+      "claims": [
+        "latency",
+        "energy"
+      ],
+      "claim_both_only_if_both_pass": true,
+      "other_regression_max": null,
+      "n_seeds": 5,
+      "ci_alpha": 0.05,
+      "optimisation_cycles_max": 2
+    },
+    "G3": {
+      "mean_forgetting_max": 0.02,
+      "task_loss_max": 0.05,
+      "new_task_gain_min": 0.03,
+      "macro_gap_max": 0.01,
+      "n_seeds": 5
+    },
+    "G4": {
+      "composition_gain_min": 0.03,
+      "ci_alpha": 0.05,
+      "ci_excludes_zero": true,
+      "growth_max": 0.25,
+      "n_seeds": 3
+    },
+    "G5": {
+      "restore_drill_max_s": 900,
+      "load_test_hours": 72,
+      "version_consistency": true
+    },
+    "G6": {
+      "pilot_weeks": 4,
+      "unresolved_critical_security_issues_max": 0,
+      "quality_within_tolerance": true,
+      "cost_within_budget": true
+    }
+  },
+  "sha256_of_body": "1d9fd06e02862040ce5e514652f8f0c9ead5dc88f2d220f0e119dbd1266d35b5"
+}
