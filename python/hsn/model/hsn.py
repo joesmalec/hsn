@@ -10,9 +10,13 @@ For every position ``t`` (:meth:`HSN.step`; ``q = q_{t−1}`` is the carried sum
     ε_t   = z_t − ẑ_t
     u_t   = S([z_t ; q_{t−1} ; ctx_t])
     feats = scorer.features(u_t, ε_t, state, ctx_t, budget, round 0)   [B, N, 3d+8]
-    α     = softmax(scorer(feats)) over units                         [B, N, M]
-    h_t   = PDGCell.step_dense(u_t, ε_t, state, α)                    every cell, one round
-    q_t   = mean_i h[i, t]      (CellGraphState.with_dense: exact, no incremental drift)
+    logits_u = router(feats)                                           [B, N, M]
+    dense:  α   = softmax(logits_u) over units
+            h_t = PDGCell.step_dense(u_t, ε_t, state, α)              every cell, one round
+            q_t = mean_i h[i, t]      (CellGraphState.with_dense: exact, no incremental drift)
+    sparse: sel = router.select(logits_u, budget, K, k_min, model.routing)        (P2.1)
+            PDGCell.step_sparse(u_t, ε_t, state, sel)                  K cells, one unit each (P2.5)
+            q_t = q_{t−1} + Σ_selected Δh / N    (incremental; the trainer resyncs periodically)
     logits = D([q_t ; u_t])     the UPDATED summary
 
 The dense reference uses the same linear scorer as the sparse model, with ``α = softmax(logits)``
@@ -35,10 +39,23 @@ output of the stop-gradient EMA copy of ``E`` (``ema_encoder``,
 is required in that mode). The target is detached in both modes and never feeds the step; ``ẑ``
 still comes from ``q_{t−1}`` alone.
 
-Scope of P1.5: dense mode only (``mode="sparse"`` raises until P2.5), one round (the
-:class:`~hsn.model.halting.HaltingHead` is owned but not called until P2.7), no custom kernels,
-no ``torch.compile``. ``StepOutput.cost`` is the executed cost as a fraction of the dense step
-(1.0 here; P2.1 replaces it with profiled costs) and ``n_rounds`` is 1.
+P2.5: :meth:`HSN.step` chooses the path from ``model.routing`` (``dense`` → the dense reference,
+unchanged; ``topk`` / ``greedy_budget`` / ``random`` / ``fixed`` → the sparse round) unless ``mode``
+is given explicitly: ``mode="dense"`` always runs the dense reference (P2.2's dense fallback and
+soft warm-up), ``mode="sparse"`` needs a sparse ``model.routing``. The scorer now lives inside the
+P2.1 :class:`~hsn.model.router.Router` (``HSN.router``; ``HSN.scorer`` is a property on it, so the
+state dict keys are ``router.scorer.*``). ``StepOutput.cost`` is the executed cost as a fraction of
+the dense step as a detached 0-dim tensor (1.0 dense; the batch mean of ``Selection.cost`` sparse,
+so reading it costs no host synchronisation; the sparse round itself synchronises three times per
+position in the index checks of ``messages_selected``, ``forward_selected`` and
+``gated_delta_update``, which P2.8 gates) and ``StepOutput.selection`` the sparse round's
+:class:`~hsn.model.router.Selection` (``None`` dense). A :class:`~hsn.profiler.Profiler` passed to
+``step`` times the P0.6 segments ``shared_path``, ``scorer``, ``messages`` / ``selected_cells``
+(sparse round only; the dense cell step is partitioned by
+:func:`hsn.kernels.costs.profile_dense_costs`) and ``decode``.
+
+Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
+called until P2.7), no custom kernels (P2.9–P2.11), no ``torch.compile`` (P2.8); ``n_rounds`` is 1.
 """
 
 from __future__ import annotations
@@ -51,12 +68,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import ModelConfig, RunConfig
-from hsn.model.cell import PDGCell
+from hsn.model.cell import PDGCell, profiler_segment
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.halting import HaltingHead
-from hsn.model.router import Scorer
+from hsn.model.router import Router, Scorer, Selection
 from hsn.model.state import CellGraphState
+from hsn.profiler import Profiler
 
 __all__ = ["PARAM_REPORT_ROWS", "HSN", "StepMode", "StepOutput"]
 
@@ -86,9 +104,11 @@ class StepOutput:
     """Everything one position produces: next-symbol ``logits [B, V]``, the encoded input ``z``,
     the prediction ``z_hat`` made before encoding, the detached prediction target ``z_target``
     (P1.6, by ``model.predictor_target``), the error ``eps = z − z_hat`` and the shared features
-    ``u`` (all ``[B, d]``), the updated ``state``, the executed ``cost`` (fraction of the dense
-    step), ``n_rounds`` and ``aux`` statistics (detached 0-dim tensors: ``state_abs_max``,
-    ``eps_abs_mean``, ``alpha_entropy``)."""
+    ``u`` (all ``[B, d]``), the updated ``state``, the executed ``cost`` (a detached 0-dim tensor in
+    the state dtype: the fraction of the dense step, 1.0 dense and the batch mean of
+    ``Selection.cost`` sparse), ``n_rounds``, ``aux`` statistics (detached 0-dim tensors:
+    ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``) and, in sparse mode, the
+    :class:`~hsn.model.router.Selection` that was executed (``None`` dense)."""
 
     logits: Tensor
     z: Tensor
@@ -97,17 +117,20 @@ class StepOutput:
     eps: Tensor
     u: Tensor
     state: CellGraphState
-    cost: float
+    cost: Tensor
     n_rounds: int
     aux: dict[str, Tensor]
+    selection: Selection | None = None
 
 
 class HSN(nn.Module):
-    """The dense predictive cell model: embeddings, ``E``, ``P``, ``S``, the :class:`PDGCell`, the
-    :class:`Scorer`, the :class:`HaltingHead` and ``D``, built from ``cfg`` (``model.*``) plus
-    ``seed`` (``run.seed``), ``unroll`` (``train.unroll``) and, when
-    ``model.predictor_target = ema_encoder``, ``ema_tau`` (``train.ema_tau``) for the
-    :class:`~hsn.model.encoder.EMATarget` copy of ``E`` (``ema_target``; ``None`` otherwise)."""
+    """The predictive cell model: embeddings, ``E``, ``P``, ``S``, the :class:`PDGCell`, the
+    :class:`Router` (the :class:`Scorer` plus P2.1 selection; ``model.cost_profile`` is read here
+    and an unaffordable ``model.k_min`` / ``model.fixed_route`` raises at construction), the
+    :class:`HaltingHead` and ``D``, built from ``cfg`` (``model.*``) plus ``seed`` (``run.seed``),
+    ``unroll`` (``train.unroll``) and, when ``model.predictor_target = ema_encoder``, ``ema_tau``
+    (``train.ema_tau``) for the :class:`~hsn.model.encoder.EMATarget` copy of ``E`` (``ema_target``;
+    ``None`` otherwise)."""
 
     def __init__(
         self, cfg: ModelConfig, *, seed: int, unroll: int, ema_tau: float | None = None
@@ -136,9 +159,18 @@ class HSN(nn.Module):
         self.predictor = Predictor(cfg)
         self.shared = SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
-        self.scorer = Scorer(cfg, unroll=unroll)
+        self.router = Router.from_config(cfg, unroll=unroll)
         self.halting = HaltingHead(cfg)
         self.decoder = Decoder(cfg)
+        # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
+        self._fixed_route: Tensor | None = (
+            torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
+        )
+
+    @property
+    def scorer(self) -> Scorer:
+        """The P1.5 :class:`Scorer`, owned by :attr:`router` since P2.5 (``router.scorer``)."""
+        return self.router.scorer
 
     @classmethod
     def from_config(cls, run: RunConfig) -> Self:
@@ -174,49 +206,72 @@ class HSN(nn.Module):
     # -- one position -----------------------------------------------------------------------------
 
     def step(
-        self, x_t: Tensor, ctx_t: Tensor, state: CellGraphState, mode: StepMode = "dense"
+        self,
+        x_t: Tensor,
+        ctx_t: Tensor,
+        state: CellGraphState,
+        mode: StepMode | None = None,
+        *,
+        profiler: Profiler | None = None,
     ) -> StepOutput:
         """One input position in the §2.2 order (see the module docstring); returns a
         :class:`StepOutput` whose ``state`` is the functional update of ``state`` (autograd intact).
 
         ``x_t`` and ``ctx_t`` are int64/int32 ``[B]`` on the state's device; ``state`` must have
-        this model's ``N`` and ``d`` and the parameters' dtype and device. Only ``mode="dense"``
-        exists in P1.5; ``"sparse"`` raises ``NotImplementedError`` (P2.5).
+        this model's ``N`` and ``d`` and the parameters' dtype and device. ``mode=None`` follows
+        ``model.routing`` (``dense`` → the dense reference, any selection mode → the sparse round);
+        ``"dense"`` runs the dense reference whatever the routing; ``"sparse"`` raises
+        ``ValueError`` when ``model.routing`` is ``dense``. ``profiler`` (P0.6) times the segments
+        named in the module docstring; ``None`` records nothing and never synchronises.
         """
-        if mode == "sparse":
-            raise NotImplementedError(
-                "mode='sparse' (selected cells, one unit each) is P2.5; P1.5 implements the dense "
-                "reference only"
-            )
-        if mode != "dense":
-            raise ValueError(f"mode must be 'dense' or 'sparse', got {mode!r}")
-        self._check_step_inputs(x_t, ctx_t, state)
         cfg = self.cfg
-        q_prev = state.q
+        if mode is None:
+            mode = "dense" if cfg.routing == "dense" else "sparse"
+        elif mode == "sparse":
+            if cfg.routing == "dense":
+                raise ValueError(
+                    "mode='sparse' needs a selection mode in model.routing (topk, greedy_budget, "
+                    "random, fixed); this model has model.routing=dense"
+                )
+        elif mode != "dense":
+            raise ValueError(f"mode must be 'dense', 'sparse' or None, got {mode!r}")
+        if profiler is not None and not isinstance(profiler, Profiler):
+            raise TypeError(f"profiler must be a hsn.profiler.Profiler or None, got {profiler!r}")
+        self._check_step_inputs(x_t, ctx_t, state)
+        B = state.batch_size
 
-        z_hat = self.predictor(q_prev)  # before x_t is encoded
-        emb = self.byte_emb(x_t)
-        z = self.encoder(emb)
-        z_target = self._prediction_target(emb)  # detached; a function of x_t only
-        eps = z - z_hat
-        u = self.shared(torch.cat([z, q_prev, self.ctx_emb(ctx_t)], dim=-1))
+        with profiler_segment(profiler, "shared_path", B):
+            z_hat, z, z_target, eps, u = self._shared_path(x_t, ctx_t, state)
         # P1.7: under autocast E, P and S emit the autocast dtype (bf16 / fp16); the state path
         # (scorer features, the softmax over units, the cell update and q) runs in the state's
         # dtype, the fp32 master precision of §3.7. Without autocast these casts are no-ops.
         u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)
 
+        selection: Selection | None = None
         with self.cell.graph.step():
-            feats = self.scorer.features(
-                u_s, eps_s, state, ctx_t, budget_frac=cfg.budget, round_idx=0, ema=None
-            )
-            unit_logits = self.scorer(feats).to(state.dtype)  # [B, N, M]
-            alpha = torch.softmax(unit_logits, dim=-1)
-            h_new, _ = self.cell.step_dense(u_s, eps_s, state, alpha)
+            with profiler_segment(profiler, "scorer", B):
+                feats = self.scorer.features(
+                    u_s, eps_s, state, ctx_t, budget_frac=cfg.budget, round_idx=0, ema=None
+                )
+                unit_logits = self.router(feats).to(state.dtype)  # [B, N, M]
+                if mode == "dense":
+                    alpha = torch.softmax(unit_logits, dim=-1)
+                else:
+                    selection = self._select(unit_logits)
+            if mode == "dense":
+                h_new, _ = self.cell.step_dense(u_s, eps_s, state, alpha)
+                new_state = self._write_dense(state, h_new)
+                cost = torch.ones((), dtype=state.dtype, device=state.device)
+            else:
+                assert selection is not None
+                new_state, cost = self._sparse_round(u_s, eps_s, state, selection, profiler)
 
-        new_state = self._write_dense(state, h_new)
-        logits = self.decoder(torch.cat([new_state.q, u], dim=-1))  # the updated q_t
+        with profiler_segment(profiler, "decode", B):
+            logits = self.decoder(torch.cat([new_state.q, u], dim=-1))  # the updated q_t
 
         with torch.no_grad():
+            if mode != "dense":
+                alpha = torch.softmax(unit_logits, dim=-1)
             log_alpha = F.log_softmax(unit_logits, dim=-1)
             aux = {
                 "state_abs_max": new_state.h.abs().amax(),
@@ -231,10 +286,56 @@ class HSN(nn.Module):
             eps=eps,
             u=u,
             state=new_state,
-            cost=1.0,
+            cost=cost,
             n_rounds=1,
             aux=aux,
+            selection=selection,
         )
+
+    def _shared_path(
+        self, x_t: Tensor, ctx_t: Tensor, state: CellGraphState
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """The shared path of §2.2 steps 2–3 from the carried summary: ``(z_hat, z, z_target, eps,
+        u)``, each ``[B, d]``; the prediction is made before ``x_t`` is encoded (global rule 2)."""
+        q_prev = state.q
+        z_hat = self.predictor(q_prev)  # before x_t is encoded
+        emb = self.byte_emb(x_t)
+        z = self.encoder(emb)
+        z_target = self._prediction_target(emb)  # detached; a function of x_t only
+        eps = z - z_hat
+        u = self.shared(torch.cat([z, q_prev, self.ctx_emb(ctx_t)], dim=-1))
+        return z_hat, z, z_target, eps, u
+
+    def _select(self, unit_logits: Tensor) -> Selection:
+        """The P2.1 selection of this model's ``model.routing`` for one round (keywords only, so
+        P2.2's gate arguments extend the call without touching it)."""
+        cfg = self.cfg
+        return self.router.select(
+            unit_logits,
+            budget=cfg.budget,
+            k_max=cfg.k_select,
+            k_min=cfg.k_min,
+            mode=cfg.routing,
+            fixed=self._fixed_route,
+            generator=None,
+        )
+
+    def _sparse_round(
+        self,
+        u_s: Tensor,
+        eps_s: Tensor,
+        state: CellGraphState,
+        selection: Selection,
+        profiler: Profiler | None,
+    ) -> tuple[CellGraphState, Tensor]:
+        """The sparse round (P2.5): :meth:`PDGCell.step_sparse` on ``selection``, the tick of the
+        unselected cells, and the executed cost (the detached batch mean of ``selection.cost`` in
+        the state dtype)."""
+        _, info = self.cell.step_sparse(u_s, eps_s, state, selection, profiler=profiler)
+        written = info["state"]
+        selected = info["selected"]
+        assert isinstance(written, CellGraphState) and isinstance(selected, Tensor)
+        return written.tick(selected), selection.cost.detach().mean().to(state.dtype)
 
     def _prediction_target(self, emb: Tensor) -> Tensor:
         """``z_target [B, d]`` for the prediction loss, detached in both modes: the byte
@@ -272,8 +373,13 @@ class HSN(nn.Module):
         document boundary at ``t``). Returns ``logits [B, T, V]``, the final state and ``info``:
         the per-position stacks ``z``, ``z_hat``, ``z_target`` (detached), ``eps``, ``u``
         (``[B, T, d]``, autograd intact except for the target) and the per-position statistics
-        ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``, ``cost`` (float) and ``n_rounds``
-        (int64), each ``[T]``.
+        ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``, ``cost`` (the model dtype) and
+        ``n_rounds`` (int64), each ``[T]``. In sparse mode (``model.routing`` not ``dense``) the
+        window's selections are stacked too, detached: ``cell_idx`` and ``unit_idx`` (int64
+        ``[B, T, K]``), ``valid`` (bool ``[B, T, K]``) and ``cost_per_row`` (fp32 ``[B, T]``), for
+        the P2.2–P2.6 consumers of the routing decisions. They are the router's decisions as
+        charged; the one case where a valid slot is not written is a selected cell of the
+        ``model.disabled_cells`` test hook.
         """
         _, T = self._check_window_inputs(tokens, ctx, state, reset)
         logits: list[Tensor] = []
@@ -289,8 +395,9 @@ class HSN(nn.Module):
             "eps_abs_mean": [],
             "alpha_entropy": [],
         }
-        costs: list[float] = []
+        costs: list[Tensor] = []
         rounds: list[int] = []
+        selections: list[Selection] = []
         with self.cell.graph.step():
             for t in range(T):
                 state = state.reset(reset[:, t])
@@ -303,12 +410,24 @@ class HSN(nn.Module):
                     stats[name].append(out.aux[name])
                 costs.append(out.cost)
                 rounds.append(out.n_rounds)
+                if out.selection is not None:
+                    selections.append(out.selection)
         info: dict[str, Tensor] = {
             name: torch.stack(values, dim=1) for name, values in stacks.items()
         }
         info.update({name: torch.stack(values) for name, values in stats.items()})
-        info["cost"] = torch.tensor(costs, dtype=self.dtype, device=state.device)
+        info["cost"] = torch.stack(costs).to(self.dtype)
         info["n_rounds"] = torch.tensor(rounds, dtype=torch.int64, device=state.device)
+        if selections:
+            if len(selections) != T:
+                raise RuntimeError(
+                    f"{len(selections)} of {T} positions ran the sparse round; a window mixes "
+                    "modes only through P2.2's dense fallback, which must stack its own selections"
+                )
+            info["cell_idx"] = torch.stack([sel.cell_idx for sel in selections], dim=1)
+            info["unit_idx"] = torch.stack([sel.unit_idx for sel in selections], dim=1)
+            info["valid"] = torch.stack([sel.valid for sel in selections], dim=1)
+            info["cost_per_row"] = torch.stack([sel.cost.detach() for sel in selections], dim=1)
         return torch.stack(logits, dim=1), state, info
 
     # -- accounting -------------------------------------------------------------------------------
