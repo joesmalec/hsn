@@ -12,6 +12,15 @@ NumPy and Python RNG states are converted to lists of integers for that reason.
 Files are written to a temporary name and renamed into place, so a crash mid-write never leaves a
 truncated checkpoint behind. Loading applies ``state_dict`` with ``strict=True`` (a model that
 does not match its checkpoint raises; plan §4.3 errors over silence) and returns the dict.
+
+P1.7 (the TBPTT trainer, :mod:`hsn.train.tbptt`) keeps the file format and stores its additions in
+``extra``: ``carried_state`` (the :class:`~hsn.model.state.CellGraphState` carried between
+windows, as the CPU tensors :func:`pack_cell_state` writes and :func:`unpack_cell_state` reads
+back onto a device, with the P1.3 layout checks) and ``q_resync`` (the summary-resync counters
+``windows``, ``since_resync``, ``resyncs``, see :func:`q_resync_counter`), next to the P0.5
+entries ``config_hash``, ``model_name`` and ``scaler``. ``loader_state`` is the explicit position
+of the stream loader (epoch, cursor into the epoch's permutation, and ``(document, offset)`` per
+row), which is what makes a resume land on the same window.
 """
 
 from __future__ import annotations
@@ -27,19 +36,31 @@ import numpy as np
 import torch
 
 import hsn
+from hsn.model.state import CellGraphState
 
 __all__ = [
+    "CELL_STATE_FIELDS",
     "CHECKPOINT_FORMAT",
+    "Q_RESYNC_KEYS",
     "capture_rng_state",
+    "check_q_resync",
     "checkpoint_path",
     "latest_checkpoint",
     "load_checkpoint",
+    "pack_cell_state",
+    "q_resync_counter",
     "restore_rng_state",
     "save_checkpoint",
+    "unpack_cell_state",
 ]
 
 CHECKPOINT_FORMAT = 1
 _FILE_RE = re.compile(r"^step_(\d{8})\.pt$")
+#: The tensors of a :class:`~hsn.model.state.CellGraphState`, as :func:`pack_cell_state` keys them.
+CELL_STATE_FIELDS: tuple[str, ...] = ("h", "q", "age", "pos")
+#: The counters of ``extra["q_resync"]`` (P1.7): windows processed in the run, windows since the
+#: last exact recomputation of the summary ``q``, and recomputations done.
+Q_RESYNC_KEYS: tuple[str, ...] = ("windows", "since_resync", "resyncs")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -196,3 +217,75 @@ def load_checkpoint(
             raise ValueError(f"{file}: checkpoint has no scheduler state to load")
         scheduler.load_state_dict(loaded["scheduler"])
     return dict(loaded)
+
+
+# --------------------------------------------------------------------------------------------------
+# P1.7: the carried cell state and the q resync counters
+# --------------------------------------------------------------------------------------------------
+
+
+def pack_cell_state(state: CellGraphState) -> dict[str, torch.Tensor]:
+    """Detached, contiguous CPU copies of ``h``, ``q``, ``age``, ``pos`` for ``carried_state``."""
+    if not isinstance(state, CellGraphState):
+        raise TypeError(f"pack_cell_state needs a CellGraphState, got {type(state).__name__}")
+    return {
+        name: getattr(state, name).detach().contiguous().to(device="cpu", copy=True)
+        for name in CELL_STATE_FIELDS
+    }
+
+
+def unpack_cell_state(payload: Mapping[str, Any], device: torch.device | str) -> CellGraphState:
+    """The state :func:`pack_cell_state` wrote, on ``device``; the P1.3 layout checks run again."""
+    if not isinstance(payload, Mapping):
+        raise TypeError(
+            f"carried cell state must be a mapping of tensors, got {type(payload).__name__}"
+        )
+    missing = [name for name in CELL_STATE_FIELDS if name not in payload]
+    unknown = sorted(name for name in payload if name not in CELL_STATE_FIELDS)
+    if missing or unknown:
+        raise ValueError(
+            f"carried cell state must hold exactly {CELL_STATE_FIELDS}: missing {missing}, "
+            f"unknown {unknown}"
+        )
+    dev = torch.device(device)
+    tensors: dict[str, torch.Tensor] = {}
+    for name in CELL_STATE_FIELDS:
+        value = payload[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"carried cell state {name!r} must be a tensor, got {type(value).__name__}"
+            )
+        tensors[name] = value.to(device=dev)
+    return CellGraphState(**tensors)
+
+
+def q_resync_counter(windows: int, since_resync: int, resyncs: int) -> dict[str, int]:
+    """``extra["q_resync"]`` from the trainer's counters (validated)."""
+    return check_q_resync(
+        {"windows": windows, "since_resync": since_resync, "resyncs": resyncs}, "q_resync"
+    )
+
+
+def check_q_resync(payload: object, where: str) -> dict[str, int]:
+    """Validate a ``q_resync`` mapping: exactly :data:`Q_RESYNC_KEYS`, non-negative integers."""
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{where}: q_resync must be a mapping, got {type(payload).__name__}")
+    missing = [key for key in Q_RESYNC_KEYS if key not in payload]
+    unknown = sorted(key for key in payload if key not in Q_RESYNC_KEYS)
+    if missing or unknown:
+        raise ValueError(
+            f"{where}: q_resync must hold exactly {Q_RESYNC_KEYS}: missing {missing}, "
+            f"unknown {unknown}"
+        )
+    counters: dict[str, int] = {}
+    for key in Q_RESYNC_KEYS:
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{where}: q_resync[{key!r}] must be an int >= 0, got {value!r}")
+        counters[key] = int(value)
+    if counters["since_resync"] > counters["windows"]:
+        raise ValueError(
+            f"{where}: q_resync has since_resync={counters['since_resync']} > windows="
+            f"{counters['windows']}"
+        )
+    return counters
