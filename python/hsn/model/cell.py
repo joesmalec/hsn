@@ -15,34 +15,74 @@ states ``h[·, t, r−1]``::
     h[i, t, r] = (1 − b_i) ⊙ h[i, t, r−1] + b_i ⊙ c_i
 
 In dense mode every cell is updated and ``α_i`` is a distribution over all ``M`` units (a softmax
-of the scorer logits, computed by :class:`~hsn.model.hsn.HSN`); the sparse path (P2.5) updates the
-selected cells with one unit each through ``UnitBank.forward_selected`` and
-``CellGraph.messages_selected``. With ``h = 0`` initially every coordinate of ``h`` stays in
-``[−1, 1]``: each update is a coordinatewise convex combination of ``h`` and a ``tanh`` output.
+of the scorer logits, computed by :class:`~hsn.model.hsn.HSN`). The sparse round (P2.5,
+:meth:`PDGCell.step_sparse`) runs the same equations for the ``K`` cells of a P2.1
+:class:`~hsn.model.router.Selection` only, one unit each, composed of the four kernel ops of
+:mod:`hsn.kernels` at the boundaries P2.9–P2.11 replace::
+
+    m   = csr_messages(h, graph, V, cell_idx)            [B, K, d]   (reads the pre-round h)
+    v   = gather_concat(u, ε, h, m, cell_idx)            [B, K, 4d]
+    F   = grouped_unit_mlp(v, unit_idx, units)           [B·K, d]    (UnitBank.forward_selected)
+    c   = tanh( W_out · α ⊙ F ),  b = σ( B · v )         α = Selection.alpha (1.0 on hard slots)
+    state' = gated_delta_update(state, cell_idx, c, b, valid)   h, q (incremental), age; no tick
+
+``Selection.alpha`` multiplies the selected unit's output before ``W_out`` (§2.3's ``Σ_j α_ij
+F_j(v_i)`` with one term) and is the only place a selection gradient enters the round: P2.2's
+straight-through estimators (the cell mask and the unit weights) must be folded into ``alpha``.
+Padded slots (``valid=False``) are ignored end to end: their cell and unit indices are replaced by
+0 before the gathers (so nothing depends on what the router pads with, in range or not), they are
+not written, add nothing to ``q`` and get no gradient. When every cell is selected with one-hot
+``α`` the sparse round equals the dense one to fp32 rounding
+(``test_p2_5_sparse_equals_dense_when_all_selected``). With ``h = 0`` initially every coordinate of
+``h`` stays in ``[−1, 1]``: each update is a coordinatewise convex combination of ``h`` and a
+``tanh`` output.
 
 ``model.disabled_cells`` is the P1.8 test hook: those cells are never updated (their row of ``h``
-is carried through unchanged, with no gradient into the discarded candidate).
+is carried through unchanged, with no gradient into the discarded candidate). In sparse mode a
+selected disabled cell is dropped from the valid slots: it is not written and keeps ageing, while
+``Selection.cost`` still charges it (the router chose it).
 ``model.ablate_shared_u`` (remove ``u`` from ``v``) is not implemented here: the P1.1 closed forms
 fix ``v`` at width ``4d`` and
 refuse to count the ablation, so this module refuses to build it rather than guess its shapes.
 
-The cell reads only the ``state`` it is given and returns the new ``h``; writing the state (the
-summary ``q``, ages, position) is :class:`~hsn.model.hsn.HSN`'s job through the P1.3 functional
-updates.
+The dense round reads only the ``state`` it is given and returns the new ``h``; writing the state
+(the summary ``q``, ages, position) is :class:`~hsn.model.hsn.HSN`'s job through the P1.3
+functional updates. The sparse round returns the per-slot new values and, in ``info["state"]``, the
+functionally updated state (``h``, incremental ``q``, ages of the written cells at 0) because the
+scatter and the ``q`` update are one kernel boundary; the tick (``age += 1`` elsewhere,
+``pos += 1``) is still :class:`~hsn.model.hsn.HSN`'s.
 """
 
 from __future__ import annotations
 
+import contextlib
+from contextlib import AbstractContextManager
+
 import torch
 from torch import Tensor, nn
 
+from hsn import kernels
 from hsn.config import ModelConfig
+from hsn.kernels.native import selection_mask
 from hsn.model.embeddings import init_weight_
 from hsn.model.graph import CellGraph
+from hsn.model.router import Selection
 from hsn.model.state import CellGraphState
 from hsn.model.units import UnitBank
+from hsn.profiler import Profiler
 
-__all__ = ["PDGCell"]
+__all__ = ["PDGCell", "profiler_segment"]
+
+
+def profiler_segment(
+    profiler: Profiler | None, name: str, tokens: int
+) -> AbstractContextManager[object]:
+    """``profiler.segment(name, tokens=tokens)`` or a null context when no profiler is attached
+    (no synchronisation and no bookkeeping unless a caller asks for a profile)."""
+    if profiler is None:
+        return contextlib.nullcontext()
+    segment: AbstractContextManager[object] = profiler.segment(name, tokens=tokens)
+    return segment
 
 
 class PDGCell(nn.Module):
@@ -131,6 +171,83 @@ class PDGCell(nn.Module):
         return h_new, info
 
     # ----------------------------------------------------------------------------------------------
+    # The sparse round (P2.5)
+    # ----------------------------------------------------------------------------------------------
+
+    def step_sparse(
+        self,
+        u: Tensor,
+        eps: Tensor,
+        state: CellGraphState,
+        sel: Selection,
+        *,
+        profiler: Profiler | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor | CellGraphState]]:
+        """One round for the ``K`` selected cells of ``sel``: ``(h_new [B, K, d], info)``.
+
+        ``u``, ``eps`` are ``[B, d]`` in the dtype and on the device of ``state.h``; ``sel`` is a
+        P2.1 :class:`~hsn.model.router.Selection` on the same device (``cell_idx``/``unit_idx``
+        ``[B, K]``, ``alpha`` and ``valid``). The four ops of :func:`hsn.kernels.ops` run in the
+        order of the module docstring: messages and inputs read ``state.h`` (the previous round),
+        the unit bank runs once per present unit on the ``B·K`` pairs, and
+        ``gated_delta_update`` writes the valid slots functionally. ``h_new[b, k]`` is the slot's
+        updated state (``h[cell]`` unchanged on padded or disabled slots). ``info`` carries ``m``,
+        ``v``, ``unit_out [B, K, d]``, ``mixed`` (``α ⊙ unit_out``), ``c``, ``b``, ``h_old``,
+        ``valid`` (the slots actually written: ``sel.valid`` minus disabled cells), ``selected``
+        (bool ``[B, N]``, the cells written — the tick mask) and ``state`` (the updated
+        :class:`~hsn.model.state.CellGraphState` before the tick). With a ``profiler`` the round is
+        timed as the P0.6 segments ``messages`` (messages, inputs, gate; then mixing, ``W_out``,
+        ``tanh`` and the update: two entries), and ``selected_cells`` (the unit bank), the
+        partition of :func:`hsn.kernels.costs.profile_dense_costs`. The graph's step guard is held
+        for the duration.
+        """
+        B, N, d = self._check_vectors(u, eps, state)
+        self._check_selection(sel, B, state)
+        K = sel.k
+        native = kernels.ops()
+        # Padded (and disabled) slots gather cell 0 and unit 0, valid indices on every backend, and
+        # are never written: nothing below reads what the router put in a padded slot.
+        valid = sel.valid
+        cells = torch.where(valid, sel.cell_idx, torch.zeros_like(sel.cell_idx))
+        if self.disabled_cells:
+            valid = valid & ~self.disabled[cells]
+            cells = torch.where(valid, cells, torch.zeros_like(cells))
+        units = torch.where(valid, sel.unit_idx, torch.zeros_like(sel.unit_idx))
+        with self.graph.step():
+            with profiler_segment(profiler, "messages", B):
+                h_prev = state.h
+                m = native.csr_messages(h_prev, self.graph, self.V, cells)  # [B, K, d]
+                v = native.gather_concat(u, eps, h_prev, m, cells)  # [B, K, 4d]
+                b = torch.sigmoid(self.gate(v))
+            with profiler_segment(profiler, "selected_cells", B):
+                unit_out = native.grouped_unit_mlp(
+                    v.reshape(B * K, 4 * d), units.reshape(B * K), self.units
+                ).reshape(B, K, d)
+            # The second per-cell entry of a position carries no tokens (profile_dense_costs does
+            # the same), so the segment's tokens stay one count per position.
+            with profiler_segment(profiler, "messages", 0):
+                # α (fp32, the selection's gradient entry) promotes the unit output like the dense
+                # path's mixing does; W_out recasts under autocast.
+                mixed = sel.alpha.unsqueeze(-1) * unit_out  # α_i F_j(v_i)
+                c = torch.tanh(self.W_out(mixed))
+                new_state = native.gated_delta_update(state, cells, c, b, valid)
+        h_old = v[..., 2 * d : 3 * d]  # the gathered h[cell] slice of v
+        h_new = torch.where(valid.unsqueeze(-1), (1 - b) * h_old + b * c, h_old).to(state.dtype)
+        info: dict[str, Tensor | CellGraphState] = {
+            "m": m,
+            "v": v,
+            "unit_out": unit_out,
+            "mixed": mixed,
+            "c": c,
+            "b": b,
+            "h_old": h_old,
+            "valid": valid,
+            "selected": selection_mask(cells, valid, N),
+            "state": new_state,
+        }
+        return h_new, info
+
+    # ----------------------------------------------------------------------------------------------
     # Accounting and validation
     # ----------------------------------------------------------------------------------------------
 
@@ -147,6 +264,13 @@ class PDGCell(nn.Module):
     def _check_inputs(
         self, u: Tensor, eps: Tensor, state: CellGraphState, alpha: Tensor
     ) -> tuple[int, int, int]:
+        B, N, d = self._check_vectors(u, eps, state)
+        self._check_like_state("alpha", alpha, (B, N, self.n_units), state)
+        return B, N, d
+
+    def _check_vectors(self, u: Tensor, eps: Tensor, state: CellGraphState) -> tuple[int, int, int]:
+        """The checks every round shares: the state's shape against this cell, ``u``/``eps``
+        ``[B, d]`` in the state's dtype and device, the parameters on the state's device."""
         if not isinstance(state, CellGraphState):
             raise TypeError(f"state must be a CellGraphState, got {type(state).__name__}")
         B, N, d = state.batch_size, state.n_cells, state.width
@@ -154,21 +278,8 @@ class PDGCell(nn.Module):
             raise ValueError(
                 f"state has N = {N}, d = {d}; this PDGCell expects N = {self.n_cells}, d = {self.d}"
             )
-        for name, x, shape in (
-            ("u", u, (B, d)),
-            ("eps", eps, (B, d)),
-            ("alpha", alpha, (B, N, self.n_units)),
-        ):
-            if not isinstance(x, Tensor):
-                raise TypeError(f"{name} must be a torch.Tensor, got {type(x).__name__}")
-            if x.shape != shape:
-                raise ValueError(f"{name} must have shape {shape}, got {tuple(x.shape)}")
-            if x.dtype != state.dtype:
-                raise ValueError(
-                    f"{name} must have dtype {state.dtype} like the state, got {x.dtype}"
-                )
-            if x.device != state.device:
-                raise ValueError(f"{name} must live on {state.device}, got {x.device}")
+        for name, x, shape in (("u", u, (B, d)), ("eps", eps, (B, d))):
+            self._check_like_state(name, x, shape, state)
         if self.V.weight.device != state.device:
             raise ValueError(
                 f"state lives on {state.device} but the cell's parameters on "
@@ -179,3 +290,43 @@ class PDGCell(nn.Module):
                 f"state has dtype {state.dtype} but the cell's parameters {self.V.weight.dtype}"
             )
         return B, N, d
+
+    @staticmethod
+    def _check_like_state(
+        name: str, x: Tensor, shape: tuple[int, ...], state: CellGraphState
+    ) -> None:
+        if not isinstance(x, Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(x).__name__}")
+        if x.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {tuple(x.shape)}")
+        if x.dtype != state.dtype:
+            raise ValueError(f"{name} must have dtype {state.dtype} like the state, got {x.dtype}")
+        if x.device != state.device:
+            raise ValueError(f"{name} must live on {state.device}, got {x.device}")
+
+    def _check_selection(self, sel: Selection, B: int, state: CellGraphState) -> None:
+        """A P2.1 ``Selection`` for ``B`` rows on the state's device with ``1 <= K <= N`` (its own
+        ``__post_init__`` validated the fields against each other)."""
+        if not isinstance(sel, Selection):
+            raise TypeError(f"sel must be a hsn.model.router.Selection, got {type(sel).__name__}")
+        if sel.cell_idx.shape[0] != B:
+            raise ValueError(f"sel has {sel.cell_idx.shape[0]} rows but the state has B = {B}")
+        if not 1 <= sel.k <= self.n_cells:
+            raise ValueError(
+                f"sel has K = {sel.k} slots; the sparse round needs 1 <= K <= N = {self.n_cells}"
+            )
+        if sel.logits.shape[1:] != (self.n_cells, self.n_units):
+            raise ValueError(
+                f"sel.logits must be [B, N, M] = [{B}, {self.n_cells}, {self.n_units}], got "
+                f"{tuple(sel.logits.shape)}"
+            )
+        if sel.cell_idx.device != state.device:
+            raise ValueError(f"sel must live on {state.device}, got {sel.cell_idx.device}")
+        # P2.2 adds dense-fallback rows (charged the dense cost, every cell written) and soft gates
+        # to Selection; the sparse round executes K slots only, so it refuses such a selection
+        # rather than run it as if it were hard (errors over silence; the merge branches instead).
+        fallback = getattr(sel, "dense_fallback", None)
+        if isinstance(fallback, Tensor) and bool(fallback.any()):
+            raise NotImplementedError(
+                "step_sparse cannot execute dense-fallback rows (P2.2); run them through step_dense"
+            )

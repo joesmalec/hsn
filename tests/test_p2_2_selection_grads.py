@@ -1037,7 +1037,15 @@ def test_p2_2_eval_mode_is_hard_and_quiet() -> None:
     with torch.no_grad():
         logits_a, state_a, info_a = model(tokens, ctx, model.init_state(32), reset)
         logits_b, state_b, info_b = model(tokens, ctx, model.init_state(32), reset)
+        masked = model.step(tokens[:, 0], ctx[:, 0], model.init_state(32), "masked")
+        sparse = model.step(tokens[:, 0], ctx[:, 0], model.init_state(32), "sparse")
     assert torch.equal(logits_a, logits_b) and torch.equal(state_a.h, state_b.h)
+    # the masked path is the sparse round's reference (P2.5): the same decision, the same state
+    assert masked.selection is not None and sparse.selection is not None
+    assert torch.equal(masked.selection.cell_idx, sparse.selection.cell_idx)
+    torch.testing.assert_close(masked.logits, sparse.logits, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(masked.state.h, sparse.state.h, atol=1e-5, rtol=1e-5)
+    assert torch.equal(masked.state.age, sparse.state.age) and torch.equal(masked.cost, sparse.cost)
     assert float(info_a["explored"].sum()) == 0.0 and float(info_a["dense_fallback"].sum()) == 0.0
     assert torch.allclose(info_a["cost"], torch.full_like(info_a["cost"], K / (N * M)))
     assert not logits_a.requires_grad and not info_a["expected_cost"].requires_grad
@@ -1048,10 +1056,63 @@ def test_p2_2_eval_mode_is_hard_and_quiet() -> None:
     assert info_t["expected_cost"].requires_grad
     out = model.step(tokens[:, 0], ctx[:, 0], model.init_state(32), "masked")
     assert isinstance(out, StepOutput) and out.selection is not None and out.cost.shape == ()
-    with pytest.raises(NotImplementedError, match="P2.5"):
-        model.step(tokens[:, 0], ctx[:, 0], model.init_state(32), "sparse")
     with pytest.raises(ValueError, match="mode"):
         model.step(tokens[:, 0], ctx[:, 0], model.init_state(32), "routed")  # type: ignore[arg-type]
+    dense_model = _build(_config("model.routing=dense"))
+    with pytest.raises(ValueError, match="model.routing=dense"):
+        dense_model.step(tokens[:, 0], ctx[:, 0], dense_model.init_state(32), "masked")
+
+
+def test_p2_2_sparse_round_takes_the_gradient() -> None:
+    """P2.2 on P2.5's sparse round: the same hard decision and state as the masked reference, a
+    finite non-zero scorer gradient through ``Selection.alpha`` (STE), and dense-fallback rows that
+    are the dense step bit for bit while the other rows stay sparse."""
+    cfg = _config("model.routing=topk", "train.gate_mode=ste")
+    model = _build(cfg, perturb=11)
+    tokens, ctx, reset = _window(cfg, B=4, T=1)
+    x, c = tokens[:, 0], ctx[:, 0]
+    state = model.init_state(4)
+    masked = model.step(x, c, state, "masked")
+    sparse = model.step(x, c, state, "sparse")
+    assert masked.selection is not None and sparse.selection is not None
+    assert torch.equal(masked.selection.cell_idx, sparse.selection.cell_idx)
+    assert torch.equal(masked.selection.unit_idx, sparse.selection.unit_idx)
+    torch.testing.assert_close(sparse.logits, masked.logits, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(sparse.state.h, masked.state.h, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(sparse.state.q, masked.state.q, atol=1e-5, rtol=1e-5)
+    assert torch.equal(sparse.state.age, masked.state.age) and torch.equal(sparse.cost, masked.cost)
+    assert float(sparse.cost) == pytest.approx(K / (N * M), abs=1e-6)
+    sparse.logits.square().mean().backward()
+    grad = model.router.scorer.net.weight.grad
+    assert grad is not None and bool(torch.isfinite(grad).all()) and float(grad.norm()) > 1e-8
+    assert sparse.selection.alpha.requires_grad  # the gradient entry of the sparse round
+    # dense-fallback rows: the dense step bit for bit, the other rows the sparse round
+    rows = torch.tensor([True, False, True, False])
+    mixed = model.step(x, c, state, "sparse", dense_rows=rows)
+    dense = model.step(x, c, state, "dense")
+    plain = model.step(x, c, state, "sparse")
+    assert mixed.selection is not None and torch.equal(mixed.selection.dense_fallback, rows)
+    assert torch.equal(mixed.logits[rows], dense.logits[rows])
+    assert torch.equal(mixed.state.h[rows], dense.state.h[rows])
+    assert torch.equal(mixed.state.age[rows], dense.state.age[rows])
+    assert torch.equal(mixed.logits[~rows], plain.logits[~rows])
+    assert torch.equal(mixed.state.h[~rows], plain.state.h[~rows])
+    assert torch.equal(mixed.state.age[~rows], plain.state.age[~rows])
+    assert torch.equal(mixed.state.pos, dense.state.pos)
+    assert float(mixed.cost) == pytest.approx(0.5 * 1.0 + 0.5 * K / (N * M), abs=1e-6)
+    with pytest.raises(ValueError, match="dense_rows"):
+        model.step(x, c, state, "dense", dense_rows=rows)
+    # a window in training: every position stacks the P2.5 decisions and the P2.2 statistics
+    logits_w, _, info = model(tokens, ctx, model.init_state(4), reset)
+    assert {
+        "cell_idx",
+        "unit_idx",
+        "valid",
+        "cost_per_row",
+        "expected_cost",
+        "route_log_prob",
+    } <= set(info)
+    assert info["cell_idx"].shape == (4, 1, K) and info["cost_per_row"].shape == (4, 1)
 
 
 @pytest.mark.parametrize("device_type", DEVICES)

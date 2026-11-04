@@ -25,6 +25,7 @@ jobs:
       - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
       - run: uv run python scripts/build_kernels.py --target cuda --out build
       - run: uv run pytest -q
+      - run: uv run pytest tests/invariants -q
       - run: cargo test --workspace
 
   dgx_spark:
@@ -40,6 +41,7 @@ jobs:
       - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
       - run: uv run python scripts/build_kernels.py --target cuda --out build
       - run: uv run pytest -q
+      - run: uv run pytest tests/invariants -q
       - run: cargo test --workspace
 
   m_series:
@@ -55,4 +57,5 @@ jobs:
       - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
       - run: uv run python scripts/build_kernels.py --target metal --out build
       - run: uv run pytest -q
+      - run: uv run pytest tests/invariants -q
       - run: cargo test --workspace

@@ -371,7 +371,7 @@ def test_p1_5_param_count_is_1_820_361_and_per_component() -> None:
         "w_out": "cell.W_out.",
         "v_msg": "cell.V.",
         "gate": "cell.gate.",
-        "scorer": "router.scorer.",  # P2.2: the router owns the scorer
+        "scorer": "router.scorer.",
         "halting": "halting.",
         "decoder": "decoder.",
     }
@@ -611,7 +611,7 @@ def test_p1_5_shapes(device_type: str) -> None:
     state = model.init_state(B)
     tokens, ctx = _ids(cfg, B, 3, seed=11)
     x, c = tokens[:, 0], ctx[:, 0]
-    with pytest.raises(NotImplementedError, match="P2.5"):
+    with pytest.raises(ValueError, match="model.routing=dense"):  # P2.5: needs a selection mode
         model.step(x, c, state, mode="sparse")
     with pytest.raises(ValueError, match="mode"):
         model.step(x, c, state, mode="soft")  # type: ignore[arg-type]
