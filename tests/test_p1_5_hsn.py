@@ -936,6 +936,15 @@ def test_p1_5_runs_on_device(device_type: str) -> None:
     window the state is carried on each side and that rounding compounds through six gated
     recurrent steps: MPS reached 0.0145 absolute on the logits, so the carried comparison allows
     5e-2, which is still far below what a wrong operation produces.
+
+    The new state ``h`` / ``q`` is checked against an fp64 reference instead of against the CPU:
+    the device must be no more than 4x as far from it as the CPU's own fp32 result (plus 1e-6).
+    ``h`` is bounded by 1 but gated from pre-activations in the hundreds under these perturbed
+    weights (``u`` reaches ~160), so ordinary fp32 rounding is ~1e-3 absolute there on *both*
+    backends, often on opposite sides of the exact value. Measured on CUDA (RTX 3060, torch
+    2.15): CPU and CUDA each 6e-4 from fp64 on one ``h`` element, 1.22e-3 apart; the device/CPU
+    error ratio was at most 1.73 on these seeds and up to 2.97 on five other seed triples. At the
+    unperturbed initialisation every output is within 1e-7 of fp64 on the CPU.
     """
     device = _device(device_type)
     cfg, model = _model(REF_A1)
@@ -947,6 +956,7 @@ def test_p1_5_runs_on_device(device_type: str) -> None:
     state = _random_state(model, B, seed=31)
     logits_cpu, state_cpu, info_cpu = model(tokens, ctx, state, reset)
     cpu_model = copy.deepcopy(model)
+    exact_model = copy.deepcopy(model).double()  # fp64 reference for the new state
 
     on_device = model.to(device)
     state_dev = _to_device(state, device)
@@ -971,8 +981,19 @@ def test_p1_5_runs_on_device(device_type: str) -> None:
                     rtol=1e-3,
                     msg=lambda m, t=t, name=name: f"position {t}, {name}: {m}",
                 )
-            torch.testing.assert_close(out_dev.state.h.cpu(), out_cpu.state.h, atol=1e-3, rtol=1e-3)
-            torch.testing.assert_close(out_dev.state.q.cpu(), out_cpu.state.q, atol=1e-3, rtol=1e-3)
+            # the new state: at least as accurate as the CPU, measured against fp64
+            s_exact = CellGraphState(
+                h=s_cpu.h.double(), q=s_cpu.q.double(), age=s_cpu.age, pos=s_cpu.pos
+            )
+            out_exact = exact_model.step(tokens[:, t], ctx[:, t], s_exact)
+            for name in ("h", "q"):
+                exact = getattr(out_exact.state, name)
+                err_cpu = (getattr(out_cpu.state, name).double() - exact).abs().max().item()
+                err_dev = (getattr(out_dev.state, name).cpu().double() - exact).abs().max().item()
+                assert err_dev <= 4 * err_cpu + 1e-6, (
+                    f"position {t}, state.{name}: {device} is {err_dev:.2e} from fp64, "
+                    f"the CPU {err_cpu:.2e}"
+                )
             s_cpu = out_cpu.state
     # the whole window with the state carried on each side: accumulated fp32 rounding only
     torch.testing.assert_close(logits_dev.cpu(), logits_cpu, atol=5e-2, rtol=5e-2)
