@@ -327,7 +327,10 @@ def set_vram_cap(device: torch.device | str, fraction: float) -> None:
     dev = _as_device(device)
     if dev.type == "cuda":
         _require_cuda(dev)
-        torch.cuda.set_per_process_memory_fraction(float(fraction), dev)
+        # Unlike memory_allocated & co., set_per_process_memory_fraction rejects an index-less
+        # torch.device("cuda") (torch 2.15), so a bare "cuda" means the current device here too.
+        index = dev.index if dev.index is not None else torch.cuda.current_device()
+        torch.cuda.set_per_process_memory_fraction(float(fraction), index)
     elif dev.type == "mps":
         _require_mps()
         torch.mps.set_per_process_memory_fraction(float(fraction))
