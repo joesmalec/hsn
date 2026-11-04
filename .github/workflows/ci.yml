@@ -52,6 +52,9 @@ jobs:
       - name: pytest
         run: uv run pytest -q
 
+      - name: pytest tests/invariants (P1.8 invariant suite, Track T)
+        run: uv run pytest tests/invariants -q
+
       - name: cargo test
         run: cargo test --workspace
 
