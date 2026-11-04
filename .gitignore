@@ -14,9 +14,10 @@ htmlcov/
 # Rust
 target/
 
-# Build outputs and experiment runs
+# Build outputs, experiment runs and generated datasets (manifests are committed under configs/data/)
 build/
 runs/
+/data/
 *.so
 *.dylib
 

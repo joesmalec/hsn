@@ -1,0 +1,2057 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/out_of_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/out_of_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "brackets/out_of_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "arithmetic/out_of_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "brackets/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "arithmetic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "algorithmic/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "algorithmic/out_of_range/dev"
+    }
+  ],
+  "name": "synthetic_v1",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.in_range.train.npz",
+      "hash": "e231844ed14999793404fb875e7e3a57800845c7e8df86104b23b1578c3c32c3",
+      "n_docs": 20000,
+      "n_loss": 110967,
+      "n_tokens": 3930681,
+      "split": "train",
+      "task": "kv",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.in_range.dev.npz",
+      "hash": "764bd2e5e8b188478686f9f08d50b9cff8d3e65dc5ab2788ddf4faf25beede6e",
+      "n_docs": 1000,
+      "n_loss": 5535,
+      "n_tokens": 195217,
+      "split": "dev",
+      "task": "kv",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.in_range.test.npz",
+      "hash": "f2a0c6b2cce170cd06c51b86de540e3f9ed6b75608ceadb3b65f0efa4e919be7",
+      "n_docs": 1000,
+      "n_loss": 5544,
+      "n_tokens": 196764,
+      "split": "test",
+      "task": "kv",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.out_of_range.train.npz",
+      "hash": "15f56f86ed372af41d7eb4652f9173b3a2955d1fad4be2515a173708ff3fba4e",
+      "n_docs": 4000,
+      "n_loss": 31402,
+      "n_tokens": 3106541,
+      "split": "train",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.out_of_range.dev.npz",
+      "hash": "61506ff0839f6129605eb71589a4ff26c15ea785ad4b0adf5543b448715e0580",
+      "n_docs": 1000,
+      "n_loss": 7837,
+      "n_tokens": 782381,
+      "split": "dev",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.out_of_range.test.npz",
+      "hash": "f7096c77ad52e87a3e945d1339181a67e054a1b6efd66eb269e987e2192ee99a",
+      "n_docs": 1000,
+      "n_loss": 7856,
+      "n_tokens": 770583,
+      "split": "test",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.in_range.train.npz",
+      "hash": "91f46a1bb63b5fc6deb7ae180aa808c76823a4e0eb9c711790d453d50aa35467",
+      "n_docs": 20000,
+      "n_loss": 41906,
+      "n_tokens": 3906807,
+      "split": "train",
+      "task": "delayed",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.in_range.dev.npz",
+      "hash": "ffabd2a1f804454fee0145a4633c44553f270aa8db66c25583e78235475280da",
+      "n_docs": 1000,
+      "n_loss": 2126,
+      "n_tokens": 194125,
+      "split": "dev",
+      "task": "delayed",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.in_range.test.npz",
+      "hash": "092b2fb5b29f5c871720a96ef7ccaa39721b6f3dce0564e43352401d583e5959",
+      "n_docs": 1000,
+      "n_loss": 2054,
+      "n_tokens": 193317,
+      "split": "test",
+      "task": "delayed",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.out_of_range.train.npz",
+      "hash": "cda899b7564faa45c3c486ca4976b7f84a20c1f02e57d81bafd5b6183b14a812",
+      "n_docs": 4000,
+      "n_loss": 8642,
+      "n_tokens": 3085575,
+      "split": "train",
+      "task": "delayed",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.out_of_range.dev.npz",
+      "hash": "d201a1294849c0043ad8db58e389a991ba28d990597a010de382ef458f5b53d1",
+      "n_docs": 1000,
+      "n_loss": 2192,
+      "n_tokens": 775530,
+      "split": "dev",
+      "task": "delayed",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.out_of_range.test.npz",
+      "hash": "ae6a84ca78accc4e324c1290db3d13b4567260323f052f325d013cfce1a049ab",
+      "n_docs": 1000,
+      "n_loss": 2145,
+      "n_tokens": 780413,
+      "split": "test",
+      "task": "delayed",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 3,
+      "family": "brackets",
+      "file": "brackets.in_range.train.npz",
+      "hash": "f136ea494fe7870423e417b6bebef3147e972a582188eb5d2627def16ef53d63",
+      "n_docs": 20000,
+      "n_loss": 437709,
+      "n_tokens": 3886865,
+      "split": "train",
+      "task": "brackets",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 3,
+      "family": "brackets",
+      "file": "brackets.in_range.dev.npz",
+      "hash": "7ce3d442f400c5c76673b34c46187ddc6e854806c45718ed26befbc502e72c4a",
+      "n_docs": 1000,
+      "n_loss": 21986,
+      "n_tokens": 195948,
+      "split": "dev",
+      "task": "brackets",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 3,
+      "family": "brackets",
+      "file": "brackets.in_range.test.npz",
+      "hash": "7f31ddab247051eeee8941457caf0a921bdcc4791eb5a314fb1244111a27d1af",
+      "n_docs": 1000,
+      "n_loss": 21638,
+      "n_tokens": 191880,
+      "split": "test",
+      "task": "brackets",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 3,
+      "family": "brackets",
+      "file": "brackets.out_of_range.train.npz",
+      "hash": "ee4b4b29c498a3a9ce827691b8e2a7221d811edcef7cb3211dfb50b5ac7693be",
+      "n_docs": 4000,
+      "n_loss": 338422,
+      "n_tokens": 3115444,
+      "split": "train",
+      "task": "brackets",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 3,
+      "family": "brackets",
+      "file": "brackets.out_of_range.dev.npz",
+      "hash": "00e3df2a1b0ea7096abb9cfd872d640c919ae3da13a00f9679fe93b572fd19c3",
+      "n_docs": 1000,
+      "n_loss": 84024,
+      "n_tokens": 774662,
+      "split": "dev",
+      "task": "brackets",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 3,
+      "family": "brackets",
+      "file": "brackets.out_of_range.test.npz",
+      "hash": "8bd247fcac727f602c5e1fff3ad46f9c4c2f0b11f362ee62dc709d6f51757172",
+      "n_docs": 1000,
+      "n_loss": 83804,
+      "n_tokens": 771498,
+      "split": "test",
+      "task": "brackets",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 4,
+      "family": "arithmetic",
+      "file": "arithmetic.in_range.train.npz",
+      "hash": "8efbb5b71e43529b8bc889793006a90b2ea8a0cf7ad3e638fcf53c2d778a0195",
+      "n_docs": 20000,
+      "n_loss": 365448,
+      "n_tokens": 3824543,
+      "split": "train",
+      "task": "arithmetic",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 4,
+      "family": "arithmetic",
+      "file": "arithmetic.in_range.dev.npz",
+      "hash": "1c7437ee0a5dba07fdae89b9fd08ce0d7f4b194c1045aac7f0610b77db29978b",
+      "n_docs": 1000,
+      "n_loss": 18167,
+      "n_tokens": 190737,
+      "split": "dev",
+      "task": "arithmetic",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 4,
+      "family": "arithmetic",
+      "file": "arithmetic.in_range.test.npz",
+      "hash": "22f8f513249f828fe209c60faa8e48c340e9ed618ff98f1d28e4ed58f749ea1d",
+      "n_docs": 1000,
+      "n_loss": 18616,
+      "n_tokens": 192196,
+      "split": "test",
+      "task": "arithmetic",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 4,
+      "family": "arithmetic",
+      "file": "arithmetic.out_of_range.train.npz",
+      "hash": "b202cc8ac9bbd91dc7a5ac18c227a5677ce343a4bb3a4e4846b9cfed878781a8",
+      "n_docs": 4000,
+      "n_loss": 105907,
+      "n_tokens": 3072308,
+      "split": "train",
+      "task": "arithmetic",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 4,
+      "family": "arithmetic",
+      "file": "arithmetic.out_of_range.dev.npz",
+      "hash": "bbab1f0d1e0cb5e6eb66bebc0889be5447a1f7be0f8b71f48e256d8321613e67",
+      "n_docs": 1000,
+      "n_loss": 26366,
+      "n_tokens": 767184,
+      "split": "dev",
+      "task": "arithmetic",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 4,
+      "family": "arithmetic",
+      "file": "arithmetic.out_of_range.test.npz",
+      "hash": "c374cd3a4ebd4be4125cb2a80903d12ca140a957ea0294dbe468f691f4e6adc2",
+      "n_docs": 1000,
+      "n_loss": 26181,
+      "n_tokens": 766876,
+      "split": "test",
+      "task": "arithmetic",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 5,
+      "family": "algorithmic",
+      "file": "algorithmic.in_range.train.npz",
+      "hash": "1c1ea2c650eb112b2de52bb156c894552d63f8d5b1a944e9fb7dd478fb351321",
+      "n_docs": 20000,
+      "n_loss": 367847,
+      "n_tokens": 3800126,
+      "split": "train",
+      "task": "algorithmic",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 5,
+      "family": "algorithmic",
+      "file": "algorithmic.in_range.dev.npz",
+      "hash": "e8a479ef5c70f06ee1326d2fc955ae3ec5194758248796b32098e854f8e33421",
+      "n_docs": 1000,
+      "n_loss": 18139,
+      "n_tokens": 192422,
+      "split": "dev",
+      "task": "algorithmic",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 5,
+      "family": "algorithmic",
+      "file": "algorithmic.in_range.test.npz",
+      "hash": "f71fd7fc8da7d17dede0e64649f59a1bb1fe0ec1718ede2f489fdc9b4e132361",
+      "n_docs": 1000,
+      "n_loss": 18720,
+      "n_tokens": 190364,
+      "split": "test",
+      "task": "algorithmic",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 5,
+      "family": "algorithmic",
+      "file": "algorithmic.out_of_range.train.npz",
+      "hash": "26e7fcace2c8ed03a8811f0e1e7b2b9d29d65bed595c4d6cacd7a58fd507930b",
+      "n_docs": 4000,
+      "n_loss": 98424,
+      "n_tokens": 3091618,
+      "split": "train",
+      "task": "algorithmic",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 5,
+      "family": "algorithmic",
+      "file": "algorithmic.out_of_range.dev.npz",
+      "hash": "964a013ccf5468a569f1ea74c2f22d9d3aa04fa0138d786684da20f22a725d5c",
+      "n_docs": 1000,
+      "n_loss": 24513,
+      "n_tokens": 776114,
+      "split": "dev",
+      "task": "algorithmic",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 5,
+      "family": "algorithmic",
+      "file": "algorithmic.out_of_range.test.npz",
+      "hash": "d95d228f197bde107451b8e83194c10208d5fb241eeb38deb7c2a3455fef7745",
+      "n_docs": 1000,
+      "n_loss": 24403,
+      "n_tokens": 774474,
+      "split": "test",
+      "task": "algorithmic",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "059ecf61afaf4360003b1da6f2bb40ef1a9c404001e14ec0f89e05094dde0c22",
+  "split_hashes": {
+    "dev": "adf07528051f75ad05a5afda3d89feb61cd390241177f2b7e3177fbb666e90ba",
+    "test": "ed44bb66366b55a5221924dc734d4a77f6efebbcf3b01e55d032e9ccb49d31d2",
+    "train": "a444a4bc2860d4af90bde90539c555ccd505e79181b3a94c641855b67eab4415"
+  },
+  "unroll": 256
+}
