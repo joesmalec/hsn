@@ -14,9 +14,11 @@ For every position ``t`` (:meth:`HSN.step`; ``q = q_{t−1}`` is the carried sum
     dense:  α   = softmax(logits_u) over units
             h_t = PDGCell.step_dense(u_t, ε_t, state, α)              every cell, one round
             q_t = mean_i h[i, t]      (CellGraphState.with_dense: exact, no incremental drift)
-    sparse: sel = router.select(logits_u, budget, K, k_min, model.routing)        (P2.1)
+    sparse: sel = router.select(logits_u, budget, K, k_min, routing, gate, τ, ε, age)  (P2.1/P2.2)
             PDGCell.step_sparse(u_t, ε_t, state, sel)                  K cells, one unit each (P2.5)
             q_t = q_{t−1} + Σ_selected Δh / N    (incremental; the trainer resyncs periodically)
+    masked: h_cand = PDGCell.step_dense(u_t, ε_t, state, sel.unit_weights)   every cell (P2.2)
+            h_t = m ⊙ h_cand + (1 − m) ⊙ h[t−1],  m = sel.cell_mask;  q_t the exact mean
     logits = D([q_t ; u_t])     the UPDATED summary
 
 The dense reference uses the same linear scorer as the sparse model, with ``α = softmax(logits)``
@@ -41,18 +43,37 @@ still comes from ``q_{t−1}`` alone.
 
 P2.5: :meth:`HSN.step` chooses the path from ``model.routing`` (``dense`` → the dense reference,
 unchanged; ``topk`` / ``greedy_budget`` / ``random`` / ``fixed`` → the sparse round) unless ``mode``
-is given explicitly: ``mode="dense"`` always runs the dense reference (P2.2's dense fallback and
-soft warm-up), ``mode="sparse"`` needs a sparse ``model.routing``. The scorer now lives inside the
-P2.1 :class:`~hsn.model.router.Router` (``HSN.router``; ``HSN.scorer`` is a property on it, so the
+is given explicitly: ``mode="dense"`` always runs the dense reference, ``mode="sparse"`` and
+``mode="masked"`` need a sparse ``model.routing``. The scorer lives inside the P2.1
+:class:`~hsn.model.router.Router` (``HSN.router``; ``HSN.scorer`` is a property on it, so the
 state dict keys are ``router.scorer.*``). ``StepOutput.cost`` is the executed cost as a fraction of
-the dense step as a detached 0-dim tensor (1.0 dense; the batch mean of ``Selection.cost`` sparse,
-so reading it costs no host synchronisation; the sparse round itself synchronises three times per
-position in the index checks of ``messages_selected``, ``forward_selected`` and
-``gated_delta_update``, which P2.8 gates) and ``StepOutput.selection`` the sparse round's
+the dense step as a detached 0-dim tensor (1.0 dense; the batch mean of ``Selection.cost``
+otherwise, so reading it costs no host synchronisation; the sparse round itself synchronises three
+times per position in the index checks of ``messages_selected``, ``forward_selected`` and
+``gated_delta_update``, which P2.8 gates) and ``StepOutput.selection`` the executed
 :class:`~hsn.model.router.Selection` (``None`` dense). A :class:`~hsn.profiler.Profiler` passed to
 ``step`` times the P0.6 segments ``shared_path``, ``scorer``, ``messages`` / ``selected_cells``
 (sparse round only; the dense cell step is partitioned by
 :func:`hsn.kernels.costs.profile_dense_costs`) and ``decode``.
+
+P2.2 (training through hard selection): the selection carries its gradient path and the routing
+controls (:mod:`hsn.model.router`), driven by the :class:`~hsn.train.schedules.SelectionSchedule` at
+``HSN.train_step`` (the trainer sets it before every window). In training the gate of the step
+(``train.gate_mode`` after ``train.soft_until_step`` steps, ``soft`` before) and the temperature
+and exploration ramps reach :meth:`Router.select`; evaluation takes the hard, gradient-free
+decision with no exploration and no dense fallback (refresh probes stay on: ``model.age_max`` is a
+property of the model). The straight-through gradient reaches the sparse round through
+``Selection.alpha`` (``cell_mask[cell] · unit_weights[cell, unit]`` on the valid slots, exactly
+1.0 forward). Mode ``masked`` is the hard selection executed on the dense path — every cell computes
+its candidate with the selection's per-cell unit weights, only the selected cells are written — the
+reference the sparse round is checked against, and the path the **soft warm-up** runs on whatever
+the mode (a soft ``cell_mask`` means every cell executes with a fractional weight; the selection is
+charged the dense cost there). The **dense fallback** is drawn once per window per row in
+:meth:`HSN.forward` with probability ``train.p_dense`` (training only, from the CPU RNG, so a
+checkpoint replays it): a dense-fallback row executes the P1.5 dense step — inside the sparse round
+by branching that row to ``step_dense``, inside the masked round through an all-ones mask — and is
+charged the dense cost in ``Selection.cost``. The masked path computes every cell, so its
+throughput is not a sparse-efficiency number.
 
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11), no ``torch.compile`` (P2.8); ``n_rounds`` is 1.
@@ -67,18 +88,19 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from hsn.config import ModelConfig, RunConfig
+from hsn.config import GateMode, ModelConfig, RunConfig
 from hsn.model.cell import PDGCell, profiler_segment
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.halting import HaltingHead
-from hsn.model.router import Router, Scorer, Selection
+from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.profiler import Profiler
+from hsn.train.schedules import SelectionSchedule
 
 __all__ = ["PARAM_REPORT_ROWS", "HSN", "StepMode", "StepOutput"]
 
-StepMode = Literal["dense", "sparse"]
+StepMode = Literal["dense", "masked", "sparse"]
 _INDEX_DTYPES = (torch.int64, torch.int32)
 
 #: Appendix C.1 rows in table order, keyed as :func:`hsn.train.memory_plan.expected_param_count`
@@ -106,9 +128,10 @@ class StepOutput:
     (P1.6, by ``model.predictor_target``), the error ``eps = z − z_hat`` and the shared features
     ``u`` (all ``[B, d]``), the updated ``state``, the executed ``cost`` (a detached 0-dim tensor in
     the state dtype: the fraction of the dense step, 1.0 dense and the batch mean of
-    ``Selection.cost`` sparse), ``n_rounds``, ``aux`` statistics (detached 0-dim tensors:
-    ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``) and, in sparse mode, the
-    :class:`~hsn.model.router.Selection` that was executed (``None`` dense)."""
+    ``Selection.cost`` otherwise), ``n_rounds``, ``aux`` statistics (detached 0-dim tensors:
+    ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy`` — the entropy of the scorer's softmax
+    over units in every mode) and, in a routed mode, the :class:`~hsn.model.router.Selection`
+    that was executed (``None`` dense)."""
 
     logits: Tensor
     z: Tensor
@@ -130,16 +153,30 @@ class HSN(nn.Module):
     :class:`HaltingHead` and ``D``, built from ``cfg`` (``model.*``) plus ``seed`` (``run.seed``),
     ``unroll`` (``train.unroll``) and, when ``model.predictor_target = ema_encoder``, ``ema_tau``
     (``train.ema_tau``) for the :class:`~hsn.model.encoder.EMATarget` copy of ``E`` (``ema_target``;
-    ``None`` otherwise)."""
+    ``None`` otherwise). ``schedule`` is the P2.2 :class:`~hsn.train.schedules.SelectionSchedule`
+    (``train.gate_mode`` and the ramps; the config defaults when ``None``: soft gates, τ = 1, no
+    exploration, no dense fallback)."""
 
     def __init__(
-        self, cfg: ModelConfig, *, seed: int, unroll: int, ema_tau: float | None = None
+        self,
+        cfg: ModelConfig,
+        *,
+        seed: int,
+        unroll: int,
+        ema_tau: float | None = None,
+        schedule: SelectionSchedule | None = None,
     ) -> None:
         super().__init__()
+        if schedule is not None and not isinstance(schedule, SelectionSchedule):
+            raise TypeError(
+                f"schedule must be a SelectionSchedule or None, got {type(schedule).__name__}"
+            )
         self.cfg = cfg
         self.seed = seed
         self.unroll = unroll
         self.ema_tau = ema_tau
+        self.schedule = schedule if schedule is not None else SelectionSchedule.neutral()
+        self.train_step = 0
         self.byte_emb = ByteEmbedding.from_config(cfg)
         self.ctx_emb = ContextEmbedding.from_config(cfg)
         self.encoder = Encoder(cfg)
@@ -159,6 +196,7 @@ class HSN(nn.Module):
         self.predictor = Predictor(cfg)
         self.shared = SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
+        # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
         self.router = Router.from_config(cfg, unroll=unroll)
         self.halting = HaltingHead(cfg)
         self.decoder = Decoder(cfg)
@@ -174,10 +212,23 @@ class HSN(nn.Module):
 
     @classmethod
     def from_config(cls, run: RunConfig) -> Self:
-        """``HSN(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau)``."""
+        """``HSN(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau,
+        schedule=SelectionSchedule.from_config(run.train))``."""
         if not isinstance(run, RunConfig):
             raise TypeError(f"from_config needs a RunConfig, got {type(run).__name__}")
-        return cls(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau)
+        return cls(
+            run.model,
+            seed=run.seed,
+            unroll=run.train.unroll,
+            ema_tau=run.train.ema_tau,
+            schedule=SelectionSchedule.from_config(run.train),
+        )
+
+    def set_train_step(self, step: int) -> None:
+        """The optimiser step the schedules read (the trainer calls this before every window)."""
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError(f"step must be an int >= 0, got {step!r}")
+        self.train_step = step
 
     # -- placement --------------------------------------------------------------------------------
 
@@ -213,6 +264,7 @@ class HSN(nn.Module):
         mode: StepMode | None = None,
         *,
         profiler: Profiler | None = None,
+        dense_rows: Tensor | None = None,
     ) -> StepOutput:
         """One input position in the §2.2 order (see the module docstring); returns a
         :class:`StepOutput` whose ``state`` is the functional update of ``state`` (autograd intact).
@@ -220,24 +272,28 @@ class HSN(nn.Module):
         ``x_t`` and ``ctx_t`` are int64/int32 ``[B]`` on the state's device; ``state`` must have
         this model's ``N`` and ``d`` and the parameters' dtype and device. ``mode=None`` follows
         ``model.routing`` (``dense`` → the dense reference, any selection mode → the sparse round);
-        ``"dense"`` runs the dense reference whatever the routing; ``"sparse"`` raises
-        ``ValueError`` when ``model.routing`` is ``dense``. ``profiler`` (P0.6) times the segments
-        named in the module docstring; ``None`` records nothing and never synchronises.
+        ``"dense"`` runs the dense reference whatever the routing; ``"sparse"`` and ``"masked"``
+        (the selection applied on the dense path, P2.2) raise ``ValueError`` when ``model.routing``
+        is ``dense``. In the soft warm-up a sparse round runs as the masked round (every cell
+        executes). ``dense_rows`` (bool ``[B]``, routed modes only) marks the rows that execute the
+        dense step instead. ``profiler`` (P0.6) times the segments named in the module docstring;
+        ``None`` records nothing and never synchronises.
         """
         cfg = self.cfg
         if mode is None:
             mode = "dense" if cfg.routing == "dense" else "sparse"
-        elif mode == "sparse":
+        elif mode in ("sparse", "masked"):
             if cfg.routing == "dense":
                 raise ValueError(
-                    "mode='sparse' needs a selection mode in model.routing (topk, greedy_budget, "
+                    f"mode={mode!r} needs a selection mode in model.routing (topk, greedy_budget, "
                     "random, fixed); this model has model.routing=dense"
                 )
         elif mode != "dense":
-            raise ValueError(f"mode must be 'dense', 'sparse' or None, got {mode!r}")
+            raise ValueError(f"mode must be 'dense', 'masked', 'sparse' or None, got {mode!r}")
         if profiler is not None and not isinstance(profiler, Profiler):
             raise TypeError(f"profiler must be a hsn.profiler.Profiler or None, got {profiler!r}")
         self._check_step_inputs(x_t, ctx_t, state)
+        dense_rows = self._check_dense_rows(dense_rows, mode, state)
         B = state.batch_size
 
         with profiler_segment(profiler, "shared_path", B):
@@ -257,14 +313,20 @@ class HSN(nn.Module):
                 if mode == "dense":
                     alpha = torch.softmax(unit_logits, dim=-1)
                 else:
-                    selection = self._select(unit_logits)
+                    selection = self._select(unit_logits, state, dense_rows)
             if mode == "dense":
                 h_new, _ = self.cell.step_dense(u_s, eps_s, state, alpha)
                 new_state = self._write_dense(state, h_new)
                 cost = torch.ones((), dtype=state.dtype, device=state.device)
             else:
                 assert selection is not None
-                new_state, cost = self._sparse_round(u_s, eps_s, state, selection, profiler)
+                if mode == "masked" or self._gate() == "soft":
+                    # the soft warm-up executes every cell with a fractional weight: masked path
+                    new_state, cost = self._masked_round(u_s, eps_s, state, selection)
+                else:
+                    new_state, cost = self._sparse_round(
+                        u_s, eps_s, state, selection, unit_logits, profiler, dense_rows
+                    )
 
         with profiler_segment(profiler, "decode", B):
             logits = self.decoder(torch.cat([new_state.q, u], dim=-1))  # the updated q_t
@@ -306,10 +368,25 @@ class HSN(nn.Module):
         u = self.shared(torch.cat([z, q_prev, self.ctx_emb(ctx_t)], dim=-1))
         return z_hat, z, z_target, eps, u
 
-    def _select(self, unit_logits: Tensor) -> Selection:
-        """The P2.1 selection of this model's ``model.routing`` for one round (keywords only, so
-        P2.2's gate arguments extend the call without touching it)."""
+    def _gate(self) -> GateMode | None:
+        """The gate of this step: the schedule's in training, ``None`` (hard, no gradient path) in
+        evaluation."""
+        return self.schedule.gate(self.train_step) if self.training else None
+
+    def _select(
+        self, unit_logits: Tensor, state: CellGraphState, dense_rows: Tensor | None
+    ) -> Selection:
+        """The selection of this model's ``model.routing`` for one round, with the P2.2 gate and
+        controls of this step: the schedule's gate, temperature and exploration rate in training
+        (the probes — exploration and refresh — post-process a hard scored decision, so not in the
+        soft warm-up and never for the controls), the hard decision in evaluation."""
         cfg = self.cfg
+        schedule, step, training = self.schedule, self.train_step, self.training
+        scored = cfg.routing in SCORED_MODES
+        gate = self._gate()
+        tau = schedule.temperature(step) if training else 1.0
+        probes = scored and gate != "soft"
+        epsilon = schedule.epsilon(step) if training and probes else 0.0
         return self.router.select(
             unit_logits,
             budget=cfg.budget,
@@ -318,6 +395,11 @@ class HSN(nn.Module):
             mode=cfg.routing,
             fixed=self._fixed_route,
             generator=None,
+            gate=gate,
+            temperature=tau,
+            epsilon=epsilon,
+            age=state.age if probes else None,
+            dense_rows=dense_rows,
         )
 
     def _sparse_round(
@@ -326,16 +408,57 @@ class HSN(nn.Module):
         eps_s: Tensor,
         state: CellGraphState,
         selection: Selection,
+        unit_logits: Tensor,
         profiler: Profiler | None,
+        dense_rows: Tensor | None,
     ) -> tuple[CellGraphState, Tensor]:
         """The sparse round (P2.5): :meth:`PDGCell.step_sparse` on ``selection``, the tick of the
         unselected cells, and the executed cost (the detached batch mean of ``selection.cost`` in
-        the state dtype)."""
-        _, info = self.cell.step_sparse(u_s, eps_s, state, selection, profiler=profiler)
+        the state dtype). The rows of ``dense_rows`` (P2.2's dense fallback) run the P1.5 dense
+        step instead — the same operations as ``mode="dense"`` — and replace the sparse result row
+        by row; the selection they did not execute is handed to the cell with its fallback flags
+        cleared."""
+        executed = selection
+        if dense_rows is not None:
+            executed = replace(selection, dense_fallback=torch.zeros_like(selection.dense_fallback))
+        _, info = self.cell.step_sparse(u_s, eps_s, state, executed, profiler=profiler)
         written = info["state"]
         selected = info["selected"]
         assert isinstance(written, CellGraphState) and isinstance(selected, Tensor)
-        return written.tick(selected), selection.cost.detach().mean().to(state.dtype)
+        new_state = written.tick(selected)
+        if dense_rows is not None:
+            h_dense, _ = self.cell.step_dense(u_s, eps_s, state, torch.softmax(unit_logits, dim=-1))
+            dense_state = self._write_dense(state, h_dense)
+            rows = dense_rows
+            new_state = CellGraphState(
+                h=torch.where(rows[:, None, None], dense_state.h, new_state.h),
+                q=torch.where(rows[:, None], dense_state.q, new_state.q),
+                age=torch.where(rows[:, None], dense_state.age, new_state.age),
+                pos=new_state.pos,  # both paths advanced it once
+            )
+        return new_state, selection.cost.detach().mean().to(state.dtype)
+
+    def _masked_round(
+        self, u_s: Tensor, eps_s: Tensor, state: CellGraphState, selection: Selection
+    ) -> tuple[CellGraphState, Tensor]:
+        """The P2.2 routed round on the dense path (module docstring): every cell computes its
+        candidate with the selection's unit weights, ``h_new = m·h_cand + (1 − m)·h_prev`` (exactly
+        ``h_cand`` where ``m = 1`` and ``h_prev`` where ``m = 0``), ``q`` the exact mean, the ages
+        reset on the cells whose weight is non-zero (the hard decision and every cell of a
+        dense-fallback row in the hard modes; every cell in the soft warm-up). Returns the state
+        and the executed cost."""
+        alpha = selection.unit_weights.to(state.dtype)
+        h_cand, _ = self.cell.step_dense(u_s, eps_s, state, alpha)
+        mask = selection.cell_mask.to(state.dtype)[:, :, None]
+        h_new = mask * h_cand + (1 - mask) * state.h
+        if self.cell.disabled_cells:  # a soft m would move a disabled cell by an ulp
+            h_new = torch.where(self.cell.disabled[None, :, None], state.h, h_new)
+        updated = selection.cell_mask.detach() > 0
+        if self.cell.disabled_cells:
+            updated = updated & ~self.cell.disabled[None, :]
+        written = state.with_dense(h_new)  # q: the exact mean (every age zeroed, restored below)
+        new_state = replace(written, age=state.age.masked_fill(updated, 0)).tick(updated)
+        return new_state, selection.cost.detach().mean().to(state.dtype)
 
     def _prediction_target(self, emb: Tensor) -> Tensor:
         """``z_target [B, d]`` for the prediction loss, detached in both modes: the byte
@@ -374,14 +497,27 @@ class HSN(nn.Module):
         the per-position stacks ``z``, ``z_hat``, ``z_target`` (detached), ``eps``, ``u``
         (``[B, T, d]``, autograd intact except for the target) and the per-position statistics
         ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``, ``cost`` (the model dtype) and
-        ``n_rounds`` (int64), each ``[T]``. In sparse mode (``model.routing`` not ``dense``) the
-        window's selections are stacked too, detached: ``cell_idx`` and ``unit_idx`` (int64
-        ``[B, T, K]``), ``valid`` (bool ``[B, T, K]``) and ``cost_per_row`` (fp32 ``[B, T]``), for
-        the P2.2–P2.6 consumers of the routing decisions. They are the router's decisions as
-        charged; the one case where a valid slot is not written is a selected cell of the
-        ``model.disabled_cells`` test hook.
+        ``n_rounds`` (int64), each ``[T]``. With a sparse ``model.routing`` (every position runs
+        :meth:`step` with ``mode=None``) the window's selections are stacked too: detached
+        ``cell_idx`` and ``unit_idx`` (int64 ``[B, T, K]``), ``valid`` (bool ``[B, T, K]``) and
+        ``cost_per_row`` (fp32 ``[B, T]``), the router's decisions as charged (the one case where a
+        valid slot is not written is a selected cell of the ``model.disabled_cells`` test hook; a
+        dense-fallback row ran the dense step instead of its slots), plus P2.2's ``expected_cost
+        [T]`` (the differentiable batch-mean expected cost, fp32), ``route_log_prob [B]`` (the
+        REINFORCE log-probability summed over the positions; zeros unless the gate is
+        ``reinforce``), ``explored [T]`` (fraction of rows with an explored slot), ``refreshed [T]``
+        (mean refreshed slots per row) and ``dense_fallback [T]`` (fraction of rows that ran
+        dense). In training the dense fallback is drawn here, once per row per window, with
+        probability ``train.p_dense``.
         """
-        _, T = self._check_window_inputs(tokens, ctx, state, reset)
+        B, T = self._check_window_inputs(tokens, ctx, state, reset)
+        dense_rows: Tensor | None = None
+        if self.cfg.routing != "dense" and self.training:
+            p_dense = self.schedule.p_dense(self.train_step)
+            if p_dense > 0.0:  # a CPU draw: the same rows on every backend, replayed by a resume
+                drawn = torch.rand(B) < p_dense
+                if bool(drawn.any()):  # a host-side check: no device synchronisation
+                    dense_rows = drawn.to(state.device)
         logits: list[Tensor] = []
         stacks: dict[str, list[Tensor]] = {
             "z": [],
@@ -401,7 +537,7 @@ class HSN(nn.Module):
         with self.cell.graph.step():
             for t in range(T):
                 state = state.reset(reset[:, t])
-                out = self.step(tokens[:, t], ctx[:, t], state)
+                out = self.step(tokens[:, t], ctx[:, t], state, dense_rows=dense_rows)
                 state = out.state
                 logits.append(out.logits)
                 for name in stacks:
@@ -421,13 +557,26 @@ class HSN(nn.Module):
         if selections:
             if len(selections) != T:
                 raise RuntimeError(
-                    f"{len(selections)} of {T} positions ran the sparse round; a window mixes "
-                    "modes only through P2.2's dense fallback, which must stack its own selections"
+                    f"{len(selections)} of {T} positions ran a routed round; every position of a "
+                    "window runs the same mode (the dense fallback is a flag on the selection)"
                 )
             info["cell_idx"] = torch.stack([sel.cell_idx for sel in selections], dim=1)
             info["unit_idx"] = torch.stack([sel.unit_idx for sel in selections], dim=1)
             info["valid"] = torch.stack([sel.valid for sel in selections], dim=1)
             info["cost_per_row"] = torch.stack([sel.cost.detach() for sel in selections], dim=1)
+            info["expected_cost"] = torch.stack([sel.expected_cost.mean() for sel in selections])
+            info["route_log_prob"] = torch.stack([sel.log_prob for sel in selections], dim=1).sum(
+                dim=1
+            )
+            info["explored"] = torch.stack(
+                [sel.explored.any(dim=1).float().mean() for sel in selections]
+            )
+            info["refreshed"] = torch.stack(
+                [sel.refreshed.float().sum(dim=1).mean() for sel in selections]
+            )
+            info["dense_fallback"] = torch.stack(
+                [sel.dense_fallback.float().mean() for sel in selections]
+            )
         return torch.stack(logits, dim=1), state, info
 
     # -- accounting -------------------------------------------------------------------------------
@@ -465,7 +614,7 @@ class HSN(nn.Module):
         return report
 
     def extra_repr(self) -> str:
-        text = f"seed={self.seed}, unroll={self.unroll}"
+        text = f"seed={self.seed}, unroll={self.unroll}, routing={self.cfg.routing!r}"
         if self.ema_target is not None:
             text += f", ema_tau={self.ema_tau}"
         return text
@@ -491,6 +640,23 @@ class HSN(nn.Module):
                 f"state lives on {state.device} but the parameters on {self.device}; move the "
                 "model with .to(device) or build the state with init_state"
             )
+
+    @staticmethod
+    def _check_dense_rows(
+        dense_rows: Tensor | None, mode: str, state: CellGraphState
+    ) -> Tensor | None:
+        if dense_rows is None:
+            return None
+        if mode == "dense":
+            raise ValueError("dense_rows is only used with a routed mode ('masked' or 'sparse')")
+        if not isinstance(dense_rows, Tensor) or dense_rows.dtype != torch.bool:
+            raise TypeError("dense_rows must be a bool torch.Tensor [B]")
+        if dense_rows.shape != (state.batch_size,) or dense_rows.device != state.device:
+            raise ValueError(
+                f"dense_rows must be a bool [B] = {(state.batch_size,)} tensor on "
+                f"{state.device}, got {tuple(dense_rows.shape)} on {dense_rows.device}"
+            )
+        return dense_rows
 
     @staticmethod
     def _check_ids(name: str, ids: Tensor, shape: tuple[int, ...], device: torch.device) -> None:

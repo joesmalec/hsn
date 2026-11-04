@@ -75,7 +75,9 @@ def _model(
     """A model from a config file (fp64 when it says so), weights seeded by ``seed``; ``perturb``
     adds seeded noise of std ``scale`` to every parameter (the P1.5 recipe at 0.3: states of order
     0.1 rather than 1e-5, so wrong operands show)."""
-    cfg = load_config(path, overrides=list(overrides))
+    # P2.2: the default gate (soft) relaxes every cell in training mode; this chunk's tests are
+    # about hard decisions, so they train with the straight-through gate (hard forward values)
+    cfg = load_config(path, overrides=["train.gate_mode=ste", *overrides])
     torch.manual_seed(seed)
     model = HSN.from_config(cfg)
     if cfg.train.precision == "fp64":
@@ -142,18 +144,40 @@ def _selection(
     alpha: Tensor | None = None,
     cost: Tensor | None = None,
 ) -> Selection:
-    """A hand-built P2.1 ``Selection`` (hard α = 1 on valid slots unless given)."""
+    """A hand-built P2.1 ``Selection`` (hard α = 1 on valid slots unless given); the P2.2 fields
+    (P2.2 landed beside this chunk) hold the hard, flag-free values of the slots."""
     device = logits.device
-    B = int(logits.shape[0])
+    B, N, M = (int(s) for s in logits.shape)
+    K = int(cell_idx.shape[1])
+    cells = cell_idx.to(device=device, dtype=torch.int64)
+    units = unit_idx.to(device=device, dtype=torch.int64)
+    valid = valid.to(device)
+    cost_t = (torch.zeros(B) if cost is None else cost).to(device)
+    # padded slots may hold anything (a sentinel >= N): only the valid slots build the masks
+    safe_cells = torch.where(valid, cells, torch.zeros_like(cells))
+    safe_units = torch.where(valid, units, torch.zeros_like(units))
+    cell_mask = torch.zeros(B, N, dtype=torch.float32, device=device).scatter_add(
+        1, safe_cells, valid.to(torch.float32)
+    )
+    unit_weights = torch.zeros(B, N, M, dtype=torch.float32, device=device)
+    rows = torch.arange(B, device=device)[:, None].expand(B, K)
+    unit_weights[rows[valid], safe_cells[valid], safe_units[valid]] = 1.0
     return Selection(
-        cell_idx=cell_idx.to(device=device, dtype=torch.int64),
-        unit_idx=unit_idx.to(device=device, dtype=torch.int64),
+        cell_idx=cells,
+        unit_idx=units,
         alpha=(valid.to(torch.float32) if alpha is None else alpha).to(device),
-        valid=valid.to(device),
+        valid=valid,
         logits=logits,
-        cost=(torch.zeros(B) if cost is None else cost).to(device),
+        cost=cost_t,
         scorer_cost=0.0,
         n_rounds_used=1,
+        cell_mask=cell_mask,
+        unit_weights=unit_weights,
+        expected_cost=cost_t.clone(),
+        log_prob=torch.zeros(B, dtype=torch.float32, device=device),
+        explored=torch.zeros(B, K, dtype=torch.bool, device=device),
+        refreshed=torch.zeros(B, K, dtype=torch.bool, device=device),
+        dense_fallback=torch.zeros(B, dtype=torch.bool, device=device),
     )
 
 
@@ -230,6 +254,7 @@ def _train_config(*overrides: str) -> RunConfig:
             "model.hidden=16",
             "model.scorer_hidden=8",
             "model.routing=topk",
+            "train.gate_mode=ste",  # P2.2: hard forward decisions with the straight-through gate
             f"train.unroll={UNROLL}",
             "train.batch=4",
             "train.micro_batch=4",
@@ -459,7 +484,11 @@ def test_p2_5_runs_on_all_backends(device_type: str) -> None:
         grads = _grad_sum(model)
         for name, value in grads.items():
             assert math.isfinite(value) and value > 0.0, (routing, name, value)
-        assert model.scorer.net.weight.grad is None, routing  # type: ignore[union-attr]
+        scorer_grad = model.scorer.net.weight.grad  # type: ignore[union-attr]
+        if routing == "random":  # nothing the random control decides depends on the scorer
+            assert scorer_grad is None, routing
+        else:  # P2.2: the straight-through gradient reaches the scorer through alpha
+            assert scorer_grad is not None and bool(torch.isfinite(scorer_grad).all()), routing
         model.zero_grad(set_to_none=True)
 
     # one topk position from the same state on both sides
@@ -502,9 +531,12 @@ def test_p2_5_runs_on_all_backends(device_type: str) -> None:
 
 def test_p2_5_padded_slots_ignored() -> None:
     """Padded slots (``valid=False``) change nothing: the state equals the unpadded selection's
-    bit for bit whatever the padded slot holds (cell 0 beside a real cell 0, another cell, a unit,
-    an α), they carry no gradient, and the validation ignores them while refusing duplicated or
-    out-of-range valid slots."""
+    whatever the padded slot holds (cell 0 beside a real cell 0, another cell, a unit, an α), they
+    carry no gradient, and the validation ignores them while refusing duplicated or out-of-range
+    valid slots. The written values are compared within fp32 rounding (``atol`` 1e-5), not bit for
+    bit: a padded pair joins its unit's block in the grouped matmul, and on the hosted ubuntu
+    runner's BLAS a block of another height rounds the same rows differently (exact on Apple
+    silicon); the ages, the tick mask and the gradients stay exact."""
     cfg, model = _model(REF_A1, ["model.routing=topk"], perturb=41)
     cell = model.cell
     B, N = 4, cfg.model.n_cells
@@ -532,9 +564,10 @@ def test_p2_5_padded_slots_ignored() -> None:
         h_pad, info_pad = cell.step_sparse(u, eps, state, sel)
         pad_state = info_pad["state"]
         assert isinstance(pad_state, CellGraphState)
-        assert torch.equal(pad_state.h, base_state.h) and torch.equal(pad_state.q, base_state.q)
+        torch.testing.assert_close(pad_state.h, base_state.h, atol=1e-5, rtol=0)
+        torch.testing.assert_close(pad_state.q, base_state.q, atol=1e-5, rtol=0)
         assert torch.equal(pad_state.age, base_state.age)
-        assert torch.equal(h_pad[:, :2], h_base)
+        torch.testing.assert_close(h_pad[:, :2], h_base, atol=1e-5, rtol=0)
         assert torch.equal(h_pad[:, 2:], state.h[:, 0:1].expand(B, 2, cfg.model.d))  # cell 0, as is
         selected = info_pad["selected"]
         assert isinstance(selected, Tensor) and torch.equal(selected, info_base["selected"])
@@ -559,13 +592,11 @@ def test_p2_5_padded_slots_ignored() -> None:
     )
     state_s = info_s["state"]
     assert isinstance(state_s, CellGraphState)
-    assert torch.equal(state_s.h[[0, 2, 3]], base_state.h[[0, 2, 3]])
-    assert torch.equal(state_s.h[1, 9], state.h[1, 9]) and torch.equal(
-        state_s.h[1, 7], base_state.h[1, 7]
-    )
-    assert bool(state_s.age[1, 9] == state.age[1, 9]) and torch.equal(
-        h_s[:, :2][[0, 2, 3]], h_base[[0, 2, 3]]
-    )
+    torch.testing.assert_close(state_s.h[[0, 2, 3]], base_state.h[[0, 2, 3]], atol=1e-5, rtol=0)
+    assert torch.equal(state_s.h[1, 9], state.h[1, 9])  # the disabled cell is never written
+    torch.testing.assert_close(state_s.h[1, 7], base_state.h[1, 7], atol=1e-5, rtol=0)
+    assert bool(state_s.age[1, 9] == state.age[1, 9])
+    torch.testing.assert_close(h_s[:, :2][[0, 2, 3]], h_base[[0, 2, 3]], atol=1e-5, rtol=0)
     valid_eff = info_s["valid"]
     assert isinstance(valid_eff, Tensor) and not bool(valid_eff[1, 1]) and bool(valid_eff[1, 0])
 
@@ -647,7 +678,17 @@ def test_p2_5_mode_from_config() -> None:
     _, _, info_d = dense(tokens, ctx, state, reset)
     _, _, info_s = sparse(tokens, ctx, state, reset)
     assert "cell_idx" not in info_d and bool((info_d["cost"] == 1.0).all())
-    assert set(info_s) == set(info_d) | {"cell_idx", "unit_idx", "valid", "cost_per_row"}
+    assert set(info_s) == set(info_d) | {
+        "cell_idx",
+        "unit_idx",
+        "valid",
+        "cost_per_row",
+        "expected_cost",  # P2.2's routed statistics
+        "route_log_prob",
+        "explored",
+        "refreshed",
+        "dense_fallback",
+    }
     assert info_s["cost"].dtype is sparse.dtype and bool((info_s["cost"] < 1.0).all())
 
 
@@ -844,8 +885,8 @@ def test_p2_5_trains_with_tbptt(
     train_docs: list[Example], dev_docs: list[Example], tmp_path: Path
 ) -> None:
     """Three TBPTT steps with ``routing=topk`` on the cpu: finite objective, the resync counters,
-    tokens/s measured, the selection stacks in the window ``info``; the router group carries no
-    gradient (hard selection, STE is P2.2) and is left out of the per-group norms."""
+    tokens/s measured, the selection stacks in the window ``info``; the router group carries the
+    straight-through gradient (P2.2) and appears in the per-group norms."""
     cfg = _train_config(
         "train.steps=3", "train.eval_every=3", "train.ckpt_every=3", "train.q_resync_every=2"
     )
@@ -858,7 +899,7 @@ def test_p2_5_trains_with_tbptt(
     assert history.steps[-1].resyncs == 1 and history.steps[-1].windows == 3
     assert history.measured["tokens_per_s"] > 0.0 and history.evals
     groups = {k for k in history.steps[-1].stats if k.startswith("grad_norm/")}
-    assert "grad_norm/cell" in groups and "grad_norm/router" not in groups
+    assert "grad_norm/cell" in groups and "grad_norm/router" in groups  # P2.2: STE flows
     carried = trainer._carried_state
     assert isinstance(carried, CellGraphState) and not carried.h.requires_grad
     torch.testing.assert_close(carried.q, carried.recompute_q(), atol=1e-5, rtol=0)

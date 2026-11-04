@@ -559,7 +559,7 @@ def test_p1_5_shapes(device_type: str) -> None:
         assert out.state.age.shape == (B, N) and out.state.pos.shape == (B,)
         assert (out.state.pos == 1).all() and (out.state.age == 0).all()
         assert out.state.dtype == dtype and out.state.device == device
-        assert out.cost == 1.0 and out.n_rounds == 1
+        assert float(out.cost) == 1.0 and out.n_rounds == 1  # P2.2: a 0-dim tensor
         assert set(out.aux) == set(AUX_KEYS)
         for key in AUX_KEYS:
             assert out.aux[key].shape == () and not out.aux[key].requires_grad, key

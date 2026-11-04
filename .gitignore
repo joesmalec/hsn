@@ -14,10 +14,11 @@ htmlcov/
 # Rust
 target/
 
-# Build outputs, experiment runs and generated datasets (manifests are committed under configs/data/)
+# Build outputs, experiment runs and generated datasets (manifests are committed under configs/data/);
+# /data without a slash also covers a symlink to the data directory (worktrees)
 build/
 runs/
-/data/
+/data
 *.so
 *.dylib
 

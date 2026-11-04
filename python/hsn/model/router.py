@@ -56,6 +56,56 @@ fail at run time. Scores are computed in fp32 whatever the logits' dtype (bf16 c
 authorise data access, tool use or state loading (global rule 7; the static check is
 ``test_p2_1_selection_carries_no_authority``). :meth:`Router.deadline_exceeded` is the separate
 wall-clock check serving uses (P5.2); it decides nothing itself.
+
+**Selection gradients (P2.2).** The decisions above are indices; nothing trains through them. The
+keyword arguments of :meth:`Router.select` add the *gradient path* and the training controls of
+plan §6 without changing a decision (``gate=None`` is exactly P2.1). The executor multiplies with
+two tensors the selection carries, both fp32 and both exactly hard in the hard modes::
+
+    cell_mask [B, N]        the weight of each cell's update       (1 selected / 0 not, forward)
+    unit_weights [B, N, M]  the mixing weights over units per cell (one-hot of the chosen unit)
+    alpha [B, K]            = cell_mask[cell] · unit_weights[cell, unit] on the valid slots
+
+``gate="ste"`` (straight-through): ``mask = hard + (soft − soft.detach())`` with ``soft =
+sigmoid((s − θ) / τ)``, ``s_i = max_j score_ij`` and θ the **detached** threshold; ``w = onehot +
+(softmax(score / τ) − softmax(score / τ).detach())``. θ is the midpoint between the lowest selected
+and the highest unselected cell score of the scored decision (before the probes below), so that
+``hard == (soft > 0.5)`` exactly for ``topk`` (for ``greedy_budget`` the selected set need not be a
+top set and the sigmoid is a surrogate) and K = N gives an all-ones mask (no unselected cell:
+θ = −∞); the chunk's ``s_(K)`` itself would pin the K-th cell at 0.5 and make soft gating with
+K = N differ from dense. ``gate="soft"`` (the warm-up, ``train.soft_until_step``): ``cell_mask =
+soft`` and ``unit_weights = softmax(score / τ)``, every cell executes and ``cost`` is the dense
+cost (soft training is charged to the training budget, paper §6); the controls stay hard.
+``gate="reinforce"``: the cells are a
+sample without replacement from ``softmax(s / τ)`` (Gumbel-top-k through the same stable sort and
+budget prefix; ``topk`` only), ``log_prob`` is its Plackett–Luce log-probability (differentiable;
+the trainer adds ``−log_prob · (R − baseline)``), the cell mask is hard (the cells train through
+``log_prob`` alone) and the units keep the straight-through weights (the chunk's REINFORCE line
+covers the cells; a hybrid, so an STE-versus-REINFORCE comparison is a comparison of the cell
+estimators).
+The unit softmax uses the *scores* ``U − λc`` so that its argmax is the hard unit (identical to the
+chunk's ``softmax(logits / τ)`` at ``λ_cost = 0``). ``random`` takes no gradient (nothing it decides
+depends on the scorer); ``fixed`` takes the unit gradient only. ``expected_cost`` is the
+differentiable ``shared + Σ_i mask_i (overhead + Σ_j w_ij c_j)`` (the cost term of P2.4); it equals
+``cost`` in the hard modes.
+
+**Routing controls (P2.2)**, post-processing of a *scored* selection (``topk``, ``greedy_budget``;
+``random`` and ``fixed`` are controls and take neither), recorded as flags so that counterfactual
+probes (P2.3) and SAN statistics (P4.6) can exclude them: **refresh probes** force cells whose
+``age > age_max`` (``model.age_max``) into the selection, stalest first, in place of the
+lowest-scoring valid slots (``refreshed``); **exploration** replaces, with probability ε per row,
+one valid non-refreshed slot (uniform) by a uniform unselected cell (``explored``); both take the
+new cell's argmax unit. The row's cost is recomputed and a row that would exceed the budget reverts
+to its scored selection (impossible with uniform per-unit costs, i.e. every profiled table; the
+revert drops both probes of the row). The draws come from the CPU generator (``generator`` or the
+global RNG, which checkpoints replay) as one ``[B, N + 2]`` tensor per position moved to the device:
+no host loop and no device-to-host synchronisation (one host-to-device copy). There is no cap on
+the probes: an ``age_max`` small against ``N / K`` turns every slot into a probe (round-robin
+routing), which is the configuration's choice. **Dense fallback** (``dense_rows``, drawn
+by :meth:`hsn.model.hsn.HSN.forward` with probability ``train.p_dense``): the row executes the P1.5
+dense step (``cell_mask = 1``, ``unit_weights = softmax(logits)``), is charged ``cost =`` the dense
+cost and flagged ``dense_fallback``; its ``cell_idx`` / ``unit_idx`` are the hard decision it did
+not run. The decisions, the budget guarantee and the deterministic orders of P2.1 are unchanged.
 """
 
 from __future__ import annotations
@@ -66,9 +116,10 @@ from dataclasses import dataclass
 from typing import Self, get_args
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
-from hsn.config import ModelConfig, Routing
+from hsn.config import GateMode, ModelConfig, Routing
 from hsn.kernels.costs import CostTable, cost_table_from_config
 from hsn.model.embeddings import init_weight_
 from hsn.model.encoder import MLP2
@@ -78,6 +129,8 @@ from hsn.train.memory_plan import SCORER_SCALAR_FEATURES
 
 __all__ = [
     "BUDGET_SLACK",
+    "GATE_MODES",
+    "SCORED_MODES",
     "SCORER_FEATURE_NAMES",
     "SELECTION_MODES",
     "EMAFeatures",
@@ -90,6 +143,11 @@ __all__ = [
 #: The selection modes, the same Literal as ``model.routing`` (one source of truth).
 SelectionMode = Routing
 SELECTION_MODES: tuple[str, ...] = tuple(get_args(Routing))
+#: The gate modes of ``train.gate_mode`` (P2.2); ``None`` in :meth:`Router.select` is "no gradient".
+GATE_MODES: tuple[str, ...] = tuple(get_args(GateMode))
+#: The modes whose decision follows the scores: the gate's cell mask, the refresh probes and the
+#: exploration apply to these; ``random`` and ``fixed`` are controls and ``dense`` has no selection.
+SCORED_MODES: tuple[str, ...] = ("topk", "greedy_budget")
 #: Relative tolerance of the budget comparison: costs are accumulated in fp32 on the device, so
 #: the exact all-cells case (``cost = 1.0``, ``budget = 1.0``) must not lose a cell to an ulp.
 BUDGET_SLACK = 1e-5
@@ -337,6 +395,16 @@ class Selection:
     ``scorer_cost`` is the scorer's own cost per position, reported beside it; ``n_rounds_used`` is
     1 until P2.7.
 
+    P2.2 (module docstring): ``cell_mask [B, N]`` and ``unit_weights [B, N, M]`` (fp32) are what
+    the executor multiplies the cell updates and the unit outputs with (exactly hard in the hard
+    modes, with the gate's gradient attached; soft values in the warm-up; ``alpha`` is their
+    product on the valid slots); ``expected_cost [B]`` (fp32) is the differentiable expected cost;
+    ``log_prob [B]`` (fp32) the REINFORCE log-probability of the sampled cells (zeros otherwise);
+    ``explored`` and ``refreshed`` (bool ``[B, K]``) flag the slots exploration and the refresh
+    probes replaced; ``dense_fallback`` (bool ``[B]``) flags the rows that executed the dense step
+    instead of their slots. In ``dense`` mode ``cell_mask`` is all ones and ``unit_weights`` the
+    softmax over units.
+
     Padded slots hold cell 0 / unit 0 so that every index is in range on every backend, and they
     **must be dropped by** ``valid`` by every consumer: a padded cell 0 collides with a genuinely
     selected cell 0 (``CellGraphState.with_delta`` rejects duplicate indices), ``alpha = 0`` is not
@@ -353,9 +421,31 @@ class Selection:
     cost: Tensor
     scorer_cost: float
     n_rounds_used: int
+    # P2.2: the gradient path and the control flags
+    cell_mask: Tensor
+    unit_weights: Tensor
+    expected_cost: Tensor
+    log_prob: Tensor
+    explored: Tensor
+    refreshed: Tensor
+    dense_fallback: Tensor
 
     def __post_init__(self) -> None:
-        for name in ("cell_idx", "unit_idx", "alpha", "valid", "logits", "cost"):
+        for name in (
+            "cell_idx",
+            "unit_idx",
+            "alpha",
+            "valid",
+            "logits",
+            "cost",
+            "cell_mask",
+            "unit_weights",
+            "expected_cost",
+            "log_prob",
+            "explored",
+            "refreshed",
+            "dense_fallback",
+        ):
             value = getattr(self, name)
             if not isinstance(value, Tensor):
                 raise TypeError(
@@ -388,12 +478,44 @@ class Selection:
                 raise ValueError(
                     f"Selection.{name} has dtype {value.dtype}; see the class docstring"
                 )
-        if self.cost.shape != (B,) or not self.cost.is_floating_point():
-            raise ValueError(
-                f"Selection.cost must be a floating [B] = {(B,)} tensor, got shape "
-                f"{tuple(self.cost.shape)} and dtype {self.cost.dtype}"
-            )
-        for name in ("cell_idx", "unit_idx", "alpha", "valid", "cost"):
+        N, M = int(self.logits.shape[1]), int(self.logits.shape[2])
+        for name in ("cost", "expected_cost", "log_prob"):
+            value = getattr(self, name)
+            if value.shape != (B,) or not value.is_floating_point():
+                raise ValueError(
+                    f"Selection.{name} must be a floating [B] = {(B,)} tensor, got shape "
+                    f"{tuple(value.shape)} and dtype {value.dtype}"
+                )
+        for name, shape, floating in (
+            ("cell_mask", (B, N), True),
+            ("unit_weights", (B, N, M), True),
+            ("explored", (B, K), False),
+            ("refreshed", (B, K), False),
+            ("dense_fallback", (B,), False),
+        ):
+            value = getattr(self, name)
+            if value.shape != shape:
+                raise ValueError(
+                    f"Selection.{name} must have shape {shape}, got {tuple(value.shape)}"
+                )
+            if floating and not value.is_floating_point():
+                raise ValueError(f"Selection.{name} must be floating, got {value.dtype}")
+            if not floating and value.dtype != torch.bool:
+                raise ValueError(f"Selection.{name} must be a bool tensor, got {value.dtype}")
+        for name in (
+            "cell_idx",
+            "unit_idx",
+            "alpha",
+            "valid",
+            "cost",
+            "cell_mask",
+            "unit_weights",
+            "expected_cost",
+            "log_prob",
+            "explored",
+            "refreshed",
+            "dense_fallback",
+        ):
             value = getattr(self, name)
             if value.device != self.logits.device:
                 raise ValueError(
@@ -426,11 +548,20 @@ class Selection:
         """Selected (non-padded) slots per row, int64 ``[B]``."""
         return self.valid.sum(dim=1)
 
+    def selected_cells(self) -> Tensor:
+        """The cells whose state this selection updates, bool ``[B, N]``: the valid slots
+        scattered (padded slots contribute nothing, so a padded cell 0 never counts) and every cell
+        of a dense-fallback row."""
+        B, N = int(self.logits.shape[0]), int(self.logits.shape[1])
+        counts = torch.zeros(B, N, dtype=torch.int64, device=self.logits.device)
+        counts = counts.scatter_add(1, self.cell_idx, self.valid.to(torch.int64))
+        return (counts > 0) | self.dense_fallback[:, None]
+
 
 class Router(nn.Module):
     """The P1.5 :class:`Scorer` plus budgeted selection (module docstring).
 
-    ``scorer`` becomes a submodule (P2.5 hands ``HSN.scorer`` over to ``HSN.router.scorer``);
+    ``scorer`` is a submodule (since P2.2 ``HSN.scorer`` is ``HSN.router.scorer``);
     ``costs`` is the :class:`~hsn.kernels.costs.CostTable` of this model shape (its ``N`` and ``M``
     must match the scorer's, otherwise the profile is stale and must be regenerated);
     ``lambda_cost`` is ``model.lambda_cost``. The table lives in the non-persistent fp32 buffer
@@ -467,6 +598,7 @@ class Router(nn.Module):
         self.scorer = scorer
         self.n_cells = scorer.n_cells
         self.n_units = scorer.n_units
+        self.age_max = scorer.age_max  # the refresh-probe threshold (model.age_max)
         self.lambda_cost = float(lambda_cost)
         self.costs = costs
         self.cell_overhead = costs.cell_overhead
@@ -545,16 +677,31 @@ class Router(nn.Module):
         mode: SelectionMode,
         fixed: Tensor | None = None,
         generator: torch.Generator | None = None,
+        *,
+        gate: GateMode | None = None,
+        temperature: float = 1.0,
+        epsilon: float = 0.0,
+        age: Tensor | None = None,
+        dense_rows: Tensor | None = None,
     ) -> Selection:
         """Select up to ``k_max`` (cell, unit) slots per row within ``budget`` (module docstring).
 
         ``logits`` are the scorer's ``[B, N, M]`` on the router's device; ``budget`` is ``B_t`` as
         a fraction of the dense step (finite, >= 0); ``0 <= k_min <= k_max <= N`` with
         ``k_max >= 1``; ``fixed`` (int64/int32 ``[L]``, distinct cells in ``[0, N)``, ``k_min <= L
-        <= k_max``) only with ``mode="fixed"``, where it is required; ``generator`` only with
-        ``mode="random"`` (the global RNG when ``None``). Every sparse mode raises ``ValueError``
-        up front when ``budget`` cannot hold ``k_min`` cells at the dearest unit (``fixed``: the
-        whole list), so the result always has ``k_min <= n_valid <= k_max`` and ``cost <= budget``.
+        <= k_max``) only with ``mode="fixed"``, where it is required; ``generator`` only where a
+        draw happens (``mode="random"``, ``epsilon > 0`` or ``gate="reinforce"``; the global RNG
+        when ``None``). Every sparse mode raises ``ValueError`` up front when ``budget`` cannot
+        hold ``k_min`` cells at the dearest unit (``fixed``: the whole list), so the result always
+        has ``k_min <= n_valid <= k_max`` and ``cost <= budget``.
+
+        P2.2 keywords (module docstring): ``gate`` is the gradient path (``None``: hard, detached
+        tensors; ``soft`` / ``ste`` / ``reinforce``: ``train.gate_mode`` at this step);
+        ``temperature`` is τ (finite, > 0); ``epsilon`` the exploration rate in ``[0, 1]`` and
+        ``age`` the state's ``age [B, N]`` for the refresh probes, both only with a scored mode
+        (``topk``, ``greedy_budget``); ``dense_rows`` (bool ``[B]``) the rows that execute the
+        dense step instead (not in ``dense`` mode, which is dense already). ``reinforce`` needs
+        ``topk``; ``dense`` accepts ``gate`` ``None`` or ``soft`` only (its units are soft already).
         """
         B, N, M = self._check_logits(logits)
         budget_f = self._check_budget(budget)
@@ -569,33 +716,61 @@ class Router(nn.Module):
             fixed_cells = self._check_fixed(fixed, N, k_max, k_min, logits.device)
         elif fixed is not None:
             raise ValueError(f"`fixed` is only used with mode='fixed', got mode={mode!r}")
-        if generator is not None and mode != "random":
-            raise ValueError(f"`generator` is only used with mode='random', got mode={mode!r}")
+        tau = self._check_gate_args(mode, gate, temperature, epsilon)
+        age_t = self._check_age(age, mode, B, N, logits.device)
+        dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
+        if generator is not None and not (mode == "random" or epsilon > 0.0 or gate == "reinforce"):
+            raise ValueError(
+                "`generator` is only used with mode='random', epsilon > 0 or gate='reinforce', "
+                f"got mode={mode!r}, epsilon={epsilon!r}, gate={gate!r}"
+            )
         if mode == "dense":
             return self._select_dense(logits)
 
         self.require_affordable(budget_f, k_min, "k_min")
-        scores = self.scores(logits)
+        scores = self.scores(logits)  # fp32, autograd intact: the gradient path reads it
+        scores_d = scores.detach()  # the decisions are indices and read a detached copy
+        log_prob = torch.zeros(B, dtype=torch.float32, device=logits.device)
         if mode == "topk":
-            cells, units = self._topk(scores, k_max)
+            if gate == "reinforce":
+                cells, units, order = self._gumbel_topk(scores_d, k_max, tau, generator)
+            else:
+                cells, units = self._topk(scores_d, k_max)
             cells, units, valid = self._truncate(cells, units, budget_f)
+            if gate == "reinforce":
+                log_prob = self._plackett_luce(scores.amax(dim=-1) / tau, order, valid)
         elif mode == "greedy_budget":
-            cells, units, valid = self._greedy(scores, budget_f, k_max)
+            cells, units, valid = self._greedy(scores_d, budget_f, k_max)
         elif mode == "random":
             cells, units = self._random(B, N, M, k_max, generator, logits.device)
             cells, units, valid = self._truncate(cells, units, budget_f)
         else:  # fixed
             self.require_affordable(budget_f, int(fixed_cells.shape[0]), "the fixed route")
-            cells, units, valid = self._fixed(scores, fixed_cells, k_max)
-        return Selection(
-            cell_idx=cells,
-            unit_idx=units,
-            alpha=valid.to(torch.float32),
-            valid=valid,
-            logits=logits,
-            cost=self._executed_cost(units, valid),
-            scorer_cost=self.scorer_cost,
-            n_rounds_used=1,
+            cells, units, valid = self._fixed(scores_d, fixed_cells, k_max)
+        scored = mode in SCORED_MODES
+        # the straight-through threshold belongs to the scored decision, before the probes
+        threshold = self._ste_threshold(scores_d.amax(dim=-1), cells, valid) if scored else None
+        if scored and (age_t is not None or epsilon > 0.0):
+            cells, units, explored, refreshed = self._post_process(
+                cells, units, valid, scores_d, age_t, epsilon, budget_f, dense, generator
+            )
+        else:
+            explored = torch.zeros(B, k_max, dtype=torch.bool, device=logits.device)
+            refreshed = torch.zeros_like(explored)
+        return self._finish(
+            logits,
+            scores,
+            cells,
+            units,
+            valid,
+            mode=mode,
+            gate=gate,
+            tau=tau,
+            threshold=threshold,
+            log_prob=log_prob,
+            explored=explored,
+            refreshed=refreshed,
+            dense=dense,
         )
 
     def require_affordable(self, budget: float, k: int, what: str) -> None:
@@ -651,6 +826,13 @@ class Router(nn.Module):
             cost=cost,
             scorer_cost=self.scorer_cost,
             n_rounds_used=1,
+            cell_mask=torch.ones(B, N, dtype=torch.float32, device=device),
+            unit_weights=probs,
+            expected_cost=cost.clone(),
+            log_prob=torch.zeros(B, dtype=torch.float32, device=device),
+            explored=torch.zeros(B, N, dtype=torch.bool, device=device),
+            refreshed=torch.zeros(B, N, dtype=torch.bool, device=device),
+            dense_fallback=torch.zeros(B, dtype=torch.bool, device=device),
         )
 
     @staticmethod
@@ -729,6 +911,303 @@ class Router(nn.Module):
     def _executed_cost(self, units: Tensor, valid: Tensor) -> Tensor:
         per_slot = (self.cell_overhead + self.cost_table.float()[units]) * valid.to(torch.float32)
         return self.shared_cost + per_slot.sum(dim=1)
+
+    # -- P2.2: the gradient path, the probes, REINFORCE ------------------------------------------
+
+    @staticmethod
+    def _selected(cells: Tensor, valid: Tensor, N: int) -> Tensor:
+        """Bool ``[B, N]``: the cells of the valid slots (padded slots add nothing)."""
+        counts = torch.zeros(cells.shape[0], N, dtype=torch.int64, device=cells.device)
+        return counts.scatter_add(1, cells, valid.to(torch.int64)) > 0
+
+    @staticmethod
+    def _draw(
+        shape: tuple[int, ...], generator: torch.Generator | None, device: torch.device
+    ) -> Tensor:
+        """Uniform ``[0, 1)`` draws from the CPU generator (``generator`` or the global RNG) moved
+        to ``device``: the same decisions on every backend for the same seed, and a checkpoint's
+        RNG state replays them."""
+        sample_device = generator.device if generator is not None else torch.device("cpu")
+        return torch.rand(shape, generator=generator, device=sample_device).to(device)
+
+    def _gumbel_topk(
+        self, scores_d: Tensor, k_max: int, tau: float, generator: torch.Generator | None
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """A sample of ``k_max`` cells without replacement from ``softmax(s / τ)`` (Gumbel-top-k)
+        through the top-k machinery; returns ``(cells, units, order)`` with ``order [B, N]`` the
+        full sampled permutation (the Plackett–Luce log-probability reads it)."""
+        B, N = int(scores_d.shape[0]), int(scores_d.shape[1])
+        cell_scores = scores_d.amax(dim=-1)
+        uniform = self._draw((B, N), generator, scores_d.device)
+        tiny = torch.finfo(torch.float32).tiny
+        gumbel = -torch.log(-torch.log(uniform.clamp(min=tiny, max=1.0 - 1e-7)))
+        perturbed = cell_scores / tau + gumbel
+        order = torch.sort(perturbed, dim=1, descending=True, stable=True).indices
+        cells = order[:, :k_max]
+        units = scores_d.argmax(dim=-1).gather(1, cells)
+        return cells, units, order
+
+    @staticmethod
+    def _plackett_luce(s_tau: Tensor, order: Tensor, valid: Tensor) -> Tensor:
+        """``log p`` of drawing the valid prefix of ``order`` without replacement from
+        ``softmax(s_tau)``: ``Σ_k [s_(k) − logsumexp_{j ∉ earlier} s_j]``, fp32 ``[B]``,
+        differentiable in ``s_tau``. The suffix log-sum-exps use an ``[N, N]`` mask (no
+        ``logcumsumexp``, whose backend support varies)."""
+        N = int(order.shape[1])
+        sorted_s = s_tau.gather(1, order)  # [B, N] in sampled order
+        later = torch.arange(N, device=order.device)
+        suffix = later[None, :] >= later[:, None]  # [N(k), N(j)]: j >= k
+        expanded = sorted_s[:, None, :].expand(-1, N, -1)
+        masked = expanded.masked_fill(~suffix[None, :, :], float("-inf"))
+        log_norm = torch.logsumexp(masked, dim=-1)  # [B, N]: logsumexp over positions k..N-1
+        terms = sorted_s - log_norm
+        K = int(valid.shape[1])
+        return (terms[:, :K] * valid.to(terms.dtype)).sum(dim=1)
+
+    def _ste_threshold(self, cell_scores_d: Tensor, cells: Tensor, valid: Tensor) -> Tensor:
+        """θ ``[B]``: the midpoint between the lowest selected and the highest unselected cell
+        score (``+inf`` when nothing is selected, ``−inf`` when everything is)."""
+        selected = self._selected(cells, valid, int(cell_scores_d.shape[1]))
+        inf = float("inf")
+        lowest_in = torch.where(selected, cell_scores_d, torch.full_like(cell_scores_d, inf))
+        highest_out = torch.where(selected, torch.full_like(cell_scores_d, -inf), cell_scores_d)
+        return 0.5 * (lowest_in.amin(dim=1) + highest_out.amax(dim=1))
+
+    def _post_process(
+        self,
+        cells: Tensor,
+        units: Tensor,
+        valid: Tensor,
+        scores_d: Tensor,
+        age: Tensor | None,
+        epsilon: float,
+        budget: float,
+        dense: Tensor | None,
+        generator: torch.Generator | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Refresh probes, then exploration, then the budget recheck (module docstring); returns
+        ``(cells, units, explored, refreshed)``. ``valid`` never changes."""
+        B, K = int(cells.shape[0]), int(cells.shape[1])
+        N = self.n_cells
+        device = cells.device
+        unit_argmax = scores_d.argmax(dim=-1)  # [B, N]
+        active = (
+            ~dense if dense is not None else torch.ones(B, dtype=torch.bool, device=device)
+        )  # dense-fallback rows keep their scored decision (it is not executed)
+        cells0, units0 = cells, units
+        n_valid = valid.sum(dim=1)
+        slots = torch.arange(K, device=device)[None, :]
+        refreshed = torch.zeros(B, K, dtype=torch.bool, device=device)
+        explored = torch.zeros(B, K, dtype=torch.bool, device=device)
+        if age is not None:
+            stale = (age > self.age_max) & ~self._selected(cells, valid, N)
+            n_force = torch.minimum(stale.sum(dim=1), n_valid)
+            key = torch.where(stale, age, torch.full_like(age, -1)).to(torch.float32)
+            order = torch.sort(key, dim=1, descending=True, stable=True).indices  # stalest first
+            j = n_valid[:, None] - 1 - slots  # the tail of the valid slots, lowest score first
+            replace = (j >= 0) & (j < n_force[:, None]) & active[:, None]
+            new_cells = order.gather(1, j.clamp(min=0, max=N - 1))
+            cells = torch.where(replace, new_cells, cells)
+            units = torch.where(replace, unit_argmax.gather(1, new_cells), units)
+            refreshed = replace
+        if epsilon > 0.0:
+            draw = self._draw((B, N + 2), generator, device)  # one host-to-device copy
+            u, r, keys = draw[:, 0], draw[:, 1], draw[:, 2:]
+            candidate = valid & ~refreshed
+            n_candidate = candidate.sum(dim=1)
+            # never a cell the scorer chose, even one a refresh probe just evicted
+            selected = self._selected(cells, valid, N) | self._selected(cells0, valid, N)
+            n_unselected = N - selected.sum(dim=1)
+            row = (u < epsilon) & (n_candidate > 0) & (n_unselected > 0) & active
+            pick = (r * n_candidate.to(r.dtype)).floor().to(torch.int64)
+            pick = torch.minimum(pick, (n_candidate - 1).clamp(min=0))
+            rank = candidate.to(torch.int64).cumsum(dim=1) - 1
+            slot = candidate & (rank == pick[:, None]) & row[:, None]  # one slot per row
+            new_cell = torch.where(selected, torch.full_like(keys, -1.0), keys).argmax(dim=1)
+            cells = torch.where(slot, new_cell[:, None], cells)
+            units = torch.where(slot, unit_argmax.gather(1, new_cell[:, None]), units)
+            explored = slot
+        # the budget guarantee: a row the probes pushed over the budget keeps its scored selection
+        over = self._executed_cost(units, valid) > budget * (1.0 + BUDGET_SLACK)
+        cells = torch.where(over[:, None], cells0, cells)
+        units = torch.where(over[:, None], units0, units)
+        return cells, units, explored & ~over[:, None], refreshed & ~over[:, None]
+
+    def _finish(
+        self,
+        logits: Tensor,
+        scores: Tensor,
+        cells: Tensor,
+        units: Tensor,
+        valid: Tensor,
+        *,
+        mode: SelectionMode,
+        gate: GateMode | None,
+        tau: float,
+        threshold: Tensor | None,
+        log_prob: Tensor,
+        explored: Tensor,
+        refreshed: Tensor,
+        dense: Tensor | None,
+    ) -> Selection:
+        """The gradient-path tensors of a sparse decision (module docstring) and the Selection."""
+        B, N, M = (int(s) for s in logits.shape)
+        K = int(cells.shape[1])
+        device = logits.device
+        scored = mode in SCORED_MODES
+        units_follow_scores = mode != "random"
+        valid_f = valid.to(torch.float32)
+        hard_mask = torch.zeros(B, N, dtype=torch.float32, device=device).scatter_add(
+            1, cells, valid_f
+        )
+        unit_argmax = scores.detach().argmax(dim=-1)  # [B, N]
+        delta = torch.where(valid, units - unit_argmax.gather(1, cells), torch.zeros_like(units))
+        unit_full = unit_argmax.scatter_add(1, cells, delta)  # the chosen unit per cell
+        unit_hard = F.one_hot(unit_full, M).to(torch.float32)  # [B, N, M]
+        cell_scores = scores.amax(dim=-1)  # [B, N], autograd intact
+        if gate is None:
+            cell_mask, unit_weights = hard_mask, unit_hard
+        else:
+            soft_units = torch.softmax(scores / tau, dim=-1)
+            if scored:
+                assert threshold is not None
+                soft_mask = torch.sigmoid((cell_scores - threshold[:, None]) / tau)
+            if gate == "soft":  # the relaxation; the controls (random, fixed) stay hard
+                unit_weights = soft_units if scored else unit_hard
+                cell_mask = soft_mask if scored else hard_mask
+            else:  # ste, reinforce: hard values; straight-through unit weights where the unit
+                # follows the scores (every mode but random), the straight-through cell mask in
+                # ste only (reinforce trains the cells through log_prob, not through the mask)
+                unit_weights = (
+                    unit_hard + (soft_units - soft_units.detach())
+                    if units_follow_scores
+                    else unit_hard
+                )
+                cell_mask = (
+                    hard_mask + (soft_mask - soft_mask.detach())
+                    if scored and gate == "ste"
+                    else hard_mask
+                )
+        cost = self._executed_cost(units, valid)
+        dense_cost = self.costs.dense_cost()
+        if gate == "soft" and scored:  # every cell executes in the warm-up
+            cost = torch.full_like(cost, dense_cost)
+        if dense is not None:
+            cell_mask = torch.where(dense[:, None], torch.ones_like(cell_mask), cell_mask)
+            unit_weights = torch.where(
+                dense[:, None, None], torch.softmax(logits.float(), dim=-1), unit_weights
+            )
+            cost = torch.where(dense, torch.full_like(cost, dense_cost), cost)
+            log_prob = torch.where(dense, torch.zeros_like(log_prob), log_prob)  # not executed
+        per_cell = self.cell_overhead + (unit_weights * self.cost_table.float()).sum(dim=-1)
+        expected = self.shared_cost + (cell_mask * per_cell).sum(dim=1)
+        if dense is not None:
+            expected = torch.where(dense, torch.full_like(expected, dense_cost), expected)
+        slot_cell = cell_mask.gather(1, cells)
+        slot_unit = (
+            unit_weights.gather(1, cells[:, :, None].expand(B, K, M))
+            .gather(2, units[:, :, None])
+            .squeeze(-1)
+        )
+        alpha = slot_cell * slot_unit * valid_f
+        return Selection(
+            cell_idx=cells,
+            unit_idx=units,
+            alpha=alpha,
+            valid=valid,
+            logits=logits,
+            cost=cost,
+            scorer_cost=self.scorer_cost,
+            n_rounds_used=1,
+            cell_mask=cell_mask,
+            unit_weights=unit_weights,
+            expected_cost=expected,
+            log_prob=log_prob,
+            explored=explored,
+            refreshed=refreshed,
+            dense_fallback=(
+                dense if dense is not None else torch.zeros(B, dtype=torch.bool, device=device)
+            ),
+        )
+
+    @staticmethod
+    def _check_gate_args(
+        mode: SelectionMode, gate: GateMode | None, temperature: float, epsilon: float
+    ) -> float:
+        if gate is not None and gate not in GATE_MODES:
+            raise ValueError(f"gate must be None or one of {GATE_MODES}, got {gate!r}")
+        if (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, int | float)
+            or not math.isfinite(temperature)
+            or temperature <= 0.0
+        ):
+            raise ValueError(f"temperature must be a finite number > 0, got {temperature!r}")
+        if (
+            isinstance(epsilon, bool)
+            or not isinstance(epsilon, int | float)
+            or not math.isfinite(epsilon)
+            or not 0.0 <= epsilon <= 1.0
+        ):
+            raise ValueError(f"epsilon must be a number in [0, 1], got {epsilon!r}")
+        if epsilon > 0.0 and mode not in SCORED_MODES:
+            raise ValueError(
+                f"exploration (epsilon={epsilon!r}) post-processes a scored selection "
+                f"({SCORED_MODES}); mode={mode!r} takes none (random / fixed are controls, dense "
+                "has no selection)"
+            )
+        if gate == "reinforce" and mode != "topk":
+            raise ValueError(
+                f"gate='reinforce' samples cells by Gumbel-top-k and needs mode='topk', got "
+                f"mode={mode!r}"
+            )
+        if mode == "dense" and gate in ("ste", "reinforce"):
+            raise ValueError(
+                f"gate={gate!r} has no hard decision to pass gradients through in mode='dense' "
+                "(its units are soft already); use gate=None or 'soft'"
+            )
+        return float(temperature)
+
+    def _check_age(
+        self, age: Tensor | None, mode: SelectionMode, B: int, N: int, device: torch.device
+    ) -> Tensor | None:
+        if age is None:
+            return None
+        if mode not in SCORED_MODES:
+            raise ValueError(
+                f"refresh probes (age=...) post-process a scored selection ({SCORED_MODES}); "
+                f"mode={mode!r} takes none"
+            )
+        if not isinstance(age, Tensor):
+            raise TypeError(f"age must be a torch.Tensor (state.age), got {type(age).__name__}")
+        if age.dtype not in _INDEX_DTYPES:
+            raise TypeError(f"age must be an int64 or int32 tensor, got {age.dtype}")
+        if age.shape != (B, N):
+            raise ValueError(f"age must have shape [B, N] = {(B, N)}, got {tuple(age.shape)}")
+        if age.device != device:
+            raise ValueError(f"age must live on {device}, got {age.device}")
+        return age.to(torch.int64)
+
+    @staticmethod
+    def _check_dense_rows(
+        dense_rows: Tensor | None, mode: SelectionMode, B: int, device: torch.device
+    ) -> Tensor | None:
+        if dense_rows is None:
+            return None
+        if mode == "dense":
+            raise ValueError(
+                "dense_rows marks rows of a sparse mode that run dense; mode='dense' is"
+            )
+        if not isinstance(dense_rows, Tensor) or dense_rows.dtype != torch.bool:
+            got = dense_rows.dtype if isinstance(dense_rows, Tensor) else type(dense_rows).__name__
+            raise TypeError(f"dense_rows must be a bool torch.Tensor, got {got}")
+        if dense_rows.shape != (B,):
+            raise ValueError(
+                f"dense_rows must have shape [B] = {(B,)}, got {tuple(dense_rows.shape)}"
+            )
+        if dense_rows.device != device:
+            raise ValueError(f"dense_rows must live on {device}, got {dense_rows.device}")
+        return dense_rows
 
     # -- validation and accounting ----------------------------------------------------------------
 

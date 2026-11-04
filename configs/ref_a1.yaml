@@ -53,3 +53,15 @@ train: # Appendix A.3; the Appendix C.3 prototype: batch 4, unroll 256, 2-byte v
   micro_batch: 4
   grad_accum: 1
   precision: bf16 # bf16 | fp16 | fp32 | fp64; sets the bytes per activation value in C.3
+  # P2.2 routing controls at their defaults (nothing active with model.routing = dense; a hard-routed
+  # run overrides model.routing and these keys on the command line)
+  gate_mode: soft # soft | ste | reinforce: the estimator after the soft warm-up
+  soft_until_step: 0 # steps trained with soft gates before gate_mode takes over
+  temperature_start: 1.0 # tau of the soft mask / unit softmax, linear ramp over temperature_steps
+  temperature_end: 1.0
+  temperature_steps: 0
+  epsilon_start: 0.0 # exploration rate: one selected cell replaced by a random one
+  epsilon_end: 0.0
+  epsilon_steps: 0
+  p_dense: 0.0 # probability that a sample runs the dense step (charged to Selection.cost)
+  reinforce_baseline_decay: 0.9 # EMA rate of the REINFORCE reward baseline (gate_mode = reinforce)

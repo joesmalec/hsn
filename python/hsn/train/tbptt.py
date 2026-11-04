@@ -41,6 +41,19 @@ learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the 
   of it, so a resumed run continues bit for bit on the CPU profile.
 * After every optimiser step :meth:`~hsn.model.hsn.HSN.update_target` moves the EMA prediction
   target when ``model.predictor_target = ema_encoder`` (P1.6; a no-op otherwise).
+* **Routing (P2.2).** Before every window the trainer hands the model its step counter
+  (:meth:`~hsn.model.hsn.HSN.set_train_step`), which the
+  :class:`~hsn.train.schedules.SelectionSchedule` turns into the gate mode, the temperature, the
+  exploration rate and the dense-fallback probability of the window. With ``train.gate_mode =
+  reinforce`` the objective of a window gains the policy-gradient term ``−mean_b log p_b · (R −
+  b̄)`` with ``R = −L_task`` of the window and ``b̄`` an EMA baseline
+  (``train.reinforce_baseline_decay``; initialised at the first reward so the first window's
+  advantage is 0; a window without loss positions or with a non-finite loss, which the fp16
+  scaler skips, leaves both the term and the baseline alone), logged as ``parts["reinforce"]``
+  and carried in the checkpoint. The model's schedule must be the configuration's. Every step
+  record also carries ``route_cost`` (the mean executed cost per position as a fraction of the
+  dense step; 1.0 in dense mode) and, in a routed run, the ``explored``, ``refreshed`` and
+  ``dense_fallback`` rates.
 
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
 non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
@@ -81,6 +94,7 @@ from hsn.train.checkpoint import (
     unpack_cell_state,
 )
 from hsn.train.loop import History, StepRecord, StreamLoader, Trainer
+from hsn.train.schedules import SelectionSchedule
 
 __all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer"]
 
@@ -132,9 +146,36 @@ class TBPTTTrainer(Trainer):
             )
         super().__init__(model, cfg, ctx, profiler, run_dir=run_dir)
         self.hsn: HSN = model
+        expected = SelectionSchedule.from_config(cfg.train)
+        if model.schedule != expected:  # P2.2: one source of truth for the gate and the ramps
+            raise ValueError(
+                f"the model's selection schedule {model.schedule} is not the configuration's "
+                f"{expected}; build the model with HSN.from_config(cfg)"
+            )
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0
+        self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
+
+    # P2.2 ------------------------------------------------------------------------------------
+
+    def _routing_terms(
+        self, total: Tensor, parts: dict[str, float], info: Mapping[str, Tensor], n_loss: int
+    ) -> tuple[Tensor, dict[str, float]]:
+        """The REINFORCE term of a window (module docstring), added when the gate of this step is
+        ``reinforce``; otherwise ``(total, parts)`` unchanged. ``n_loss`` is the window's number
+        of loss positions: without any there is no reward, and a non-finite task loss (an fp16
+        overflow the scaler skips) must not poison the baseline, so both leave everything alone."""
+        if "route_log_prob" not in info or self.hsn.schedule.gate(self.step) != "reinforce":
+            return total, parts
+        reward = -parts["task"]
+        if n_loss == 0 or not math.isfinite(reward):
+            return total, {**parts, "reinforce": 0.0}
+        baseline = self.reinforce_baseline if self.reinforce_baseline is not None else reward
+        term = -info["route_log_prob"].float().mean() * (reward - baseline)
+        decay = self.cfg.train.reinforce_baseline_decay
+        self.reinforce_baseline = decay * baseline + (1.0 - decay) * reward
+        return total + term, {**parts, "reinforce": float(term.detach())}
 
     # window helpers --------------------------------------------------------------------------
 
@@ -252,6 +293,8 @@ class TBPTTTrainer(Trainer):
             state_abs_max = 0.0
             eps_sum = 0.0
             entropy_sum = 0.0
+            cost_sum = 0.0
+            rate_sums: dict[str, float] = {}
             loss_sum = 0.0
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
@@ -260,10 +303,12 @@ class TBPTTTrainer(Trainer):
                 window = next(loader)
                 batch = self._to_device(window)
                 state = self._window_start(state)
+                self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
                 logits, state, info = self._forward(batch, state)
                 total, parts = assemble_loss({"logits": logits, **info}, batch, self.cfg)
                 loss_mask = batch["loss_mask"]
                 count = int(loss_mask.sum())
+                total, parts = self._routing_terms(total, parts, info, count)
                 tokens_in_step += int((window["doc"] >= 0).sum())
                 if count > 0:
                     flat_targets = batch["targets"][loss_mask]
@@ -276,6 +321,10 @@ class TBPTTTrainer(Trainer):
                 state_abs_max = max(state_abs_max, float(info["state_abs_max"].max()))
                 eps_sum += float(info["eps_abs_mean"].float().mean())
                 entropy_sum += float(info["alpha_entropy"].float().mean())
+                cost_sum += float(info["cost"].float().mean())
+                for key in ("explored", "refreshed", "dense_fallback"):
+                    if key in info:
+                        rate_sums[key] = rate_sums.get(key, 0.0) + float(info[key].float().mean())
                 scaled = total / n_windows
                 with self._segment("backward", tokens=tokens_in_step):
                     if self.scaler is not None:
@@ -309,6 +358,8 @@ class TBPTTTrainer(Trainer):
                 "state_abs_max": state_abs_max,
                 "eps_mean": eps_sum / n_windows,
                 "alpha_entropy": entropy_sum / n_windows,
+                "route_cost": cost_sum / n_windows,
+                **{key: value / n_windows for key, value in rate_sums.items()},
                 **group_norms,
             }
             record = TBPTTStepRecord(
@@ -382,6 +433,7 @@ class TBPTTTrainer(Trainer):
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "carried_state": pack_cell_state(state),
             "q_resync": q_resync_counter(self.windows, self.windows_since_resync, self.resyncs),
+            "reinforce_baseline": self.reinforce_baseline,  # P2.2 (None unless reinforce ran)
         }
         save_checkpoint(
             path,
@@ -426,5 +478,19 @@ class TBPTTTrainer(Trainer):
         self.windows = counters["windows"]
         self.windows_since_resync = counters["since_resync"]
         self.resyncs = counters["resyncs"]
+        if "reinforce_baseline" in extra:
+            baseline = extra["reinforce_baseline"]
+            if baseline is not None and (
+                isinstance(baseline, bool)
+                or not isinstance(baseline, int | float)
+                or not math.isfinite(baseline)
+            ):
+                raise ValueError(f"{path}: reinforce_baseline must be a finite number or None")
+            self.reinforce_baseline = None if baseline is None else float(baseline)
+        elif self.cfg.train.gate_mode == "reinforce":
+            raise ValueError(
+                f"{path} has no reinforce_baseline (written before P2.2) but train.gate_mode="
+                "reinforce needs it to continue the same objective"
+            )
         self.step = int(loaded["step"])
         return self.step

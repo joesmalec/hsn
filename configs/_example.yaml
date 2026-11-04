@@ -85,15 +85,16 @@ train: # Appendix A.3
   lambda_ponder: 0.0 # halting
   aux_enabled: [] # which of cost / balance / graph are on (<= 1 unless justified)
   allow_multiple_aux: "" # written justification enabling more than one auxiliary term
-  gate_mode: soft # soft | ste | reinforce (P2.2)
-  soft_until_step: 0
-  temperature_start: 1.0
-  temperature_end: 1.0
+  gate_mode: soft # soft | ste | reinforce (P2.2): the estimator after the soft warm-up
+  soft_until_step: 0 # steps trained with soft gates before gate_mode takes over
+  temperature_start: 1.0 # tau of the soft mask / unit softmax: linear ramp over temperature_steps
+  temperature_end: 1.0 # must equal temperature_start when temperature_steps = 0
   temperature_steps: 0
-  epsilon_start: 0.0
-  epsilon_end: 0.0
+  epsilon_start: 0.0 # exploration: one selected cell replaced by a random one with probability eps
+  epsilon_end: 0.0 # must equal epsilon_start when epsilon_steps = 0
   epsilon_steps: 0
-  p_dense: 0.0
+  p_dense: 0.0 # probability that a sample runs the dense step (charged to Selection.cost)
+  reinforce_baseline_decay: 0.9 # P2.2: EMA rate of the REINFORCE reward baseline (gate_mode = reinforce)
   probe_fraction: 0.05 # P2.3
   n_probe: 4
   probe_horizon: 16

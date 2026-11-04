@@ -736,6 +736,14 @@ def test_p2_1_selection_carries_no_authority() -> None:
         "cost",
         "scorer_cost",
         "n_rounds_used",
+        # P2.2: the gradient path and the control flags (indices, weights, costs and flags only)
+        "cell_mask",
+        "unit_weights",
+        "expected_cost",
+        "log_prob",
+        "explored",
+        "refreshed",
+        "dense_fallback",
     ]
     hints = get_type_hints(Selection)
     for field in fields:
