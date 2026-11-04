@@ -1,0 +1,35 @@
+# tiny_gradcheck: the smallest HSN that exercises every component, in fp64 for finite-difference
+# gradient checks (P1.1; used by P1.8). V=16, d=4, N=3, M=2, K=2, R=1, D_g=2, H=8, n_ctx=4.
+# 1,083 parameters by the closed forms in python/hsn/train/memory_plan.py.
+
+run_id: tiny_gradcheck
+seed: 0
+notes: "Tiny fp64 configuration for finite-difference gradient checks."
+profile: cpu # gradient checks run on the CPU profile (fp32 autocast policy, no device autocast)
+model_name: hsn
+
+model: # Appendix A.1; everything not listed keeps its Appendix A default
+  vocab_size: 16 # V
+  d: 4 # width
+  n_cells: 3 # N
+  n_units: 2 # M
+  k_select: 2 # K
+  k_min: 1
+  r_max: 1 # R
+  in_degree: 2 # D_g (must be < n_cells)
+  hidden: 8 # H
+  n_context: 4 # context symbols
+  context_dim: 4 # (= d)
+  scorer: linear
+  scorer_hidden: 8 # keeps a `model.scorer=mlp` override tiny too
+
+train:
+  unroll: 8 # short TBPTT window: finite differences over a few positions
+  batch: 2
+  micro_batch: 2
+  grad_accum: 1
+  precision: fp64 # fp64 only for gradcheck (Appendix A.3)
+  steps: 1
+  eval_every: 1
+  ckpt_every: 1
+  stats_every: 1
