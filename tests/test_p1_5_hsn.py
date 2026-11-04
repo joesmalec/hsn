@@ -927,12 +927,13 @@ def _to_device(state: CellGraphState, device: torch.device) -> CellGraphState:
 def test_p1_5_runs_on_device(device_type: str) -> None:
     """The forward on the device agrees with the CPU.
 
-    Two tolerances (P1.7, measured on MPS): every single position, started from the *same* input
-    state on both sides, must agree to 1e-4 (the device's one-step numerics; a broken kernel
-    shows here as an order-one error). Over the whole window the state is carried on each side
-    and fp32 rounding (accumulation order of the device's matmuls) compounds through six gated
-    recurrent steps of a perturbed model: MPS reached 0.0145 absolute on the logits, so the
-    carried comparison allows 5e-2, which is still far below what a wrong operation produces.
+    Two tolerances (P1.7, measured on MPS with the weights perturbed to std 0.3): every single
+    position, started from the *same* input state on both sides, must agree to 1e-3 (the device's
+    one-step numerics: MPS gives 3.2e-4 absolute on 3 of 1,024 logits of a 512-wide decoder,
+    fp32 accumulation order; a broken kernel shows here as an order-one error). Over the whole
+    window the state is carried on each side and that rounding compounds through six gated
+    recurrent steps: MPS reached 0.0145 absolute on the logits, so the carried comparison allows
+    5e-2, which is still far below what a wrong operation produces.
     """
     device = _device(device_type)
     cfg, model = _model(REF_A1)
@@ -964,12 +965,12 @@ def test_p1_5_runs_on_device(device_type: str) -> None:
                 torch.testing.assert_close(
                     getattr(out_dev, name).cpu(),
                     getattr(out_cpu, name),
-                    atol=1e-4,
-                    rtol=1e-4,
+                    atol=1e-3,
+                    rtol=1e-3,
                     msg=lambda m, t=t, name=name: f"position {t}, {name}: {m}",
                 )
-            torch.testing.assert_close(out_dev.state.h.cpu(), out_cpu.state.h, atol=1e-4, rtol=1e-4)
-            torch.testing.assert_close(out_dev.state.q.cpu(), out_cpu.state.q, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(out_dev.state.h.cpu(), out_cpu.state.h, atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(out_dev.state.q.cpu(), out_cpu.state.q, atol=1e-3, rtol=1e-3)
             s_cpu = out_cpu.state
     # the whole window with the state carried on each side: accumulated fp32 rounding only
     torch.testing.assert_close(logits_dev.cpu(), logits_cpu, atol=5e-2, rtol=5e-2)
