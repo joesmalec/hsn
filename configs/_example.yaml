@@ -52,6 +52,7 @@ data: # Appendix A.2
   tasks: [] # task names or stage ids
   context_symbols: configs/data/context_symbols.yaml # id table
   split: train # train | dev | test (test only in gate scripts)
+  align_docs: true # P0.5: every document starts at a window boundary (in_range = fits one window)
 
 train: # Appendix A.3
   optimizer: adamw # adamw | lazy_adamw (P2.6)
@@ -107,6 +108,7 @@ train: # Appendix A.3
   shared_lr_scale_on_conflict: 0.5
   activation_checkpoint: none # none | per_round | per_window (P4.3)
   deterministic: false # deterministic kernels and backward
+  search_trials: 1 # P0.5: hyperparameter-search trials every method gets (equal budgets, §12)
 
 replay: # Appendix A.4 (P3.1)
   path: null
@@ -156,3 +158,15 @@ serve: # Appendix A.4 (P5.3 / P5.4)
     max_deadline_ms: 1000.0
     rps_per_tenant: 10.0
   capture_policy: disabled # disabled | local_only | shared_candidates
+
+baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which baseline runs
+  gru: # 1,977,856 parameters measured for V=256, 16 context symbols
+    d_model: 384 # embedding and hidden width
+    n_layers: 2 # stacked GRU layers
+    dropout: 0.0 # on embeddings, between layers, on the output
+  transformer: # 1,930,624 parameters measured for V=256, 16 context symbols, unroll 256
+    d_model: 192 # width; a multiple of n_heads
+    n_layers: 4 # pre-norm blocks
+    n_heads: 4 # attention heads
+    ffn_hidden: 768 # MLP hidden width (4 x d_model)
+    dropout: 0.0 # embeddings, attention, residual branches

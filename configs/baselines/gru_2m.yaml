@@ -1,0 +1,38 @@
+# GRU baseline at the documented ≈2M-parameter setting (P0.5): 1,977,856 parameters measured by
+# GRUBaseline.param_report() for V=256 and 16 context symbols (d_model 384, 2 layers). Trained on
+# synthetic_v1 with the generic trainer (python/hsn/train/loop.py); `hsn run` (P0.8) is the entry
+# point, until then `Trainer(GRUBaseline(cfg), cfg, resolve(cfg.hardware)).fit(train, dev, steps)`.
+# Everything not listed keeps its Appendix A default (configs/_example.yaml).
+
+run_id: gru_2m
+seed: 0
+notes: "GRU baseline, ~2M parameters (P0.5 baseline ladder control)."
+profile: cpu # override with `profile=<name>`
+model_name: gru
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv, delayed, brackets, arithmetic, algorithmic]
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train:
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 256 # the window synthetic_v1 defines in_range against
+  batch: 4
+  micro_batch: 4
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 200
+  ckpt_every: 1000
+  stats_every: 50
+  search_trials: 1 # the same budget for every method in the ladder
+
+baseline:
+  gru:
+    d_model: 384
+    n_layers: 2
+    dropout: 0.0
