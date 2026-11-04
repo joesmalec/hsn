@@ -33,7 +33,7 @@ learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the 
   gradient norm before clipping. Every ``train.stats_every`` steps (and at the last step) the record
   also carries ``grad_norm/<group>``, the pre-clip norm per parameter group, one group per top-level
   submodule of the model (``byte_emb``, ``ctx_emb``, ``encoder``, ``predictor``, ``shared``,
-  ``cell``, ``scorer``, ``decoder``; a group without gradients, such as ``halting`` while
+  ``cell``, ``router``, ``decoder``; a group without gradients, such as ``halting`` while
   ``model.r_max = 1``, is not reported), and one log line prints all of it.
 * **Checkpoints** are the P0.5 files (model, optimiser, scheduler, step, RNG state of Python,
   NumPy, torch, CUDA and MPS, loader position, loss scaler, config hash) plus the carried cell state

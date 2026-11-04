@@ -417,7 +417,11 @@ def profile_dense_costs(
             raise ValueError(f"{name} must be an int >= 1, got {value!r}")
     if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
         raise ValueError(f"warmup must be an int >= 0, got {warmup!r}")
-    if ctx.device != model.device:
+    # Parameters report an indexed device (``mps:0``) while a profile names ``mps``: compare the
+    # type, and the index only when the context pins one.
+    if ctx.device.type != model.device.type or (
+        ctx.device.index is not None and ctx.device.index != model.device.index
+    ):
         raise ValueError(
             f"ctx names {ctx.device} but the model lives on {model.device}; move the model first"
         )
@@ -437,7 +441,7 @@ def profile_dense_costs(
         with torch.no_grad():
             for t in range(warmup):
                 with profiler.segment("startup"):
-                    state = model.step(tokens[:, t], contexts[:, t], state).state
+                    state = model.step(tokens[:, t], contexts[:, t], state, mode="dense").state
             for t in range(warmup, total):
                 x_t, ctx_t = tokens[:, t], contexts[:, t]
                 with profiler.segment("shared_path", tokens=batch):
@@ -471,7 +475,7 @@ def profile_dense_costs(
                     new_state = state.with_dense(h_new)
                 with profiler.segment("decode", tokens=batch):
                     logits = model.decoder(torch.cat([new_state.q, u], dim=-1))
-                out = model.step(x_t, ctx_t, state)  # the reference, outside every segment
+                out = model.step(x_t, ctx_t, state, mode="dense")  # the reference, unsegmented
                 if not torch.allclose(
                     logits.float(), out.logits.float(), rtol=1e-4, atol=1e-5
                 ) or not torch.allclose(

@@ -218,9 +218,11 @@ def _ref_step(
 
     feats = _ref_features(dims, u, eps, h, age, pos, ctx, dims["budget"], 0, [0.0] * N, [0.0] * N)
     if dims["scorer"] == "linear":
-        unit_logits = [_linear(p["scorer.net.weight"], p["scorer.net.bias"], f) for f in feats]
+        unit_logits = [
+            _linear(p["router.scorer.net.weight"], p["router.scorer.net.bias"], f) for f in feats
+        ]
     else:
-        unit_logits = [_mlp2(p, "scorer.net", f) for f in feats]
+        unit_logits = [_mlp2(p, "router.scorer.net", f) for f in feats]
     alpha = [_softmax(row) for row in unit_logits]
 
     Vh = [_linear(p["cell.V.weight"], None, h[j]) for j in range(N)]
@@ -369,7 +371,7 @@ def test_p1_5_param_count_is_1_820_361_and_per_component() -> None:
         "w_out": "cell.W_out.",
         "v_msg": "cell.V.",
         "gate": "cell.gate.",
-        "scorer": "scorer.",
+        "scorer": "router.scorer.",
         "halting": "halting.",
         "decoder": "decoder.",
     }
@@ -609,7 +611,7 @@ def test_p1_5_shapes(device_type: str) -> None:
     state = model.init_state(B)
     tokens, ctx = _ids(cfg, B, 3, seed=11)
     x, c = tokens[:, 0], ctx[:, 0]
-    with pytest.raises(NotImplementedError, match="P2.5"):
+    with pytest.raises(ValueError, match="model.routing=dense"):  # P2.5: needs a selection mode
         model.step(x, c, state, mode="sparse")
     with pytest.raises(ValueError, match="mode"):
         model.step(x, c, state, mode="soft")  # type: ignore[arg-type]
