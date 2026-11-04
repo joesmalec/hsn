@@ -1,0 +1,160 @@
+# synthetic_v1: the P0.4 synthetic task suite (plan P0.4; Appendix D stages 1-2).
+#
+# Ten tasks: five families, each as an in-range variant (every dependency fits one unroll window
+# of 256 positions) and an out-of-range variant (every dependency exceeds it; length
+# extrapolation). Both variants of a family share the same params by construction (YAML anchors)
+# and the same context id; only the dependency and length ranges, the seed and the split sizes
+# differ. Byte values 0-15 are reserved control symbols (PAD=0 BOS=1 EOS=2 QRY=3 SEP=4 NONE=5),
+# 16-31 are family marker symbols, data alphabets start at 32 (python/hsn/data/synthetic.py).
+# The kv and delayed families use disjoint key alphabets per split; nothing else depends on the
+# split. Hashes of the generated shards: configs/data/synthetic_v1.manifest.json (golden copy of
+# the manifest.json that `python -m hsn.data.synthetic build` writes next to the shards).
+
+name: synthetic_v1
+unroll: 256 # the TBPTT window that defines in_range (= train.unroll of the reference configuration)
+
+tasks:
+  - name: kv
+    variant: in_range
+    family: kv
+    context_id: 1
+    seed: 1001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256] # whole documents fit one window
+    dep_len_range: [16, 240]
+    params: &kv_params
+      markers: { ins: 16, ovr: 17, del: 18 }
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] } # disjoint per split
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 8 # keys one document may touch (the anchor key and seven others)
+      op_rate: 0.15 # probability that a middle position starts an operation
+      p_del: 0.25 # DEL (else OVR) when the key is present
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 } # kind of the long-range anchor operation
+      max_queries: 8
+  - name: kv
+    variant: out_of_range
+    family: kv
+    context_id: 1
+    seed: 1002
+    n_train: 4000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params: *kv_params
+
+  - name: delayed
+    variant: in_range
+    family: delayed
+    context_id: 2
+    seed: 2001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params: &delayed_params
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] } # disjoint per split
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
+  - name: delayed
+    variant: out_of_range
+    family: delayed
+    context_id: 2
+    seed: 2002
+    n_train: 4000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params: *delayed_params
+
+  - name: brackets
+    variant: in_range
+    family: brackets
+    context_id: 3
+    seed: 3001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params: &brackets_params
+      opens: [32, 36] # four bracket types
+      closes: [36, 40]
+      verdict: { valid: 24, invalid: 25 }
+      max_depth: 8
+      p_query: 0.25 # probability that a close is marked with QRY (a loss position)
+      p_invalid: 0.5 # probability that one unqueried close inside the anchor span is corrupted
+      block_max: 48 # longest balanced block before the anchor span
+  - name: brackets
+    variant: out_of_range
+    family: brackets
+    context_id: 3
+    seed: 3002
+    n_train: 4000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params: *brackets_params
+
+  - name: arithmetic
+    variant: in_range
+    family: arithmetic
+    context_id: 4
+    seed: 4001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [19, 240] # >= 2 * digits_max + 3
+    params: &arithmetic_params
+      digits: [48, 58] # '0'..'9'
+      markers: { plus: 19, eq: 20 }
+      filler: [192, 256]
+      digits_max: 8
+  - name: arithmetic
+    variant: out_of_range
+    family: arithmetic
+    context_id: 4
+    seed: 4002
+    n_train: 4000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params: *arithmetic_params
+
+  - name: algorithmic
+    variant: in_range
+    family: algorithmic
+    context_id: 5
+    seed: 5001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240] # >= 2 * n_max
+    params: &algorithmic_params
+      markers: { copy: 21, reverse: 22, sort: 23 }
+      items: [64, 128]
+      filler: [192, 256]
+      n_min: 2
+      n_max: 8
+  - name: algorithmic
+    variant: out_of_range
+    family: algorithmic
+    context_id: 5
+    seed: 5002
+    n_train: 4000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params: *algorithmic_params
