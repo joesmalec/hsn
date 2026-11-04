@@ -555,7 +555,8 @@ class Trainer:
         while self.step < steps:
             started = time.perf_counter()
             self.optimizer.zero_grad(set_to_none=True)
-            loss_sum = 0.0  # a host float64: MPS tensors cannot be float64 (P1.7)
+            # host-side float64 accumulator: MPS has no float64 (P0.8 fix for profile:m_series)
+            loss_sum = torch.zeros((), dtype=torch.float64)
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
             tokens_in_step = 0
@@ -572,7 +573,7 @@ class Trainer:
                     flat_targets = batch["targets"][loss_mask]
                     loss = F.cross_entropy(flat_logits, flat_targets)
                     correct += (flat_logits.argmax(dim=-1) == flat_targets).sum()
-                    loss_sum += float(loss.detach()) * count
+                    loss_sum += loss.detach().cpu().double() * count
                     n_loss += count
                 else:  # no loss positions in this window (padding only): zero gradient
                     loss = logits.float().sum() * 0.0
@@ -593,7 +594,7 @@ class Trainer:
                     self.optimizer.step()
                 self.scheduler.step()
             self.step += 1
-            mean_loss = loss_sum / n_loss if n_loss else float("nan")
+            mean_loss = float(loss_sum) / n_loss if n_loss else float("nan")
             accuracy = float(correct) / n_loss if n_loss else float("nan")
             if self.scaler is None and n_loss and not math.isfinite(mean_loss):
                 raise RuntimeError(f"loss is {mean_loss} at step {self.step}")

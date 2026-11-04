@@ -12,8 +12,7 @@ windows (the ``[B, T]`` batches :func:`hsn.data.dataset.collate_windows` and the
 produce), carrying the recurrent state between consecutive windows exactly as training does, and
 returns the averages overall and per *group* (``"<task>/<variant>"`` by default, taken from the
 ``doc`` index of every position through ``group_of_doc``). Every accuracy is a fraction in
-``[0, 1]`` (the unit :mod:`hsn.eval.metrics` expects); counts are integers. Sums are accumulated
-in float64 on the host, since MPS tensors cannot be float64 (P1.7).
+``[0, 1]`` (the unit :mod:`hsn.eval.metrics` expects); counts are integers.
 """
 
 from __future__ import annotations
@@ -111,7 +110,7 @@ class MetricAccumulator:
         if self.group_names and group_ids is not None:
             if tuple(group_ids.shape) != shape:
                 raise ValueError(f"group_ids must have shape {shape}, got {tuple(group_ids.shape)}")
-            groups = group_ids[loss_mask].to(device="cpu", dtype=torch.int64)
+            groups = group_ids[loss_mask].to(torch.int64)
             if bool((groups < 0).any()) or bool((groups >= len(self.group_names)).any()):
                 raise ValueError("group_ids at loss positions must index group_names")
             self._group_n = [
@@ -130,13 +129,13 @@ class MetricAccumulator:
                     f"metric {name!r} must return one value per position ({n}), "
                     f"got shape {tuple(values.shape)}"
                 )
-            # The sums are kept in float64 on the host: MPS has no float64 (P1.7), and a CPU
-            # accumulation is the same on every backend. Move first, cast second: a combined
-            # ``.to(device, dtype)`` performs the cast on the source device, which MPS refuses.
-            values = values.detach().cpu().to(torch.float64)
+            # host-side float64 sums: MPS has no float64 (P0.8 fix for profile:m_series)
+            values = values.detach().cpu().to(torch.float64)  # move first: MPS cannot cast
             self._sums[name] += float(values.sum())
             if groups is not None:
-                per_group = torch.bincount(groups, weights=values, minlength=len(self.group_names))
+                per_group = torch.bincount(
+                    groups.cpu(), weights=values, minlength=len(self.group_names)
+                )
                 self._group_sums[name] = [
                     a + b for a, b in zip(self._group_sums[name], per_group.tolist(), strict=True)
                 ]

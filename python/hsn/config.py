@@ -92,6 +92,7 @@ Routing = Literal["dense", "topk", "greedy_budget", "random", "fixed"]
 PredictorTarget = Literal["fixed_embedding", "ema_encoder"]
 Tokenizer = Literal["bytes"]
 Split = Literal["train", "dev", "test"]
+Variant = Literal["in_range", "out_of_range"]  # P0.4 dependency-length variants
 Optimizer = Literal["adamw", "lazy_adamw"]
 Precision = Literal["bf16", "fp16", "fp32", "fp64"]
 GateMode = Literal["soft", "ste", "reinforce"]
@@ -244,6 +245,9 @@ class DataConfig(_StrictModel):
     manifest: Path | None = None  # split manifest with hashes (P0.4 / P4.1)
     tokenizer: Tokenizer = "bytes"  # only byte-level in this program
     tasks: list[str] = []  # task names or stage ids
+    # P0.8: which P0.4 variants of the named tasks a run loads (train and dev alike); empty = every
+    # variant the manifest has. The baselines and G1 train on ``[in_range]`` (plan P0.8, P1.9).
+    variants: list[Variant] = []
     context_symbols: Path = Path("configs/data/context_symbols.yaml")  # id table
     split: Split = "train"  # guarded: test only in gate scripts
     # P0.5: start every document at a window boundary when streams are built (the tail of its
