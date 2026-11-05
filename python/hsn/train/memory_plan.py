@@ -104,7 +104,9 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
     ``predictor`` P (d → H → d), ``shared`` S (2d + context_dim → H → d), ``units`` (M × (4d → H →
     d)), ``w_out`` (d × d, no bias), ``v_msg`` (d × d, no bias), ``gate`` B (4d → d), ``scorer``
     (3d + 8 → M, or → scorer_hidden → M when ``scorer=mlp``), ``halting`` (2d → 1), ``decoder`` D
-    (2d → H → V), ``total``. The reference configuration gives 1,820,361.
+    (2d → H → V), ``cell_norm`` (the P1.5a RMSNorm gain over the 4d cell input, 0 when
+    ``cell_norm=none``), ``total``. The reference configuration gives 1,820,617 (1,820,361 before
+    amendment A1, which added the 256-parameter ``cell_norm`` row).
     """
     _check_supported(m)
     d, h, v = m.d, m.hidden, m.vocab_size
@@ -118,6 +120,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "w_out": d * d,
         "v_msg": d * d,
         "gate": 4 * d * d + d,
+        "cell_norm": 4 * d if m.cell_norm == "rms" else 0,  # P1.5a: the RMSNorm gain
         "scorer": _scorer_params(m),
         "halting": 2 * d + 1,
         "decoder": _mlp(2 * d, h, v),
@@ -132,7 +135,9 @@ def macs_per_token(m: ModelConfig) -> dict[str, int]:
     Keys: ``shared`` (E + P + S + D), ``per_cell`` (one unit + W_out + D_g messages through V +
     gate B), ``selected`` (K × per_cell), ``scorer`` (N × one scorer application; linear or mlp per
     ``model.scorer``), ``sparse_total`` (shared + selected + scorer) and ``dense_total`` (shared +
-    N × per_cell + scorer). 1 MAC = 2 FLOPs.
+    N × per_cell + scorer). 1 MAC = 2 FLOPs. The table counts the linear layers (biases included,
+    Appendix H.3); the activations, the tanh, the sigmoid and the P1.5a RMSNorm on the cell input
+    are not linear layers and stay outside it, so amendment A1 leaves C.2 unchanged.
     """
     params = expected_param_count(m)
     unit = params["units"] // m.n_units

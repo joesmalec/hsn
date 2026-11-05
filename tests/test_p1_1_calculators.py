@@ -37,10 +37,11 @@ APPENDIX_C1 = {
     "w_out": 4_096,
     "v_msg": 4_096,
     "gate": 16_448,
+    "cell_norm": 256,  # P1.5a (amendment A1): the RMSNorm gain over the 4d cell input
     "scorer": 1_608,
     "halting": 129,
     "decoder": 197_376,
-    "total": 1_820_361,
+    "total": 1_820_617,  # 1,820,361 before amendment A1
 }
 
 
@@ -49,7 +50,8 @@ APPENDIX_C1 = {
 # --------------------------------------------------------------------------------------------------
 
 
-def test_p1_1_ref_a1_total_is_1_820_361() -> None:
+def test_p1_1_ref_a1_total_is_1_820_617() -> None:
+    """1,820,361 Appendix C parameters plus the 256 of amendment A1's ``cell_norm`` row."""
     cfg = load_config(REF_A1)
     assert cfg.profile == "cpu" and cfg.run_id == "ref_a1"
     # The schema defaults are the Appendix C configuration; the YAML spells it out and agrees.
@@ -60,7 +62,7 @@ def test_p1_1_ref_a1_total_is_1_820_361() -> None:
     assert list(counts) == list(APPENDIX_C1)  # table order, "total" last
     for component, expected in APPENDIX_C1.items():
         assert counts[component] == expected, component
-    assert counts["total"] == 1_820_361
+    assert counts["total"] == 1_820_617
     assert counts["total"] == sum(v for k, v in counts.items() if k != "total")
     assert counts["units"] == 8 * 164_416  # Appendix E.2 unit size
 
@@ -98,7 +100,7 @@ def test_p1_1_memory_matches_appendix_c3() -> None:
 
     plan = memory_plan(cfg.model, cfg.train.batch, cfg.train.unroll, value_bytes)
     assert isinstance(plan, MemoryPlan)
-    assert plan.train_state_bytes == 1_820_361 * 16 == 29_125_776
+    assert plan.train_state_bytes == 1_820_617 * 16 == 29_129_872  # A1: 1,820,361 + 256
     assert format_bytes(plan.train_state_bytes) == "27.8 MiB"
     assert plan.rec_state_bytes == 4 * 32 * 64 * 2 == 16 * KIB
     assert format_bytes(plan.rec_state_bytes) == "16 KiB"
@@ -137,7 +139,8 @@ def test_p1_1_tiny_gradcheck_loads() -> None:
     assert (m.r_max, m.in_degree, m.hidden, m.n_context, m.context_dim) == (1, 2, 8, 4, 4)
     assert cfg.train.precision == "fp64" and cfg.profile == "cpu"
     counts = expected_param_count(m)
-    # By hand: 64 + 16 + 76 + 76 + 140 + 2 × 172 + 16 + 16 + 68 + 42 + 9 + 216.
+    # By hand: 64 + 16 + 76 + 76 + 140 + 2 × 172 + 16 + 16 + 68 + 16 (A1 cell_norm, 4d) + 42 + 9
+    # + 216 = 1,099 (1,083 before amendment A1).
     assert counts == {
         "byte_emb": 64,
         "ctx_emb": 16,
@@ -148,17 +151,18 @@ def test_p1_1_tiny_gradcheck_loads() -> None:
         "w_out": 16,
         "v_msg": 16,
         "gate": 68,
+        "cell_norm": 16,
         "scorer": 42,
         "halting": 9,
         "decoder": 216,
-        "total": 1_083,
+        "total": 1_099,
     }
     assert activations_per_token(m) == {"shared": 64, "per_cell": 36}
     macs = macs_per_token(m)
     assert macs["per_cell"] == 172 + 16 + 2 * 16 + 68 == 288
     assert macs["sparse_total"] == (76 + 76 + 140 + 216) + 2 * 288 + 3 * 42
     plan = memory_plan(m, cfg.train.batch, cfg.train.unroll, value_bytes_for("fp64"))
-    assert plan.train_state_bytes == 1_083 * TRAIN_STATE_BYTES_PER_PARAM
+    assert plan.train_state_bytes == 1_099 * TRAIN_STATE_BYTES_PER_PARAM
     assert plan.rec_state_bytes == 2 * 3 * 4 * 8
     assert plan.saved_sparse_bytes == 2 * 8 * (64 + 2 * 36) * 8
 
@@ -178,7 +182,8 @@ def test_p1_1_closed_forms_generalise_to_appendix_e2() -> None:
     assert counts["scorer"] == 11_004  # 392 -> 28
     assert counts["halting"] == 257
     assert counts["decoder"] == 525_568
-    assert counts["total"] == 20_104_445
+    assert counts["cell_norm"] == 512  # amendment A1: 4d
+    assert counts["total"] == 20_104_957  # Appendix E.2's 20,104,445 + 512
     # Appendix E.3: per-token activations 4,864 / 1,920; saved sparse 109.0 MiB at B=8, T=256.
     assert activations_per_token(m) == {"shared": 4_864, "per_cell": 1_920}
     plan = memory_plan(m, 8, 256, 2)
@@ -187,7 +192,7 @@ def test_p1_1_closed_forms_generalise_to_appendix_e2() -> None:
     assert plan.rec_state_bytes == 96 * KIB and format_bytes(plan.rec_state_bytes) == "96 KiB"
     # Appendix E.3 prints the training state as 306.7 MiB; 20,104,445 × 16 B = 306.77 MiB, which
     # the C.3 convention (27.776 -> "27.8 MiB") rounds to 306.8. Left to P4.2 to settle.
-    assert plan.train_state_bytes == 20_104_445 * 16
+    assert plan.train_state_bytes == 20_104_957 * 16
     assert plan.saved_dense_bytes == 8 * 256 * (4_864 + 2 * 48 * 1_920) * 2  # 739.0 MiB
     assert format_bytes(plan.saved_dense_bytes) == "739 MiB"
 
@@ -195,7 +200,7 @@ def test_p1_1_closed_forms_generalise_to_appendix_e2() -> None:
     big = ModelConfig(
         d=256, n_cells=64, n_units=36, k_select=8, r_max=2, hidden=2048, context_dim=256
     )
-    assert expected_param_count(big)["total"] == 100_722_757
+    assert expected_param_count(big)["total"] == 100_723_781  # Appendix E's 100,722,757 + 1,024
     assert expected_param_count(big)["units"] == 36 * 2_623_744
     assert activations_per_token(big) == {"shared": 9_472, "per_cell": 3_840}
     big_plan = memory_plan(big, 16, 512, 2)
@@ -216,7 +221,8 @@ def test_p1_1_count_params_script_prints_appendix_c() -> None:
     assert run.returncode == 0, run.stderr
     out = run.stdout
     for figure in (
-        "| **Total** |  | **1,820,361** |",
+        "| Cell input RMSNorm gain (amendment A1) | 256 | 256 |",
+        "| **Total** |  | **1,820,617** |",
         "| Router scorer, linear | 200 → 8 | 1,608 |",
         "| Shared per-token work E + P + S + D | 461,248 | 35 % |",
         "| 201,344 | 15 % |",
@@ -226,7 +232,7 @@ def test_p1_1_count_params_script_prints_appendix_c() -> None:
         "| 6,955,712 | 528 % |",
         "| Two-layer scorer, 128 hidden, over 32 cells (32 × 26,760) | 856,320 | would lift sparse "
         "to 31 % of dense |",
-        "| 1,820,361 × 16 | 27.8 MiB |",
+        "| 1,820,617 × 16 | 27.8 MiB |",
         "| 4 × 32 × 64 × 2 | 16 KiB |",
         "| 16 × 64 × 256 × 2 | 512 KiB |",
         "| 4 × 256 × (2,560 + 4 × 960) × 2 | 12.5 MiB |",

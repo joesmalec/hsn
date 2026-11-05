@@ -56,14 +56,22 @@ def parse_init(init: str) -> float:
     return std
 
 
-def init_weight_(weight: Tensor, init: str) -> Tensor:
-    """Initialise ``weight`` in place as ``model.init`` asks and return it.
+def init_weight_(weight: Tensor, init: str, *, fan_in: int | None = None) -> Tensor:
+    """Initialise ``weight`` in place as ``model.init`` / ``model.state_init`` asks and return it.
 
     ``trunc_normal_<std>``: N(0, std²) truncated to ``[-2·std, 2·std]`` (see the module docstring
-    for why the bounds are explicit). Biases are not initialised here: every P1.2 module zeroes
-    them.
+    for why the bounds are explicit). ``fan_in`` (P1.5a, amendment A1): the same truncated normal
+    with std ``1/sqrt(fan_in)``, the fan-in being ``weight.shape[1]`` unless given: the input width
+    of an ``nn.Linear`` weight ``[out, in]`` and of a stacked unit weight ``[M, in, out]``. Biases
+    are not initialised here: every P1.2 module zeroes them (the cell sets its gate's bias).
     """
-    std = parse_init(init)
+    if init == "fan_in":
+        fan = int(weight.shape[1]) if fan_in is None else int(fan_in)
+        if fan < 1:
+            raise ValueError(f"init 'fan_in' needs a fan-in >= 1, got {fan}")
+        std = 1.0 / math.sqrt(fan)
+    else:
+        std = parse_init(init)
     return nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
 
 
@@ -117,7 +125,7 @@ class ByteEmbedding(_IdEmbedding):
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> Self:
-        return cls(cfg.vocab_size, cfg.d, init=cfg.init)
+        return cls(cfg.vocab_size, cfg.d, init=cfg.state_init)
 
 
 class ContextEmbedding(_IdEmbedding):
@@ -131,4 +139,4 @@ class ContextEmbedding(_IdEmbedding):
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> Self:
-        return cls(cfg.n_context, cfg.context_dim, init=cfg.init)
+        return cls(cfg.n_context, cfg.context_dim, init=cfg.state_init)

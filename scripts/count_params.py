@@ -94,6 +94,7 @@ def parameter_table(m: ModelConfig) -> str:
         ("Output projection W_out", f"{d} × {d}", _n(p["w_out"])),
         ("Message projection V", f"{d} × {d}", _n(p["v_msg"])),
         ("Gate B", f"{4 * d} → {d}", _n(p["gate"])),
+        ("Cell input RMSNorm gain (amendment A1)", f"{4 * d}", _n(p["cell_norm"])),
         (f"Router scorer, {m.scorer}", _scorer_shape(m, scorer_in), _n(p["scorer"])),
         ("Halting head", f"{2 * d} → 1", _n(p["halting"])),
         ("Decoder D", f"{2 * d} → {h} → {v}", _n(p["decoder"])),

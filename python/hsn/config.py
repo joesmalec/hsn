@@ -176,7 +176,17 @@ class ModelConfig(_StrictModel):
     n_context: int = Field(default=16, ge=1)  # context symbols
     context_dim: int = Field(default=64, ge=1)  # context embedding width (= d)
     activation: str = "gelu"  # MLP activation (paper unspecified)
-    init: str = "trunc_normal_0.02"  # weight init (paper unspecified)
+    init: str = "trunc_normal_0.02"  # weight init of embeddings, scorer, halting, decoder
+    # --- P1.5a (amendment A1, docs/amendments/A1_init_norm.md): the token-to-state path ---
+    # init of E, P, S, the unit MLPs, V, W_out and the gate weight: "fan_in" = truncated normal
+    # with std 1/sqrt(fan_in) per layer (default), or "trunc_normal_<std>" (the pre-A1 behaviour
+    # with trunc_normal_0.02)
+    state_init: str = "fan_in"
+    # RMSNorm over the 4d cell input v before the unit MLPs and the gate ("none" = the P1.5 cell)
+    cell_norm: Literal["rms", "none"] = "rms"
+    # the gate's bias at init: sigmoid(-3.0) = 0.047, so cells retain 95 % per position at the start
+    gate_bias_init: float = -3.0
+    # --- end P1.5a ---
     scorer: Scorer = "linear"  # router scorer
     scorer_hidden: int = Field(default=128, ge=1)  # hidden width when scorer = mlp
     scorer_features: ScorerFeaturesConfig = ScorerFeaturesConfig()
@@ -202,6 +212,10 @@ class ModelConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        if self.state_init != "fan_in" and not self.state_init.startswith("trunc_normal_"):
+            raise ValueError(
+                f"model.state_init={self.state_init!r} must be 'fan_in' or 'trunc_normal_<std>'"
+            )
         if self.k_select > self.n_cells:
             raise ValueError(
                 f"model.k_select={self.k_select} must be <= model.n_cells={self.n_cells}"

@@ -308,7 +308,7 @@ def test_p1_6_ema_moves_toward_online() -> None:
     # parameter accounting is unchanged by the frozen copy; its size is reported on its own
     cfg_r, ref = _model(REF_A1, [EMA])
     report = ref.param_report()
-    assert report["total"] == 1_820_361 and report["total_trainable"] == 1_820_489
+    assert report["total"] == 1_820_617 and report["total_trainable"] == 1_820_745  # A1 totals
     assert report["total_trainable"] == sum(p.numel() for p in ref.parameters())
     assert all(p.requires_grad for p in ref.parameters())
     assert (

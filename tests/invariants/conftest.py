@@ -224,8 +224,8 @@ def tiny_model() -> HSN:
 
 @pytest.fixture
 def ref_model() -> HSN:
-    """The Appendix C reference configuration in fp32 on the CPU (1,820,361 parameters plus 128
-    edge logits), weights seeded from ``run.seed``."""
+    """The Appendix C reference configuration in fp32 on the CPU (1,820,617 parameters after
+    amendment A1, plus 128 edge logits), weights seeded from ``run.seed``."""
     _, model = build_model("ref")
     assert model.dtype is torch.float32 and model.device.type == "cpu"
     return model

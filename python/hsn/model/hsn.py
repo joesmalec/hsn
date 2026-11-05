@@ -23,9 +23,10 @@ For every position ``t`` (:meth:`HSN.step`; ``q = q_{t−1}`` is the carried sum
 
 The dense reference uses the same linear scorer as the sparse model, with ``α = softmax(logits)``
 over all units and every cell updated (Appendix H.5), so the measured parameter count is exactly
-Appendix C.1: :meth:`HSN.param_report` lists the twelve C.1 rows and their ``total`` (1,820,361 for
-``configs/ref_a1.yaml``). The learned edge weights of the P1.4 graph (``N·(D_g + random_edges)``
-logits, 128 for A.1) are trainable parameters that Appendix C does not list; the report gives them
+Appendix C.1: :meth:`HSN.param_report` lists the twelve C.1 rows plus amendment A1's ``cell_norm``
+row (P1.5a) and their ``total`` (1,820,617 for ``configs/ref_a1.yaml``; 1,820,361 before A1). The
+learned edge weights of the P1.4 graph (``N·(D_g + random_edges)`` logits, 128 for A.1) are
+trainable parameters that Appendix C does not list; the report gives them
 as ``edges`` and ``total_trainable = total + edges``, which is what a run manifest's
 ``param_count`` must record (§0.5: measured, not assumed).
 
@@ -115,6 +116,7 @@ PARAM_REPORT_ROWS: tuple[str, ...] = (
     "w_out",
     "v_msg",
     "gate",
+    "cell_norm",  # P1.5a (amendment A1): the RMSNorm gain over the 4d cell input
     "scorer",
     "halting",
     "decoder",
@@ -598,6 +600,7 @@ class HSN(nn.Module):
             "w_out": self.cell.W_out,
             "v_msg": self.cell.V,
             "gate": self.cell.gate,
+            "cell_norm": self.cell.norm,
             "scorer": self.scorer,
             "halting": self.halting,
             "decoder": self.decoder,

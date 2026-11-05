@@ -4,8 +4,8 @@ the scorer that maps it to ``M`` unit logits.
 Plan §2.5 and Appendix H.2/H.5. Every candidate (cell, unit) is scored from information available at
 position ``t`` before any cell is updated (global rule 2). The dense reference (P1.5) and the sparse
 model (P2.1) share this one scorer: in dense mode ``α = softmax(logits)`` over the units of every
-cell, so the parameter count stays at Appendix C's 1,820,361 (``scorer`` row: ``(3d + 8) × M + M``,
-1,608 for A.1); P2.1 adds selection (top-K, budgets, deadlines) beside it in this module. The scorer
+cell, so the scorer adds nothing beyond Appendix C's ``scorer`` row (``(3d + 8) × M + M``, 1,608
+for A.1); P2.1 adds selection (top-K, budgets, deadlines) beside it in this module. The scorer
 is linear by default; ``model.scorer = mlp`` swaps in a two-layer :class:`~hsn.model.encoder.MLP2`
 with hidden width ``model.scorer_hidden`` (the C.2 "two-layer scorer" row), which costs more per
 position than the four selected cells execute (plan §2.5).

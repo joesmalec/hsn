@@ -1232,7 +1232,7 @@ def test_p2_2_config_fields(tmp_path: Path) -> None:
     # the model keeps its P1.5 count and report rows (the router owns the scorer, no extra params)
     model = HSN.from_config(cfg)
     report = model.param_report()
-    assert report["total"] == 1_820_361 and report["scorer"] == 1_608
+    assert report["total"] == 1_820_617 and report["scorer"] == 1_608  # the A1 total
     assert model.router.param_count() == 1_608 and "_fixed_route" not in model.state_dict()
     fixed = HSN.from_config(
         load_config(REF_A1, overrides=["model.routing=fixed", "model.fixed_route=[3, 1]"])

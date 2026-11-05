@@ -125,14 +125,14 @@ class Encoder(MLP2):
     """``E``: encoded input ``z_t = E(emb(x_t))``, ``d -> H -> d`` (C.1 row ``encoder``)."""
 
     def __init__(self, cfg: ModelConfig) -> None:
-        super().__init__(cfg.d, cfg.hidden, cfg.d, cfg.activation, init=cfg.init)
+        super().__init__(cfg.d, cfg.hidden, cfg.d, cfg.activation, init=cfg.state_init)
 
 
 class Predictor(MLP2):
     """``P``: predicted representation ``ẑ_t = P(q_{t-1})``, ``d -> H -> d`` (C.1 ``predictor``)."""
 
     def __init__(self, cfg: ModelConfig) -> None:
-        super().__init__(cfg.d, cfg.hidden, cfg.d, cfg.activation, init=cfg.init)
+        super().__init__(cfg.d, cfg.hidden, cfg.d, cfg.activation, init=cfg.state_init)
 
 
 class SharedTransform(MLP2):
@@ -141,7 +141,7 @@ class SharedTransform(MLP2):
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__(
-            2 * cfg.d + cfg.context_dim, cfg.hidden, cfg.d, cfg.activation, init=cfg.init
+            2 * cfg.d + cfg.context_dim, cfg.hidden, cfg.d, cfg.activation, init=cfg.state_init
         )
 
 

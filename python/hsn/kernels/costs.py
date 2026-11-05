@@ -21,7 +21,8 @@ is unambiguous. The **cost-model partition** of :func:`profile_dense_costs` is
 * ``shared_path``: ``P(q)``, ``E(emb(x))``, ``ε``, ``S([z; q; ctx])`` — once per position;
 * ``scorer``: the features, the logits and the dense ``softmax`` over units — once per position;
 * ``messages``: everything per cell that is not the unit MLP — the messages ``m``, the cell input
-  ``v``, the gate ``b``, the mixing, ``W_out``, ``tanh`` and the gated update (two entries per
+  ``v`` and its RMSNorm (P1.5a), the gate ``b``, the mixing, ``W_out``, ``tanh`` and the gated
+  update (two entries per
   position, before and after the unit pass; the chunk's "per-cell overhead (messages, gate)");
 * ``selected_cells``: the unit bank only (``UnitBank.forward_all``: every unit on every cell);
 * ``decode``: ``D([q_t; u_t])`` — once per position.
@@ -463,6 +464,7 @@ def profile_dense_costs(
                         [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_prev, m],
                         dim=-1,
                     )
+                    v = cell.norm(v)  # P1.5a: the units and the gate read the normalised input
                     b = torch.sigmoid(cell.gate(v))
                 with profiler.segment("selected_cells", tokens=batch):
                     unit_out = cell.units.forward_all(v)
