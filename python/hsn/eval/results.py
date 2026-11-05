@@ -642,7 +642,10 @@ def _seed_rows(records: Sequence[RunRecord]) -> list[dict[str, Any]]:
 
 
 def _uncertainty(records: Sequence[RunRecord]) -> dict[str, Any]:
-    """Bootstrap over task × seed units (never tokens, §2.8), paired by seed across models."""
+    """Bootstrap over task × seed units (never tokens, §2.8), paired by seed across models over
+    the units measured in both arms; a unit measured in one arm only (a seed that did not finish
+    for one model, as in the G1 package) is listed under ``unpaired_units`` and never paired with
+    a neighbour (the P0.7 rule), and a pair with fewer than two common units gets no interval."""
     originals = [record for record in records if not record.is_rerun]
     per_model: dict[str, dict[str, float]] = {}
     for record in originals:
@@ -664,14 +667,33 @@ def _uncertainty(records: Sequence[RunRecord]) -> dict[str, Any]:
             entry["note"] = "bootstrap needs at least two units"
         result["per_model"][model] = entry
     for baseline, candidate in combinations(sorted(per_model), 2):
-        samples = PairedSamples.from_mappings(per_model[baseline], per_model[candidate])
-        entry = {"baseline": baseline, "candidate": candidate, "n_units": samples.n_units}
-        if samples.n_units >= 2:
+        base_units, cand_units = per_model[baseline], per_model[candidate]
+        common = sorted(set(base_units) & set(cand_units))
+        unpaired = sorted((set(base_units) | set(cand_units)) - set(common))
+        entry = {
+            "baseline": baseline,
+            "candidate": candidate,
+            "n_units": len(common),
+            "unpaired_units": unpaired,
+        }
+        notes: list[str] = []
+        if len(common) >= 2:
+            samples = PairedSamples.from_mappings(
+                {key: base_units[key] for key in common}, {key: cand_units[key] for key in common}
+            )
             ci = paired_bootstrap(samples.candidate, samples.baseline)
             entry["difference_ci"] = _ci_dict(ci)
             entry["ci_excludes_zero"] = bool(ci.low > 0.0 or ci.high < 0.0)
         else:
             entry["difference_ci"] = None
+            notes.append("fewer than two units were measured in both arms")
+        if unpaired:
+            notes.append(
+                f"{len(unpaired)} unit(s) measured in one arm only are not paired (a seed that "
+                "did not finish for one model)"
+            )
+        if notes:
+            entry["note"] = "; ".join(notes)
         result["paired"][f"{candidate} - {baseline}"] = entry
     return result
 

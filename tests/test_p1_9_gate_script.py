@@ -714,3 +714,31 @@ def test_p1_9_run_units_no_retry_failed(tmp_path: Path) -> None:
     (skipped,) = gate.run_units([stopped], retry_failed=False, **kwargs)
     assert skipped.status == "failed" and "not retried" in skipped.error
     assert stopped.run_dir.is_dir()  # not quarantined
+
+
+def test_p1_9_uncertainty_pairs_common_units() -> None:
+    """The package's paired bootstrap pairs the task x seed units measured in both arms and lists
+    the rest (the G1 package: one finished HSN seed against five baseline seeds); fewer than two
+    common units give no interval."""
+    from types import SimpleNamespace
+
+    from hsn.eval import results
+
+    def record(model: str, seed: int, kv: float, delayed: float) -> Any:
+        groups = {"kv/in_range": kv, "delayed/in_range": delayed}
+        return SimpleNamespace(
+            model_name=model, seed=seed, is_rerun=False, group_accuracy=lambda: dict(groups)
+        )
+
+    records = [record("hsn", 0, 0.16, 0.02)] + [
+        record("gru", s, 0.3 + 0.01 * s, 0.6 + 0.02 * s) for s in range(5)
+    ]
+    out = results._uncertainty(records)
+    assert out["per_model"]["hsn"]["n_units"] == 2 and out["per_model"]["gru"]["n_units"] == 10
+    pair = out["paired"]["hsn - gru"]
+    assert pair["n_units"] == 2 and len(pair["unpaired_units"]) == 8
+    assert pair["difference_ci"] is not None and "not paired" in pair["note"]
+    assert all("seed0" not in u for u in pair["unpaired_units"])
+    single = results._uncertainty([record("hsn", 0, 0.16, 0.02), record("gru", 1, 0.3, 0.6)])
+    assert single["paired"]["hsn - gru"]["difference_ci"] is None
+    assert single["paired"]["hsn - gru"]["n_units"] == 0
