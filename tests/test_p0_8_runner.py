@@ -483,9 +483,9 @@ def test_p0_8_run_artifacts_and_registry(runs: dict[str, Path], tmp_path: Path) 
     model = build_model(resolved)
     assert model_hash(model) == model_hash(model)
     # registry
-    assert set(MODEL_REGISTRY) >= {"gru", "transformer"}
+    assert set(MODEL_REGISTRY) >= {"gru", "transformer", "hsn"}  # hsn registered by P1.9
     with pytest.raises(KeyError, match="registered"):
-        build_model(load_config(EXAMPLE, overrides=["model_name=hsn"]))
+        build_model(load_config(EXAMPLE, overrides=["model_name=selective_ssm"]))
     with pytest.raises(ValueError, match="already registered"):
         register_model("gru", MODEL_REGISTRY["gru"])
     with pytest.raises(ValueError):

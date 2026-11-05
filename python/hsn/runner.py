@@ -11,8 +11,9 @@ assumed"), §2.10 (cost arithmetic), Track E (evidence packages).
     hsn package --gate G0 --runs runs/<a> runs/<b> ... --out evidence/G0.zip
 
 The runner wires config (P0.2) → device (P0.3) → data (P0.4) → model (the registry below: the P0.5
-baselines now, HSN once P1.5 registers it) → trainer (P0.5) → evaluation → result store (P0.8) →
-run manifest. One run directory ``<out>/<run_id>`` holds:
+baselines and, since P1.9, the P1.5 HSN) → trainer (:func:`make_trainer`: the P1.7 TBPTT trainer for
+the HSN, the P0.5 trainer otherwise) → evaluation → result store (P0.8) → run manifest. One run
+directory ``<out>/<run_id>`` holds:
 
 ``config.resolved.yaml``, ``run_manifest.json`` (P0.2 writer), ``history.json`` (every step and
 evaluation), ``metrics.json`` (the final dev evaluation, measured numbers, hashes, data provenance),
@@ -65,6 +66,7 @@ from hsn.eval.results import (
     RunRecord,
     evidence_package,
 )
+from hsn.model.hsn import HSN
 from hsn.profiler import (
     NullMeter,
     NvmlEnergyMeter,
@@ -75,6 +77,7 @@ from hsn.profiler import (
 )
 from hsn.train.amp import autocast_ctx
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
+from hsn.train.tbptt import TBPTTTrainer
 
 __all__ = [
     "MODEL_REGISTRY",
@@ -84,6 +87,7 @@ __all__ = [
     "load_datasets",
     "main",
     "make_power_meter",
+    "make_trainer",
     "model_hash",
     "parse_seeds",
     "profile_run",
@@ -105,6 +109,7 @@ PowerChoice = Literal["none", "profile"]
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "gru": GRUBaseline,
     "transformer": TransformerBaseline,
+    "hsn": HSN.from_config,  # P1.9: the dense predictive cell (P1.5) trained by TBPTTTrainer (P1.7)
 }
 
 
@@ -126,6 +131,34 @@ def build_model(cfg: RunConfig) -> nn.Module:
             f"no model registered as {cfg.model_name!r}; registered: {sorted(MODEL_REGISTRY)}"
         ) from None
     return factory(cfg)
+
+
+def make_trainer(
+    model: nn.Module,
+    cfg: RunConfig,
+    ctx: DeviceContext,
+    *,
+    run_dir: str | Path | None = None,
+    profiler: Any | None = None,
+) -> Trainer:
+    """The trainer for ``model`` (P1.9): the P1.7 :class:`TBPTTTrainer` for an :class:`HSN` (its
+    window loop, loss assembly and checkpoint contents are the HSN ones, and its ``fit`` reads the
+    HSN ``param_report``), the generic P0.5 :class:`Trainer` for everything else."""
+    if isinstance(model, HSN):
+        return TBPTTTrainer(model, cfg, ctx, profiler, run_dir=run_dir)
+    return Trainer(model, cfg, ctx, profiler, run_dir=run_dir)
+
+
+def _detach(state: Any) -> Any:
+    """``state`` without autograd history: the state's own ``detach`` when it has one (the HSN
+    :class:`~hsn.model.state.CellGraphState`), else the P0.5 tensor walk."""
+    if (
+        state is not None
+        and not isinstance(state, Tensor)
+        and callable(getattr(state, "detach", None))
+    ):
+        return state.detach()
+    return detach_state(state)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -167,12 +200,19 @@ def _data_provenance(cfg: RunConfig, train_ds: ByteDataset, dev_ds: ByteDataset)
 
 
 def model_hash(model: nn.Module) -> str:
-    """blake2b-256 over the state dict in key order: name, dtype, shape and the raw bytes."""
+    """blake2b-256 over the state dict in key order: name, dtype, shape and the raw bytes of every
+    tensor; a non-tensor entry (a module's ``get_extra_state``, which the HSN uses for its
+    versions and topology) contributes its canonical JSON instead."""
     digest = hashlib.blake2b(digest_size=32)
-    for name, tensor in sorted(model.state_dict().items()):
-        flat = tensor.detach().to("cpu").contiguous().reshape(-1)
-        digest.update(f"{name}:{flat.dtype}:{tuple(tensor.shape)}\n".encode())
-        digest.update(flat.view(torch.uint8).numpy().tobytes())
+    for name, value in sorted(model.state_dict().items()):
+        if isinstance(value, Tensor):
+            flat = value.detach().to("cpu").contiguous().reshape(-1)
+            digest.update(f"{name}:{flat.dtype}:{tuple(value.shape)}\n".encode())
+            digest.update(flat.view(torch.uint8).numpy().tobytes())
+        else:
+            text = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
+            digest.update(f"{name}:extra_state:{len(text)}\n".encode())
+            digest.update(text.encode())
     return digest.hexdigest()
 
 
@@ -206,8 +246,10 @@ def make_power_meter(cfg: RunConfig, choice: PowerChoice) -> PowerMeter:
 
 PROFILE_SEGMENTS: dict[str, str] = {
     "startup": "first window of the pass (warm-up; P0.6 standalone segment)",
-    "shared_path": "the complete forward pass of the dense baseline: training pass with the loss, "
-    "serving pass in eval mode under no_grad",
+    "shared_path": "the complete forward pass of the model (every cell of the dense HSN, or the "
+    "dense baseline): training pass with the task cross-entropy, serving pass in eval mode under "
+    "no_grad; the HSN prediction term is not part of this profiled loss (P2.13 profiles the HSN "
+    "segments separately)",
     "backward": "loss.backward()",
     "optimizer": "gradient clipping and the AdamW step",
 }
@@ -277,7 +319,7 @@ def profile_run(
     optimizer.zero_grad(set_to_none=True)
     for _ in range(steps):
         window = _to_device(next(loader), device)
-        state = detach_state(state)
+        state = _detach(state)
         tokens = _n_tokens(window)
         with train_prof.segment("shared_path", tokens=tokens), autocast_ctx(ctx):
             logits, state, _ = probe(window["tokens"], window["context"], state, window["reset"])
@@ -428,7 +470,7 @@ def run_one(
         train_ds, dev_ds = load_datasets(cfg)
         seed_everything(cfg.seed)
         model = build_model(cfg)
-        trainer = Trainer(model, cfg, ctx, run_dir=run_dir)
+        trainer = make_trainer(model, cfg, ctx, run_dir=run_dir)
         history: History = trainer.fit(train_ds, dev_ds, cfg.train.steps)
         train_report, serve_report = profile_run(
             model,

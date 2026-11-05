@@ -154,8 +154,12 @@ class PDGCell(nn.Module):
             )  # [B, N, 4d]
             unit_out = self.units.forward_all(v)  # [B, N, M, d]
             mixed = (alpha.unsqueeze(-1) * unit_out).sum(dim=2)  # Σ_j α_ij F_j(v_i)
-            c = torch.tanh(self.W_out(mixed))
-            b = torch.sigmoid(self.gate(v))
+            # P1.9: tanh, the gate and the convex combination run in the state's dtype. Under
+            # bf16 autocast W_out and the gate emit bf16; a bf16 ``1 - b`` is rounded, the weights
+            # no longer sum to one and |h| compounds past the §2.3 bound over a window (measured
+            # 1.33 after 256 positions on rtx3060). Without autocast the casts are no-ops.
+            c = torch.tanh(self.W_out(mixed).to(h_prev.dtype))
+            b = torch.sigmoid(self.gate(v).to(h_prev.dtype))
             h_new = (1 - b) * h_prev + b * c
             if self.disabled_cells:
                 h_new = torch.where(self.disabled[None, :, None], h_prev, h_new)
@@ -218,7 +222,7 @@ class PDGCell(nn.Module):
                 h_prev = state.h
                 m = native.csr_messages(h_prev, self.graph, self.V, cells)  # [B, K, d]
                 v = native.gather_concat(u, eps, h_prev, m, cells)  # [B, K, 4d]
-                b = torch.sigmoid(self.gate(v))
+                b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
                 unit_out = native.grouped_unit_mlp(
                     v.reshape(B * K, 4 * d), units.reshape(B * K), self.units
@@ -229,7 +233,7 @@ class PDGCell(nn.Module):
                 # α (fp32, the selection's gradient entry) promotes the unit output like the dense
                 # path's mixing does; W_out recasts under autocast.
                 mixed = sel.alpha.unsqueeze(-1) * unit_out  # α_i F_j(v_i)
-                c = torch.tanh(self.W_out(mixed))
+                c = torch.tanh(self.W_out(mixed).to(state.dtype))  # P1.9: see step_dense
                 new_state = native.gated_delta_update(state, cells, c, b, valid)
         h_old = v[..., 2 * d : 3 * d]  # the gathered h[cell] slice of v
         h_new = torch.where(valid.unsqueeze(-1), (1 - b) * h_old + b * c, h_old).to(state.dtype)
