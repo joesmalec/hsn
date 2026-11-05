@@ -111,7 +111,7 @@ DEFAULT_BASELINES = (
 #: The default search grid: trial 0 is the configuration itself; each further trial is one override
 #: set on top of it (steps, learning rate and schedule, batch — chunk P1.9 "search the recipe").
 DEFAULT_TRIALS: tuple[tuple[str, ...], ...] = (
-    ("train.lr=3e-3",),
+    ("train.lr=1e-3",),
     ("train.batch=32", "train.micro_batch=32"),
     ("train.schedule=constant", "train.warmup_steps=0"),
 )

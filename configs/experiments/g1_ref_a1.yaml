@@ -64,7 +64,7 @@ train: # the recipe of record; batch is free throughput for the launch-bound den
   micro_batch: 16
   grad_accum: 1
   precision: bf16 # bf16 | fp16 | fp32 | fp64
-  lr: 1.0e-3
+  lr: 3.0e-3 # the P1.9 overfit diagnosis: 64 docs reach 100 % train accuracy by step 1,400 at 3e-3; 1e-3 stalls at 0.57 in 1,000 steps
   weight_decay: 0.01
   warmup_steps: 200
   schedule: cosine # constant | cosine | linear
