@@ -2,17 +2,19 @@
 
 :class:`TBPTTTrainer` is the P0.5 :class:`~hsn.train.loop.Trainer` specialised for the
 :class:`~hsn.model.hsn.HSN` module. It keeps the generic parts unchanged (the resumable document
-streams of :class:`~hsn.train.loop.StreamLoader`, AdamW with the P0.5 parameter groups, the
-learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the step
-:class:`~hsn.train.loop.History` and the checkpoint files) and owns the HSN window loop::
+streams of :class:`~hsn.train.loop.StreamLoader`, the optimiser ``train.optimizer`` names with the
+P0.5 parameter groups, the learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`,
+evaluation, the step :class:`~hsn.train.loop.History` and the checkpoint files) and owns the HSN
+window loop::
 
     per window:  state = state.detach()                          (every ``train.q_resync_every``
                  q     = state.recompute_q()                      windows, at the window start)
                  logits, state, info = model(tokens, ctx, state, reset)
                  total, parts = assemble_loss({"logits": logits, **info}, batch, cfg)
                  backward (scaled under fp16)
-    per step:    unscale; grad_norm per group; clip to train.grad_clip; optimiser step;
-                 scheduler step; model.update_target(); log parts and statistics
+    per step:    unscale; grad_norm per group; clip to train.grad_clip; optimiser step (with the
+                 units the step's windows executed, P2.6); scheduler step; model.update_target();
+                 log parts and statistics
 
 * **Truncated BPTT.** Every window starts from ``state.detach()``: the carried
   :class:`~hsn.model.state.CellGraphState` keeps its values and loses its autograd history, so a
@@ -54,6 +56,14 @@ learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the 
   record also carries ``route_cost`` (the mean executed cost per position as a fraction of the
   dense step; 1.0 in dense mode) and, in a routed run, the ``explored``, ``refreshed`` and
   ``dense_fallback`` rates.
+* **Active units (P2.6).** In a routed run every step record carries ``active_units``, the sorted
+  ids of the units that executed in the step's windows: the union of the window ``unit_idx`` over
+  the valid slots (:func:`~hsn.train.lazy_adam.active_units_from_indices`), every unit when the
+  gate of the step is ``soft`` (the masked round runs the whole bank) or a row ran the dense
+  fallback, ORed over the ``train.grad_accum`` windows of the step; ``stats["active_units"]`` is
+  their count. With ``train.optimizer = lazy_adamw`` (the default of sparse runs) the mask is handed
+  to :meth:`~hsn.train.lazy_adam.LazyAdamW.step`, so a unit that did not execute receives no
+  optimiser update; in dense routing the record holds ``None`` and every unit updates.
 
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
 non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
@@ -93,6 +103,7 @@ from hsn.train.checkpoint import (
     save_checkpoint,
     unpack_cell_state,
 )
+from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
 from hsn.train.loop import History, StepRecord, StreamLoader, Trainer
 from hsn.train.schedules import SelectionSchedule
 
@@ -110,14 +121,16 @@ class TBPTTStepRecord(StepRecord):
     """A P0.5 :class:`~hsn.train.loop.StepRecord` (``loss`` is the task cross-entropy over the
     step's loss positions) plus the P1.7 statistics: ``total`` (the assembled objective, mean over
     the step's windows), ``parts`` (every λ-weighted term, same mean), ``stats`` (the
-    :data:`STAT_KEYS` every step and ``grad_norm/<group>`` on stats steps) and the resync counters
-    after the step."""
+    :data:`STAT_KEYS` every step and ``grad_norm/<group>`` on stats steps), the resync counters
+    after the step and, in a routed run, ``active_units`` (P2.6: the sorted ids of the units the
+    step's windows executed; ``None`` in dense routing, where every unit runs)."""
 
     total: float = math.nan
     parts: dict[str, float] = field(default_factory=dict)
     stats: dict[str, float] = field(default_factory=dict)
     windows: int = 0
     resyncs: int = 0
+    active_units: list[int] | None = None
 
 
 class TBPTTTrainer(Trainer):
@@ -190,6 +203,20 @@ class TBPTTTrainer(Trainer):
             self.resyncs += 1
             self.windows_since_resync = 0
         return state
+
+    def _window_active_units(self, info: Mapping[str, Tensor]) -> Tensor | None:
+        """The units a window executed (P2.6), bool ``[M]`` on the CPU; ``None`` in dense routing
+        (``info`` has no selection stacks: every unit ran). Every unit when the gate of this step
+        is ``soft`` — the masked round runs the whole bank — or when a row ran the dense fallback;
+        otherwise the union of ``unit_idx`` over the valid slots."""
+        if "unit_idx" not in info:
+            return None
+        n_units = self.hsn.cell.units.n_units
+        if self.hsn.schedule.gate(self.step) == "soft":
+            return torch.ones(n_units, dtype=torch.bool)
+        return active_units_from_indices(
+            info["unit_idx"], info["valid"], n_units, dense_rows=info["dense_fallback"] > 0
+        )
 
     def _grad_groups(self) -> dict[str, list[nn.Parameter]]:
         """Trainable parameters per top-level submodule (plus ``root`` for direct parameters)."""
@@ -299,12 +326,16 @@ class TBPTTTrainer(Trainer):
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
             tokens_in_step = 0
+            active: Tensor | None = None  # P2.6: the units the step's windows executed
             for _ in range(n_windows):
                 window = next(loader)
                 batch = self._to_device(window)
                 state = self._window_start(state)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
                 logits, state, info = self._forward(batch, state)
+                window_active = self._window_active_units(info)
+                if window_active is not None:
+                    active = window_active if active is None else active | window_active
                 total, parts = assemble_loss({"logits": logits, **info}, batch, self.cfg)
                 loss_mask = batch["loss_mask"]
                 count = int(loss_mask.sum())
@@ -338,14 +369,18 @@ class TBPTTTrainer(Trainer):
                 group_norms = self._group_grad_norms(groups) if stats_step else {}
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
+                step_kwargs: dict[str, Any] = {}
+                if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
+                    step_kwargs["active_units"] = active
                 if self.scaler is not None:
-                    self.scaler.step(self.optimizer)
+                    self.scaler.step(self.optimizer, **step_kwargs)
                     self.scaler.update()
                 else:
-                    self.optimizer.step()
+                    self.optimizer.step(**step_kwargs)
                 self.scheduler.step()
                 self.hsn.update_target()
             self.step = next_step
+            active_ids = None if active is None else active.nonzero().flatten().tolist()
             mean_total = total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
             accuracy = float(correct) / n_loss if n_loss else float("nan")
@@ -360,6 +395,7 @@ class TBPTTTrainer(Trainer):
                 "alpha_entropy": entropy_sum / n_windows,
                 "route_cost": cost_sum / n_windows,
                 **{key: value / n_windows for key, value in rate_sums.items()},
+                **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
                 **group_norms,
             }
             record = TBPTTStepRecord(
@@ -376,11 +412,12 @@ class TBPTTTrainer(Trainer):
                 stats=stats,
                 windows=self.windows,
                 resyncs=self.resyncs,
+                active_units=active_ids,
             )
             history.steps.append(record)
             if stats_step:
                 logger.info(
-                    "step %d/%d total %.4f %s acc %.4f lr %.2e grad_norm %.4f %s tokens/s %.0f",
+                    "step %d/%d total %.4f %s acc %.4f lr %.2e grad_norm %.4f %s tokens/s %.0f%s",
                     self.step,
                     steps,
                     mean_total,
@@ -390,6 +427,7 @@ class TBPTTTrainer(Trainer):
                     grad_norm,
                     " ".join(f"{name} {value:.4f}" for name, value in stats.items()),
                     tokens_in_step / seconds if seconds > 0 else 0.0,
+                    "" if active_ids is None else f" active {active_ids}",
                 )
             if self.step % train.eval_every == 0 or self.step == steps:
                 result = self.evaluate(dev_ds, metrics)

@@ -10,6 +10,10 @@ Defaults where Appendix A lists alternatives without naming one are the first al
 (``edge_norm=softmax``, ``scorer=linear``, ``routing=dense``, ``predictor_target=fixed_embedding``,
 ``optimizer=adamw``, ``precision=bf16``, ``gate_mode=soft``, ``activation_checkpoint=none``,
 ``stream.policy=utility_lru``, ``serve.encryption=none``, ``serve.capture_policy=disabled``).
+One default follows another key: ``train.optimizer`` left unset resolves to ``lazy_adamw`` when
+``model.routing`` is a selection mode (P2.6: per-unit lazy Adam is the default of sparse runs) and
+stays ``adamw`` for dense routing, so a dense configuration such as ``configs/ref_a1.yaml`` keeps
+its resolved values and hash; an explicit ``train.optimizer`` is always kept.
 Schedules, exploration and auxiliary loss weights default to neutral (off) so that nothing is
 active unless a config asks for it (global rule 4: one auxiliary term at a time); ``lambda_p``
 defaults to 1.0 because ``L_pred`` is part of the base objective (Plan §2.6), not an auxiliary term.
@@ -267,7 +271,9 @@ class DataConfig(_StrictModel):
 class TrainConfig(_StrictModel):
     """Appendix A.3 ``train.*`` including loss weights and the one-at-a-time auxiliary rule."""
 
-    optimizer: Optimizer = "adamw"  # P2.6
+    # P2.6: unset resolves per model.routing (dense -> adamw, a selection mode -> lazy_adamw) in
+    # RunConfig._default_optimizer_by_routing; an explicit value is kept.
+    optimizer: Optimizer = "adamw"
     lr: float = Field(default=1e-3, gt=0.0)
     betas: tuple[float, float] = (0.9, 0.999)
     weight_decay: float = Field(default=0.01, ge=0.0)
@@ -588,6 +594,31 @@ class RunConfig(_StrictModel):
     notes: str = ""
     profile: Profile = "cpu"  # name of the hardware profile
     model_name: ModelName = "hsn"
+
+    # --- P2.6: the optimiser default follows the routing ---
+    @model_validator(mode="before")
+    @classmethod
+    def _default_optimizer_by_routing(cls, data: Any) -> Any:
+        """``train.optimizer`` left unset resolves to ``lazy_adamw`` when ``model.routing`` is a
+        selection mode; dense data is returned untouched (the field default ``adamw`` applies) and
+        an explicit value is always kept."""
+        if not isinstance(data, dict):
+            return data
+        train = data.get("train")
+        if train is not None and not isinstance(train, dict):
+            return data  # a TrainConfig instance, or a type error for the field to report
+        if train is not None and "optimizer" in train:
+            return data
+        model = data.get("model")
+        if isinstance(model, dict):
+            routing = model.get("routing", "dense")
+        else:
+            routing = getattr(model, "routing", "dense")
+        if routing == "dense":
+            return data
+        return {**data, "train": {**(train or {}), "optimizer": "lazy_adamw"}}
+
+    # --- end P2.6 ---
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:

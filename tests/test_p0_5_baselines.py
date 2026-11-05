@@ -654,7 +654,7 @@ def test_p0_5_trainer_guards(train_docs: list[Example], tmp_path: Path) -> None:
     with pytest.raises(NotImplementedError, match="P4.3"):
         Trainer(_build(cfg), cfg, _cpu(), run_dir=tmp_path)
     cfg = _config("model_name=gru", "train.optimizer=lazy_adamw")
-    with pytest.raises(NotImplementedError, match="P2.6"):
+    with pytest.raises(ValueError, match="UnitBank"):  # P2.6: lazy Adam needs a unit bank
         Trainer(_build(cfg), cfg, _cpu(), run_dir=tmp_path)
     cfg = _config("model_name=gru", "train.schedule=step")
     with pytest.raises(ValueError, match="schedule"):

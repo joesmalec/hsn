@@ -34,7 +34,13 @@ trials (paper §12); recording a trial beyond the budget raises.
 **Guards.** The test split is refused unless a caller says ``allow_test=True`` (gate scripts only;
 chunk "Do not"). Shape mismatches, unknown schedules, a non-finite loss under bf16/fp32, a
 checkpoint from another configuration and features that belong to later chunks (micro-batching,
-P4.3; lazy Adam, P2.6) raise instead of being reinterpreted (plan §4.3: errors over silence).
+P4.3) raise instead of being reinterpreted (plan §4.3: errors over silence).
+
+**Optimiser (P2.6).** ``train.optimizer=adamw`` builds ``torch.optim.AdamW`` with weight decay on
+the tensors of ``ndim >= 2`` and none on the rest; ``train.optimizer=lazy_adamw`` builds the same
+groups as a :class:`~hsn.train.lazy_adam.LazyAdamW` with the unit bank's stacked tensors in unit
+groups, and needs a model with a :class:`~hsn.model.units.UnitBank` (the baselines have none and
+raise). The TBPTT trainer hands the lazy optimiser the units each step executed.
 """
 
 from __future__ import annotations
@@ -76,6 +82,7 @@ from hsn.train.checkpoint import (
     restore_rng_state,
     save_checkpoint,
 )
+from hsn.train.lazy_adam import build_lazy_adamw
 
 __all__ = [
     "SCHEDULES",
@@ -392,8 +399,8 @@ class Trainer:
                 f"train.micro_batch={train.micro_batch} != train.batch={train.batch}: "
                 "micro-batching arrives with P4.3"
             )
-        if train.optimizer != "adamw":
-            raise NotImplementedError(f"train.optimizer={train.optimizer!r} arrives with P2.6")
+        if train.optimizer not in ("adamw", "lazy_adamw"):
+            raise ValueError(f"train.optimizer={train.optimizer!r} is not adamw or lazy_adamw")
         if train.schedule not in SCHEDULES:
             raise ValueError(f"train.schedule={train.schedule!r} is not one of {SCHEDULES}")
         self.model = model
@@ -414,8 +421,12 @@ class Trainer:
 
     # construction ----------------------------------------------------------------------------
 
-    def _make_optimizer(self) -> torch.optim.AdamW:
+    def _make_optimizer(self) -> torch.optim.Optimizer:
         train = self.cfg.train
+        if train.optimizer == "lazy_adamw":  # P2.6: the unit bank's tensors in unit groups
+            return build_lazy_adamw(
+                self.model, lr=train.lr, betas=train.betas, weight_decay=train.weight_decay
+            )
         decay = [p for p in self.model.parameters() if p.requires_grad and p.ndim >= 2]
         no_decay = [p for p in self.model.parameters() if p.requires_grad and p.ndim < 2]
         if not decay and not no_decay:
