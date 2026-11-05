@@ -647,3 +647,31 @@ def test_p1_9_experiment_config_matches_ref_a1() -> None:
     assert (
         gru.data.tasks == ["kv", "delayed"] and gru.train.search_trials == cfg.train.search_trials
     )
+
+
+def test_p1_9_pick_best_excludes_memory_infeasible() -> None:
+    """The search winner is the best trial that fits the seed stage's per-run memory budget; a
+    better trial above it is marked excluded with the numbers (measured on rtx3060: the batch-32
+    trial peaks at 5.69 GiB and three or two copies do not fit the 12 GB card)."""
+    gate = load_script("gate_g1")
+
+    def trial(index: int, mean: float, peak: float) -> dict[str, Any]:
+        return {
+            "index": index,
+            "status": "ok",
+            "peak_bytes": peak,
+            "result": {
+                gate.SEARCH_METRIC: mean,
+                "g1_min_dev_accuracy": mean / 2,
+                "dev_loss": 4.0 - mean,
+            },
+        }
+
+    trials = [trial(0, 0.088, 3.3e9), trial(1, 0.089, 3.3e9), trial(2, 0.104, 6.1e9)]
+    assert gate.pick_best(trials) == 2
+    assert "excluded" not in trials[2]
+    assert gate.pick_best(trials, max_peak_bytes=12.9e9 * 0.85 / 3) == 1
+    assert "exceeds" in trials[2]["excluded"] and "excluded" not in trials[1]
+    failed = [{"index": 0, "status": "failed", "error": "boom"}]
+    assert gate.pick_best(failed) is None
+    assert gate.pick_best([trial(0, 0.5, 9e9)], max_peak_bytes=1e9) is None

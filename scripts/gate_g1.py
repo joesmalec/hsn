@@ -29,8 +29,12 @@ stage):
 5. Recipe search on dev (chunk step 3; paper §12 equal search budgets): ``train.search_trials``
    trials, each the configuration plus one ``--trial`` override set, seed ``--search-seed`` for
    ``--search-steps`` steps; the GRU and Transformer configurations get the same trials, the same
-   horizon and the matched budget keys of the experiment configuration. ``search.json`` records
-   every trial, including the failed ones.
+   horizon and the matched recipe and budget keys of the experiment configuration (so that every
+   method's trial 0 is the recipe of record and every trial differs from it). ``search.json``
+   records every trial, including the failed ones. The winner of a method is its best trial
+   among those whose measured ``peak_bytes`` fit the seed stage: ``--jobs`` copies run side by
+   side on one card, so a trial above ``vram_bytes * vram_cap_fraction * --memory-headroom /
+   --jobs`` is marked ``excluded`` and reported, never run as the seeds.
 6. Five seeds of the winning recipe per method, each run carrying the P0.6 profiling pass (``--power
    profile`` reads the NVML meter); a rerun of the first HSN seed.
 7. Test, exactly once per run (chunk step 3; pitfall: tuning on test): the final checkpoint is
@@ -66,12 +70,12 @@ import sys
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import torch
-from hsn.config import REPO_ROOT, RunConfig, config_hash, load_config
+from hsn.config import REPO_ROOT, RunConfig, config_hash, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
 from hsn.data.leakage import check_leakage
 from hsn.device import resolve, seed_everything
@@ -115,8 +119,10 @@ DEFAULT_TRIALS: tuple[tuple[str, ...], ...] = (
     ("train.batch=32", "train.micro_batch=32"),
     ("train.schedule=constant", "train.warmup_steps=0"),
 )
-#: Keys of the experiment configuration every baseline inherits so that the budgets match
-#: (paper §12: equal search budgets; matched training compute).
+#: Keys of the experiment configuration every baseline inherits so that the budgets and the trial
+#: grid match (paper §12: equal search budgets; matched training compute): the budget keys, and the
+#: recipe keys the trials vary, so that trial 0 is the same recipe for every method and no trial
+#: repeats a baseline's own default (gru_2m/transformer_2m already train at lr 1e-3).
 MATCHED_TRAIN_KEYS = (
     "steps",
     "batch",
@@ -126,7 +132,16 @@ MATCHED_TRAIN_KEYS = (
     "ckpt_every",
     "stats_every",
     "search_trials",
+    "lr",
+    "weight_decay",
+    "warmup_steps",
+    "schedule",
+    "grad_clip",
 )
+#: Fraction of the profile's device memory the concurrent seed runs may use in sum (their measured
+#: ``peak_bytes``); the rest is the CUDA context and the allocator's reserve of every process
+#: (measured on rtx3060: a 5.69 GiB peak shows as a 6.5 GB process).
+MEMORY_HEADROOM = 0.85
 #: Invariant test(s) that evidence the freeze's ``correct_reset`` (P1.8, Track T).
 RESET_INVARIANTS = ("test_p1_8_reset_removes_prior_state",)
 TEST_EVAL_FILE = "test_eval.json"
@@ -845,20 +860,36 @@ def g1_result(metrics: Mapping[str, Any], frozen: MetricsFreeze) -> dict[str, fl
     }
 
 
-def pick_best(trials: Sequence[Mapping[str, Any]]) -> int | None:
+def pick_best(
+    trials: Sequence[MutableMapping[str, Any]], *, max_peak_bytes: float | None = None
+) -> int | None:
     """Index of the best trial: highest mean dev accuracy over the G1 tasks, then highest minimum,
-    then lowest dev loss, then the lowest index; failed trials never win."""
-    ranked = [
-        (
-            -float(t["result"][SEARCH_METRIC]),
-            -float(t["result"]["g1_min_dev_accuracy"]),
-            float(t["result"]["dev_loss"]),
-            int(t["index"]),
+    then lowest dev loss, then the lowest index; failed trials never win. With ``max_peak_bytes``
+    a trial whose measured ``peak_bytes`` exceeds it cannot win either (the seed stage runs
+    ``--jobs`` copies of the winner on one card): it is marked ``excluded`` in place, with the
+    numbers, and reported."""
+    ranked = []
+    for t in trials:
+        if t.get("status") not in ("ok", "reused") or not _is_finite_number(
+            t.get("result", {}).get(SEARCH_METRIC)
+        ):
+            continue
+        peak = t.get("peak_bytes")
+        peak_value = float(peak) if _is_finite_number(peak) else None
+        if max_peak_bytes is not None and peak_value is not None and peak_value > max_peak_bytes:
+            t["excluded"] = (
+                f"peak_bytes {peak_value:.4g} exceeds the seed stage's per-run memory budget "
+                f"{max_peak_bytes:.4g} (the concurrent seeds would not fit the card)"
+            )
+            continue
+        ranked.append(
+            (
+                -float(t["result"][SEARCH_METRIC]),
+                -float(t["result"]["g1_min_dev_accuracy"]),
+                float(t["result"]["dev_loss"]),
+                int(t["index"]),
+            )
         )
-        for t in trials
-        if t.get("status") in ("ok", "reused")
-        and _is_finite_number(t.get("result", {}).get(SEARCH_METRIC))
-    ]
     if not ranked:
         return None
     return min(ranked)[3]
@@ -881,8 +912,11 @@ def search_method(
     logs_dir: Path,
     ledger: Ledger,
     poll_s: float = 5.0,
+    max_peak_bytes: float | None = None,
 ) -> dict[str, Any]:
-    """Every trial of one method within its ``train.search_trials`` budget; returns the record."""
+    """Every trial of one method within its ``train.search_trials`` budget; returns the record
+    (``best_index`` among the trials that fit ``max_peak_bytes``, ``best_unconstrained_index``
+    without that constraint)."""
     base = load_config(config, overrides=list(base_overrides))
     budget = SearchBudget.from_config(base)
     if len(trials) != budget.trials_allowed:
@@ -985,11 +1019,13 @@ def search_method(
                 g: float(e["accuracy"]) for g, e in metrics["final"]["per_group"].items()
             },
             tokens_per_s=metrics["measured"].get("tokens_per_s"),
+            peak_bytes=metrics["measured"].get("peak_bytes"),
         )
         budget.record(
             load_config(outcome.run_dir / RESOLVED_CONFIG_FILE), {**result, "failed": 0.0}
         )
-    best = pick_best(planned)
+    unconstrained = pick_best(planned)
+    best = pick_best(planned, max_peak_bytes=max_peak_bytes)
     return {
         "model": model,
         "config": str(config),
@@ -1000,8 +1036,11 @@ def search_method(
         "trials": planned,
         "best_index": best,
         "best_overrides": planned[best]["overrides"] if best is not None else None,
+        "best_unconstrained_index": unconstrained,
+        "max_peak_bytes_per_run": max_peak_bytes,
         "selection": f"highest {SEARCH_METRIC}, then highest g1_min_dev_accuracy, then lowest "
-        "dev_loss, then lowest index",
+        "dev_loss, then lowest index, among the trials whose peak_bytes fit the seed stage's "
+        "per-run memory budget (max_peak_bytes_per_run; None = no constraint)",
         # the budget keeps NaN for a failed trial (it never wins); strict JSON has no NaN
         "budget": json.loads(budget.to_json(), parse_constant=lambda _: None),
     }
@@ -1335,6 +1374,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--jobs", type=int, default=1, help="concurrent `hsn run` subprocesses")
     parser.add_argument(
+        "--memory-headroom",
+        type=float,
+        default=MEMORY_HEADROOM,
+        help="fraction of the profile's vram_bytes the --jobs concurrent seed runs may use in sum "
+        "(measured peak_bytes per run); a search trial above its share is excluded from winning",
+    )
+    parser.add_argument(
         "--poll-seconds", type=float, default=5.0, help="poll interval of the --jobs launcher"
     )
     parser.add_argument(
@@ -1542,6 +1588,13 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
         t0 = time.perf_counter()
         methods: dict[str, Any] = {}
         matched = matched_overrides(cfg)
+        hardware = load_hardware_profile(args.profile)
+        if not 0.0 < args.memory_headroom <= 1.0:
+            parser.error(f"--memory-headroom must be in (0, 1], got {args.memory_headroom}")
+        memory_budget = (
+            float(hardware.vram_bytes) * hardware.vram_cap_fraction * args.memory_headroom
+        )
+        max_peak = memory_budget / args.jobs if hardware.vram_bytes > 0 else None
         plan = [(cfg.model_name, config, [])]
         plan += [(load_config(b).model_name, b, matched) for b in baselines]
         for model, path, extra in plan:
@@ -1563,13 +1616,23 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
                 logs_dir=logs_dir,
                 ledger=ledger,
                 poll_s=args.poll_seconds,
+                max_peak_bytes=max_peak,
             )
             if methods[model]["best_index"] is None:
-                raise RuntimeError(f"no trial of {model} finished; see {ledger.path}")
+                raise RuntimeError(
+                    f"no trial of {model} finished within the memory budget; see {ledger.path}"
+                )
         search = {
             "trials": [list(t) for t in trials],
             "matched_overrides": matched,
             "methods": methods,
+            "memory": {
+                "vram_bytes": hardware.vram_bytes,
+                "vram_cap_fraction": hardware.vram_cap_fraction,
+                "headroom": args.memory_headroom,
+                "jobs": args.jobs,
+                "max_peak_bytes_per_run": max_peak,
+            },
             "seconds": time.perf_counter() - t0,
         }
         _write_json(out / "search.json", search)
@@ -1582,7 +1645,11 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
     gpu["after_search"] = gpu_processes()
     for model, record in search["methods"].items():
         logger.info(
-            "search %s: best trial %s %s", model, record["best_index"], record["best_overrides"]
+            "search %s: best trial %s %s (unconstrained best %s)",
+            model,
+            record["best_index"],
+            record["best_overrides"],
+            record.get("best_unconstrained_index"),
         )
 
     if args.stop_after == "search":
@@ -1851,12 +1918,16 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
             m: {
                 "best_index": v["best_index"],
                 "best_overrides": v["best_overrides"],
+                "best_unconstrained_index": v.get("best_unconstrained_index"),
+                "max_peak_bytes_per_run": v.get("max_peak_bytes_per_run"),
                 "trials": [
                     {
                         "index": t["index"],
                         "overrides": t["overrides"],
                         "status": t["status"],
                         "result": t.get("result"),
+                        "peak_bytes": t.get("peak_bytes"),
+                        "excluded": t.get("excluded"),
                         "error": t.get("error"),
                     }
                     for t in v["trials"]
