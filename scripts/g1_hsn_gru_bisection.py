@@ -58,9 +58,12 @@ def install_gru_update(model: Any, seed: int) -> nn.GRUCell:
                 [u[:, None, :].expand(B, N, dd), eps[:, None, :].expand(B, N, dd), h_prev, m],
                 dim=-1,
             )
-            h_new = cell.gru_update(
-                v.reshape(B * N, 4 * dd).to(h_prev.dtype), h_prev.reshape(B * N, dd)
-            ).reshape(B, N, dd)
+            # The state path runs in the state's dtype (fp32 master precision), as the PDG
+            # update does: the GRU cell is computed outside autocast on fp32 inputs.
+            with torch.autocast(device_type=h_prev.device.type, enabled=False):
+                h_new = cell.gru_update(
+                    v.reshape(B * N, 4 * dd).to(h_prev.dtype), h_prev.reshape(B * N, dd)
+                ).reshape(B, N, dd)
         return h_new, {"m": m, "v": v, "h_prev": h_prev}
 
     cell.step_dense = step_dense

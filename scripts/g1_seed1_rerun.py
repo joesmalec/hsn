@@ -2,7 +2,7 @@
 """G1 diagnosis (first brief, item 6): rerun HSN seed 1 for the first N steps of its original
 12,000-step schedule with the non-finite-gradient guard, in fp32 or bf16, logging every step.
 
-    python scripts/g1_seed1_rerun.py --mode bf16 --out evidence/G1/diagnosis/reruns2/bf16 [--steps 4000]
+    python scripts/g1_seed1_rerun.py --mode bf16 --out evidence/G1/diagnosis/reruns2/bf16
 
 The configuration is the gate's seed-0 resolved configuration with seed=1 (the recipe of record:
 lr 1e-3 cosine over train.steps=12,000, warmup 200, batch 16); the trainer is asked to fit only
