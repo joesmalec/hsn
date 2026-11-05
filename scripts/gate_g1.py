@@ -425,10 +425,10 @@ def overfit_check(
     target: float,
     run_dir: Path,
 ) -> dict[str, Any]:
-    """Train the configuration on ``n_docs`` training documents and measure the accuracy over the
-    answer positions of those same documents after every ``eval_every`` steps; stop early at
-    ``target``. The data order restarts at every evaluation chunk (the loader is rebuilt), which
-    does not matter for a fixed set of documents cycled many times."""
+    """Train the configuration on ``n_docs`` training documents for ``steps`` steps in one
+    uninterrupted ``fit`` (the normal training loop) and measure the accuracy over the answer
+    positions of those same documents every ``eval_every`` steps; the check passes when any
+    evaluation reaches ``target``."""
     if steps < 1 or eval_every < 1:
         raise ValueError("--overfit-steps and --overfit-eval-every must be >= 1")
     cfg = load_config(
@@ -449,61 +449,51 @@ def overfit_check(
     model = build_model(cfg)
     trainer = make_trainer(model, cfg, ctx, run_dir=run_dir)
     started = time.perf_counter()
+    history = trainer.fit(docs, docs, steps)  # one uninterrupted fit: the normal training loop
+    step_records: list[dict[str, Any]] = [
+        {
+            "step": record.step,
+            "loss": record.loss,
+            "accuracy": record.accuracy,
+            "grad_norm": record.grad_norm,
+            "lr": record.lr,
+            "group_norms": {
+                k: v for k, v in getattr(record, "stats", {}).items() if k.startswith("grad_norm/")
+            },
+            "stats": {
+                k: v
+                for k, v in getattr(record, "stats", {}).items()
+                if not k.startswith("grad_norm/")
+            },
+            "parts": dict(getattr(record, "parts", {})),
+        }
+        for record in history.steps
+    ]
     evals: list[dict[str, Any]] = []
-    step_records: list[dict[str, Any]] = []
-    tokens = 0.0
-    train_seconds = 0.0
     reached: int | None = None
-    horizon = 0
-    while horizon < steps:
-        horizon = min(horizon + eval_every, steps)
-        history = trainer.fit(docs, docs, horizon)
-        for record in history.steps:
-            step_records.append(
-                {
-                    "step": record.step,
-                    "loss": record.loss,
-                    "accuracy": record.accuracy,
-                    "grad_norm": record.grad_norm,
-                    "lr": record.lr,
-                    "group_norms": {
-                        k: v
-                        for k, v in getattr(record, "stats", {}).items()
-                        if k.startswith("grad_norm/")
-                    },
-                    "stats": {
-                        k: v
-                        for k, v in getattr(record, "stats", {}).items()
-                        if not k.startswith("grad_norm/")
-                    },
-                    "parts": dict(getattr(record, "parts", {})),
-                }
-            )
-        tokens += float(history.measured.get("tokens", 0.0))
-        train_seconds += float(history.measured.get("train_seconds", 0.0))
-        for entry in history.evals:
-            evals.append(
-                {
-                    "step": entry["step"],
-                    "accuracy": float(entry["accuracy"]),
-                    "loss": float(entry["loss"]),
-                    "per_group": {
-                        g: {"accuracy": float(e["accuracy"]), "loss": float(e["loss"])}
-                        for g, e in entry["per_group"].items()
-                    },
-                }
-            )
-            if reached is None and float(entry["accuracy"]) >= target:
-                reached = int(entry["step"])
+    for entry in history.evals:
+        evals.append(
+            {
+                "step": entry["step"],
+                "accuracy": float(entry["accuracy"]),
+                "loss": float(entry["loss"]),
+                "per_group": {
+                    g: {"accuracy": float(e["accuracy"]), "loss": float(e["loss"])}
+                    for g, e in entry["per_group"].items()
+                },
+            }
+        )
+        if reached is None and float(entry["accuracy"]) >= target:
+            reached = int(entry["step"])
         logger.info(
             "overfit step %d/%d: train-set accuracy %.4f loss %.4f",
-            horizon,
+            entry["step"],
             steps,
-            evals[-1]["accuracy"],
-            evals[-1]["loss"],
+            float(entry["accuracy"]),
+            float(entry["loss"]),
         )
-        if reached is not None:
-            break
+    tokens = float(history.measured.get("tokens", 0.0))
+    train_seconds = float(history.measured.get("train_seconds", 0.0))
     norms_finite = all(_is_finite_number(r["grad_norm"]) for r in step_records) and all(
         _is_finite_number(v) for r in step_records for v in r["group_norms"].values()
     )
@@ -533,8 +523,8 @@ def overfit_check(
         "train_seconds": train_seconds,
         "seconds": time.perf_counter() - started,
         "passed": passed,
-        "note": "accuracy over the answer positions of the same documents the model trains on; "
-        "the data order restarts at every evaluation chunk",
+        "note": "accuracy over the answer positions of the same documents the model trains on, "
+        "evaluated every eval_every steps of one uninterrupted fit",
     }
 
 
