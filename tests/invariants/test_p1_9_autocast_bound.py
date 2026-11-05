@@ -8,11 +8,11 @@ logs show ``state_abs_max`` 1.06 to 1.37; a pre-fix overfit checkpoint reaches 1
 combination in the state's dtype; this test pins the bound under the device profile's autocast.
 
 Random saturating weights do not expose the defect: their gates round to exactly 0 or 1 in bf16 and
-the pre-fix cell also stays at 1.0. The regime that does is a gate that opens fully at ``h = 0`` and
-nearly closes (``b`` about 1e-3) once ``|h|`` is about 1, with a candidate ``c`` about +1: in bf16
-``1 - b`` rounds to exactly 1 and every position adds ``b * c``. :func:`growth_regime` sets it up from
-the cell's parameters; measured on rtx3060 after 256 positions: pre-fix cell 1.106, fixed cell 0.998,
-fp32 reference 0.998.
+the pre-fix cell also stays at 1.0. The regime that does is a gate that opens fully at ``h = 0``
+and nearly closes (``b`` about 1e-3) once ``|h|`` is about 1, with a candidate ``c`` about +1: in
+bf16 ``1 - b`` rounds to exactly 1 and every position adds ``b * c``. :func:`growth_regime` sets it
+up from the cell's parameters; measured on rtx3060 after 256 positions: pre-fix cell 1.106, fixed
+cell 0.998, fp32 reference 0.998.
 """
 
 from __future__ import annotations
@@ -35,11 +35,13 @@ cuda_param = pytest.param("rtx3060", marks=pytest.mark.cuda)
 mps_param = pytest.param("m_series", marks=pytest.mark.mps)
 
 
-def growth_regime(model: HSN, *, bias: float = 6.0, slope: float = 13.0, unit_out: float = 5.0) -> None:
+def growth_regime(
+    model: HSN, *, bias: float = 6.0, slope: float = 13.0, unit_out: float = 5.0
+) -> None:
     """The cell's parameters set so that ``b = sigmoid(bias - slope * h)`` coordinatewise (the gate
     reads its own coordinate of ``h_prev``, the third block of ``v = [u; eps; h; m]``) and ``c =
-    tanh(unit_out)`` (constant unit outputs through an identity ``W_out``): about 0.998 at ``h = 0``,
-    about 1e-3 at ``h = 1``, so ``h`` jumps to ``c`` and then creeps towards it."""
+    tanh(unit_out)`` (constant unit outputs through an identity ``W_out``): about 0.998 at
+    ``h = 0``, about 1e-3 at ``h = 1``, so ``h`` jumps to ``c`` and then creeps towards it."""
     cell = model.cell
     d = cell.d
     with torch.no_grad():
