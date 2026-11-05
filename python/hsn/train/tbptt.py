@@ -106,7 +106,7 @@ from hsn.train.checkpoint import (
     save_checkpoint,
     unpack_cell_state,
 )
-from hsn.train.loop import History, StepRecord, StreamLoader, Trainer
+from hsn.train.loop import History, StepRecord, StreamLoader, Trainer, _skipped_counter
 from hsn.train.schedules import SelectionSchedule
 
 __all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer"]
@@ -364,10 +364,11 @@ class TBPTTTrainer(Trainer):
                 group_norms = self._group_grad_norms(groups) if stats_step else {}
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
+                skipped = self._guard_nonfinite(grad_norm, next_step)
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                else:
+                elif not skipped:
                     self.optimizer.step()
                 self.scheduler.step()
                 self.hsn.update_target()
@@ -375,7 +376,7 @@ class TBPTTTrainer(Trainer):
             mean_total = total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
             accuracy = float(correct) / n_loss if n_loss else float("nan")
-            if self.scaler is None and not math.isfinite(mean_total):
+            if self.scaler is None and not math.isfinite(mean_total) and not skipped:
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
             seconds = time.perf_counter() - started
             train_seconds += seconds
@@ -385,6 +386,7 @@ class TBPTTTrainer(Trainer):
                 "eps_mean": eps_sum / n_windows,
                 "alpha_entropy": entropy_sum / n_windows,
                 "route_cost": cost_sum / n_windows,
+                "skipped_nonfinite": float(self.skipped_nonfinite),
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **group_norms,
                 **term_norms,
@@ -443,6 +445,7 @@ class TBPTTTrainer(Trainer):
             "steps": float(self.step),
             "windows": float(self.windows),
             "resyncs": float(self.resyncs),
+            "skipped_nonfinite_steps": float(self.skipped_nonfinite),
         }
         return history
 
@@ -461,6 +464,7 @@ class TBPTTTrainer(Trainer):
             "carried_state": pack_cell_state(state),
             "q_resync": q_resync_counter(self.windows, self.windows_since_resync, self.resyncs),
             "reinforce_baseline": self.reinforce_baseline,  # P2.2 (None unless reinforce ran)
+            "skipped_nonfinite": self.skipped_nonfinite,  # the non-finite-gradient guard's count
         }
         save_checkpoint(
             path,
@@ -505,6 +509,7 @@ class TBPTTTrainer(Trainer):
         self.windows = counters["windows"]
         self.windows_since_resync = counters["since_resync"]
         self.resyncs = counters["resyncs"]
+        self.skipped_nonfinite = _skipped_counter(extra, str(path))
         if "reinforce_baseline" in extra:
             baseline = extra["reinforce_baseline"]
             if baseline is not None and (
