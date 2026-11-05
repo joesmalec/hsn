@@ -162,6 +162,7 @@ def write_junit(path: Path, *, reset: str = "passed", extra_failure: bool = Fals
     reset invariant: passed | failed | skipped)."""
     cases = {
         "test_p1_8_reset_removes_prior_state[cpu]": reset,
+        "test_p1_8_reset_removes_prior_state[mps]": "skipped",  # absent device: no evidence
         "test_p1_8_prediction_no_leakage": "passed",
         "test_p1_8_gradcheck_tiny_fp64": "passed",
         "test_p1_8_checkpoint_exact": "failed" if extra_failure else "passed",
@@ -412,13 +413,13 @@ def test_p1_9_gate_script_fails_below_threshold(gate_run: dict[str, Any], tmp_pa
     # the invariant report: a failure or a missing / failed reset invariant is not evidence
     failing = write_junit(tmp_path / "failing.xml", extra_failure=True)
     parsed = gate.parse_junit(failing)
-    assert parsed["tests"] == 5 and parsed["failures"] == 1 and parsed["skipped"] == 1
+    assert parsed["tests"] == 6 and parsed["failures"] == 1 and parsed["skipped"] == 2
     verdict_inv = gate.invariants_verdict(parsed, None)
     assert verdict_inv["passed"] is False and verdict_inv["correct_reset"] is True
     reset_failed = gate.parse_junit(write_junit(tmp_path / "reset.xml", reset="failed"))
     assert gate.invariants_verdict(reset_failed, 1)["correct_reset"] is False
     reset_skipped = gate.parse_junit(write_junit(tmp_path / "skipped.xml", reset="skipped"))
-    assert gate.invariants_verdict(reset_skipped, 0)["correct_reset"] is False
+    assert gate.invariants_verdict(reset_skipped, 0)["correct_reset"] is False  # no variant ran
     good = gate.invariants_verdict(gate.parse_junit(write_junit(tmp_path / "ok.xml")), 0)
     assert good["passed"] and good["correct_reset"]
     assert (

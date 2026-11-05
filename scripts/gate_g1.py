@@ -290,7 +290,9 @@ def parse_junit(path: Path) -> dict[str, Any]:
 
 def invariants_verdict(parsed: Mapping[str, Any], returncode: int | None) -> dict[str, Any]:
     """``passed`` (the suite ran with at least one test and no failure or error; the pytest exit
-    code must be 0 when known) and ``correct_reset`` (every reset invariant that ran passed)."""
+    code must be 0 when known) and ``correct_reset`` (at least one variant of every reset
+    invariant passed and none failed; a variant skipped for an absent device is not evidence
+    either way)."""
     cases: Mapping[str, str] = parsed["cases"]
     passed = (
         int(parsed["tests"]) >= 1
@@ -303,7 +305,19 @@ def invariants_verdict(parsed: Mapping[str, Any], returncode: int | None) -> dic
         for name, status in cases.items()
         if any(name.split("::")[-1].startswith(test) for test in RESET_INVARIANTS)
     }
-    correct_reset = bool(reset_cases) and all(s == "passed" for s in reset_cases.values())
+    correct_reset = all(
+        any(
+            status == "passed"
+            for name, status in reset_cases.items()
+            if name.split("::")[-1].startswith(test)
+        )
+        and not any(
+            status in ("failed", "error")
+            for name, status in reset_cases.items()
+            if name.split("::")[-1].startswith(test)
+        )
+        for test in RESET_INVARIANTS
+    )
     return {"passed": passed, "correct_reset": correct_reset, "reset_cases": reset_cases}
 
 
@@ -457,6 +471,12 @@ def overfit_check(
                         for k, v in getattr(record, "stats", {}).items()
                         if k.startswith("grad_norm/")
                     },
+                    "stats": {
+                        k: v
+                        for k, v in getattr(record, "stats", {}).items()
+                        if not k.startswith("grad_norm/")
+                    },
+                    "parts": dict(getattr(record, "parts", {})),
                 }
             )
         tokens += float(history.measured.get("tokens", 0.0))
@@ -1420,6 +1440,12 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
 
     # 3. invariant suite ---------------------------------------------------------------------------
     invariants = _cached(out, "invariants.json")
+    if invariants is not None and Path(str(invariants.get("junit", ""))).is_file():
+        # the junit report is the evidence; the verdict is derived from it again on every resume
+        invariants.update(
+            invariants_verdict(parse_junit(Path(invariants["junit"])), invariants.get("returncode"))
+        )
+        _write_json(out / "invariants.json", invariants)
     if invariants is None:
         invariants = run_invariant_suite(
             out,
