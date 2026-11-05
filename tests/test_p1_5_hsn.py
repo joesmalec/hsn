@@ -87,8 +87,9 @@ def _random_state(model: HSN, B: int, seed: int, ticks: int = 2) -> CellGraphSta
 # --------------------------------------------------------------------------------------------------
 # The pure-Python reference: one input step written out with loops and the math module. It reads
 # the weights as nested lists and never calls torch, so it checks the wiring (operand order,
-# layouts, the softmax over units, tanh on the mixed output, the updated q in the decoder) against
-# plan §2.2 / §2.3 / §2.4 rather than against torch itself.
+# layouts, the softmax over units, the P1.5a RMSNorm on the cell input, tanh on the mixed output,
+# the updated q in the decoder) against plan §2.2 / §2.3 / §2.4 and amendment A1 rather than
+# against torch itself.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -116,6 +117,7 @@ def _dims(cfg: RunConfig, model: HSN) -> dict[str, Any]:
         "scorer": m.scorer,
         "exclude": set(m.scorer_features.exclude),
         "edge_norm": m.edge_norm,
+        "cell_norm": m.cell_norm,  # P1.5a: RMSNorm on the cell input, or none
         "disabled": set(m.disabled_cells),
         "indptr": graph.indptr.tolist(),
         "indices": graph.indices.tolist(),
@@ -136,6 +138,12 @@ def _gelu(x: float) -> float:
 
 def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
+
+
+def _rmsnorm(x: list[float], weight: list[float], eps: float = 1e-6) -> list[float]:
+    """``nn.RMSNorm`` (P1.5a, amendment A1): ``x / sqrt(mean(x²) + eps) * weight``."""
+    scale = 1.0 / math.sqrt(sum(v * v for v in x) / len(x) + eps)
+    return [v * scale * w for v, w in zip(x, weight, strict=True)]
 
 
 def _softmax(xs: list[float]) -> list[float]:
@@ -244,7 +252,9 @@ def _ref_step(
 
     v, c_out, b_out, h_new, unit_out = [], [], [], [], []
     for i in range(N):
-        v_i = u + eps + h[i] + m[i]
+        v_raw = u + eps + h[i] + m[i]
+        # P1.5a: the units and the gate read the normalised input; the gated update reads h[i]
+        v_i = _rmsnorm(v_raw, p["cell.norm.weight"]) if dims["cell_norm"] == "rms" else v_raw
         outs = [_unit(p, j, v_i) for j in range(M)]
         mixed = [sum(alpha[i][j] * outs[j][c] for j in range(M)) for c in range(d)]
         c_i = [math.tanh(val) for val in _linear(p["cell.W_out.weight"], None, mixed)]
@@ -338,7 +348,8 @@ def _check_position(
 # --------------------------------------------------------------------------------------------------
 
 
-def test_p1_5_param_count_is_1_820_361_and_per_component() -> None:
+def test_p1_5_param_count_is_1_820_617_and_per_component() -> None:
+    """Appendix C.1's 1,820,361 plus the 256 of amendment A1's ``cell_norm`` row (P1.5a)."""
     cfg, model = _model(REF_A1)
     expected = expected_param_count(cfg.model)
     report = model.param_report()
@@ -346,19 +357,20 @@ def test_p1_5_param_count_is_1_820_361_and_per_component() -> None:
     assert list(expected) == [*PARAM_REPORT_ROWS, "total"]  # the P1.1 table order
     for component, count in expected.items():
         assert report[component] == count, component
-    assert report["total"] == 1_820_361
+    assert report["total"] == 1_820_617
     # Appendix C.1 to the digit, measured from the modules
     assert report["scorer"] == 1_608 == model.scorer.param_count()
     assert model.scorer.in_features == 3 * cfg.model.d + SCORER_SCALAR_FEATURES == 200
     assert report["halting"] == 129 == model.halting.param_count()
     assert report["gate"] == 16_448 and report["w_out"] == report["v_msg"] == 4_096
+    assert report["cell_norm"] == 256 == model.cell.norm.weight.numel()  # A1: the 4d gain
     assert report["units"] == 1_315_328 == model.cell.units.param_count()
     assert report["decoder"] == 197_376 and report["shared"] == 131_648
     # the P1.4 edge logits are trainable but outside Appendix C; the run manifest records them
     assert report["edges"] == cfg.model.n_cells * cfg.model.in_degree == 128
     assert report["edges"] == model.cell.graph.edge_logit.numel()
     measured = sum(p.numel() for p in model.parameters())
-    assert report["total_trainable"] == measured == 1_820_361 + 128 == 1_820_489
+    assert report["total_trainable"] == measured == 1_820_617 + 128 == 1_820_745
     assert all(p.requires_grad for p in model.parameters())
     # every parameter belongs to exactly one row (or is the edge logit)
     owners = {
@@ -371,6 +383,7 @@ def test_p1_5_param_count_is_1_820_361_and_per_component() -> None:
         "w_out": "cell.W_out.",
         "v_msg": "cell.V.",
         "gate": "cell.gate.",
+        "cell_norm": "cell.norm.",
         "scorer": "router.scorer.",
         "halting": "halting.",
         "decoder": "decoder.",
@@ -379,25 +392,31 @@ def test_p1_5_param_count_is_1_820_361_and_per_component() -> None:
         rows = [row for row, prefix in owners.items() if name.startswith(prefix)]
         assert len(rows) == 1 or name == "cell.graph.edge_logit", name
 
-    # the tiny configuration (1,083) and two overrides, row by row
+    # the tiny configuration (1,083 + 16 for the A1 gain) and three overrides, row by row
     cfg_t, tiny = _model(TINY)
     report_t = tiny.param_report()
     expected_t = expected_param_count(cfg_t.model)
     assert all(report_t[k] == v for k, v in expected_t.items())
-    assert report_t["total"] == 1_083 and report_t["edges"] == 3 * 2
-    assert report_t["total_trainable"] == sum(p.numel() for p in tiny.parameters()) == 1_089
+    assert report_t["total"] == 1_099 and report_t["edges"] == 3 * 2
+    assert report_t["total_trainable"] == sum(p.numel() for p in tiny.parameters()) == 1_105
 
     cfg_m, mlp = _model(REF_A1, ["model.scorer=mlp"])
     report_m = mlp.param_report()
     expected_m = expected_param_count(cfg_m.model)
     assert all(report_m[k] == v for k, v in expected_m.items())
-    assert report_m["scorer"] == 26_760 and report_m["total"] == 1_820_361 - 1_608 + 26_760
+    assert report_m["scorer"] == 26_760 and report_m["total"] == 1_820_617 - 1_608 + 26_760
 
     cfg_r, random_edges = _model(REF_A1, ["model.random_edges=2"])
     report_r = random_edges.param_report()
-    assert report_r["total"] == 1_820_361 == expected_param_count(cfg_r.model)["total"]
+    assert report_r["total"] == 1_820_617 == expected_param_count(cfg_r.model)["total"]
     assert report_r["edges"] == 32 * 6 == 192
-    assert report_r["total_trainable"] == 1_820_361 + 192
+    assert report_r["total_trainable"] == 1_820_617 + 192
+
+    # model.cell_norm=none drops the row and reproduces the pre-amendment total of 1,820,361
+    cfg_n, no_norm = _model(REF_A1, ["model.cell_norm=none"])
+    report_n = no_norm.param_report()
+    assert report_n["cell_norm"] == 0 == expected_param_count(cfg_n.model)["cell_norm"]
+    assert report_n["total"] == 1_820_361 and isinstance(no_norm.cell.norm, torch.nn.Identity)
 
 
 def test_p1_5_state_bounded_after_1000_steps() -> None:
@@ -1003,7 +1022,7 @@ def test_p1_5_runs_on_device(device_type: str) -> None:
     assert torch.equal(state_out.pos.cpu(), state_cpu.pos)
     for key in ("z", "z_hat", "eps", "u", *AUX_KEYS):
         torch.testing.assert_close(info_dev[key].cpu(), info_cpu[key], atol=5e-2, rtol=5e-2)
-    assert on_device.param_report()["total"] == 1_820_361
+    assert on_device.param_report()["total"] == 1_820_617
     # backward on the device reaches the edge logits and the gate
     logits_dev.square().mean().backward()  # type: ignore[no-untyped-call]
     assert on_device.cell.graph.edge_logit.grad is not None

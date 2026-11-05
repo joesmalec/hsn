@@ -113,8 +113,16 @@ class PDGCell(nn.Module):
         self.W_out = nn.Linear(d, d, bias=False)
         self.gate = nn.Linear(4 * d, d)
         for linear in (self.V, self.W_out, self.gate):
-            init_weight_(linear.weight, cfg.init)
-        nn.init.zeros_(self.gate.bias)
+            init_weight_(linear.weight, cfg.state_init)
+        # P1.5a (amendment A1): the gate starts near retention, sigmoid(-3) = 0.047 by default,
+        # instead of 0.5; a bias of 0 reproduces the P1.5 cell.
+        nn.init.constant_(self.gate.bias, cfg.gate_bias_init)
+        # P1.5a: RMSNorm over the 4d cell input before the unit MLPs and the gate (a learned gain
+        # of width 4d, the Appendix C.1 row ``cell_norm``); Identity when model.cell_norm = none.
+        self.cell_norm = cfg.cell_norm
+        self.norm: nn.Module = (
+            nn.RMSNorm(4 * d, eps=1e-6) if cfg.cell_norm == "rms" else nn.Identity()
+        )
         self.units = UnitBank.from_config(cfg)
         self.graph = CellGraph(
             cfg.n_cells,
@@ -149,9 +157,10 @@ class PDGCell(nn.Module):
         with self.graph.step():
             h_prev = state.h
             m = self.graph.messages_dense(h_prev, self.V)  # [B, N, d]
-            v = torch.cat(
+            v_raw = torch.cat(
                 [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_prev, m], dim=-1
             )  # [B, N, 4d]
+            v = self.norm(v_raw)  # P1.5a: what the units and the gate read
             unit_out = self.units.forward_all(v)  # [B, N, M, d]
             mixed = (alpha.unsqueeze(-1) * unit_out).sum(dim=2)  # Σ_j α_ij F_j(v_i)
             # P1.9: tanh, the gate and the convex combination run in the state's dtype. Under
@@ -165,7 +174,8 @@ class PDGCell(nn.Module):
                 h_new = torch.where(self.disabled[None, :, None], h_prev, h_new)
         info = {
             "m": m,
-            "v": v,
+            "v": v,  # the normalised cell input (P1.5a); ``v_raw`` is the concatenation
+            "v_raw": v_raw,
             "unit_out": unit_out,
             "mixed": mixed,
             "c": c,
@@ -221,7 +231,8 @@ class PDGCell(nn.Module):
             with profiler_segment(profiler, "messages", B):
                 h_prev = state.h
                 m = native.csr_messages(h_prev, self.graph, self.V, cells)  # [B, K, d]
-                v = native.gather_concat(u, eps, h_prev, m, cells)  # [B, K, 4d]
+                v_raw = native.gather_concat(u, eps, h_prev, m, cells)  # [B, K, 4d]
+                v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
                 unit_out = native.grouped_unit_mlp(
@@ -235,7 +246,7 @@ class PDGCell(nn.Module):
                 mixed = sel.alpha.unsqueeze(-1) * unit_out  # α_i F_j(v_i)
                 c = torch.tanh(self.W_out(mixed).to(state.dtype))  # P1.9: see step_dense
                 new_state = native.gated_delta_update(state, cells, c, b, valid)
-        h_old = v[..., 2 * d : 3 * d]  # the gathered h[cell] slice of v
+        h_old = v_raw[..., 2 * d : 3 * d]  # the gathered h[cell] slice of the raw v
         h_new = torch.where(valid.unsqueeze(-1), (1 - b) * h_old + b * c, h_old).to(state.dtype)
         info: dict[str, Tensor | CellGraphState] = {
             "m": m,

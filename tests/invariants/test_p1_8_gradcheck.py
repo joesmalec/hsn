@@ -50,8 +50,9 @@ def test_p1_8_gradcheck_tiny_fp64(
     assert any(name.startswith("halting.") for name in names)
     report = model.param_report()
     n_inputs = h0.numel() + sum(p.numel() for p in params)
-    assert report["total"] == 1_083 and report["edges"] == model.cell.graph.n_edges == 6
-    assert n_inputs == report["total_trainable"] + B * model.cfg.n_cells * model.cfg.d == 1_113
+    # 1,083 + the 16 of amendment A1's cell_norm gain (4d = 16 for the tiny configuration)
+    assert report["total"] == 1_099 and report["edges"] == model.cell.graph.n_edges == 6
+    assert n_inputs == report["total_trainable"] + B * model.cfg.n_cells * model.cfg.d == 1_129
 
     def window(h: Tensor, *values: Tensor) -> tuple[Tensor, ...]:
         """Every differentiable output of one window from the state ``h`` under the parameters

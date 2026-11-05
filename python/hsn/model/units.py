@@ -108,7 +108,7 @@ class UnitBank(nn.Module):
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> Self:
-        return cls(cfg.n_units, cfg.d, cfg.hidden, cfg.activation, init=cfg.init)
+        return cls(cfg.n_units, cfg.d, cfg.hidden, cfg.activation, init=cfg.state_init)
 
     # ----------------------------------------------------------------------------------------------
     # Execution

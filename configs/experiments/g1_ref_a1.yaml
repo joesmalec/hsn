@@ -32,7 +32,10 @@ model: # Appendix A.1
   n_context: 16 # context symbols
   context_dim: 64 # context embedding width (= d)
   activation: gelu # MLP activation (paper unspecified)
-  init: trunc_normal_0.02 # weight init (paper unspecified)
+  init: trunc_normal_0.02 # weight init of embeddings, scorer, halting, decoder (paper unspecified)
+  state_init: fan_in # P1.5a (amendment A1): E, P, S, units, V, W_out, gate weight; fan_in | trunc_normal_<std>
+  cell_norm: rms # P1.5a: RMSNorm over the 4d cell input before the units and the gate; rms | none
+  gate_bias_init: -3.0 # P1.5a: gate bias at init, sigmoid(-3) = 0.047 (cells retain by default)
   scorer: linear # linear | mlp; Appendix C counts the linear scorer (200 -> 8)
   scorer_hidden: 128 # hidden width when scorer = mlp (the C.2 "two-layer scorer" row)
   scorer_features:

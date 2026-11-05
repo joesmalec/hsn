@@ -40,10 +40,13 @@ secondary factor that limits long-range retention once the path is alive.
 
 1. **Fan-in-scaled initialisation of the token-to-state path.** New config field `model.state_init`
    (default `fan_in`; `trunc_normal_<std>` still accepted, so the old behaviour is reproducible). It
-   applies to the encoder `E`, the predictor `P`, the shared transform `S`, the unit MLPs (`W1`, `W2`),
-   the message projection `V`, the output projection `W_out` and the gate's weight: truncated normal
-   (±2σ) with σ = 1/sqrt(fan_in) of the layer, biases zero. `model.init` (default `trunc_normal_0.02`)
-   keeps governing the byte and context embeddings, the scorer, the halting head and the decoder `D`.
+   applies to the byte and context embeddings (fan-in = their width d, so σ = 1/sqrt(d) = 0.125 for
+   `ref_a1`: the path's input is scaled like its layers, which is what lets the invariant below
+   compare every stage against the embedding), the encoder `E`, the predictor `P`, the shared
+   transform `S`, the unit MLPs (`W1`, `W2`), the message projection `V`, the output projection
+   `W_out` and the gate's weight: truncated normal (±2σ) with σ = 1/sqrt(fan_in) of the layer, biases
+   zero. `model.init` (default `trunc_normal_0.02`) keeps governing the scorer, the halting head and
+   the decoder `D`, the modules that read the state rather than write it.
 2. **RMSNorm on the cell input.** `v_i = [u; eps; h_i; m_i]` is normalised over its 4d width (a
    learned gain, eps 1e-6) before the unit MLPs and the gate, on the dense, masked and sparse paths
    alike, so that the scale of what the cell reads no longer depends on the initialisation or on

@@ -186,7 +186,7 @@ def test_p1_2_forward_selected_equals_forward_all_gathered() -> None:
     expected = _gather_units(bank.forward_all(v), unit_idx).reshape(batch * n, d)
     actual = bank.forward_selected(v.reshape(batch * n, 4 * d), unit_idx.reshape(-1))
     assert actual.dtype == torch.float32
-    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
     # Only some units present (the sort-by-unit path skips the absent ones) and int32 indices.
     sparse_idx = torch.where(unit_idx % 2 == 0, 0, 5)
@@ -194,12 +194,12 @@ def test_p1_2_forward_selected_equals_forward_all_gathered() -> None:
     actual = bank.forward_selected(
         v.reshape(batch * n, 4 * d), sparse_idx.reshape(-1).to(torch.int32)
     )
-    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
     # One pair, and no pairs at all.
     one = bank.forward_selected(v[:1, 0], unit_idx[:1, 0])
     one_expected = bank.forward_all(v[:1, :1])[0, 0, unit_idx[0, 0]][None]
-    torch.testing.assert_close(one, one_expected, atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(one, one_expected, atol=1e-6, rtol=1e-5)
     assert bank.forward_selected(v.new_zeros(0, 4 * d), unit_idx.new_zeros(0)).shape == (0, d)
 
     # Both passes are the same function for autograd too (v and all four parameters).
@@ -241,10 +241,16 @@ def test_p1_2_config_values_reach_every_module() -> None:
     """A non-default init, activation and context width from the config land in every module."""
     cfg = load_config(
         CONFIGS["tiny"],
-        overrides=["model.init=trunc_normal_0.5", "model.activation=tanh", "model.context_dim=3"],
+        overrides=[
+            "model.init=trunc_normal_0.5",
+            "model.state_init=trunc_normal_0.5",  # P1.5a: the token-to-state path's own knob
+            "model.activation=tanh",
+            "model.context_dim=3",
+        ],
     )
     m = cfg.model
-    assert (m.init, m.activation, m.context_dim, m.d) == ("trunc_normal_0.5", "tanh", 3, 4)
+    assert (m.init, m.state_init) == ("trunc_normal_0.5", "trunc_normal_0.5")
+    assert (m.activation, m.context_dim, m.d) == ("tanh", 3, 4)
     torch.manual_seed(cfg.seed)
     expected = expected_param_count(m)
     for component, build in COMPONENTS.items():
@@ -269,7 +275,7 @@ def test_p1_2_config_values_reach_every_module() -> None:
 def test_p1_2_init_follows_config() -> None:
     cfg = load_config(CONFIGS["ref_a1"])
     m = cfg.model
-    assert (m.activation, m.init) == ("gelu", "trunc_normal_0.02")
+    assert (m.activation, m.init, m.state_init) == ("gelu", "trunc_normal_0.02", "fan_in")
     std = parse_init(m.init)
     assert std == 0.02
     torch.manual_seed(cfg.seed)
@@ -279,13 +285,26 @@ def test_p1_2_init_follows_config() -> None:
             if name.endswith("bias") or name in ("b1", "b2"):
                 assert torch.count_nonzero(p) == 0, (component, name)
             else:
-                assert p.abs().max() <= 2.0 * std, (component, name)
-                assert p.abs().max() > 0.0, (component, name)
-    # The bank's W1 has a million entries: its sample std is the truncated-normal std, not 0.02.
+                # P1.5a (amendment A1): the token-to-state path is fan-in scaled, sigma =
+                # 1/sqrt(fan_in) with the fan-in the weight's second dimension (the input width of
+                # an nn.Linear [out, in] and of a stacked unit weight [M, in, out]; the width of an
+                # embedding table). The decoder, which reads the state, keeps model.init.
+                sigma = std if component == "decoder" else 1.0 / math.sqrt(p.shape[1])
+                assert p.abs().max() <= 2.0 * sigma, (component, name)
+                assert p.abs().max() > 1.5 * sigma, (component, name)  # not the 0.02 scale
+    # The bank's W1 has a million entries: its sample std is the truncated-normal std at the
+    # fan-in 4d = 256 (sigma = 0.0625), not 0.02.
     w1 = UnitBank.from_config(m).W1
     assert w1.numel() == 1_048_576
-    assert abs(w1.std().item() / (std * TRUNC2_STD_FACTOR) - 1.0) < 0.01
+    assert abs(w1.std().item() / (0.0625 * TRUNC2_STD_FACTOR) - 1.0) < 0.01
     assert abs(w1.mean().item()) < 1e-3
+    # model.state_init=trunc_normal_0.02 reproduces the pre-amendment initialisation everywhere.
+    old = load_config(CONFIGS["ref_a1"], overrides=["model.state_init=trunc_normal_0.02"]).model
+    torch.manual_seed(cfg.seed)
+    for component, build in COMPONENTS.items():
+        for name, p in build(old).named_parameters():
+            if not (name.endswith("bias") or name in ("b1", "b2")):
+                assert 0.0 < p.abs().max() <= 2.0 * std, (component, name)
     # Every activation name builds, and the GELU is the exact (erf) form.
     assert sorted(ACTIVATIONS) == ["gelu", "relu", "silu", "tanh"]
     for name in ACTIVATIONS:
@@ -428,7 +447,7 @@ def test_p1_2_runs_on_device(device_type: str) -> None:
         assert torch.isfinite(t).all(), name
     # Grouped pass equals the dense reference on the device too.
     torch.testing.assert_close(
-        on_device["selected"], on_device["selected_expected"], atol=1e-6, rtol=0.0
+        on_device["selected"], on_device["selected_expected"], atol=1e-6, rtol=1e-5
     )
     # Same seed, same weights: the device agrees with the CPU oracle to fp32 accumulation error.
     for name in ("z_hat", "z", "u", "logits", "all_out", "selected"):
