@@ -650,6 +650,29 @@ class RunConfig(_StrictModel):
                 "train.epsilon_start and train.epsilon_end to 0"
             )
         # --- end P2.2 ---
+        # --- P2.4: an auxiliary term that could not act is refused ---
+        aux = train.aux_enabled
+        needs_selection = [name for name in ("cost", "balance") if name in aux]
+        if routing == "dense" and needs_selection:
+            raise ValueError(
+                f"train.aux_enabled={aux}: {needs_selection} penalise a selection (cost: the "
+                "executed cost, balance: the routed assignments) but model.routing=dense makes "
+                "none; choose a sparse routing or drop the term"
+            )
+        if "graph" in aux:
+            model = self.model
+            if model.edge_norm != "sigmoid":
+                raise ValueError(
+                    f"train.aux_enabled names 'graph' but model.edge_norm={model.edge_norm!r}: "
+                    "under softmax Σ|a_ij| is the constant number of non-empty rows and carries "
+                    "no gradient; set model.edge_norm=sigmoid"
+                )
+            if model.in_degree + model.random_edges == 0:
+                raise ValueError(
+                    "train.aux_enabled names 'graph' but model.in_degree + model.random_edges = 0 "
+                    "gives an edgeless graph with nothing to shrink; drop the term"
+                )
+        # --- end P2.4 ---
         return self
 
 

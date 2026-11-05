@@ -194,10 +194,11 @@ def test_p0_2_validators_reject() -> None:
     with pytest.raises(ValueError, match="one at a time"):
         build(train={"aux_enabled": ["cost", "balance"], "allow_multiple_aux": "   "})
     justified = build(
+        model={"routing": "topk"},  # P2.4: cost / balance need a selection to penalise
         train={
             "aux_enabled": ["cost", "balance"],
             "allow_multiple_aux": "ablation 3: cost + balance",
-        }
+        },
     )
     assert justified.train.aux_enabled == ["cost", "balance"]
     with pytest.raises(ValueError, match="twice"):
