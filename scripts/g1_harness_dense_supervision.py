@@ -52,6 +52,7 @@ def main() -> None:
     ap.add_argument("--tasks", default="delayed")
     ap.add_argument("--arms", default="sparse,dense")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -80,6 +81,7 @@ def main() -> None:
                 f"run_id=dense_{arm}",
                 f"data.tasks=[{','.join(tasks)}]",
                 "data.variants=[in_range]",
+                *args.override,
             ],
         )
         ctx = resolve(cfg.hardware)
