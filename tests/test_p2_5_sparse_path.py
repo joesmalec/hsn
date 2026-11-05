@@ -684,6 +684,7 @@ def test_p2_5_mode_from_config() -> None:
         "valid",
         "cost_per_row",
         "expected_cost",  # P2.2's routed statistics
+        "unit_logits",  # P2.4: the balance term's input
         "route_log_prob",
         "explored",
         "refreshed",
