@@ -681,3 +681,30 @@ def test_p1_9_pick_best_excludes_memory_infeasible() -> None:
     failed = [{"index": 0, "status": "failed", "error": "boom"}]
     assert gate.pick_best(failed) is None
     assert gate.pick_best([trial(0, 0.5, 9e9)], max_peak_bytes=1e9) is None
+
+
+def test_p1_9_run_units_no_retry_failed(tmp_path: Path) -> None:
+    """With ``retry_failed=False`` a unit the ledger records as a failed run is reported failed
+    without running (a resume after a deterministic divergence); by default it runs again."""
+    gate = load_script("gate_g1")
+    ledger = gate.Ledger(tmp_path / "ledger.jsonl")
+    unit = gate.Unit("hsn:s1", "hsn", None, 1, [], tmp_path / "runs", "g1", "cpu")
+    ledger.add(
+        {
+            "kind": "failed_run",
+            "model": "hsn",
+            "label": unit.label,
+            "run_id": unit.run_dir.name,
+            "overrides": [],
+            "status": "failed",
+            "error": "RuntimeError: the objective is nan at step 3143",
+        }
+    )
+    kwargs = dict(jobs=1, profile_steps=1, power="none", logs_dir=tmp_path / "logs", ledger=ledger)
+    (skipped,) = gate.run_units([unit], retry_failed=False, **kwargs)
+    assert skipped.status == "failed" and skipped.run_dir is None
+    assert "not retried" in skipped.error and "nan at step 3143" in skipped.error
+    assert ledger.entries[-1]["kind"] == "skipped_failed_run"
+    (retried,) = gate.run_units([unit], **kwargs)  # the default runs it: config None -> ValueError
+    assert retried.status == "failed" and "no configuration" in retried.error
+    assert ledger.entries[-1]["kind"] == "failed_run"

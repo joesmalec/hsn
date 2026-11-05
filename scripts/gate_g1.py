@@ -674,10 +674,14 @@ def run_units(
     logs_dir: Path,
     ledger: Ledger,
     poll_s: float = 5.0,
+    retry_failed: bool = True,
 ) -> list[UnitResult]:
     """Run every unit (reusing a finished run directory), ``jobs`` at a time as subprocesses when
     ``jobs > 1``, in this process otherwise; a unit with ``depends_on`` starts only after that
-    unit finished. A unit that fails is recorded in the ledger and does not stop the others."""
+    unit finished. A unit that fails is recorded in the ledger and does not stop the others.
+    With ``retry_failed`` false a unit the ledger already records as a failed run (an earlier
+    invocation) is not run again but reported failed, for a resume after a deterministic
+    divergence (``--no-retry-failed``)."""
     if jobs < 1:
         raise ValueError(f"--jobs must be >= 1, got {jobs}")
     results: dict[str, UnitResult] = {}
@@ -691,6 +695,33 @@ def run_units(
         if (unit.run_dir / unit.done_marker).is_file():
             logger.info("reusing %s (%s)", unit.label, unit.run_dir)
             results[unit.label] = UnitResult(unit, "reused", unit.run_dir)
+            continue
+        prior = next(
+            (
+                e
+                for e in ledger.entries
+                if e.get("kind") == "failed_run" and e.get("run_id") == unit.run_dir.name
+            ),
+            None,
+        )
+        if prior is not None and not retry_failed:
+            text = (
+                f"not retried: recorded as failed at {prior.get('recorded_at')} "
+                f"(--no-retry-failed): {str(prior.get('error', ''))[-300:]}"
+            )
+            logger.warning("%s %s", unit.label, text.splitlines()[0])
+            ledger.add(
+                {
+                    "kind": "skipped_failed_run",
+                    "model": unit.model,
+                    "label": unit.label,
+                    "run_id": unit.run_dir.name,
+                    "overrides": unit.overrides,
+                    "status": "not retried (recorded failure of an earlier invocation)",
+                    "error": text,
+                }
+            )
+            results[unit.label] = UnitResult(unit, "failed", None, text, 0.0)
             continue
         tail = _quarantine_crash(unit.run_dir, unit.done_marker)
         if tail is not None:
@@ -1382,6 +1413,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--jobs", type=int, default=1, help="concurrent `hsn run` subprocesses")
     parser.add_argument(
+        "--retry-failed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="on a resume, run again a seed or trial the ledger records as failed (default); "
+        "--no-retry-failed reports it failed without running it (a deterministic divergence)",
+    )
+    parser.add_argument(
+        "--rerun-fallback",
+        choices=("hsn", "any", "none"),
+        default="hsn",
+        help="when the planned rerun of the first HSN seed cannot run because that seed failed: "
+        "rerun the first finished HSN seed (hsn), the first finished run of any method (any), "
+        "or none (the package then cannot be built)",
+    )
+    parser.add_argument(
         "--memory-headroom",
         type=float,
         default=MEMORY_HEADROOM,
@@ -1703,9 +1749,8 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
         logs_dir=logs_dir,
         ledger=ledger,
         poll_s=args.poll_seconds,
+        retry_failed=args.retry_failed,
     )
-    timings["seeds_and_rerun"] = time.perf_counter() - t0
-    gpu["after_seeds"] = gpu_processes()
     seed_runs = [r for r in outcomes if r.unit.kind == "run"]
     rerun_result = next(r for r in outcomes if r.unit.kind == "rerun")
     by_model: dict[str, list[UnitResult]] = {}
@@ -1714,6 +1759,47 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
     hsn_dirs = [r.run_dir for r in by_model.get(cfg.model_name, []) if r.run_dir is not None]
     if not hsn_dirs:
         raise RuntimeError(f"no HSN seed run finished; see {ledger.path}")
+    rerun_note = None
+    if rerun_result.run_dir is None and args.rerun_fallback != "none":
+        # the planned rerun had no finished source (the first HSN seed failed): the package needs
+        # an independent rerun, so the first finished run takes its place and the swap is recorded
+        candidates = [
+            r
+            for r in seed_runs
+            if r.run_dir is not None
+            and (args.rerun_fallback == "any" or r.unit.model == cfg.model_name)
+        ]
+        if candidates:
+            source = candidates[0]
+            fallback = Unit(
+                f"{source.unit.model}:rerun-s{source.unit.seed}-fallback",
+                source.unit.model,
+                None,
+                source.unit.seed,
+                [],
+                runs_dir,
+                "",
+                args.profile,
+                kind="rerun",
+                source=source.run_dir,
+                tolerance=tolerance,
+            )
+            rerun_note = (
+                f"the planned rerun of {first_hsn.label} could not run ({rerun_result.error}); "
+                f"{source.unit.label} was rerun instead (--rerun-fallback {args.rerun_fallback})"
+            )
+            logger.warning(rerun_note)
+            (rerun_result,) = run_units(
+                [fallback],
+                jobs=1,
+                profile_steps=args.profile_steps,
+                power=args.power,
+                logs_dir=logs_dir,
+                ledger=ledger,
+                poll_s=args.poll_seconds,
+            )
+    timings["seeds_and_rerun"] = time.perf_counter() - t0
+    gpu["after_seeds"] = gpu_processes()
     if rerun_result.run_dir is None:
         raise RuntimeError(f"the rerun of {first_hsn.label} failed; see {ledger.path}")
     rerun_dir = rerun_result.run_dir
@@ -1884,17 +1970,20 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
         ],
         "gradient_reports": grad_reports,
         "rerun": {
-            k: verdict_rerun[k]
-            for k in (
-                "original_run_id",
-                "rerun_run_id",
-                "tolerance",
-                "gated_abs_diff",
-                "max_abs_diff",
-                "max_abs_diff_loss",
-                "model_hash_equal",
-                "passed",
-            )
+            **{
+                k: verdict_rerun[k]
+                for k in (
+                    "original_run_id",
+                    "rerun_run_id",
+                    "tolerance",
+                    "gated_abs_diff",
+                    "max_abs_diff",
+                    "max_abs_diff_loss",
+                    "model_hash_equal",
+                    "passed",
+                )
+            },
+            "note": rerun_note,
         },
         "overfit": {
             k: overfit[k]
