@@ -69,9 +69,9 @@ train: # the recipe of record; batch is free throughput for the launch-bound den
   warmup_steps: 200
   schedule: cosine # constant | cosine | linear
   grad_clip: 1.0
-  steps: 12000
+  steps: 4000 # P1.9 restart (5 Nov 2026): 12,000 did not fit the overnight budget (two waves of three seeds at ~1.26 s/step); 4,000 = 1.6 epochs of the 40,000 training documents at batch 16
   eval_every: 1000 # a full dev pass of the two tasks (2,000 documents) costs ~1 min at batch 16 on rtx3060
-  ckpt_every: 4000
+  ckpt_every: 4000 # one checkpoint, at the end (the gate evaluates it on test once)
   stats_every: 10 # grad_norm/<group> on every tenth step (the gate checks every logged norm is finite)
   q_resync_every: 64
   lambda_p: 1.0 # L_pred with the fixed-embedding target (P1.6); the only auxiliary term of Phase 1
