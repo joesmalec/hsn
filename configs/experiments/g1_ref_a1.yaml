@@ -1,0 +1,89 @@
+# g1_ref_a1: the G1 gate experiment (P1.9) — ref_a1 on the frozen G1 task set.
+#
+# The model block is a verbatim copy of configs/ref_a1.yaml (tests/test_p1_9_gate_script.py asserts the
+# two blocks are equal, so the dimensions still have one source); `model.routing` stays dense until G1
+# passes (chunk "Do not"). The data block names exactly the frozen G1 tasks of configs/metrics_freeze.json
+# (kv/in_range, delayed/in_range); scripts/gate_g1.py refuses any other task set. The train block is the
+# recipe the five seeds run: `train.search_trials` is the search budget shared by every method of the
+# baseline ladder, and the gate script's search (`--trial`, seed 0, a shorter horizon) picks among
+# recipes derived from this one; the winner is written back here so that the committed file is the
+# configuration of record. Measured numbers are never stored here (plan §0.5).
+#
+#   python scripts/gate_g1.py --profile rtx3060 --seeds 0,1,2,3,4 --out evidence/G1/
+
+run_id: g1_ref_a1
+seed: 0
+notes: "G1 gate run of the Appendix C reference configuration (1,820,361 parameters) on kv/delayed in_range."
+profile: cpu # hardware profile: configs/hardware/<profile>.yaml; override with `profile=<name>`
+model_name: hsn
+
+model: # Appendix A.1
+  vocab_size: 256 # byte vocabulary V
+  d: 64 # width
+  n_cells: 32 # N
+  n_units: 8 # M
+  k_select: 4 # K cells per round
+  k_min: 1 # minimum selected cells
+  r_max: 1 # internal rounds cap R
+  in_degree: 4 # D_g
+  random_edges: 0 # extra random candidate edges
+  edge_norm: softmax # softmax | sigmoid
+  hidden: 512 # H for every two-layer MLP
+  n_context: 16 # context symbols
+  context_dim: 64 # context embedding width (= d)
+  activation: gelu # MLP activation (paper unspecified)
+  init: trunc_normal_0.02 # weight init (paper unspecified)
+  scorer: linear # linear | mlp; Appendix C counts the linear scorer (200 -> 8)
+  scorer_hidden: 128 # hidden width when scorer = mlp (the C.2 "two-layer scorer" row)
+  scorer_features:
+    exclude: [] # feature names to zero (ablation; e.g. [eps])
+  routing: dense # dense | topk | greedy_budget | random | fixed
+  fixed_route: [] # cells for routing = fixed
+  budget: 1.0 # B_t as a fraction of the dense step cost
+  lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
+  deadline_ms: null # wall-clock deadline (serving)
+  cost_profile: null # P2.1: cost profile (P0.6 report + cost_profile block) for the router's cost table; null = uniform placeholder
+  static_k: true # pad selection to fixed K (needed for graphs / compile)
+  age_max: 64 # refresh-probe threshold
+  halt_threshold: 0.5 # inference halting threshold
+  predictor_target: fixed_embedding # fixed_embedding | ema_encoder (P1.6)
+  disabled_cells: [] # test hook
+  ablate_shared_u: false # ablation: remove u from v (not covered by the P1.1 closed forms)
+  state_schema_version: 1 # bumped on any state layout change
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv, delayed] # the frozen G1 task set (configs/metrics_freeze.json g1_tasks), never changed here
+  variants: [in_range] # the designated in-range state tasks
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train: # the recipe of record; batch is free throughput for the launch-bound dense step (P1.9 measurements)
+  unroll: 256 # TBPTT window T; the window synthetic_v1 defines in_range against
+  batch: 16 # B (the Appendix C.3 prototype says 4; the step time is the same at 16 on profile:rtx3060)
+  micro_batch: 16
+  grad_accum: 1
+  precision: bf16 # bf16 | fp16 | fp32 | fp64
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 200
+  schedule: cosine # constant | cosine | linear
+  grad_clip: 1.0
+  steps: 12000
+  eval_every: 1000 # a full dev pass of the two tasks (2,000 documents) costs ~1 min at batch 16 on rtx3060
+  ckpt_every: 4000
+  stats_every: 10 # grad_norm/<group> on every tenth step (the gate checks every logged norm is finite)
+  q_resync_every: 64
+  lambda_p: 1.0 # L_pred with the fixed-embedding target (P1.6); the only auxiliary term of Phase 1
+  search_trials: 4 # the search budget: the same number of trials for ref_a1, the GRU and the Transformer
+  # P2.2 routing controls at their defaults (nothing active with model.routing = dense)
+  gate_mode: soft
+  soft_until_step: 0
+  temperature_start: 1.0
+  temperature_end: 1.0
+  temperature_steps: 0
+  epsilon_start: 0.0
+  epsilon_end: 0.0
+  epsilon_steps: 0
+  p_dense: 0.0
+  reinforce_baseline_decay: 0.9

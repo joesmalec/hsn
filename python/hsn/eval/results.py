@@ -819,6 +819,8 @@ def _summary(
     cost: Mapping[str, Any],
     freeze: MetricsFreeze,
     decision: Mapping[str, Any] | None,
+    failed: Mapping[str, Any],
+    extras: Sequence[str],
 ) -> str:
     lines: list[str] = [
         f"# Evidence package {gate}",
@@ -1035,15 +1037,40 @@ def _summary(
             f"training step p50 {step_ms:.2f} ms (shared_path + backward + optimizer), serving "
             f"window p50 {serve_ms:.2f} ms."
         )
-    lines += [
-        "",
-        "## Failed configurations and negative findings",
-        "",
-        "- None recorded for this gate (see `failed_configurations.json`).",
-        "",
-        "Test results above are measured on the dev split; nothing here touched the test split. "
-        "Forecasts are confined to the cost section and labelled as such.",
-    ]
+    n_failed = len(failed.get("failed_configurations", []))
+    n_negative = len(failed.get("negative_findings", []))
+    lines += ["", "## Failed configurations and negative findings", ""]
+    if n_failed or n_negative:
+        lines.append(
+            f"- {n_failed} failed configuration(s) and {n_negative} negative finding(s) are listed "
+            "in `failed_configurations.json` (supplied by the gate script)."
+        )
+        for entry in list(failed.get("failed_configurations", []))[:20]:
+            if isinstance(entry, Mapping):
+                lines.append(
+                    f"  - {entry.get('model', entry.get('model_name', '?'))}: "
+                    f"{entry.get('overrides', entry.get('config', ''))} -> "
+                    f"{entry.get('status', entry.get('error', '?'))}"
+                )
+        for entry in list(failed.get("negative_findings", []))[:20]:
+            lines.append(f"  - {entry}")
+    else:
+        lines.append("- None recorded for this gate (see `failed_configurations.json`).")
+    if extras:
+        lines += ["", "## Gate script files at the package root", ""]
+        lines += [f"- `{name}`" for name in sorted(extras)]
+    lines.append("")
+    if "test_results.json" in extras:
+        lines.append(
+            "Test results in the run tables above are measured on the dev split; the gate script "
+            "evaluated the test split exactly once per run and its numbers are in "
+            "`test_results.json`. Forecasts are confined to the cost section and labelled as such."
+        )
+    else:
+        lines.append(
+            "Test results above are measured on the dev split; nothing here touched the test "
+            "split. Forecasts are confined to the cost section and labelled as such."
+        )
     return "\n".join(lines)
 
 
@@ -1150,16 +1177,16 @@ def evidence_package(
         _write_json(stage / "freeze" / "schema.json", metrics_freeze_schema())
         files["frozen_metrics"] += ["freeze/metrics_freeze.json", "freeze/schema.json"]
 
-        _write_json(
-            stage / "failed_configurations.json",
-            {
-                "failed_configurations": [],
-                "negative_findings": [],
-                "note": "Track E: every configuration that failed and every negative finding of "
-                "the "
-                "gate is listed here; none for this package.",
-            },
-        )
+        if "failed_configurations.json" not in extras:  # a gate script may supply its own list
+            _write_json(
+                stage / "failed_configurations.json",
+                {
+                    "failed_configurations": [],
+                    "negative_findings": [],
+                    "note": "Track E: every configuration that failed and every negative finding "
+                    "of the gate is listed here; none for this package.",
+                },
+            )
         files["failed_configurations"].append("failed_configurations.json")
 
         decision: dict[str, Any] | None = None
@@ -1167,6 +1194,10 @@ def evidence_package(
             shutil.copyfile(source, stage / name)
             if name == "decision.json":
                 decision = _read_json(stage / name)
+        failed = _read_json(stage / "failed_configurations.json")
+        for key in ("failed_configurations", "negative_findings"):
+            if not isinstance(failed.get(key), list):
+                raise ValueError(f"failed_configurations.json must hold a list under {key!r}")
 
         summary = _summary(
             gate,
@@ -1179,6 +1210,8 @@ def evidence_package(
             cost,
             frozen,
             decision,
+            failed,
+            sorted(extras),
         )
         _write_text(stage / "SUMMARY.md", summary)
 
