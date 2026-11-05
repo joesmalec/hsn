@@ -339,13 +339,15 @@ def main() -> None:
             f"[{label}] grad norms (median): value {med['grad_value_token']:.3e}  "
             f"key {med['grad_key_token']:.3e}  QRY {med['grad_qry_token']:.3e}  "
             f"answer-input {med['grad_answer_input']:.3e}  | value<1e-8: "
-            f"{gp['fraction_value_grad_below_1e-8']:.2f}  acc {gp['accuracy_on_probed_positions']:.2f}",
+            f"{gp['fraction_value_grad_below_1e-8']:.2f}  "
+            f"acc {gp['accuracy_on_probed_positions']:.2f}",
             flush=True,
         )
         w = wr["window"]
         frozen = w["cells_frozen_fraction_(mean gate over positions < 0.01)"]
         print(
-            f"[{label}] gate mean {w['gate_mean']:.3f}  <0.01: {w['gate_fraction_below_0.01']:.3f}  "
+            f"[{label}] gate mean {w['gate_mean']:.3f}  "
+            f"<0.01: {w['gate_fraction_below_0.01']:.3f}  "
             f">0.99: {w['gate_fraction_above_0.99']:.3f}  p10/50/90 {w['gate_p10']:.3f}/"
             f"{w['gate_p50']:.3f}/{w['gate_p90']:.3f}  |dh| {w['mean_abs_delta_h_per_step']:.4f}  "
             f"frozen cells {frozen:.2f}",
@@ -354,7 +356,8 @@ def main() -> None:
         s = wr["summary_q"]
         print(
             f"[{label}] q: |q| at value {s['q_norm_at_value']['median']:.4f}, at query "
-            f"{s['q_norm_at_query']['median']:.4f}, change {s['q_change_value_to_query']['median']:.4f} "
+            f"{s['q_norm_at_query']['median']:.4f}, "
+            f"change {s['q_change_value_to_query']['median']:.4f} "
             f"(rel {s['q_change_relative']['median']:.3f}), cosine "
             f"{s['q_cosine_value_to_query']['median']:.3f}",
             flush=True,

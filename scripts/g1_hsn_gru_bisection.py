@@ -146,8 +146,9 @@ def main() -> None:
     history = trainer.fit(train, dev, args.steps)
     summary = {
         "replacement": (
-            "per-cell nn.GRUCell(4d, d) shared across cells on the PDG input v = [u, eps, h_i, m_i];"
-            " encoder, predictor, shared path, scorer, graph messages, summary q and decoder unchanged"
+            "per-cell nn.GRUCell(4d, d) shared across cells on the PDG input "
+            "v = [u, eps, h_i, m_i]; encoder, predictor, shared path, scorer, graph messages, "
+            "summary q and decoder unchanged"
         ),
         "gru_params": n_gru,
         "lr": cfg.train.lr,
