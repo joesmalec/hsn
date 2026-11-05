@@ -654,15 +654,15 @@ def test_p2_2_reinforce_loss_finite(
     assert list(records[0].parts) == ["task", "pred", "reinforce"]
     assert trainer.reinforce_baseline is not None and math.isfinite(trainer.reinforce_baseline)
     baseline = trainer.reinforce_baseline
-    total = torch.tensor(1.5)
     info = {"route_log_prob": torch.tensor([-2.0, -3.0])}
-    for parts, n_loss in (({"task": math.nan}, 5), ({"task": math.inf}, 5), ({"task": 1.0}, 0)):
-        kept, kept_parts = trainer._routing_terms(total, parts, info, n_loss)
-        assert kept is total and kept_parts["reinforce"] == 0.0
+    for task, n_loss in ((math.nan, 5), (math.inf, 5), (1.0, 0)):  # P2.4: terms in, terms out
+        kept = trainer._routing_terms({"task": torch.tensor(task)}, info, n_loss)
+        assert list(kept) == ["task", "reinforce"] and float(kept["reinforce"]) == 0.0
         assert trainer.reinforce_baseline == baseline  # a skipped window never moves it
-    moved, moved_parts = trainer._routing_terms(total, {"task": 1.0}, info, 5)
-    assert float(moved) == pytest.approx(1.5 + 2.5 * (-1.0 - baseline))
-    assert moved_parts["reinforce"] == pytest.approx(2.5 * (-1.0 - baseline))
+    terms = {"task": torch.tensor(1.0), "pred": torch.tensor(0.5)}
+    moved = trainer._routing_terms(terms, info, 5)
+    assert float(sum(moved.values())) == pytest.approx(1.5 + 2.5 * (-1.0 - baseline))
+    assert float(moved["reinforce"]) == pytest.approx(2.5 * (-1.0 - baseline))
     assert trainer.reinforce_baseline == pytest.approx(0.5 * baseline + 0.5 * -1.0)
     assert records[-1].stats["route_cost"] == pytest.approx(K / (N * M), abs=1e-6)
     # the baseline is checkpointed and restored; a pre-P2.2 checkpoint is refused in this mode
