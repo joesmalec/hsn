@@ -708,3 +708,9 @@ def test_p1_9_run_units_no_retry_failed(tmp_path: Path) -> None:
     (retried,) = gate.run_units([unit], **kwargs)  # the default runs it: config None -> ValueError
     assert retried.status == "failed" and "no configuration" in retried.error
     assert ledger.entries[-1]["kind"] == "failed_run"
+    stopped = gate.Unit("hsn:s4", "hsn", None, 4, [], tmp_path / "runs", "g1", "cpu")
+    (stopped.run_dir).mkdir(parents=True)  # a stopped run's directory, left where it is
+    ledger.add({"kind": "stopped_run", "run_id": stopped.run_dir.name, "error": "stopped"})
+    (skipped,) = gate.run_units([stopped], retry_failed=False, **kwargs)
+    assert skipped.status == "failed" and "not retried" in skipped.error
+    assert stopped.run_dir.is_dir()  # not quarantined

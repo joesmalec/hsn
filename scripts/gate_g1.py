@@ -679,9 +679,10 @@ def run_units(
     """Run every unit (reusing a finished run directory), ``jobs`` at a time as subprocesses when
     ``jobs > 1``, in this process otherwise; a unit with ``depends_on`` starts only after that
     unit finished. A unit that fails is recorded in the ledger and does not stop the others.
-    With ``retry_failed`` false a unit the ledger already records as a failed run (an earlier
-    invocation) is not run again but reported failed, for a resume after a deterministic
-    divergence (``--no-retry-failed``)."""
+    With ``retry_failed`` false a unit the ledger already records as a failed or stopped run (an
+    earlier invocation; kinds ``failed_run`` and ``stopped_run``) is not run again but reported
+    failed, for a resume after a deterministic divergence or a stop (``--no-retry-failed``); its
+    directory is left where it is."""
     if jobs < 1:
         raise ValueError(f"--jobs must be >= 1, got {jobs}")
     results: dict[str, UnitResult] = {}
@@ -700,7 +701,8 @@ def run_units(
             (
                 e
                 for e in ledger.entries
-                if e.get("kind") == "failed_run" and e.get("run_id") == unit.run_dir.name
+                if e.get("kind") in ("failed_run", "stopped_run")
+                and e.get("run_id") == unit.run_dir.name
             ),
             None,
         )
@@ -1428,6 +1430,12 @@ def _parser() -> argparse.ArgumentParser:
         "or none (the package then cannot be built)",
     )
     parser.add_argument(
+        "--rerun-of",
+        metavar="LABEL",
+        help="the seed unit the package's independent rerun repeats (e.g. gru:s0); default: the "
+        "first HSN seed",
+    )
+    parser.add_argument(
         "--memory-headroom",
         type=float,
         default=MEMORY_HEADROOM,
@@ -1726,10 +1734,18 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
                     f"{model}:s{seed}", model, path, seed, overrides, runs_dir, run_id, args.profile
                 )
             )
-    first_hsn = next(u for u in units if u.model == cfg.model_name)
+    if args.rerun_of is None:
+        first_hsn = next(u for u in units if u.model == cfg.model_name)
+    else:
+        chosen = next((u for u in units if u.label == args.rerun_of), None)
+        if chosen is None:
+            parser.error(
+                f"--rerun-of {args.rerun_of!r} is not a seed unit: {[u.label for u in units]}"
+            )
+        first_hsn = chosen
     rerun_unit = Unit(
-        f"{cfg.model_name}:rerun-s{first_hsn.seed}",
-        cfg.model_name,
+        f"{first_hsn.model}:rerun-s{first_hsn.seed}",
+        first_hsn.model,
         None,
         first_hsn.seed,
         [],
