@@ -148,9 +148,10 @@ def main() -> None:
             p0 = int(loss_pos[0])
             lo, hi = max(0, p0 - 8), min(n, p0 + 4)
             facts_s = ", ".join(f"{sym(k)}: {sym(v)}" for k, v in facts.items())
+            dep0 = int(dep[r, p0])
             lines.append(
                 f"row {r} doc {meta.get('doc_id')} length {n}, first query at position {p0} "
-                f"(dependency at {p0 - int(dep[r, p0])}, dep {int(dep[r, p0])}); facts {{{facts_s}}}"
+                f"(dependency at {p0 - dep0}, dep {dep0}); facts {{{facts_s}}}"
             )
             lines.append("  t        : " + " ".join(f"{t:>5d}" for t in range(lo, hi)))
             lines.append(
