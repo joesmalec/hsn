@@ -32,9 +32,10 @@ stage):
    horizon and the matched recipe and budget keys of the experiment configuration (so that every
    method's trial 0 is the recipe of record and every trial differs from it). ``search.json``
    records every trial, including the failed ones. The winner of a method is its best trial
-   among those whose measured ``peak_bytes`` fit the seed stage: ``--jobs`` copies run side by
-   side on one card, so a trial above ``vram_bytes * vram_cap_fraction * --memory-headroom /
-   --jobs`` is marked ``excluded`` and reported, never run as the seeds.
+   among those whose logged gradient norms were all finite (the gate's own criterion) and whose
+   measured ``peak_bytes`` fit the seed stage: ``--jobs`` copies run side by side on one card, so
+   a trial above ``vram_bytes * vram_cap_fraction * --memory-headroom / --jobs`` is marked
+   ``excluded`` and reported, never run as the seeds.
 6. Five seeds of the winning recipe per method, each run carrying the P0.6 profiling pass (``--power
    profile`` reads the NVML meter); a rerun of the first HSN seed.
 7. Test, exactly once per run (chunk step 3; pitfall: tuning on test): the final checkpoint is
@@ -864,15 +865,22 @@ def pick_best(
     trials: Sequence[MutableMapping[str, Any]], *, max_peak_bytes: float | None = None
 ) -> int | None:
     """Index of the best trial: highest mean dev accuracy over the G1 tasks, then highest minimum,
-    then lowest dev loss, then the lowest index; failed trials never win. With ``max_peak_bytes``
-    a trial whose measured ``peak_bytes`` exceeds it cannot win either (the seed stage runs
-    ``--jobs`` copies of the winner on one card): it is marked ``excluded`` in place, with the
-    numbers, and reported."""
+    then lowest dev loss, then the lowest index; failed trials never win. Two more trials cannot
+    win and are marked ``excluded`` in place, with the numbers, and reported: one whose logged
+    gradient norms were not all finite (the gate requires finite gradients throughout, so such a
+    recipe is not run as the seeds) and, with ``max_peak_bytes``, one whose measured
+    ``peak_bytes`` exceeds it (the seed stage runs ``--jobs`` copies of the winner on one card)."""
     ranked = []
     for t in trials:
         if t.get("status") not in ("ok", "reused") or not _is_finite_number(
             t.get("result", {}).get(SEARCH_METRIC)
         ):
+            continue
+        if float(t["result"].get("grad_norms_finite", 1.0)) == 0.0:
+            t["excluded"] = (
+                "a logged gradient norm of this trial was not finite; the gate requires finite "
+                "gradients throughout, so the recipe is not run as the seeds"
+            )
             continue
         peak = t.get("peak_bytes")
         peak_value = float(peak) if _is_finite_number(peak) else None

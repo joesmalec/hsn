@@ -655,7 +655,7 @@ def test_p1_9_pick_best_excludes_memory_infeasible() -> None:
     trial peaks at 5.69 GiB and three or two copies do not fit the 12 GB card)."""
     gate = load_script("gate_g1")
 
-    def trial(index: int, mean: float, peak: float) -> dict[str, Any]:
+    def trial(index: int, mean: float, peak: float, finite: float = 1.0) -> dict[str, Any]:
         return {
             "index": index,
             "status": "ok",
@@ -664,12 +664,18 @@ def test_p1_9_pick_best_excludes_memory_infeasible() -> None:
                 gate.SEARCH_METRIC: mean,
                 "g1_min_dev_accuracy": mean / 2,
                 "dev_loss": 4.0 - mean,
+                "grad_norms_finite": finite,
             },
         }
 
-    trials = [trial(0, 0.088, 3.3e9), trial(1, 0.089, 3.3e9), trial(2, 0.104, 6.1e9)]
+    trials = [
+        trial(0, 0.088, 3.3e9),
+        trial(1, 0.089, 3.3e9),
+        trial(2, 0.104, 6.1e9),
+        trial(3, 0.090, 3.3e9, finite=0.0),  # the best feasible by accuracy, but a NaN norm
+    ]
     assert gate.pick_best(trials) == 2
-    assert "excluded" not in trials[2]
+    assert "excluded" not in trials[2] and "not finite" in trials[3]["excluded"]
     assert gate.pick_best(trials, max_peak_bytes=12.9e9 * 0.85 / 3) == 1
     assert "exceeds" in trials[2]["excluded"] and "excluded" not in trials[1]
     failed = [{"index": 0, "status": "failed", "error": "boom"}]
