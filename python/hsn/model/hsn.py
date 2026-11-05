@@ -507,8 +507,9 @@ class HSN(nn.Module):
         REINFORCE log-probability summed over the positions; zeros unless the gate is
         ``reinforce``), ``explored [T]`` (fraction of rows with an explored slot), ``refreshed [T]``
         (mean refreshed slots per row) and ``dense_fallback [T]`` (fraction of rows that ran
-        dense). In training the dense fallback is drawn here, once per row per window, with
-        probability ``train.p_dense``.
+        dense), and P2.4's ``unit_logits [B, T, N, M]`` (the scorer's logits of every position in
+        the state dtype, autograd intact: the balance term's input). In training the dense
+        fallback is drawn here, once per row per window, with probability ``train.p_dense``.
         """
         B, T = self._check_window_inputs(tokens, ctx, state, reset)
         dense_rows: Tensor | None = None
@@ -563,6 +564,7 @@ class HSN(nn.Module):
             info["cell_idx"] = torch.stack([sel.cell_idx for sel in selections], dim=1)
             info["unit_idx"] = torch.stack([sel.unit_idx for sel in selections], dim=1)
             info["valid"] = torch.stack([sel.valid for sel in selections], dim=1)
+            info["unit_logits"] = torch.stack([sel.logits for sel in selections], dim=1)  # P2.4
             info["cost_per_row"] = torch.stack([sel.cost.detach() for sel in selections], dim=1)
             info["expected_cost"] = torch.stack([sel.expected_cost.mean() for sel in selections])
             info["route_log_prob"] = torch.stack([sel.log_prob for sel in selections], dim=1).sum(

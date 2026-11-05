@@ -9,7 +9,11 @@ learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the 
     per window:  state = state.detach()                          (every ``train.q_resync_every``
                  q     = state.recompute_q()                      windows, at the window start)
                  logits, state, info = model(tokens, ctx, state, reset)
-                 total, parts = assemble_loss({"logits": logits, **info}, batch, cfg)
+                 extras = auxiliary_terms(info, cfg, model.cell.graph)       (P2.4)
+                 terms  = assemble_terms({"logits": logits, **info}, batch, cfg, extras)
+                 terms  = _routing_terms(terms, info)                         (P2.2 REINFORCE)
+                 total, parts = total_and_parts(terms)
+                 grad_norm_report(model, terms) on the first window of a stats step
                  backward (scaled under fp16)
     per step:    unscale; grad_norm per group; clip to train.grad_clip; optimiser step;
                  scheduler step; model.update_target(); log parts and statistics
@@ -25,8 +29,12 @@ learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the 
   which removes the floating-point drift incremental sparse updates accumulate (P1.3 pitfall). The
   dense step of P1.5 writes the exact mean, so until P2.5 the resync is a numerical no-op; the
   counters (``windows``, ``windows_since_resync``, ``resyncs``) are part of every checkpoint.
-* **The objective** is :func:`hsn.losses.assemble_loss`: every §2.6 term, with ``task`` and
-  ``pred`` the only active ones in Phase 1.
+* **The objective** is :func:`hsn.losses.assemble_terms`: every §2.6 term, with ``task`` and
+  ``pred`` the only active ones in Phase 1. P2.4 adds the auxiliary terms: the raw values of the
+  terms named in ``train.aux_enabled`` come from :func:`hsn.losses.auxiliary_terms` (``cost`` from
+  the window's expected cost over the router's dense cost, ``balance`` from the stacked unit logits
+  and routed slots, ``graph`` from the cell graph) and enter the assembly as ``extras``; the
+  one-at-a-time rule is the configuration's and the assembly's.
 * **Statistics.** Every :class:`TBPTTStepRecord` carries the λ-weighted loss ``parts`` (mean over
   the step's windows), the model's own statistics from ``info`` (``state_abs_max`` over the step,
   ``eps_mean`` = mean |ε| and ``alpha_entropy``, means over positions and windows) and the global
@@ -34,7 +42,10 @@ learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the 
   also carries ``grad_norm/<group>``, the pre-clip norm per parameter group, one group per top-level
   submodule of the model (``byte_emb``, ``ctx_emb``, ``encoder``, ``predictor``, ``shared``,
   ``cell``, ``router``, ``decoder``; a group without gradients, such as ``halting`` while
-  ``model.r_max = 1``, is not reported), and one log line prints all of it.
+  ``model.r_max = 1``, is not reported), and — P2.4 — ``term_grad_norm/<term>``, the gradient norm
+  of every objective term on its own (:func:`hsn.losses.grad_norm_report` on the step's first
+  window, before its backward, scaled by the fp16 loss scale when there is one; a term without a
+  gradient path reports 0), and one log line prints all of it.
 * **Checkpoints** are the P0.5 files (model, optimiser, scheduler, step, RNG state of Python,
   NumPy, torch, CUDA and MPS, loader position, loss scaler, config hash) plus the carried cell state
   and the resync counters in ``extra`` (:mod:`hsn.train.checkpoint`); :meth:`resume` restores all
@@ -46,7 +57,9 @@ learning-rate schedule, the AMP policy of :mod:`hsn.train.amp`, evaluation, the 
   :class:`~hsn.train.schedules.SelectionSchedule` turns into the gate mode, the temperature, the
   exploration rate and the dense-fallback probability of the window. With ``train.gate_mode =
   reinforce`` the objective of a window gains the policy-gradient term ``−mean_b log p_b · (R −
-  b̄)`` with ``R = −L_task`` of the window and ``b̄`` an EMA baseline
+  b̄)`` with ``R = −L_task`` of the window — ``R = −(L_task + λ_c·L_cost)`` when the P2.4 cost
+  term is on, since the REINFORCE cell mask is hard and the cost penalty can reach the sampled
+  cells only through the reward — and ``b̄`` an EMA baseline
   (``train.reinforce_baseline_decay``; initialised at the first reward so the first window's
   advantage is 0; a window without loss positions or with a non-finite loss, which the fp16
   scaler skips, leaves both the term and the baseline alone), logged as ``parts["reinforce"]``
@@ -78,7 +91,7 @@ from hsn.config import RunConfig
 from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, memory_stats, reset_peak, synchronize
 from hsn.eval.evaluate import Metric
-from hsn.losses import assemble_loss
+from hsn.losses import assemble_terms, auxiliary_terms, grad_norm_report, total_and_parts
 from hsn.model.hsn import HSN
 from hsn.model.state import CellGraphState
 from hsn.train.amp import autocast_name
@@ -160,22 +173,27 @@ class TBPTTTrainer(Trainer):
     # P2.2 ------------------------------------------------------------------------------------
 
     def _routing_terms(
-        self, total: Tensor, parts: dict[str, float], info: Mapping[str, Tensor], n_loss: int
-    ) -> tuple[Tensor, dict[str, float]]:
-        """The REINFORCE term of a window (module docstring), added when the gate of this step is
-        ``reinforce``; otherwise ``(total, parts)`` unchanged. ``n_loss`` is the window's number
-        of loss positions: without any there is no reward, and a non-finite task loss (an fp16
-        overflow the scaler skips) must not poison the baseline, so both leave everything alone."""
+        self, terms: dict[str, Tensor], info: Mapping[str, Tensor], n_loss: int
+    ) -> dict[str, Tensor]:
+        """The window's terms plus the REINFORCE term (module docstring) when the gate of this step
+        is ``reinforce``; otherwise ``terms`` unchanged. The reward is ``−task`` of the window, or
+        ``−(task + cost)`` with the P2.4 cost term on (both λ-weighted parts). ``n_loss`` is the
+        window's number of loss positions: without any there is no reward, and a non-finite task
+        loss (an fp16 overflow the scaler skips) must not poison the baseline, so both leave the
+        baseline alone and add a zero term."""
         if "route_log_prob" not in info or self.hsn.schedule.gate(self.step) != "reinforce":
-            return total, parts
-        reward = -parts["task"]
+            return terms
+        task = terms["task"]
+        reward = -float(task.detach())
+        if "cost" in terms:  # P2.4: the hard REINFORCE mask sees the cost penalty only here
+            reward -= float(terms["cost"].detach())
         if n_loss == 0 or not math.isfinite(reward):
-            return total, {**parts, "reinforce": 0.0}
+            return {**terms, "reinforce": torch.zeros_like(task.detach())}
         baseline = self.reinforce_baseline if self.reinforce_baseline is not None else reward
         term = -info["route_log_prob"].float().mean() * (reward - baseline)
         decay = self.cfg.train.reinforce_baseline_decay
         self.reinforce_baseline = decay * baseline + (1.0 - decay) * reward
-        return total + term, {**parts, "reinforce": float(term.detach())}
+        return {**terms, "reinforce": term}
 
     # window helpers --------------------------------------------------------------------------
 
@@ -282,11 +300,16 @@ class TBPTTTrainer(Trainer):
         groups = self._grad_groups()
         max_norm = train.grad_clip if train.grad_clip > 0.0 else math.inf
         n_windows = train.grad_accum
+        reference_cost = self.hsn.router.costs.dense_cost()  # P2.4: the cost term's normaliser
+        graph = self.hsn.cell.graph
         reset_peak(device)
         train_seconds = 0.0
         total_tokens = 0
         while self.step < steps:
             started = time.perf_counter()
+            next_step = self.step + 1
+            stats_step = next_step % train.stats_every == 0 or next_step == steps
+            term_norms: dict[str, float] = {}
             self.optimizer.zero_grad(set_to_none=True)
             part_sums: dict[str, float] = {}
             total_sum = 0.0
@@ -299,16 +322,21 @@ class TBPTTTrainer(Trainer):
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
             tokens_in_step = 0
-            for _ in range(n_windows):
+            for window_index in range(n_windows):
                 window = next(loader)
                 batch = self._to_device(window)
                 state = self._window_start(state)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
                 logits, state, info = self._forward(batch, state)
-                total, parts = assemble_loss({"logits": logits, **info}, batch, self.cfg)
+                extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
+                terms = assemble_terms({"logits": logits, **info}, batch, self.cfg, extras)
                 loss_mask = batch["loss_mask"]
                 count = int(loss_mask.sum())
-                total, parts = self._routing_terms(total, parts, info, count)
+                terms = self._routing_terms(terms, info, count)
+                total, parts = total_and_parts(terms)
+                if stats_step and window_index == 0:  # P2.4: per-term gradient norms, one window
+                    scale = self.scaler.get_scale() if self.scaler is not None else 1.0
+                    term_norms = grad_norm_report(self.model, terms, scale=scale)
                 tokens_in_step += int((window["doc"] >= 0).sum())
                 if count > 0:
                     flat_targets = batch["targets"][loss_mask]
@@ -330,8 +358,6 @@ class TBPTTTrainer(Trainer):
                     if self.scaler is not None:
                         scaled = self.scaler.scale(scaled)
                     scaled.backward()  # type: ignore[no-untyped-call]
-            next_step = self.step + 1
-            stats_step = next_step % train.stats_every == 0 or next_step == steps
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
@@ -361,6 +387,7 @@ class TBPTTTrainer(Trainer):
                 "route_cost": cost_sum / n_windows,
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **group_norms,
+                **term_norms,
             }
             record = TBPTTStepRecord(
                 step=self.step,

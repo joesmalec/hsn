@@ -50,20 +50,89 @@ time and the assembly refuses it again, because a configuration can be built in 
 is on without a value, a value for a term that is off, and an unknown name in ``extras`` all raise
 (errors over silence). Loss inputs are upcast to fp32 first (losses stay in fp32 whatever autocast
 produced). ``parts`` holds every included term as a λ-weighted float (the P1.6 convention) in
-formula order, so each can be logged and its gradient inspected.
+formula order, so each can be logged and its gradient inspected. :func:`assemble_terms` is the same
+assembly returning the λ-weighted term *tensors* (formula order) and :func:`total_and_parts` turns
+them into ``(total, parts)``; :func:`assemble_loss` is their composition.
+
+P2.4: the auxiliary terms of §2.6 and the per-term gradient report, under the one-at-a-time rule::
+
+    cost_loss(selection, reference)  = mean_b selection.expected_cost[b] / reference
+    balance_loss(logits, unit_idx, valid)
+                                     = M · Σ_j f_j · p̄_j
+                                       f_j = valid slots routed to unit j / valid slots
+                                       p̄_j = mean over every (row, cell) of softmax(logits)[..., j]
+    graph_loss(graph)                = Σ_(i,j) |a_ij| = graph.l1()
+
+``cost_loss`` reads :attr:`~hsn.model.router.Selection.expected_cost`, the differentiable expected
+cost of P2.2, not the detached accounting ``cost``: the two are equal in the hard modes and only the
+former carries the gate gradient. Every profiled cost table is uniform over units
+(:mod:`hsn.kernels.costs`), so that gradient flows through the cell mask alone (the soft warm-up
+and the straight-through mask); under REINFORCE the mask is hard and the penalty reaches the sampled
+cells only through the reward (the trainer adds the λ-weighted cost part to it); with ``random``
+routing the value carries no gradient and with ``fixed`` a zero one (the controls take no routing
+gradient, and the report below shows 0). In the soft warm-up the penalty is the relaxed mask's cost
+while the charged cost (``route_cost`` in the trainer's statistics) stays dense; dense-fallback rows
+are the constant dense cost. ``reference_cost`` is the dense step in table units
+(:meth:`~hsn.kernels.costs.CostTable.dense_cost`, 1.0 by construction). ``balance_loss`` is the
+Switch-Transformer load-balancing term: ``f`` counts valid (non-padded) slots only — a padded slot
+holds unit 0 and would bias the count — and ``p̄`` averages the unit softmax of every scored cell
+(the signature carries no ``cell_idx``; every cell has a live unit softmax: the warm-up and the
+dense-fallback rows execute all of them). It is exactly 1 when both ``f`` and ``p̄`` are uniform
+and rises towards ``M`` as both concentrate on one unit; the gradient reaches the scorer through
+``p̄``. ``graph_loss`` is the §2.6 sum as written: every edge's gradient is then ``λ_g · σ'(l_e)``
+whatever the edge count, a per-edge L1 prior, so ``λ_g`` transfers across ``N`` and ``D_g`` and
+survives SAN changing the edge count (a per-edge mean would silently weaken the penalty as the
+graph grows); the sigmoid bounds every ``|a_ij| ≤ 1``. Under ``model.edge_norm = softmax`` the
+sum is a constant with no gradient, and an edgeless graph has nothing to shrink: both are refused.
+
+:func:`auxiliary_terms` is the window-level bridge the trainer calls: from the ``info`` of
+:meth:`hsn.model.hsn.HSN.forward` it computes the raw value of every term named in
+``train.aux_enabled`` — ``cost`` as the mean over positions of ``info["expected_cost"]`` (the
+``(1/T) Σ_t`` of §2.6) over the reference cost, ``balance`` from ``info["unit_logits"]``,
+``info["unit_idx"]`` and ``info["valid"]`` over the whole window, ``graph`` from the model's
+:class:`~hsn.model.graph.CellGraph` — and returns exactly the ``extras`` the assembly accepts. A
+term that needs a selection (cost, balance) under dense routing raises.
+
+:func:`grad_norm_report` is the inspection the normalisation is for: for every term tensor it takes
+``torch.autograd.grad`` over the model's trainable parameters (``retain_graph``, never touching
+``.grad``) and reports the global L2 norm as ``term_grad_norm/<term>``; a term without a gradient
+path (a constant, or one that reaches no parameter) reports 0.0 so the keys are predictable.
+``scale`` is the fp16 loss scale: the term is scaled before the backward and the norm divided back,
+because an unscaled fp16 backward underflows (:mod:`hsn.train.amp`).
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from hsn.config import AUX_TERMS, PredictorTarget, RunConfig
+from hsn.model.graph import CellGraph
+from hsn.model.router import Selection
 
-__all__ = ["TERMS", "assemble_loss", "pred_loss", "prediction_terms", "variance_floor"]
+__all__ = [
+    "TERM_GRAD_NORM_PREFIX",
+    "TERMS",
+    "assemble_loss",
+    "assemble_terms",
+    "auxiliary_terms",
+    "balance_loss",
+    "cost_loss",
+    "grad_norm_report",
+    "graph_loss",
+    "pred_loss",
+    "prediction_terms",
+    "total_and_parts",
+    "variance_floor",
+]
+
+#: The key prefix of the per-term gradient norms of :func:`grad_norm_report` (P2.4); distinct from
+#: the trainer's per-parameter-group ``grad_norm/<group>``.
+TERM_GRAD_NORM_PREFIX = "term_grad_norm/"
 
 #: The terms of the objective (§2.6) in formula order.
 TERMS: tuple[str, ...] = ("task", "pred", "replay", "distill", "ewc", "cost", "balance", "graph")
@@ -200,13 +269,14 @@ def _check_tensor(name: str, x: object) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def assemble_loss(
+def assemble_terms(
     out: Mapping[str, Tensor],
     batch: Mapping[str, Tensor],
     cfg: RunConfig,
     extras: Mapping[str, Tensor] | None = None,
-) -> tuple[Tensor, dict[str, float]]:
-    """The §2.6 objective of one window: ``(total, parts)`` (module docstring).
+) -> dict[str, Tensor]:
+    """The λ-weighted terms of the §2.6 objective of one window, in formula order (module
+    docstring); :func:`assemble_loss` sums them.
 
     ``out`` is the model's window output: ``logits [B, T, V]`` plus the ``info`` of
     :meth:`hsn.model.hsn.HSN.forward` (``z_hat``, ``z_target``, ``z`` ``[B, T, d]`` for the
@@ -215,9 +285,9 @@ def assemble_loss(
     configuration (``train.lambda_*``, ``train.aux_enabled``, ``train.allow_multiple_aux``,
     ``train.variance_floor_gamma`` and ``model.predictor_target``). ``extras`` maps the name of
     every enabled replay / distill / ewc / cost / balance / graph term to its raw (unweighted) 0-dim
-    value. ``total`` is a 0-dim fp32 tensor with the graph; ``parts`` the λ-weighted value of every
-    included term as a float, in formula order (``variance_floor`` follows ``pred`` in EMA mode).
-    A window without loss positions contributes a zero task term with a zero gradient.
+    value (:func:`auxiliary_terms` builds the P2.4 ones). Every value is a 0-dim fp32 tensor with
+    its graph (``variance_floor`` follows ``pred`` in EMA mode). A window without loss positions
+    contributes a zero task term with a zero gradient.
     """
     if not isinstance(cfg, RunConfig):
         raise TypeError(f"assemble_loss needs the RunConfig, got {type(cfg).__name__}")
@@ -307,13 +377,36 @@ def assemble_loss(
             "configuration (set the term's weight, and for cost / balance / graph name it in "
             "train.aux_enabled)"
         )
+    return terms
 
+
+def total_and_parts(terms: Mapping[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
+    """``(total, parts)`` of λ-weighted term tensors: ``total`` is their sum in the given order
+    starting from ``task`` (a 0-dim tensor with the graph), ``parts`` every term as a float."""
+    if not isinstance(terms, Mapping) or "task" not in terms:
+        raise ValueError("total_and_parts: terms must be a mapping that holds the 'task' term")
+    for name, value in terms.items():
+        if not isinstance(value, Tensor) or not torch.is_floating_point(value) or value.ndim != 0:
+            raise ValueError(f"total_and_parts: terms[{name!r}] must be a 0-dim floating tensor")
     total = terms["task"]
     for name, value in terms.items():
         if name != "task":
             total = total + value
     parts = {name: float(value.detach()) for name, value in terms.items()}
     return total, parts
+
+
+def assemble_loss(
+    out: Mapping[str, Tensor],
+    batch: Mapping[str, Tensor],
+    cfg: RunConfig,
+    extras: Mapping[str, Tensor] | None = None,
+) -> tuple[Tensor, dict[str, float]]:
+    """The §2.6 objective of one window: ``(total, parts)`` (module docstring), i.e.
+    :func:`total_and_parts` of :func:`assemble_terms` with the same arguments. ``total`` is a 0-dim
+    fp32 tensor with the graph; ``parts`` the λ-weighted value of every included term as a float,
+    in formula order."""
+    return total_and_parts(assemble_terms(out, batch, cfg, extras))
 
 
 def _field(mapping: Mapping[str, Tensor], key: str, where: str) -> Tensor:
@@ -368,3 +461,191 @@ def _take_extra(name: str, given: dict[str, Tensor]) -> Tensor:
             f"its computation arrives with chunk {_SOURCE[name]}"
         )
     return given.pop(name)
+
+
+# --------------------------------------------------------------------------------------------------
+# P2.4: the auxiliary terms and the per-term gradient report
+# --------------------------------------------------------------------------------------------------
+
+
+def cost_loss(selection: Selection, reference_cost: float = 1.0) -> Tensor:
+    """``L_cost`` of one round (module docstring): the batch mean of the selection's differentiable
+    ``expected_cost`` over ``reference_cost`` (the dense step in table units), a 0-dim fp32 tensor.
+    ``reference_cost`` must be a finite number > 0."""
+    if not isinstance(selection, Selection):
+        raise TypeError(f"cost_loss needs a Selection, got {type(selection).__name__}")
+    reference = _check_reference_cost(reference_cost)
+    return selection.expected_cost.float().mean() / reference
+
+
+def balance_loss(logits: Tensor, unit_idx: Tensor, valid: Tensor) -> Tensor:
+    """``L_balance = M · Σ_j f_j · p̄_j`` (module docstring) of the scorer ``logits [..., N, M]``
+    and the routed slots ``unit_idx`` (int64 ``[..., K]``) masked by ``valid`` (bool ``[..., K]``),
+    with the same leading shape (``[B]`` for one round, ``[B, T]`` for a window). ``f`` counts the
+    valid slots only; ``p̄`` is the mean unit softmax (fp32) over every leading index and cell.
+    Returns a 0-dim fp32 tensor. Refuses a window without a valid slot, an index outside
+    ``[0, M)``, and mismatched shapes, dtypes or devices."""
+    _check_tensor("logits", logits)
+    if logits.ndim < 3:
+        raise ValueError(
+            f"balance_loss: logits must be [..., N, M] with at least one leading dimension, got "
+            f"shape {tuple(logits.shape)}"
+        )
+    for name, x, dtype in (("unit_idx", unit_idx, torch.int64), ("valid", valid, torch.bool)):
+        if not isinstance(x, Tensor):
+            raise TypeError(f"balance_loss: {name} must be a torch.Tensor, got {type(x).__name__}")
+        if x.dtype != dtype:
+            raise ValueError(f"balance_loss: {name} must have dtype {dtype}, got {x.dtype}")
+        if x.device != logits.device:
+            raise ValueError(
+                f"balance_loss: {name} lives on {x.device} but logits on {logits.device}"
+            )
+    lead = tuple(logits.shape[:-2])
+    M = int(logits.shape[-1])
+    if unit_idx.ndim != len(lead) + 1 or tuple(unit_idx.shape[:-1]) != lead:
+        raise ValueError(
+            f"balance_loss: unit_idx must be [{', '.join(str(n) for n in lead)}, K] to match "
+            f"logits {tuple(logits.shape)}, got {tuple(unit_idx.shape)}"
+        )
+    if valid.shape != unit_idx.shape:
+        raise ValueError(
+            f"balance_loss: valid must have unit_idx's shape {tuple(unit_idx.shape)}, got "
+            f"{tuple(valid.shape)}"
+        )
+    routed = unit_idx[valid]  # the units of the valid slots, [n_valid]
+    n_valid = int(routed.numel())
+    if n_valid == 0:
+        raise ValueError("balance_loss: no valid slot; the balance of nothing is undefined")
+    lo, hi = int(routed.min()), int(routed.max())
+    if lo < 0 or hi >= M:
+        raise ValueError(
+            f"balance_loss: unit_idx holds {lo if lo < 0 else hi}, outside [0, {M}) for M = {M}"
+        )
+    fraction = torch.bincount(routed, minlength=M).to(torch.float32) / n_valid  # f_j [M]
+    probability = torch.softmax(logits.float(), dim=-1).reshape(-1, M).mean(dim=0)  # p̄_j [M]
+    return M * (fraction * probability).sum()
+
+
+def graph_loss(graph: CellGraph) -> Tensor:
+    """``L_graph = Σ_(i,j) |a_ij|`` over the learned edge weights of ``graph`` (module docstring),
+    a 0-dim fp32 tensor. Refuses a graph whose ``edge_norm`` is not ``sigmoid`` (under ``softmax``
+    the sum is a constant without gradient) and an edgeless graph (nothing to shrink)."""
+    if not isinstance(graph, CellGraph):
+        raise TypeError(f"graph_loss needs a CellGraph, got {type(graph).__name__}")
+    if graph.edge_norm != "sigmoid":
+        raise ValueError(
+            f"graph_loss: the graph normalises its edges with {graph.edge_norm!r}, under which "
+            "Σ|a_ij| is the constant number of non-empty rows and carries no gradient; set "
+            "model.edge_norm=sigmoid to use the graph penalty"
+        )
+    if graph.n_edges == 0:
+        raise ValueError(
+            "graph_loss: the graph has no edge (model.in_degree + model.random_edges = 0), so "
+            "the penalty has nothing to shrink; drop 'graph' from train.aux_enabled"
+        )
+    return graph.l1().float()
+
+
+def auxiliary_terms(
+    info: Mapping[str, Tensor],
+    cfg: RunConfig,
+    graph: CellGraph | None,
+    *,
+    reference_cost: float = 1.0,
+) -> dict[str, Tensor]:
+    """The raw values of the P2.4 terms named in ``cfg.train.aux_enabled`` for one window (module
+    docstring), from the ``info`` of :meth:`hsn.model.hsn.HSN.forward` and the model's ``graph``:
+    exactly the ``extras`` :func:`assemble_terms` accepts (``{}`` when none is enabled). ``cost``
+    and ``balance`` need the routed keys of ``info`` (``expected_cost``, ``unit_logits``,
+    ``unit_idx``, ``valid``) and raise under dense routing; ``graph`` needs ``graph``.
+    ``reference_cost`` is the dense step in table units."""
+    if not isinstance(cfg, RunConfig):
+        raise TypeError(f"auxiliary_terms needs the RunConfig, got {type(cfg).__name__}")
+    if not isinstance(info, Mapping):
+        raise TypeError(f"auxiliary_terms: info must be a mapping, got {type(info).__name__}")
+    enabled = cfg.train.aux_enabled
+    terms: dict[str, Tensor] = {}
+    for name in AUX_TERMS:  # formula order
+        if name not in enabled:
+            continue
+        if name == "cost":
+            expected = _routed_field(info, "expected_cost", name)
+            terms[name] = expected.float().mean() / _check_reference_cost(reference_cost)
+        elif name == "balance":
+            terms[name] = balance_loss(
+                _routed_field(info, "unit_logits", name),
+                _routed_field(info, "unit_idx", name),
+                _routed_field(info, "valid", name),
+            )
+        else:  # graph
+            if graph is None:
+                raise ValueError(
+                    "auxiliary_terms: 'graph' is in train.aux_enabled but no CellGraph was given"
+                )
+            terms[name] = graph_loss(graph)
+    return terms
+
+
+def grad_norm_report(
+    model: nn.Module, parts: Mapping[str, Tensor], *, scale: float = 1.0
+) -> dict[str, float]:
+    """``{"term_grad_norm/<term>": ‖∂term/∂θ‖₂}`` over the trainable parameters of ``model`` for
+    every 0-dim term tensor in ``parts`` (module docstring). Each norm is taken with
+    ``torch.autograd.grad`` on ``scale · term`` (``retain_graph=True``, so the graph stays usable
+    for the training backward; ``.grad`` is never touched) and divided by ``scale``, the fp16 loss
+    scale (1.0 otherwise). A term that requires no grad or reaches no parameter reports 0.0; a
+    non-finite norm is reported as it is."""
+    if not isinstance(model, nn.Module):
+        raise TypeError(f"grad_norm_report needs an nn.Module, got {type(model).__name__}")
+    if not isinstance(parts, Mapping):
+        raise TypeError(f"grad_norm_report: parts must be a mapping, got {type(parts).__name__}")
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, int | float)
+        or not math.isfinite(scale)
+        or scale <= 0.0
+    ):
+        raise ValueError(f"grad_norm_report: scale must be a finite number > 0, got {scale!r}")
+    params = [p for p in model.parameters() if p.requires_grad]
+    report: dict[str, float] = {}
+    for name, term in parts.items():
+        if not isinstance(term, Tensor) or not torch.is_floating_point(term) or term.ndim != 0:
+            raise ValueError(f"grad_norm_report: parts[{name!r}] must be a 0-dim floating tensor")
+        key = f"{TERM_GRAD_NORM_PREFIX}{name}"
+        if not term.requires_grad or not params:
+            report[key] = 0.0
+            continue
+        scaled = term * scale if scale != 1.0 else term
+        grads = torch.autograd.grad(scaled, params, retain_graph=True, allow_unused=True)
+        norms = [torch.linalg.vector_norm(g.detach().float()) for g in grads if g is not None]
+        if not norms:
+            report[key] = 0.0
+            continue
+        report[key] = float(torch.linalg.vector_norm(torch.stack(norms))) / scale
+    return report
+
+
+def _check_reference_cost(reference_cost: float) -> float:
+    if (
+        isinstance(reference_cost, bool)
+        or not isinstance(reference_cost, int | float)
+        or not math.isfinite(reference_cost)
+        or reference_cost <= 0.0
+    ):
+        raise ValueError(f"reference_cost must be a finite number > 0, got {reference_cost!r}")
+    return float(reference_cost)
+
+
+def _routed_field(info: Mapping[str, Tensor], key: str, term: str) -> Tensor:
+    if key not in info:
+        raise ValueError(
+            f"{term!r} is in train.aux_enabled but the window info has no {key!r}: only a routed "
+            "model.routing (topk, greedy_budget, random, fixed) produces a selection to penalise; "
+            f"choose one or drop {term!r}"
+        )
+    value = info[key]
+    if not isinstance(value, Tensor):
+        raise TypeError(
+            f"auxiliary_terms: info[{key!r}] must be a tensor, got {type(value).__name__}"
+        )
+    return value
