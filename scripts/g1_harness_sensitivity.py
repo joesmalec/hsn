@@ -54,6 +54,7 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--n-docs", type=int, default=50)
     ap.add_argument("--label", default=None)
+    ap.add_argument("--split", default="dev", help="dev (DIAGNOSIS.md) or train (overfit docs)")
     args = ap.parse_args()
     run_dir = Path(args.run)
     out = Path(args.out)
@@ -70,7 +71,7 @@ def main() -> None:
     model.eval()
     dev = ByteDataset.load(
         Path(str(cfg.data.manifest)),
-        "dev",
+        args.split,
         ["delayed"],
         ["in_range"],
         expected_unroll=cfg.train.unroll,
@@ -137,7 +138,11 @@ def main() -> None:
         "checkpoint": checkpoint.name,
         "model": cfg.model_name,
         "autocast": str(ctx.autocast_dtype),
+        "split": args.split,
         "n_probed": n,
+        "n_changed_to_new_value": sum(p["follows_new_value"] for p in probes),
+        "n_changed_to_other": sum(p["changed"] and not p["follows_new_value"] for p in probes),
+        "n_unchanged": sum(not p["changed"] for p in probes),
         "changed_fraction": sum(p["changed"] for p in probes) / n if n else None,
         "follows_new_value_fraction": sum(p["follows_new_value"] for p in probes) / n
         if n

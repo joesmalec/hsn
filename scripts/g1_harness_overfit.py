@@ -37,6 +37,7 @@ def main() -> None:
     ap.add_argument("--n-docs", type=int, default=64)
     ap.add_argument("--target", type=float, default=0.99)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--lr", type=float, default=3e-4, help="overfit-recipe tuning arms only")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -47,7 +48,7 @@ def main() -> None:
             "hardware.autocast_dtype=fp32",
             "train.precision=fp32",
             "train.weight_decay=0",
-            "train.lr=3e-4",
+            f"train.lr={args.lr}",
             "train.schedule=constant",
             "train.warmup_steps=200",
             "train.batch=4",
