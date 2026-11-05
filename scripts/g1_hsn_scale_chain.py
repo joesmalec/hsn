@@ -96,9 +96,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     cfg = load_config(
         run_dir / "config.resolved.yaml",
-        overrides=["profile=cpu"]
-        if False
-        else ["hardware.autocast_dtype=fp32", "train.precision=fp32"],
+        overrides=["hardware.autocast_dtype=fp32", "train.precision=fp32"],
     )
     ctx = resolve(cfg.hardware)
     train_ds, _ = load_datasets(cfg)
