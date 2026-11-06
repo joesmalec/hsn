@@ -1,8 +1,9 @@
 //! P2.9 tests of the CPU oracle: the header's constants equal `spec.rs`; finite differences in
 //! f64 confirm every backward formula (the q coupling included); the gated update's summary
-//! coupling and padded slots hold exactly; every precondition is refused with its status code.
+//! coupling and padded slots hold exactly; every precondition is refused with its status code;
+//! the committed vectors regenerate byte for byte and the f32 oracle reproduces them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use hsn_kernels::spec::{self, Op, Role};
@@ -477,4 +478,149 @@ fn test_p2_9_invalid_arguments_rejected() {
         spec::ERR_INDEX_OUT_OF_RANGE
     );
     assert_eq!(status(gated(&[0, 1], &[1, 2])), spec::ERR_INVALID_ARGUMENT);
+}
+
+// ------------------------------------------------------------------------------------------------
+// The committed vectors
+// ------------------------------------------------------------------------------------------------
+
+const BLESS: &str = "HSN_WRITE_TESTVECTORS=1 cargo test -p hsn-kernels --test oracle \
+                     vectors_regenerate_deterministically";
+
+/// Generating twice gives the same bytes; the committed files and `MANIFEST.json` are exactly
+/// those bytes (so the vectors are a function of the code alone, on every platform). With
+/// `HSN_WRITE_TESTVECTORS=1` the files are written first (the bless step).
+#[test]
+fn vectors_regenerate_deterministically() {
+    let dir = vectors::default_dir();
+    let first = vectors::generate_all().expect("generate");
+    let second = vectors::generate_all().expect("generate");
+    assert_eq!(first.len(), spec::SIZES.len() * Op::ALL.len());
+    for (a, b) in first.iter().zip(&second) {
+        assert!(
+            a.bytes == b.bytes,
+            "{} is not deterministic",
+            a.vector.file_name()
+        );
+    }
+    if std::env::var("HSN_WRITE_TESTVECTORS").as_deref() == Ok("1") {
+        vectors::write_all(&dir, &first).expect("write the vectors");
+        println!(
+            "wrote {} vectors and {} to {}",
+            first.len(),
+            vectors::MANIFEST,
+            dir.display()
+        );
+    }
+
+    // Every output and gradient is finite and carries signal (all-zero tensors would hide bugs).
+    for f in &first {
+        for (name, tensor) in &f.vector.tensors {
+            let values = tensor.data.to_f64();
+            assert!(
+                values.iter().all(|x| x.is_finite()),
+                "{name} of {}",
+                f.vector.file_name()
+            );
+            assert!(
+                values.iter().any(|&x| x != 0.0) || name == "age_out",
+                "{name} is all zero"
+            );
+        }
+    }
+
+    let manifest_path = dir.join(vectors::MANIFEST);
+    let committed = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("{}: {e}; regenerate with {BLESS}", manifest_path.display()));
+    assert!(
+        committed == vectors::manifest(&first),
+        "{} differs from the regenerated manifest; regenerate with {BLESS}",
+        manifest_path.display()
+    );
+    for f in &first {
+        let path = dir.join(f.vector.file_name());
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}; regenerate with {BLESS}", path.display()));
+        assert!(
+            bytes == f.bytes,
+            "{} differs from the regenerated vector; regenerate with {BLESS}",
+            path.display()
+        );
+        let loaded = vectors::load(&dir, f.vector.op, &f.vector.size).expect("load");
+        assert!(loaded == f.vector, "{} does not parse back", path.display());
+    }
+    let listed: BTreeSet<String> = first.iter().map(|f| f.vector.file_name()).collect();
+    for entry in std::fs::read_dir(&dir).expect("list the vector directory") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name == vectors::MANIFEST || listed.contains(&name),
+            "{name} in {} is not a generated vector",
+            dir.display()
+        );
+    }
+}
+
+/// Max |x − ref| and max |x − ref| / (atol + rtol·|ref|) of `actual` against `expected`; integer
+/// tensors must be equal.
+fn agreement(name: &str, actual: &vectors::Tensor, expected: &vectors::Tensor) -> (f64, f64) {
+    assert_eq!(actual.shape, expected.shape, "{name}: shape");
+    let (a, e) = (actual.data.to_f64(), expected.data.to_f64());
+    if matches!(expected.data, Data::I32(_)) {
+        assert_eq!(a, e, "{name}: integer tensors differ");
+        return (0.0, 0.0);
+    }
+    let tol = spec::TOL_F32;
+    let mut worst = (0.0f64, 0.0f64);
+    for (x, r) in a.iter().zip(&e) {
+        worst.0 = worst.0.max((x - r).abs());
+        worst.1 = worst.1.max(tol.ratio(*x, *r));
+    }
+    worst
+}
+
+/// The f32 oracle reproduces the (f64-computed) vectors within the fp32 tolerance, forward from
+/// the stored inputs and backward from the stored saved tensors and cotangents.
+#[test]
+fn test_p2_9_oracle_f32_matches_vectors() {
+    let dir = vectors::default_dir();
+    println!(
+        "f32 oracle vs the vectors (tolerance ratio <= 1): op, size, max |x - ref|, max ratio"
+    );
+    for size in spec::SIZES {
+        for op in Op::ALL {
+            let v = vectors::load(&dir, op, size.name).unwrap_or_else(|e| {
+                panic!("{} {}: {e}; regenerate with {BLESS}", op.name(), size.name)
+            });
+            let inputs = vectors::with_roles(op, &v.tensors, &[Role::Input]);
+            let out = vectors::forward(&CpuBackend, op, &v.dims, &inputs).expect("forward");
+            let stored = vectors::with_roles(
+                op,
+                &v.tensors,
+                &[Role::Input, Role::Output, Role::Cotangent],
+            );
+            let grads = vectors::backward(&CpuBackend, op, &v.dims, &stored).expect("backward");
+            let mut worst = (0.0f64, 0.0f64);
+            for (name, tensor) in out.iter().chain(&grads) {
+                let (abs, ratio) = agreement(name, tensor, &v.tensors[name]);
+                assert!(
+                    ratio <= 1.0,
+                    "{} {}: {name} off by {abs:e} (ratio {ratio})",
+                    op.name(),
+                    size.name
+                );
+                worst = (worst.0.max(abs), worst.1.max(ratio));
+            }
+            println!(
+                "  {:<20} {:<5} {:.2e}  {:.4}",
+                op.name(),
+                size.name,
+                worst.0,
+                worst.1
+            );
+        }
+    }
 }

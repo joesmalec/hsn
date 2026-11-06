@@ -10,6 +10,9 @@ repos:
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=1500"] # uv.lock resolves the Linux CUDA wheel tree and is large
+        # P2.9: the kernel test vectors are generated, hash-pinned binaries (MANIFEST.json); the
+        # ref and odd grouped-MLP files hold [M, 4d, H] weights and gradients (about 10 and 5 MB).
+        exclude: ^kernels/testvectors/.*\.safetensors$
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.3
     hooks:
