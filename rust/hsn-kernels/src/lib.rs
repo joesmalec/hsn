@@ -12,8 +12,11 @@
 //! carried at run time by the [`TensorRef`] / [`TensorMut`] views (the ABI's `void*` plus
 //! `dtype`), and an [`Error`] whose [`Error::status`] is the ABI's return code.
 
+pub mod cpu;
 pub mod spec;
+pub mod vectors;
 
+pub use cpu::CpuBackend;
 pub use spec::{
     CellDims, CsrMessages, CsrMessagesBwd, GatedDeltaUpdate, GatedDeltaUpdateBwd, GatherConcat,
     GatherConcatBwd, GroupedUnitMlpBwd, GroupedUnitMlpFwd, UnitDims,
