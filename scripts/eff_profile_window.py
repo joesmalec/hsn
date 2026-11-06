@@ -341,6 +341,7 @@ def attribute(events: list[Any], T: int) -> dict[str, Any]:
                 "launches_per_position": round(total / T, 2),
                 "wall_ms_profiled": round(rec["wall_ms_profiled"], 1),
                 "gpu_busy_fraction": round(busy / wall_us, 4) if wall_us > 0 else None,
+                "gpu_busy_ms": round(busy / 1000.0, 1),
                 "rows": [
                     {
                         "row": name,
