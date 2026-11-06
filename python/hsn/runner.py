@@ -67,6 +67,7 @@ from hsn.eval.results import (
     evidence_package,
 )
 from hsn.model.hsn import HSN
+from hsn.model.router import SCORED_MODES
 from hsn.profiler import (
     NullMeter,
     NvmlEnergyMeter,
@@ -77,6 +78,7 @@ from hsn.profiler import (
 )
 from hsn.train.amp import autocast_ctx
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
+from hsn.train.probes import choose_probe_position, probe_window, window_split
 from hsn.train.tbptt import TBPTTTrainer
 
 __all__ = [
@@ -252,7 +254,46 @@ PROFILE_SEGMENTS: dict[str, str] = {
     "segments separately)",
     "backward": "loss.backward()",
     "optimizer": "gradient clipping and the AdamW step",
+    "probe": "P2.3, only when train.lambda_u > 0: one counterfactual utility probe of the window "
+    "per profiled step (no-grad rollouts from the window-start state, at the first step past a "
+    "scored routing's soft warm-up); a training run pays it on train.probe_fraction of its windows",
 }
+
+
+def _profile_probe(
+    model: HSN,
+    cfg: RunConfig,
+    ctx: DeviceContext,
+    train_ds: ByteDataset,
+    window: Batch,
+    state: Any,
+    profiler: Profiler,
+    index: int,
+) -> None:
+    """Time one P2.3 probe of ``window`` from ``state`` (timing only; nothing is kept), at the
+    first step whose gate is hard, from a generator seeded by ``(run.seed, index)``."""
+    train = cfg.train
+    generator = torch.Generator(device="cpu").manual_seed(cfg.seed * 1_000_003 + index)
+    t = choose_probe_position(window["loss_mask"], train.probe_horizon, generator)
+    if t is None:
+        return
+    split = window_split(train_ds, window["doc"])
+    first = train.soft_until_step if cfg.model.routing in SCORED_MODES else 0
+    step = model.train_step
+    model.set_train_step(first)
+    try:
+        with profiler.segment("probe", tokens=_n_tokens(window)), autocast_ctx(ctx):
+            probe_window(
+                model,
+                state,
+                {**window, "split": split},
+                t,
+                n_probe=train.n_probe,
+                horizon=train.probe_horizon,
+                generator=generator,
+            )
+    finally:
+        model.set_train_step(step)
 
 
 def _to_device(window: Batch, device: torch.device) -> Batch:
@@ -284,13 +325,15 @@ def profile_run(
     """P0.6 reports of ``steps`` training steps and ``steps`` serving windows (a copy of ``model``).
 
     The copy keeps the trained weights of ``model`` untouched. Timing only: the training pass runs
-    AdamW at ``train.lr`` without loss scaling, so its losses are not results.
+    AdamW at ``train.lr`` without loss scaling, so its losses are not results. With
+    ``train.lambda_u > 0`` (an HSN) every profiled training step also times one P2.3 counterfactual
+    probe of its window under the ``probe`` segment (:data:`PROFILE_SEGMENTS`).
     """
     if steps < 1:
         raise ValueError(f"steps must be >= 1, got {steps}")
     device = ctx.device
     count = device.type == "cuda"
-    probe = copy.deepcopy(model).to(device=device, dtype=ctx.master_dtype)
+    replica = copy.deepcopy(model).to(device=device, dtype=ctx.master_dtype)
     batch_size, unroll = cfg.train.batch, cfg.train.unroll
 
     train_prof = Profiler(ctx, power=power(), count_launches=count)
@@ -303,26 +346,30 @@ def profile_run(
         align_docs=cfg.data.align_docs,
         epochs=None,
     )
-    params = [p for p in probe.parameters() if p.requires_grad]
+    params = [p for p in replica.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         params, lr=cfg.train.lr, betas=cfg.train.betas, weight_decay=cfg.train.weight_decay
     )
     max_norm = cfg.train.grad_clip if cfg.train.grad_clip > 0.0 else math.inf
-    probe.train()
-    api = cast(SequenceModel, probe)
+    replica.train()
+    api = cast(SequenceModel, replica)
     state: Any = api.init_state(batch_size, device)
     window = _to_device(next(loader), device)
     with train_prof.segment("startup", tokens=_n_tokens(window)):
         with autocast_ctx(ctx):
-            logits, state, _ = probe(window["tokens"], window["context"], state, window["reset"])
+            logits, state, _ = replica(window["tokens"], window["context"], state, window["reset"])
         _window_loss(logits, window).backward()  # type: ignore[no-untyped-call]
     optimizer.zero_grad(set_to_none=True)
-    for _ in range(steps):
+    counterfactual = isinstance(replica, HSN) and cfg.train.lambda_u > 0.0
+    for index in range(steps):
         window = _to_device(next(loader), device)
         state = _detach(state)
         tokens = _n_tokens(window)
+        if counterfactual:
+            assert isinstance(replica, HSN)
+            _profile_probe(replica, cfg, ctx, train_ds, window, state, train_prof, index)
         with train_prof.segment("shared_path", tokens=tokens), autocast_ctx(ctx):
-            logits, state, _ = probe(window["tokens"], window["context"], state, window["reset"])
+            logits, state, _ = replica(window["tokens"], window["context"], state, window["reset"])
             loss = _window_loss(logits, window)
         with train_prof.segment("backward", tokens=tokens):
             loss.backward()  # type: ignore[no-untyped-call]
@@ -332,7 +379,7 @@ def profile_run(
             optimizer.zero_grad(set_to_none=True)
 
     serve_prof = Profiler(ctx, power=power(), count_launches=count)
-    probe.eval()
+    replica.eval()
     dev_loader: Iterator[Batch] = iter(
         StreamLoader(
             dev_ds,
@@ -353,7 +400,7 @@ def profile_run(
                 break
             name = "startup" if index == 0 else "shared_path"
             with serve_prof.segment(name, tokens=_n_tokens(window)), autocast_ctx(ctx):
-                _, state, _ = probe(window["tokens"], window["context"], state, window["reset"])
+                _, state, _ = replica(window["tokens"], window["context"], state, window["reset"])
     synchronize(device)
     return train_prof.report(), serve_prof.report()
 

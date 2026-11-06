@@ -106,14 +106,33 @@ by :meth:`hsn.model.hsn.HSN.forward` with probability ``train.p_dense``): the ro
 dense step (``cell_mask = 1``, ``unit_weights = softmax(logits)``), is charged ``cost =`` the dense
 cost and flagged ``dense_fallback``; its ``cell_idx`` / ``unit_idx`` are the hard decision it did
 not run. The decisions, the budget guarantee and the deterministic orders of P2.1 are unchanged.
+
+**Counterfactual support (P2.3).** The scorer owns the running averages it reads: two persistent
+buffers ``ema_utility [N]`` and ``ema_selected [N]``, zero at initialisation, read by
+:meth:`Scorer.features` whenever no explicit :class:`EMAFeatures` is passed (so a model whose
+averages were never updated sees exactly the zeros it saw before P2.3). :meth:`EMAFeatures.update`
+is the pure EMA step and :meth:`Scorer.load_ema` writes its result back; only the P2.3 trainer does
+that, once per window, when ``train.lambda_u > 0``. A state dict written before the buffers existed
+(``Scorer`` version 1) loads with zeros for them; a version-2 dict without them is refused. The
+counterfactual probes of :mod:`hsn.train.probes` (distinct from the refresh probes above) execute
+an *edited* selection through the unchanged :meth:`hsn.model.hsn.HSN.step`:
+:meth:`Router.intercept` arms a :class:`RouterTap` that records the features the scorer saw and the
+selections :meth:`Router.select` returned, and applies an optional edit to each selection before it
+is returned; :meth:`Router.with_candidate` is that edit: one candidate (cell, unit) per row added to
+the selection (an unselected cell written with the given unit) or removed from it (a valid slot
+dropped), with ``cell_mask``, ``unit_weights``, ``alpha`` and ``cost`` kept consistent so that the
+sparse and the masked round execute the same counterfactual. An edited selection may exceed the
+budget: it is a training probe, charged to the training budget, never a routing decision.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 import time
-from dataclasses import dataclass
-from typing import Self, get_args
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from typing import Any, Self, get_args
 
 import torch
 import torch.nn.functional as F
@@ -129,12 +148,16 @@ from hsn.train.memory_plan import SCORER_SCALAR_FEATURES
 
 __all__ = [
     "BUDGET_SLACK",
+    "CANDIDATE_ADD",
+    "CANDIDATE_NONE",
+    "CANDIDATE_REMOVE",
     "GATE_MODES",
     "SCORED_MODES",
     "SCORER_FEATURE_NAMES",
     "SELECTION_MODES",
     "EMAFeatures",
     "Router",
+    "RouterTap",
     "Scorer",
     "Selection",
     "SelectionMode",
@@ -174,16 +197,101 @@ if len(_SCALAR_FEATURES) != SCORER_SCALAR_FEATURES:  # pragma: no cover - layout
         f"{SCORER_SCALAR_FEATURES}"
     )
 _INDEX_DTYPES = (torch.int64, torch.int32)
+#: The candidate kinds of :meth:`Router.with_candidate` (P2.3), one per row.
+CANDIDATE_NONE, CANDIDATE_ADD, CANDIDATE_REMOVE = 0, 1, 2
+_EMA_BUFFERS = ("ema_utility", "ema_selected")
+
+
+def _check_decay(decay: float) -> float:
+    if (
+        isinstance(decay, bool)
+        or not isinstance(decay, int | float)
+        or not math.isfinite(decay)
+        or not 0.0 <= decay <= 1.0
+    ):
+        raise ValueError(f"decay (train.ema_decay) must be a number in [0, 1], got {decay!r}")
+    return float(decay)
 
 
 @dataclass(frozen=True)
 class EMAFeatures:
     """The P2.3 running averages per cell: ``utility`` (EMA of the counterfactual utility) and
     ``selected`` (EMA of the selection indicator), each ``[B, N]`` or ``[N]`` (broadcast over the
-    batch). Until P2.3 no caller has them and the scorer sees zeros."""
+    batch). :attr:`Scorer.ema` is the ``[N]`` view of the scorer's own buffers; ``ema_utility`` and
+    ``ema_selected`` are the chunk's names for the two fields."""
 
     utility: Tensor
     selected: Tensor
+
+    @property
+    def ema_utility(self) -> Tensor:
+        return self.utility
+
+    @property
+    def ema_selected(self) -> Tensor:
+        return self.selected
+
+    def update(
+        self,
+        selection: Tensor,
+        realised_utility: Tensor | None,
+        decay: float,
+        *,
+        measured: Tensor | None = None,
+    ) -> EMAFeatures:
+        """One EMA step, ``ema ← decay · ema + (1 − decay) · x``, returned as new ``[N]`` tensors
+        (this object is unchanged; :meth:`Scorer.load_ema` writes the result into the buffers).
+
+        ``selection`` (bool ``[..., N]``, at least one leading row) marks the cells selected at each
+        (row, position) of the window: ``x`` for ``selected`` is the fraction of rows in which the
+        cell was selected. ``realised_utility`` (floating ``[N]``) is the window's measured utility
+        per cell, or ``None`` (no measurement: ``utility`` is carried over); ``measured`` (bool
+        ``[N]``, all True by default) names the cells it measured — the others keep their average.
+        ``decay`` is ``train.ema_decay`` in ``[0, 1]``. Both fields must be ``[N]``."""
+        decay = _check_decay(decay)
+        utility, selected = self.utility, self.selected
+        if utility.ndim != 1 or selected.shape != utility.shape:
+            raise ValueError(
+                "EMAFeatures.update needs [N] averages (the scorer's buffers), got utility "
+                f"{tuple(utility.shape)} and selected {tuple(selected.shape)}"
+            )
+        N = int(utility.shape[0])
+        if not isinstance(selection, Tensor) or selection.dtype != torch.bool:
+            raise TypeError("selection must be a bool torch.Tensor [..., N]")
+        if selection.ndim < 2 or selection.shape[-1] != N or selection.numel() == 0:
+            raise ValueError(
+                f"selection must be a non-empty bool [..., N = {N}] tensor, got "
+                f"{tuple(selection.shape)}"
+            )
+        if selection.device != selected.device:
+            raise ValueError(
+                f"selection lives on {selection.device}, the averages on {selected.device}"
+            )
+        frequency = selection.reshape(-1, N).to(selected.dtype).mean(dim=0)
+        new_selected = decay * selected.detach() + (1.0 - decay) * frequency
+        new_utility = utility.detach().clone()
+        if realised_utility is not None:
+            if not isinstance(realised_utility, Tensor) or not realised_utility.is_floating_point():
+                raise TypeError("realised_utility must be a floating torch.Tensor [N] or None")
+            if realised_utility.shape != (N,) or realised_utility.device != utility.device:
+                raise ValueError(
+                    f"realised_utility must be [N] = {(N,)} on {utility.device}, got "
+                    f"{tuple(realised_utility.shape)} on {realised_utility.device}"
+                )
+            if measured is None:
+                measured = torch.ones(N, dtype=torch.bool, device=utility.device)
+            elif (
+                not isinstance(measured, Tensor)
+                or measured.dtype != torch.bool
+                or measured.shape != (N,)
+                or measured.device != utility.device
+            ):
+                raise ValueError(f"measured must be a bool [N] = {(N,)} tensor on {utility.device}")
+            stepped = decay * new_utility + (1.0 - decay) * realised_utility.to(utility.dtype)
+            new_utility = torch.where(measured, stepped, new_utility)
+        elif measured is not None:
+            raise ValueError("measured names measured cells but realised_utility is None")
+        return EMAFeatures(utility=new_utility, selected=new_selected)
 
 
 class Scorer(nn.Module):
@@ -193,9 +301,18 @@ class Scorer(nn.Module):
     ``r_max``, ``n_context``, ``scorer``, ``scorer_hidden``, ``scorer_features.exclude``,
     ``activation``, ``init``); ``unroll`` is ``train.unroll``, the normaliser of the position
     feature, which lives outside ``model.*`` and is therefore a required argument.
+
+    P2.3: the persistent buffers ``ema_utility`` and ``ema_selected`` (``[N]``, zeros at
+    initialisation) are the running averages :meth:`features` reads when no :class:`EMAFeatures`
+    is given; :attr:`ema` views them and :meth:`load_ema` writes them (module docstring).
     """
 
+    #: State-dict version (``nn.Module`` convention): 2 since P2.3 added the EMA buffers.
+    _version = 2
+
     _excluded: Tensor  # bool [3d+8]: True at zeroed feature slots (non-persistent)
+    ema_utility: Tensor  # [N] P2.3 running average of the counterfactual utility (persistent)
+    ema_selected: Tensor  # [N] P2.3 running average of the selection indicator (persistent)
 
     def __init__(self, cfg: ModelConfig, *, unroll: int) -> None:
         super().__init__()
@@ -243,6 +360,59 @@ class Scorer(nn.Module):
         for name in self.exclude:
             excluded[self.feature_slices[name]] = True
         self.register_buffer("_excluded", excluded, persistent=False)
+        for name in _EMA_BUFFERS:  # P2.3: zeros until the trainer updates them
+            self.register_buffer(name, torch.zeros(cfg.n_cells))
+
+    # ----------------------------------------------------------------------------------------------
+    # P2.3: the running averages
+    # ----------------------------------------------------------------------------------------------
+
+    @property
+    def ema(self) -> EMAFeatures:
+        """The scorer's own averages as an :class:`EMAFeatures` (views of the ``[N]`` buffers)."""
+        return EMAFeatures(utility=self.ema_utility, selected=self.ema_selected)
+
+    def load_ema(self, ema: EMAFeatures) -> None:
+        """Write ``ema`` (``[N]`` floating tensors on this module's device) into the buffers, in
+        place and without autograd (the result of :meth:`EMAFeatures.update`)."""
+        if not isinstance(ema, EMAFeatures):
+            raise TypeError(f"load_ema needs an EMAFeatures, got {type(ema).__name__}")
+        for name, value in (("utility", ema.utility), ("selected", ema.selected)):
+            buffer = getattr(self, f"ema_{name}")
+            if not isinstance(value, Tensor) or not value.is_floating_point():
+                raise TypeError(f"EMAFeatures.{name} must be a floating torch.Tensor")
+            if value.shape != buffer.shape or value.device != buffer.device:
+                raise ValueError(
+                    f"EMAFeatures.{name} must be [N] = {tuple(buffer.shape)} on {buffer.device}, "
+                    f"got {tuple(value.shape)} on {value.device}"
+                )
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(f"EMAFeatures.{name} holds a non-finite value")
+        with torch.no_grad():
+            self.ema_utility.copy_(ema.utility)
+            self.ema_selected.copy_(ema.selected)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """A version-1 state dict (written before P2.3) has no EMA buffers; every model of that
+        version had them at zero, so they load as zeros. Version 2 must carry them."""
+        version = local_metadata.get("version")
+        if version is None or version < 2:
+            for name in _EMA_BUFFERS:
+                key = prefix + name
+                if key not in state_dict:
+                    state_dict[key] = torch.zeros_like(getattr(self, name))
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     # ----------------------------------------------------------------------------------------------
     # Features
@@ -262,8 +432,8 @@ class Scorer(nn.Module):
 
         ``u``, ``eps`` are ``[B, d]`` (the dtype and device of ``state.h``); ``ctx`` the context ids
         ``[B]`` (int64/int32); ``budget_frac`` a finite number >= 0; ``round_idx`` an int in
-        ``[0, r_max)``; ``ema`` the P2.3 averages or ``None`` (zeros). Shape, dtype and device
-        mismatches raise.
+        ``[0, r_max)``; ``ema`` explicit averages, or ``None`` for the scorer's own buffers
+        (:attr:`ema`; zeros until P2.3 updates them). Shape, dtype and device mismatches raise.
         """
         B, N, d = state.batch_size, state.n_cells, state.width
         if N != self.n_cells or d != self.d:
@@ -301,11 +471,9 @@ class Scorer(nn.Module):
         rnd = torch.full((B, N), round_idx / self.r_max, dtype=dtype, device=device)
         context = (ctx.to(dtype) / self.n_context)[:, None].expand(B, N)
         if ema is None:
-            ema_utility = torch.zeros(B, N, dtype=dtype, device=device)
-            ema_selected = torch.zeros(B, N, dtype=dtype, device=device)
-        else:
-            ema_utility = self._check_ema(ema.utility, "utility", B, N, state).to(dtype)
-            ema_selected = self._check_ema(ema.selected, "selected", B, N, state).to(dtype)
+            ema = self.ema  # P2.3: the scorer's own averages (zeros until updated)
+        ema_utility = self._check_ema(ema.utility, "utility", B, N, state).to(dtype)
+        ema_selected = self._check_ema(ema.selected, "selected", B, N, state).to(dtype)
         pos = (state.pos.to(dtype) / self.unroll)[:, None].expand(B, N)
         one = torch.ones(B, N, dtype=dtype, device=device)
         scalars = torch.stack(
@@ -558,6 +726,18 @@ class Selection:
         return (counts > 0) | self.dense_fallback[:, None]
 
 
+@dataclass
+class RouterTap:
+    """What :meth:`Router.intercept` records while it is armed (P2.3): the detached ``features``
+    every :meth:`Router.forward` call scored (``[B, N, 3d+8]``) and the ``selections`` every
+    :meth:`Router.select` call returned (after ``edit``), in call order. ``edit`` maps the
+    selection :meth:`Router.select` made to the one it returns (``None``: unchanged)."""
+
+    edit: Callable[[Selection], Selection] | None = None
+    features: list[Tensor] = field(default_factory=list)
+    selections: list[Selection] = field(default_factory=list)
+
+
 class Router(nn.Module):
     """The P1.5 :class:`Scorer` plus budgeted selection (module docstring).
 
@@ -609,6 +789,7 @@ class Router(nn.Module):
         self.max_pair_cost = costs.max_pair_cost()
         self._unit_costs: list[float] = [float(v) for v in costs.unit.tolist()]
         self.register_buffer("cost_table", costs.unit.to(torch.float32), persistent=False)
+        self._tap: RouterTap | None = None  # P2.3: armed by intercept()
 
     @classmethod
     def from_config(cls, cfg: ModelConfig, *, unroll: int, scorer: Scorer | None = None) -> Self:
@@ -637,7 +818,9 @@ class Router(nn.Module):
     ) -> Tensor:
         """``feats [B, N, 3d+8] -> logits [B, N, M]`` through the scorer, timed as the ``scorer``
         segment of ``profiler`` when one is given (``tokens`` defaults to ``B``, one position per
-        batch row)."""
+        batch row). While :meth:`intercept` is armed the features are recorded (P2.3)."""
+        if self._tap is not None:
+            self._tap.features.append(feats.detach())
         if profiler is None:
             plain: Tensor = self.scorer(feats)
             return plain
@@ -725,7 +908,7 @@ class Router(nn.Module):
                 f"got mode={mode!r}, epsilon={epsilon!r}, gate={gate!r}"
             )
         if mode == "dense":
-            return self._select_dense(logits)
+            return self._tapped(self._select_dense(logits))
 
         self.require_affordable(budget_f, k_min, "k_min")
         scores = self.scores(logits)  # fp32, autograd intact: the gradient path reads it
@@ -757,7 +940,7 @@ class Router(nn.Module):
         else:
             explored = torch.zeros(B, k_max, dtype=torch.bool, device=logits.device)
             refreshed = torch.zeros_like(explored)
-        return self._finish(
+        selection = self._finish(
             logits,
             scores,
             cells,
@@ -772,6 +955,7 @@ class Router(nn.Module):
             refreshed=refreshed,
             dense=dense,
         )
+        return self._tapped(selection)
 
     def require_affordable(self, budget: float, k: int, what: str) -> None:
         """Raise ``ValueError`` unless ``k`` cells fit in ``budget`` whatever units they use:
@@ -805,6 +989,155 @@ class Router(nn.Module):
                 f"deadline_ms must be a finite number > 0 or None, got {deadline_ms!r}"
             )
         return (time.monotonic_ns() - start_ns) / 1e6 > deadline_ms
+
+    # -- P2.3: counterfactual support -------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def intercept(
+        self, edit: Callable[[Selection], Selection] | None = None
+    ) -> Iterator[RouterTap]:
+        """Arm a :class:`RouterTap` for the duration of the ``with`` block: :meth:`forward`
+        records its features and :meth:`select` returns ``edit(selection)`` (unchanged without
+        ``edit``) and records it. One tap at a time: nesting raises. The tap is how the
+        counterfactual probes (:mod:`hsn.train.probes`) read and edit the selection that
+        :meth:`hsn.model.hsn.HSN.step` executes, without a hook in the model's step."""
+        if self._tap is not None:
+            raise RuntimeError("Router.intercept is already armed; taps do not nest")
+        if edit is not None and not callable(edit):
+            raise TypeError(f"edit must be callable or None, got {type(edit).__name__}")
+        tap = RouterTap(edit=edit)
+        self._tap = tap
+        try:
+            yield tap
+        finally:
+            self._tap = None
+
+    def _tapped(self, selection: Selection) -> Selection:
+        tap = self._tap
+        if tap is None:
+            return selection
+        if tap.edit is not None:
+            edited = tap.edit(selection)
+            if not isinstance(edited, Selection):
+                raise TypeError(f"the tap's edit must return a Selection, got {type(edited)}")
+            if edited.logits.shape != selection.logits.shape:
+                raise ValueError(
+                    f"the tap's edit changed the selection's [B, N, M] from "
+                    f"{tuple(selection.logits.shape)} to {tuple(edited.logits.shape)}"
+                )
+            selection = edited
+        tap.selections.append(selection)
+        return selection
+
+    def with_candidate(
+        self, selection: Selection, cells: Tensor, units: Tensor, kind: Tensor
+    ) -> Selection:
+        """``selection`` with one counterfactual candidate per row (module docstring, P2.3).
+
+        ``cells`` and ``units`` are int64 ``[B]``; ``kind`` (int64 ``[B]``) is
+        :data:`CANDIDATE_NONE` (row unchanged), :data:`CANDIDATE_ADD` (``cells[b]`` must be
+        unselected in row ``b``; it is written with unit ``units[b]`` in a free padded slot — one
+        padded column is appended when ``K < N`` — with ``cell_mask = 1`` and one-hot
+        ``unit_weights``) or :data:`CANDIDATE_REMOVE` (a valid slot holding ``(cells[b],
+        units[b])`` becomes padded and the cell's ``cell_mask`` 0). ``cost`` and ``expected_cost``
+        are recomputed on the edited rows. The selection must be hard (``cell_mask`` 0/1: not the
+        soft warm-up)
+        and an edited row must not be a dense-fallback row. Meant for no-grad probes: the edited
+        tensors carry no gradient path of their own."""
+        B, N, M = (int(s) for s in selection.logits.shape)
+        device = selection.logits.device
+        for name, value in (("cells", cells), ("units", units), ("kind", kind)):
+            if not isinstance(value, Tensor) or value.dtype != torch.int64:
+                raise TypeError(f"{name} must be an int64 torch.Tensor [B]")
+            if value.shape != (B,) or value.device != device:
+                raise ValueError(
+                    f"{name} must be [B] = {(B,)} on {device}, got {tuple(value.shape)} on "
+                    f"{value.device}"
+                )
+        add = kind == CANDIDATE_ADD
+        remove = kind == CANDIDATE_REMOVE
+        edited = add | remove
+        safe_cells = cells.clamp(0, N - 1)
+        safe_units = units.clamp(0, M - 1)
+        selected = selection.selected_cells()
+        match = (
+            selection.valid
+            & (selection.cell_idx == safe_cells[:, None])
+            & (selection.unit_idx == safe_units[:, None])
+        )  # [B, K]: at most one slot (cells are distinct within a row)
+        mask = selection.cell_mask.detach()
+        problems = torch.stack(
+            [
+                (~edited & (kind != CANDIDATE_NONE)).any(),
+                (edited & ((cells < 0) | (cells >= N) | (units < 0) | (units >= M))).any(),
+                (add & selected.gather(1, safe_cells[:, None]).squeeze(1)).any(),
+                (remove & ~match.any(dim=1)).any(),
+                (edited & selection.dense_fallback).any(),
+                ((mask != 0) & (mask != 1)).any(),
+            ]
+        ).tolist()  # one device-to-host copy
+        reasons = (
+            "kind holds a value other than CANDIDATE_NONE / ADD / REMOVE",
+            f"a candidate lies outside cells [0, {N}) or units [0, {M})",
+            "an added candidate's cell is already selected in its row",
+            "a removed candidate is not a valid slot (cell, unit) of its row",
+            "a candidate row is a dense-fallback row (it does not execute its selection)",
+            "the selection is soft (cell_mask not 0/1): a soft gate has no hard counterfactual",
+        )
+        bad = [reason for flag, reason in zip(problems, reasons, strict=True) if flag]
+        if bad:
+            raise ValueError("with_candidate: " + "; ".join(bad))
+
+        def padded(x: Tensor, value: float | bool) -> Tensor:
+            if selection.k >= N:  # no unselected cell without a padded slot: nothing to append
+                return x
+            return torch.cat([x, torch.full_like(x[:, :1], value)], dim=1)
+
+        cell_idx = padded(selection.cell_idx, 0)
+        unit_idx = padded(selection.unit_idx, 0)
+        valid = padded(selection.valid, False)
+        alpha = padded(selection.alpha.detach(), 0.0)
+        explored = padded(selection.explored, False)
+        refreshed = padded(selection.refreshed, False)
+        slots = int(cell_idx.shape[1])
+        match = padded(match, False)
+        free = (~valid).to(torch.float32).argmax(dim=1)  # the first padded slot of each row
+        slot_add = F.one_hot(free, slots).to(torch.bool) & add[:, None]
+        slot_remove = match & remove[:, None]
+        changed = slot_add | slot_remove
+        cell_idx = torch.where(slot_add, safe_cells[:, None], cell_idx).masked_fill(slot_remove, 0)
+        unit_idx = torch.where(slot_add, safe_units[:, None], unit_idx).masked_fill(slot_remove, 0)
+        valid = (valid | slot_add) & ~slot_remove
+        alpha = alpha.masked_fill(slot_add, 1.0).masked_fill(slot_remove, 0.0)
+        explored = explored & ~changed
+        refreshed = refreshed & ~changed
+        cell_hot = F.one_hot(safe_cells, N).to(torch.bool)  # [B, N]
+        cell_mask = mask.masked_fill(cell_hot & add[:, None], 1.0)
+        cell_mask = cell_mask.masked_fill(cell_hot & remove[:, None], 0.0)
+        unit_hot = F.one_hot(safe_units, M).to(selection.unit_weights.dtype)  # [B, M]
+        unit_weights = torch.where(
+            (cell_hot & add[:, None])[:, :, None],
+            unit_hot[:, None, :],
+            selection.unit_weights.detach(),
+        )
+        recomputed = self._executed_cost(unit_idx, valid)
+        return Selection(
+            cell_idx=cell_idx,
+            unit_idx=unit_idx,
+            alpha=alpha,
+            valid=valid,
+            logits=selection.logits,
+            cost=torch.where(edited, recomputed, selection.cost),
+            scorer_cost=selection.scorer_cost,
+            n_rounds_used=selection.n_rounds_used,
+            cell_mask=cell_mask,
+            unit_weights=unit_weights,
+            expected_cost=torch.where(edited, recomputed, selection.expected_cost.detach()),
+            log_prob=selection.log_prob,
+            explored=explored,
+            refreshed=refreshed,
+            dense_fallback=selection.dense_fallback,
+        )
 
     # -- the modes --------------------------------------------------------------------------------
 

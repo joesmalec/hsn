@@ -94,6 +94,7 @@ SEGMENT_NAMES: tuple[str, ...] = (
     "decode",
     "backward",
     "optimizer",
+    "probe",  # P2.3: counterfactual utility probes (no-grad rollouts on a training window)
     "compile",
     "startup",
 )
