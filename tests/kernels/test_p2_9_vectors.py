@@ -1,9 +1,12 @@
 """P2.9 tests: the C header ``kernels/include/hsn_ops.h`` compiles under gcc, clang and nvcc (as C
-and C++), its constants equal :mod:`hsn.kernels.spec`, and the spec's tolerance and int32 helpers
-behave."""
+and C++) and its constants equal :mod:`hsn.kernels.spec`; the committed test vectors match their
+manifest and the spec; and the P2.5 native ops reproduce every vector (all three sizes, fp32) —
+``test_p2_9_native_matches_oracle_vectors``, the chunk's cross-check of the PyTorch path against
+the Rust CPU oracle."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -12,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from hsn.kernels import spec
+from hsn.kernels import spec, testvectors
 
 REPO = Path(__file__).resolve().parents[2]
 INCLUDE = REPO / "kernels" / "include"
@@ -141,3 +144,115 @@ def test_p2_9_spec_tables_are_consistent() -> None:
         "gated_delta_update",
     )
     assert spec.SIZES["ref"].P == 16
+
+
+# --------------------------------------------------------------------------------------------------
+# The vectors
+# --------------------------------------------------------------------------------------------------
+
+CASES = [(op, size) for size in spec.SIZES for op in spec.OP_NAMES]
+CASE_IDS = [f"{size}-{op}" for op, size in CASES]
+DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.cuda),
+    pytest.param("mps", marks=pytest.mark.mps),
+]
+
+
+def _device(device_type: str) -> torch.device:
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no cuda device on this machine")
+    if device_type == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("no mps device on this machine")
+    return torch.empty(0, device=device_type).device
+
+
+@pytest.mark.parametrize("device_type", DEVICES)
+@pytest.mark.parametrize(("op", "size"), CASES, ids=CASE_IDS)
+def test_p2_9_native_matches_oracle_vectors(op: str, size: str, device_type: str) -> None:
+    """Every forward output and every gradient of the native op agrees with the oracle's vector
+    within the fp32 tolerance (``atol = rtol = 1e-5``; ``age_out`` exactly)."""
+    device = _device(device_type)
+    vector = testvectors.load_vector(op, size, device=device)
+    actual = testvectors.run_native(vector)
+    compared = {t.name for t in spec.OPS[op].tensors if t.role in ("output", "grad")}
+    assert set(actual) == compared - testvectors.NATIVE_UNCOMPARED
+    failures = []
+    for name in sorted(actual):
+        assert actual[name].device == device, name
+        report = spec.allclose_report(actual[name], vector.tensors[name], torch.float32)
+        if not report.ok:
+            failures.append(f"{name}: {report}")
+    assert not failures, f"{op} at {size} on {device}: " + "; ".join(failures)
+
+
+def test_p2_9_manifest_matches_files() -> None:
+    """The manifest lists exactly the 12 (size, op) files present, each matching its byte count
+    and SHA-256 (checked by ``load_vector``), at this spec version."""
+    manifest = testvectors.load_manifest()
+    assert manifest.spec_version == spec.SPEC_VERSION
+    on_disk = sorted(p.name for p in testvectors.DEFAULT_DIR.glob("*.safetensors"))
+    assert on_disk == sorted(entry.path for entry in manifest.files)
+    assert len(manifest.files) == len(spec.SIZES) * len(spec.OPS)
+    for entry in manifest.files:
+        vector = testvectors.load_vector(entry.op, entry.size)
+        assert vector.dims == entry.dims
+
+
+def test_p2_9_vectors_match_spec_shapes() -> None:
+    """Every tensor has the spec's dtype and shape at its size, and the vectors cover the cases
+    the spec calls out: repeated cells in gather/messages, an empty CSR row among the selected
+    cells at ``odd``, padded gated slots holding never-read values, an absent unit at ``odd``."""
+    for op, size in CASES:
+        vector = testvectors.load_vector(op, size)
+        for tensor_spec in spec.OPS[op].tensors:
+            tensor = vector.tensors[tensor_spec.name]
+            assert tuple(tensor.shape) == tensor_spec.resolve(vector.dims), tensor_spec.name
+            expected = torch.float32 if tensor_spec.kind == "float" else torch.int32
+            assert tensor.dtype == expected, tensor_spec.name
+        t = vector.tensors
+        if op in ("gather_concat", "csr_messages"):
+            last = t["cell_idx"][-1]
+            assert int(last[0]) == int(last[-1]), "the last row repeats a cell"
+        if op == "csr_messages" and size == "odd":
+            degree = t["indptr"][1:] - t["indptr"][:-1]
+            assert bool((degree[t["cell_idx"].long()] == 0).any()), "an empty row is selected"
+        if op == "gated_delta_update":
+            padded = t["cell_idx"][t["valid"] == 0]
+            n_cells = vector.dims["N"]
+            if size != "tiny":
+                assert bool(((padded < 0) | (padded >= n_cells)).any()), "out-of-range padding"
+            assert padded.numel() > 0
+        if op == "grouped_unit_mlp" and size == "odd":
+            assert 3 not in t["unit_idx"].tolist()
+            assert not bool(t["grad_W1"][3].any()) and not bool(t["grad_b2"][3].any())
+
+
+def test_p2_9_load_refuses_tampered_vector(tmp_path: Path) -> None:
+    """A file whose bytes no longer match its manifest entry, or a manifest of another spec
+    version, is refused."""
+    for path in testvectors.DEFAULT_DIR.iterdir():
+        if path.name.startswith("tiny_") or path.name == testvectors.MANIFEST:
+            shutil.copy(path, tmp_path / path.name)
+    manifest_path = tmp_path / testvectors.MANIFEST
+    doc = json.loads(manifest_path.read_text())
+    target = tmp_path / testvectors.file_name("gated_delta_update", "tiny")
+    data = bytearray(target.read_bytes())
+    data[-1] ^= 0x01
+    target.write_bytes(bytes(data))
+    with pytest.raises(testvectors.VectorError, match="does not match MANIFEST.json"):
+        testvectors.load_vector("gated_delta_update", "tiny", root=tmp_path)
+    # The untouched tiny vectors still load from the copy.
+    assert testvectors.load_vector("gather_concat", "tiny", root=tmp_path).size == "tiny"
+    doc["spec_version"] = spec.SPEC_VERSION + 1
+    manifest_path.write_text(json.dumps(doc))
+    with pytest.raises(testvectors.VectorError, match="spec version"):
+        testvectors.load_vector("gather_concat", "tiny", root=tmp_path)
+
+
+def test_p2_9_run_native_keeps_global_rng() -> None:
+    """Running a vector builds modules but never advances the caller's random state."""
+    before = torch.random.get_rng_state()
+    for op in spec.OP_NAMES:
+        testvectors.run_native(testvectors.load_vector(op, "tiny"))
+    assert torch.equal(torch.random.get_rng_state(), before)
