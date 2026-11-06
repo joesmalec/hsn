@@ -1,0 +1,99 @@
+# p2_3_kv_probes: the P2.3 definition-of-done run (counterfactual utility targets).
+#
+# The G1 recipe of configs/experiments/g1_ref_a1.yaml with the differences the P2.3 protocol fixed
+# before any run: hard top-K routing (model.routing=topk, K = 4 of N = 32) trained with the P2.2
+# straight-through gate from step 0, the kv/in_range task alone (the criterion is measured there),
+# 3,000 steps, and the P2.3 counterfactual probes with the Appendix A.3 defaults and lambda_u 1.0.
+# Exploration and dense fallback stay off (one feature at a time). The matched control is the same
+# file with train.lambda_u=0. Both run on profile:cpu (fp32), concurrently, then
+# scripts/p2_3_utility_correlation.py measures the dev Spearman correlation of the scorer's U with
+# the probes' loss reductions (horizon 16; secondary: horizon to the end of the window).
+#
+#   OMP_NUM_THREADS=8 hsn run --config configs/experiments/p2_3_kv_probes.yaml --seeds 0 --out runs/p2_3
+#   OMP_NUM_THREADS=8 hsn run --config configs/experiments/p2_3_kv_probes.yaml --seeds 0 --out runs/p2_3 \
+#       --override train.lambda_u=0 --override run_id=p2_3_kv_control
+
+run_id: p2_3_kv_probes
+seed: 0
+notes: "P2.3 definition-of-done run: the G1 recipe with hard top-K routing (STE), trained on kv/in_range with counterfactual utility probes (lambda_u 1.0); the matched control overrides train.lambda_u=0. Protocol fixed in the P2.3 plan before any run."
+profile: cpu # hardware profile: configs/hardware/<profile>.yaml; override with `profile=<name>`
+model_name: hsn
+
+model: # Appendix A.1
+  vocab_size: 256 # byte vocabulary V
+  d: 64 # width
+  n_cells: 32 # N
+  n_units: 8 # M
+  k_select: 4 # K cells per round
+  k_min: 1 # minimum selected cells
+  r_max: 1 # internal rounds cap R
+  in_degree: 4 # D_g
+  random_edges: 0 # extra random candidate edges
+  edge_norm: softmax # softmax | sigmoid
+  hidden: 512 # H for every two-layer MLP
+  n_context: 16 # context symbols
+  context_dim: 64 # context embedding width (= d)
+  activation: gelu # MLP activation (paper unspecified)
+  init: trunc_normal_0.02 # weight init of embeddings, scorer, halting, decoder (paper unspecified)
+  state_init: fan_in # P1.5a (amendment A1): E, P, S, units, V, W_out, gate weight; fan_in | trunc_normal_<std>
+  cell_norm: rms # P1.5a: RMSNorm over the 4d cell input before the units and the gate; rms | none
+  gate_bias_init: -3.0 # P1.5a: gate bias at init, sigmoid(-3) = 0.047 (cells retain by default)
+  scorer: linear # linear | mlp; Appendix C counts the linear scorer (200 -> 8)
+  scorer_hidden: 128 # hidden width when scorer = mlp (the C.2 "two-layer scorer" row)
+  scorer_features:
+    exclude: [] # feature names to zero (ablation; e.g. [eps])
+  routing: topk # dense | topk | greedy_budget | random | fixed
+  fixed_route: [] # cells for routing = fixed
+  budget: 1.0 # B_t as a fraction of the dense step cost
+  lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
+  deadline_ms: null # wall-clock deadline (serving)
+  cost_profile: null # P2.1: cost profile (P0.6 report + cost_profile block) for the router's cost table; null = uniform placeholder
+  static_k: true # pad selection to fixed K (needed for graphs / compile)
+  age_max: 64 # refresh-probe threshold
+  halt_threshold: 0.5 # inference halting threshold
+  predictor_target: fixed_embedding # fixed_embedding | ema_encoder (P1.6)
+  disabled_cells: [] # test hook
+  ablate_shared_u: false # ablation: remove u from v (not covered by the P1.1 closed forms)
+  state_schema_version: 1 # bumped on any state layout change
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv] # the P2.3 definition of done is measured on kv in-range
+  variants: [in_range] # the designated in-range state tasks
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train: # the recipe of record; batch is free throughput for the launch-bound dense step (P1.9 measurements)
+  unroll: 256 # TBPTT window T; the window synthetic_v1 defines in_range against
+  batch: 16 # B (the Appendix C.3 prototype says 4; the step time is the same at 16 on profile:rtx3060)
+  micro_batch: 16
+  grad_accum: 1
+  precision: bf16 # bf16 | fp16 | fp32 | fp64
+  lr: 3.0e-3 # the P1.9 overfit diagnosis: 64 docs reach 100 % train accuracy by step 1,400 at 3e-3; 1e-3 stalls at 0.57 in 1,000 steps
+  weight_decay: 0.01
+  warmup_steps: 200
+  schedule: cosine # constant | cosine | linear
+  grad_clip: 1.0
+  steps: 3000 # the user-approved P2.3 budget (the cosine schedule completes)
+  eval_every: 500
+  ckpt_every: 1000
+  stats_every: 50 # term_grad_norm/utility against /task every 50 steps (a stats step costs ~2x)
+  q_resync_every: 64
+  lambda_p: 1.0 # L_pred with the fixed-embedding target (P1.6); the only auxiliary term of Phase 1
+  search_trials: 4 # the search budget: the same number of trials for ref_a1, the GRU and the Transformer
+  # P2.2 routing controls at their defaults (nothing active with model.routing = dense)
+  gate_mode: ste # P2.2 straight-through hard selection from step 0 (soft_until_step 0)
+  soft_until_step: 0
+  temperature_start: 1.0
+  temperature_end: 1.0
+  temperature_steps: 0
+  epsilon_start: 0.0
+  epsilon_end: 0.0
+  epsilon_steps: 0
+  p_dense: 0.0
+  reinforce_baseline_decay: 0.9
+  lambda_u: 1.0 # P2.3: the utility regression weight, a unit weight chosen before any run
+  probe_fraction: 0.05 # P2.3 defaults (Appendix A.3)
+  n_probe: 4
+  probe_horizon: 16
+  ema_decay: 0.99
