@@ -27,8 +27,15 @@ The verdict uses the rule fixed in ``POST_A1_CHECKS.md`` before HSN's 5(c) ran: 
 >= 50 % of the correct answers follow the edit and <= 10 % are unchanged; does not read state when
 < 20 % follow; partial otherwise.
 
+For an HSN model the ``eff_overfit.py`` diagnostics are recorded on the first 4 dev documents every
+``--diag-every`` steps, and on the first ``--diag-docs`` dev documents after training
+(``trained_state``: cell diversity, cell spread, participation ratio of the cell states, saturation
+at answer and valid positions): a variant that breaks bitwise cell identity but keeps the cells
+parallel still has an effective state of width d.
+
 Writes ``<out>/<name>_reads_state.json`` (the dev curve, the probe counts, the verdict, the
-histogram of first-query answers and every probe) and the trainer's run directory ``<out>/<name>/``.
+histogram of first-query answers, the diagnostics and every probe) and the trainer's run directory
+``<out>/<name>/``.
 """
 
 from __future__ import annotations
@@ -46,7 +53,14 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from eff_overfit import REPO, VARIANTS, card_status, gpu_processes, install_variant  # noqa: E402
+from eff_overfit import (  # noqa: E402
+    REPO,
+    VARIANTS,
+    Diagnostics,
+    card_status,
+    gpu_processes,
+    install_variant,
+)
 from hsn.config import load_config  # noqa: E402
 from hsn.data.dataset import ByteDataset  # noqa: E402
 from hsn.device import resolve, seed_everything  # noqa: E402
@@ -118,6 +132,8 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-train", type=int, default=0, help="0 = the full training split (smoke)")
     ap.add_argument("--n-dev", type=int, default=0, help="0 = every dev document (smoke)")
+    ap.add_argument("--diag-every", type=int, default=500, help="0 = no diagnostics in training")
+    ap.add_argument("--diag-docs", type=int, default=32, help="dev documents for trained_state")
     ap.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     args = ap.parse_args()
     out = Path(args.out)
@@ -155,6 +171,9 @@ def main() -> None:
     model = build_model(cfg)
     variant = install_variant(model, args.variant, args.seed, args.offset_std)
     trainer = make_trainer(model, cfg, ctx, run_dir=out / args.name)
+    diag = Diagnostics(model, cfg, ctx, dev, max(args.diag_every, 1))
+    if args.diag_every:
+        diag.wrap(trainer.optimizer)
     t0 = time.perf_counter()
     history = trainer.fit(train, dev, args.steps)
     train_s = time.perf_counter() - t0
@@ -166,6 +185,8 @@ def main() -> None:
         }
         for e in history.evals
     ]
+
+    trained_state = Diagnostics(model, cfg, ctx, dev, 1, n_docs=args.diag_docs).state_stats()
 
     # 5(c): the edit probe on every dev document (as g1_harness_sensitivity.py --n-docs 0)
     model.eval()
@@ -235,6 +256,8 @@ def main() -> None:
             collections.Counter(p["argmax_original"] for p in probes).most_common()
         ),
         "distinct_first_query_answers": len({p["argmax_original"] for p in probes}),
+        "trained_state": trained_state,
+        "diagnostics": diag.records,
         "card": card_status(os.getpid(), seen),
         "gpu_processes": seen,
         "probes": probes,
@@ -243,7 +266,14 @@ def main() -> None:
     path.write_text(json.dumps(result, indent=1, default=str))
     print(path)
     print(
-        json.dumps({k: v for k, v in result.items() if k not in ("probes", "overrides")}, indent=1)
+        json.dumps(
+            {
+                k: v
+                for k, v in result.items()
+                if k not in ("probes", "overrides", "diagnostics", "gpu_processes")
+            },
+            indent=1,
+        )
     )
 
 

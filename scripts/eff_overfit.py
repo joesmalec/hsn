@@ -83,6 +83,7 @@ VARIANTS = (
     "gru_cell_direct_input",
     "cell_offset",
     "cell_embed",
+    "cell_embed_linear_head",
     "linear_head",
     "decoder_fc1_fan_in",
 )
@@ -283,17 +284,24 @@ def install_variant(model: nn.Module, variant: str, seed: int, offset_std: float
         # of model.init (trunc_normal_0.02); D's output layer keeps 0.02
         init_weight_(model.decoder.fc1.weight, "fan_in")
         return {"variant": variant, "decoder_fc1_init": "fan_in"}
-    if variant in ("cell_offset", "cell_embed"):
+    if variant in ("cell_offset", "cell_embed", "cell_embed_linear_head"):
+        learned = variant != "cell_offset"
         offset = torch.randn(N, 4 * d, generator=gen) * offset_std
-        identity = CellIdentity(cell.norm, offset, learned=variant == "cell_embed")
+        identity = CellIdentity(cell.norm, offset, learned=learned)
         # step_dense reads self.norm(v_raw); the cell_norm row of HSN.param_report now holds the
-        # RMSNorm gain plus, for cell_embed, the learned vectors, so its check still balances
+        # RMSNorm gain plus, for the learned variants, the per-cell vectors, so its check balances
         cell.norm = identity
-        return {
+        record = {
             "variant": variant,
             "offset_std": offset_std,
-            "extra_params": N * 4 * d if variant == "cell_embed" else 0,
+            "extra_params": N * 4 * d if learned else 0,
         }
+        if variant == "cell_embed_linear_head":
+            # S2 + V1: learned cell identity with the baseline readout (V1 removed the state
+            # saturation that re-synchronised the S2 cells in E3); the decoder row counts the head
+            model.decoder = LinearHead(d, model.cfg.vocab_size)
+            record["decoder"] = "LayerNorm(q) -> Linear(d, V)"
+        return record
     if variant in ("gru_cell", "gru_cell_linear_head", "gru_cell_direct_input"):
         direct = variant == "gru_cell_direct_input"
         # PyTorch's default initialisation (as nn.GRU in gru_2m); the direct variant reads width d
@@ -391,6 +399,7 @@ class Diagnostics:
         ctx: DeviceContext,
         docs: ByteDataset,
         every: int,
+        n_docs: int = 4,
     ) -> None:
         self.model = model
         self.cfg = cfg
@@ -401,7 +410,7 @@ class Diagnostics:
         self.calls = 0
         self.window: dict[str, Tensor] | None = None
         if isinstance(model, HSN):
-            examples = [docs.examples[i] for i in range(min(4, len(docs)))]
+            examples = [docs.examples[i] for i in range(min(n_docs, len(docs)))]
             batch = collate_windows(
                 examples, cfg.train.unroll, batch=len(examples), align_docs=cfg.data.align_docs
             )
@@ -476,6 +485,11 @@ class Diagnostics:
             out[f"sat99/{tag}"] = float((hs.abs() >= 0.99).float().mean())
             out[f"abs_h/{tag}"] = float(hs.abs().mean())
             out[f"cell_spread/{tag}"] = float((hs - hs[:, :1]).abs().amax())
+            # participation ratio of the [N, d] cell-state matrix: 1 when every cell holds the
+            # same direction, up to min(N, d) when the cells span independent directions
+            sv2 = torch.linalg.svdvals(hs).square()
+            pr = sv2.sum(-1).square() / sv2.square().sum(-1).clamp_min(1e-24)
+            out[f"rank_pr/{tag}"] = float(pr.mean())
         if captured[0][1] is not None:
             b = torch.stack([c[1] for c in captured], dim=1).float()  # type: ignore[misc]
             bv = b[valid].reshape(-1)

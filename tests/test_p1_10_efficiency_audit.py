@@ -170,6 +170,28 @@ def test_p1_10_reads_state_outcomes_partition_probes() -> None:
     assert rs.outcome_counts(correct) == {"follow": 1, "other": 1, "unchanged": 0}
 
 
+def test_p1_10_cell_identity_variant_breaks_symmetry() -> None:
+    eo = _load_script("eff_overfit")
+    torch.manual_seed(0)
+    run = load_config(REPO / "configs" / "ref_a1.yaml")
+    model = HSN.from_config(run).float()
+    base = model.param_report()["total_trainable"]
+    record = eo.install_variant(model, "cell_embed_linear_head", seed=0, offset_std=0.5)
+    report = model.param_report()  # raises if any parameter is unaccounted for
+    d, N, V = run.model.d, run.model.n_cells, run.model.vocab_size
+    old_decoder = sum(p.numel() for p in HSN.from_config(run).decoder.parameters())
+    assert record["extra_params"] == N * 4 * d
+    assert report["total_trainable"] == base + N * 4 * d - old_decoder + (2 * d + d * V + V)
+    B, T = 2, 6
+    tokens = torch.randint(0, V, (B, T))
+    ctx = torch.randint(0, run.model.n_context, (B, T))
+    reset = torch.zeros(B, T, dtype=torch.bool)
+    reset[:, 0] = True
+    logits, final, _ = model(tokens, ctx, model.init_state(B), reset)
+    assert logits.shape == (B, T, V)
+    assert float((final.h - final.h[:, :1]).abs().amax()) > 0.0
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
