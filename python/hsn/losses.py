@@ -99,6 +99,19 @@ term that needs a selection (cost, balance) under dense routing raises.
 path (a constant, or one that reaches no parameter) reports 0.0 so the keys are predictable.
 ``scale`` is the fp16 loss scale: the term is scaled before the backward and the norm divided back,
 because an unscaled fp16 backward underflows (:mod:`hsn.train.amp`).
+
+P2.3: :func:`utility_loss` is the regression of the scorer's predicted utility onto the
+counterfactual targets of :mod:`hsn.train.probes`::
+
+    utility_loss(U_pred, U_target) = mean over probe pairs of (U_pred − U_target)²
+
+``U_pred`` is the scorer's logit ``U_ij`` at the probed position, cell and unit (before the cost
+term ``λ_cost · c``), computed from the detached features of the probe, so the gradient reaches the
+scorer only; ``U_target`` is the measured loss reduction (positive: the candidate helps) and must
+not require grad. The term is ``λ_u · utility_loss`` (``train.lambda_u``). It is not one of
+:data:`TERMS`: the TBPTT trainer adds it as ``utility`` (zero on windows without a probe, like the
+REINFORCE term of P2.2) only when ``train.lambda_u > 0``, so the objective of every other
+configuration is unchanged.
 """
 
 from __future__ import annotations
@@ -127,6 +140,7 @@ __all__ = [
     "pred_loss",
     "prediction_terms",
     "total_and_parts",
+    "utility_loss",
     "variance_floor",
 ]
 
@@ -649,3 +663,35 @@ def _routed_field(info: Mapping[str, Tensor], key: str, term: str) -> Tensor:
             f"auxiliary_terms: info[{key!r}] must be a tensor, got {type(value).__name__}"
         )
     return value
+
+
+# --------------------------------------------------------------------------------------------------
+# P2.3: the utility regression
+# --------------------------------------------------------------------------------------------------
+
+
+def utility_loss(U_pred: Tensor, U_target: Tensor) -> Tensor:  # noqa: N803 - the chunk's names
+    """Mean squared error between the predicted utilities ``U_pred [P, 1]`` and the probe targets
+    ``U_target [P, 1]`` (any shape ``[*, 1]``, the same for both; ``P >= 1`` pairs), a 0-dim fp32
+    tensor (module docstring). ``U_target`` must not require grad (the targets are measurements,
+    not a path into the model); an empty set of pairs or a non-finite target raises."""
+    _check_tensor("U_pred", U_pred)
+    _check_tensor("U_target", U_target)
+    if U_pred.ndim < 1 or U_pred.shape[-1] != 1:
+        raise ValueError(f"utility_loss: U_pred must be [*, 1], got {tuple(U_pred.shape)}")
+    if U_target.shape != U_pred.shape:
+        raise ValueError(
+            f"utility_loss: U_target has shape {tuple(U_target.shape)} but U_pred "
+            f"{tuple(U_pred.shape)}"
+        )
+    if U_pred.numel() == 0:
+        raise ValueError("utility_loss: no probe pair (the mean of nothing is undefined)")
+    if U_target.requires_grad:
+        raise ValueError("utility_loss: U_target requires grad; the probe targets must be detached")
+    if U_pred.device != U_target.device:
+        raise ValueError(
+            f"utility_loss: U_pred lives on {U_pred.device} but U_target on {U_target.device}"
+        )
+    if not bool(torch.isfinite(U_target).all()):
+        raise ValueError("utility_loss: U_target holds a non-finite value")
+    return F.mse_loss(U_pred.float(), U_target.float())
