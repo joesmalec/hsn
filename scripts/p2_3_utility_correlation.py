@@ -56,12 +56,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0, help="probe-position and bootstrap seed")
     parser.add_argument("--n-bootstrap", type=int, default=1000)
     parser.add_argument("--profile", help="hardware profile override (default: the run's)")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="the run's configuration file (default: <run_dir>/config.resolved.yaml, which the "
+        "runner writes when the run ends; with --init the experiment file gives the same weights)",
+    )
     parser.add_argument("--out", type=Path, help="output JSON (default: inside the run dir)")
     args = parser.parse_args(argv)
 
     run_dir: Path = args.run_dir
     overrides = [f"profile={args.profile}"] if args.profile else []
-    cfg = load_config(run_dir / "config.resolved.yaml", overrides=overrides)
+    cfg = load_config(args.config or run_dir / "config.resolved.yaml", overrides=overrides)
     if cfg.model_name != "hsn":
         raise SystemExit(f"{run_dir} trained {cfg.model_name!r}; the probes need the HSN")
     horizon: int | None = None if args.horizon == "end" else int(args.horizon)
@@ -112,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     record = {
         **result.to_dict(),
         "run_dir": str(run_dir),
+        "config": str(args.config or run_dir / "config.resolved.yaml"),
         "weights": source,
         "split": "dev",
         "tasks": list(cfg.data.tasks),
