@@ -52,7 +52,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--n-docs", type=int, default=50)
+    ap.add_argument("--n-docs", type=int, default=50, help="0 = every document of the split")
     ap.add_argument("--label", default=None)
     ap.add_argument("--split", default="dev", help="dev (DIAGNOSIS.md) or train (overfit docs)")
     args = ap.parse_args()
@@ -89,7 +89,7 @@ def main() -> None:
 
     probes: list[dict[str, Any]] = []
     for i in range(len(dev)):
-        if len(probes) >= args.n_docs:
+        if args.n_docs > 0 and len(probes) >= args.n_docs:
             break
         ex = dev.examples[i]
         tokens = np.asarray(ex.tokens, dtype=np.int64)
@@ -143,6 +143,17 @@ def main() -> None:
         "n_changed_to_new_value": sum(p["follows_new_value"] for p in probes),
         "n_changed_to_other": sum(p["changed"] and not p["follows_new_value"] for p in probes),
         "n_unchanged": sum(not p["changed"] for p in probes),
+        # post-A1 5(c): the same three counts over the documents answered correctly before the edit
+        "n_correct_before_edit": sum(p["original_correct"] for p in probes),
+        "correct_before_edit": {
+            "n_changed_to_new_value": sum(
+                p["follows_new_value"] for p in probes if p["original_correct"]
+            ),
+            "n_changed_to_other": sum(
+                p["changed"] and not p["follows_new_value"] for p in probes if p["original_correct"]
+            ),
+            "n_unchanged": sum(not p["changed"] for p in probes if p["original_correct"]),
+        },
         "changed_fraction": sum(p["changed"] for p in probes) / n if n else None,
         "follows_new_value_fraction": sum(p["follows_new_value"] for p in probes) / n
         if n
