@@ -3,7 +3,11 @@
 training recipe and the 5(c) edit probe, with an ``eff_overfit.py`` variant installed.
 
     python scripts/eff_reads_state.py --name <arm> --out evidence/EFF/reads_state \
-        [--variant pdg|gru_cell|...] [--override KEY=VALUE ...] [--steps 3000]
+        [--variant pdg|gru_cell|...] [--override KEY=VALUE ...] [--steps 3000] [--config <yaml>]
+
+``--config`` defaults to ``configs/experiments/g1_ref_a1.yaml``; a baseline configuration (for
+example ``configs/baselines/gru_2m.yaml`` with ``--override baseline.gru.d_model=64``) runs the same
+recipe as a control (pass the HSN recipe's schedule keys as overrides so the two match).
 
 5(b), as ``scripts/g1_harness_dense_supervision.py`` (branch ``g1-diagnosis``, ``5deec76``) runs its
 ``sparse`` arm: ``configs/experiments/g1_ref_a1.yaml`` (bf16 autocast, weight decay 0.01, cosine
@@ -87,6 +91,7 @@ def verdict(follow: int, unchanged: int, correct: int) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--config", default=str(REPO / "configs" / "experiments" / "g1_ref_a1.yaml"))
     ap.add_argument("--name", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--variant", choices=VARIANTS, default="pdg")
@@ -119,7 +124,7 @@ def main() -> None:
         "data.variants=[in_range]",
         *args.override,
     ]
-    cfg = load_config(REPO / "configs" / "experiments" / "g1_ref_a1.yaml", overrides=overrides)
+    cfg = load_config(args.config, overrides=overrides)
     ctx = resolve(cfg.hardware)
     manifest = Path(str(cfg.data.manifest))
     train = ByteDataset.load(
@@ -201,6 +206,7 @@ def main() -> None:
     seen.append(gpu_processes())
     result = {
         "name": args.name,
+        "config": args.config,
         **variant,
         "overrides": overrides,
         "autocast": history.autocast,
