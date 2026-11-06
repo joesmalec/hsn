@@ -27,6 +27,10 @@ Variants (HSN only; installed on the built instance, no repository code changes,
 * ``gru_cell_direct_input`` (W2): ``gru_cell`` whose update reads ``emb(x_t) + ctx_emb(ctx_t)``
   (width ``d``, the GRU baseline's input) instead of ``norm([u; eps; h_i; m_i])``; E, P, S and
   ``eps`` still run and feed the decoder and the prediction loss.
+* ``linear_head`` (V1): the PDG model with ``D([q; u])`` replaced by ``Linear(LayerNorm(q))``
+  as in ``gru_cell_linear_head``.
+* ``decoder_fc1_fan_in`` (V2): the PDG model with the decoder's first layer at the A1 fan-in
+  initialisation instead of ``model.init``; its output layer keeps ``model.init``.
 * ``cell_offset``: a fixed per-cell vector ``o_i ~ N(0, offset_std^2)`` of width ``4d`` (a buffer
   from its own generator seeded with ``--seed``; no parameter) added to the normalised cell input
   of the dense round, so the cells are no longer interchangeable.
@@ -66,6 +70,7 @@ import torch
 from hsn.config import RunConfig, load_config
 from hsn.data.dataset import ByteDataset, collate_windows
 from hsn.device import DeviceContext, resolve, seed_everything
+from hsn.model.embeddings import init_weight_
 from hsn.model.hsn import HSN
 from hsn.runner import build_model, make_trainer
 from torch import Tensor, nn
@@ -78,6 +83,8 @@ VARIANTS = (
     "gru_cell_direct_input",
     "cell_offset",
     "cell_embed",
+    "linear_head",
+    "decoder_fc1_fan_in",
 )
 THRESHOLDS = (0.90, 0.99)
 
@@ -266,6 +273,16 @@ def install_variant(model: nn.Module, variant: str, seed: int, offset_std: float
     cell = model.cell
     d, N = cell.d, cell.n_cells
     gen = torch.Generator().manual_seed(seed)
+    if variant == "linear_head":
+        # V1: the PDG model with HSN's MLP decoder D([q; u]) replaced by the GRU baseline's readout
+        # Linear(LayerNorm(q)); the decoder row of HSN.param_report counts the new head
+        model.decoder = LinearHead(d, model.cfg.vocab_size)
+        return {"variant": variant, "decoder": "LayerNorm(q) -> Linear(d, V)"}
+    if variant == "decoder_fc1_fan_in":
+        # V2: the PDG model with D's first layer (the read of [q; u]) at the A1 fan-in init instead
+        # of model.init (trunc_normal_0.02); D's output layer keeps 0.02
+        init_weight_(model.decoder.fc1.weight, "fan_in")
+        return {"variant": variant, "decoder_fc1_init": "fan_in"}
     if variant in ("cell_offset", "cell_embed"):
         offset = torch.randn(N, 4 * d, generator=gen) * offset_std
         identity = CellIdentity(cell.norm, offset, learned=variant == "cell_embed")
