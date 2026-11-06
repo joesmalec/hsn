@@ -21,6 +21,12 @@ Variants (HSN only; installed on the built instance, no repository code changes,
   normalised cell input ``norm([u; eps; h_i; m_i])`` (the A1 wrapper), with PyTorch's default GRU
   initialisation (the one ``gru_2m`` uses). The unit bank, ``W_out`` and the gate stay in place
   but receive no gradient.
+* ``gru_cell_linear_head`` (wrapper bisection W1): ``gru_cell`` with HSN's MLP decoder
+  ``D([q; u])`` replaced by the GRU baseline's readout ``Linear(LayerNorm(q))`` (weights
+  ``N(0, 0.02^2)``, bias 0; ``u`` is not read).
+* ``gru_cell_direct_input`` (W2): ``gru_cell`` whose update reads ``emb(x_t) + ctx_emb(ctx_t)``
+  (width ``d``, the GRU baseline's input) instead of ``norm([u; eps; h_i; m_i])``; E, P, S and
+  ``eps`` still run and feed the decoder and the prediction loss.
 * ``cell_offset``: a fixed per-cell vector ``o_i ~ N(0, offset_std^2)`` of width ``4d`` (a buffer
   from its own generator seeded with ``--seed``; no parameter) added to the normalised cell input
   of the dense round, so the cells are no longer interchangeable.
@@ -65,7 +71,14 @@ from hsn.runner import build_model, make_trainer
 from torch import Tensor, nn
 
 REPO = Path(__file__).resolve().parents[1]
-VARIANTS = ("pdg", "gru_cell", "cell_offset", "cell_embed")
+VARIANTS = (
+    "pdg",
+    "gru_cell",
+    "gru_cell_linear_head",
+    "gru_cell_direct_input",
+    "cell_offset",
+    "cell_embed",
+)
 THRESHOLDS = (0.90, 0.99)
 
 
@@ -191,6 +204,24 @@ class CellIdentity(nn.Module):
         return out + self.offset.to(out.dtype)[None]
 
 
+class LinearHead(nn.Module):
+    """The GRU baseline's readout on HSN's summary: ``Linear(LayerNorm(q))`` applied to the decoder
+    input ``[q; u]`` (``u`` is not read). The linear layer is named ``fc1`` because
+    :attr:`HSN.device` and :attr:`HSN.dtype` read ``decoder.fc1.weight``."""
+
+    def __init__(self, d: int, vocab: int) -> None:
+        super().__init__()
+        self.d = d
+        self.norm = nn.LayerNorm(d)
+        self.fc1 = nn.Linear(d, vocab)
+        nn.init.normal_(self.fc1.weight, std=0.02)
+        nn.init.zeros_(self.fc1.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        out: Tensor = self.fc1(self.norm(x[..., : self.d]))
+        return out
+
+
 def _param_report_with(extra_rows: dict[str, nn.Module]) -> Any:
     """``HSN.param_report`` with the variant's extra rows (modules outside every Appendix C row)
     added to its honesty check (``total_trainable = total + edges + extras``)."""
@@ -246,9 +277,22 @@ def install_variant(model: nn.Module, variant: str, seed: int, offset_std: float
             "offset_std": offset_std,
             "extra_params": N * 4 * d if variant == "cell_embed" else 0,
         }
-    if variant == "gru_cell":
-        gru = nn.GRUCell(4 * d, d)  # PyTorch's default initialisation (as nn.GRU in gru_2m)
+    if variant in ("gru_cell", "gru_cell_linear_head", "gru_cell_direct_input"):
+        direct = variant == "gru_cell_direct_input"
+        # PyTorch's default initialisation (as nn.GRU in gru_2m); the direct variant reads width d
+        gru = nn.GRUCell(d if direct else 4 * d, d)
         cell.gru_update = gru
+        if direct:
+            # W2: the cell reads emb(x_t) + ctx_emb(ctx_t), the GRU baseline's input, instead of
+            # norm([u; eps; h_i; m_i]); E, P, S and eps still run and feed the decoder and L_pred
+            original_shared_path = model._shared_path
+
+            def shared_path(x_t: Tensor, ctx_t: Tensor, state: Any) -> Any:
+                out = original_shared_path(x_t, ctx_t, state)
+                cell._direct_input = model.byte_emb(x_t) + model.ctx_emb(ctx_t)
+                return out
+
+            model._shared_path = shared_path  # type: ignore[method-assign]
 
         def step_dense(
             u: Tensor, eps: Tensor, state: Any, alpha: Tensor
@@ -256,21 +300,42 @@ def install_variant(model: nn.Module, variant: str, seed: int, offset_std: float
             B, NN, dd = cell._check_inputs(u, eps, state, alpha)
             with cell.graph.step():
                 h_prev = state.h
-                m = cell.graph.messages_dense(h_prev, cell.V)
-                v_raw = torch.cat(
-                    [u[:, None, :].expand(B, NN, dd), eps[:, None, :].expand(B, NN, dd), h_prev, m],
-                    dim=-1,
-                )
-                v = cell.norm(v_raw)
+                if direct:
+                    x_in = cell._direct_input.to(h_prev.dtype)  # [B, d]
+                    v = x_in[:, None, :].expand(B, NN, dd)
+                    info: dict[str, Tensor] = {"v": v, "h_prev": h_prev}
+                    width = dd
+                else:
+                    m = cell.graph.messages_dense(h_prev, cell.V)
+                    v_raw = torch.cat(
+                        [
+                            u[:, None, :].expand(B, NN, dd),
+                            eps[:, None, :].expand(B, NN, dd),
+                            h_prev,
+                            m,
+                        ],
+                        dim=-1,
+                    )
+                    v = cell.norm(v_raw)
+                    info = {"m": m, "v": v, "v_raw": v_raw, "h_prev": h_prev}
+                    width = 4 * dd
                 with torch.autocast(device_type=h_prev.device.type, enabled=False):
                     h_new = cell.gru_update(
-                        v.reshape(B * NN, 4 * dd).to(h_prev.dtype), h_prev.reshape(B * NN, dd)
+                        v.reshape(B * NN, width).to(h_prev.dtype), h_prev.reshape(B * NN, dd)
                     ).reshape(B, NN, dd)
-            return h_new, {"m": m, "v": v, "v_raw": v_raw, "h_prev": h_prev}
+            return h_new, info
 
         cell.step_dense = step_dense
-        model.param_report = types.MethodType(_param_report_with({"gru_update": gru}), model)
-        return {"variant": "gru_cell", "extra_params": sum(p.numel() for p in gru.parameters())}
+        extra: dict[str, nn.Module] = {"gru_update": gru}
+        record: dict[str, Any] = {"variant": variant}
+        if variant == "gru_cell_linear_head":
+            # W1: the GRU baseline's readout (LayerNorm + linear, std 0.02, bias 0) on q only,
+            # in place of HSN's MLP decoder D([q; u])
+            model.decoder = LinearHead(d, model.cfg.vocab_size)
+            record["decoder"] = "LayerNorm(q) -> Linear(d, V)"
+        model.param_report = types.MethodType(_param_report_with(extra), model)
+        record["extra_params"] = sum(p.numel() for p in gru.parameters())
+        return record
     raise ValueError(f"unknown variant {variant!r}; known: {VARIANTS}")
 
 
