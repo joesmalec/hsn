@@ -149,6 +149,27 @@ def test_p1_10_attribution_sums_to_total() -> None:
     assert only["launches_total"] == sum(rows.values()) == len(kernels) - 1
 
 
+def test_p1_10_reads_state_outcomes_partition_probes() -> None:
+    rs = _load_script("eff_reads_state")
+
+    def probe(before: int, after: int, old: int, new: int) -> dict[str, Any]:
+        return {
+            "changed": before != after,
+            "follows_new_value": after == new,
+            "original_correct": before == old,
+        }
+
+    probes = [
+        probe(182, 182, 150, 182),  # constant answer that happens to equal the new value
+        probe(182, 182, 150, 160),  # constant answer
+        probe(150, 160, 150, 160),  # follows the edit
+        probe(150, 170, 150, 160),  # changes to another symbol
+    ]
+    assert rs.outcome_counts(probes) == {"follow": 1, "other": 1, "unchanged": 2}
+    correct = [p for p in probes if p["original_correct"]]
+    assert rs.outcome_counts(correct) == {"follow": 1, "other": 1, "unchanged": 0}
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(

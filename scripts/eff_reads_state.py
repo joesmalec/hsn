@@ -21,9 +21,11 @@ in every dev delayed document the value of the first fact is replaced by a value
 the document, and the argmax at the answer position of the first query for that fact's key is read
 before and after the edit, from a fresh state, one window, evaluation mode, the run's autocast.
 Reported over all probed documents and over those answered correctly before the edit: answers that
-follow the edit, change to another symbol, or stay unchanged. The verdict uses the rule fixed in
-``POST_A1_CHECKS.md`` before HSN's 5(c) ran: reads state when >= 50 % of the correct answers follow
-the edit and <= 10 % are unchanged; does not read state when < 20 % follow; partial otherwise.
+change to the new value (follow the edit), change to another symbol, or stay unchanged (the three
+partition the probes; the per-probe ``follows_new_value`` is the raw ``after == new value``).
+The verdict uses the rule fixed in ``POST_A1_CHECKS.md`` before HSN's 5(c) ran: reads state when
+>= 50 % of the correct answers follow the edit and <= 10 % are unchanged; does not read state when
+< 20 % follow; partial otherwise.
 
 Writes ``<out>/<name>_reads_state.json`` (the dev curve, the probe counts, the verdict, the
 histogram of first-query answers and every probe) and the trainer's run directory ``<out>/<name>/``.
@@ -76,6 +78,18 @@ def absent_value(old: int, present: set[int]) -> int:
         if v not in present:
             return v
     raise ValueError("every value symbol occurs in the document")
+
+
+def outcome_counts(probes: list[dict[str, Any]]) -> dict[str, int]:
+    """Partition probes into follow / other / unchanged. A probe follows only when its answer
+    changed: a model that gives one constant answer would otherwise count every probe whose new
+    value equals that answer as both following the edit and unchanged."""
+    follow = sum(p["changed"] and p["follows_new_value"] for p in probes)
+    other = sum(p["changed"] and not p["follows_new_value"] for p in probes)
+    unchanged = sum(not p["changed"] for p in probes)
+    if follow + other + unchanged != len(probes):
+        raise AssertionError("outcome counts do not partition the probes")
+    return {"follow": follow, "other": other, "unchanged": unchanged}
 
 
 def verdict(follow: int, unchanged: int, correct: int) -> str:
@@ -200,9 +214,7 @@ def main() -> None:
             }
         )
     correct = [p for p in probes if p["original_correct"]]
-    c_follow = sum(p["follows_new_value"] for p in correct)
-    c_other = sum(p["changed"] and not p["follows_new_value"] for p in correct)
-    c_unchanged = sum(not p["changed"] for p in correct)
+    c_counts = outcome_counts(correct)
     seen.append(gpu_processes())
     result = {
         "name": args.name,
@@ -216,18 +228,9 @@ def main() -> None:
         "evals": evals,
         "n_probed": len(probes),
         "first_query_accuracy": len(correct) / len(probes) if probes else None,
-        "all": {
-            "follow": sum(p["follows_new_value"] for p in probes),
-            "other": sum(p["changed"] and not p["follows_new_value"] for p in probes),
-            "unchanged": sum(not p["changed"] for p in probes),
-        },
-        "correct_before_edit": {
-            "n": len(correct),
-            "follow": c_follow,
-            "other": c_other,
-            "unchanged": c_unchanged,
-        },
-        "verdict": verdict(c_follow, c_unchanged, len(correct)),
+        "all": outcome_counts(probes),
+        "correct_before_edit": {"n": len(correct), **c_counts},
+        "verdict": verdict(c_counts["follow"], c_counts["unchanged"], len(correct)),
         "first_query_answer_histogram": dict(
             collections.Counter(p["argmax_original"] for p in probes).most_common()
         ),
