@@ -14,3 +14,4 @@ metal = [] # empty until P2.11; must stay off by default
 
 [dependencies]
 hsn-core.workspace = true
+thiserror.workspace = true
