@@ -68,10 +68,11 @@ B, T = 3, 8
 #: 64 seeds hold both kinds many times over; the test asserts it found them).
 SEED_SEARCH = 64
 
-#: Compiled vs eager, fp32, measured on the CPU (inductor) and CUDA; the tolerance is 10x the
-#: largest measured difference (the efficiency audit's rule). See the PR for the measurements.
+#: Compiled vs eager in fp32: 10x the largest difference measured (the efficiency audit's rule),
+#: rounded up to one digit. CPU (inductor, 7 Nov 2026, every case below over three seeds): values
+#: (logits, state, info) 7.2e-7, parameter gradients 1.14e-5.
 TOL = {
-    ("cpu", "fp32"): {"values": 1e-5, "grads": 1e-4},
+    ("cpu", "fp32"): {"values": 8e-6, "grads": 1.2e-4},
     ("cuda", "fp32"): {"values": 1e-4, "grads": 1e-3},
 }
 
@@ -696,10 +697,12 @@ def test_p2_8_trainer_compile_time_separate(
             compiled = trainer._compiled
             assert compiled is not None
             assert compiled.calls == 3  # steps 1, 2, 4; steps 3 and 5 are statistics steps
+            assert trainer.compiled_window is compiled
             assert not trainer._cut_enabled
     eager, comp = histories["none"], histories["reduce-overhead"]
     assert comp.measured["compile_steps"] >= 1.0 and comp.measured["compile_seconds"] > 0.0
     assert eager.measured["compile_steps"] == 0.0 and eager.measured["compile_seconds"] == 0.0
+    assert eager.measured["compiled_windows"] == 0.0 and comp.measured["compiled_windows"] == 3.0
     stamped = sum(r.seconds for r in comp.steps)
     total = comp.measured["train_seconds"] + comp.measured["compile_seconds"]
     assert abs(stamped - total) < 1e-6

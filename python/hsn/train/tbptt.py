@@ -127,7 +127,9 @@ window loop::
   behaviour, equal to the cut one). A step during which a window compiled or recorded a graph is
   a *compile step*: its wall time goes to ``measured["compile_seconds"]`` (and
   ``measured["compile_steps"]``) and stays out of ``train_seconds`` and ``tokens_per_s``; its step
-  record still carries its wall time. Evaluation and the probes stay eager.
+  record still carries its wall time. ``measured["compiled_windows"]`` counts the windows that
+  ran compiled (0 in an eager run) and :attr:`TBPTTTrainer.compiled_window` is the window itself.
+  Evaluation and the probes stay eager.
 
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
 non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
@@ -305,6 +307,13 @@ class TBPTTTrainer(Trainer):
             cfg.data.align_docs and cfg.model.routing == "dense" and self._compiled is None
         )
         self._cut_pending = False  # the carried state comes from a cut window
+
+    @property
+    def compiled_window(self) -> CompiledWindow | None:
+        """P2.8: the compiled training window (``None`` when ``hardware.compile_mode`` is
+        ``none``, or on MPS without compile support); its ``calls`` and ``compile_seconds``
+        count what ran compiled."""
+        return self._compiled
 
     # P2.2 ------------------------------------------------------------------------------------
 
@@ -746,6 +755,8 @@ class TBPTTTrainer(Trainer):
             "resyncs": float(self.resyncs),
             "compile_seconds": compile_seconds,
             "compile_steps": float(compile_steps),
+            # P2.8: windows this trainer ran through the compiled window (0: every window eager)
+            "compiled_windows": float(self._compiled.calls if self._compiled is not None else 0),
         }
         return history
 
