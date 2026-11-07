@@ -42,8 +42,10 @@ from hsn.experiments.variant_names import (
     VARIANTS,
     variant_params,
 )
+from hsn.model.cell import WindowConsts
 from hsn.model.embeddings import init_weight_
 from hsn.model.hsn import HSN
+from hsn.model.state import CellGraphState
 
 __all__ = [
     "DEFAULT_OFFSET_STD",
@@ -190,8 +192,18 @@ def _install_gru_cell(model: HSN, variant: str) -> dict[str, Any]:
     cell.gru_update = gru
 
     def step_dense(
-        u: Tensor, eps: Tensor, state: Any, alpha: Tensor
+        u: Tensor,
+        eps: Tensor,
+        state: CellGraphState,
+        alpha: Tensor,
+        *,
+        consts: WindowConsts | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
+        if consts is not None:  # P2.8's compiled window: variants run eager only
+            raise NotImplementedError(
+                f"variant {variant}: P2.8's compiled window is not supported (variants run eager "
+                "only: hardware.compile_mode=none)"
+            )
         B, NN, dd = cell._check_inputs(u, eps, state, alpha)
         with cell.graph.step():
             h_prev = state.h

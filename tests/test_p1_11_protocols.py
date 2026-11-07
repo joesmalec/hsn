@@ -151,14 +151,10 @@ def test_p1_11_reads_state_record(tiny_manifest: Path, tmp_path: Path) -> None: 
         "total_s",
     }
     assert record["walls"]["eval_s"] > 0 and record["eval_count"] == 3
-    assert record["compile"] == {
-        "mode": "none",
-        "compiled_window": False,
-        "compiled_windows": None,
-        "compile_seconds": None,
-        "compile_steps": None,
-        "window_compile_seconds": None,
-    }
+    compile_info = record["compile"]  # P2.8 records zeros on an eager run
+    assert compile_info["mode"] == "none" and compile_info["compiled_window"] is False
+    for key in ("compiled_windows", "compile_seconds", "compile_steps", "window_compile_seconds"):
+        assert compile_info[key] in (None, 0.0), (key, compile_info[key])
     assert [d["step"] for d in record["diagnostics"]] == [2, 4, 6]
     check_hsn_reads_state_record(record, eval_steps=[2, 4, 6], diag_steps=[2, 4, 6])
     first = record["evals"][0]
