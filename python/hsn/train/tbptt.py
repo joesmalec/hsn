@@ -165,7 +165,7 @@ from hsn.train.checkpoint import (
     unpack_cell_state,
 )
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
-from hsn.train.loop import History, StepRecord, StreamLoader, Trainer
+from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
 from hsn.train.probes import (
     ProbeResult,
     cell_utility,
@@ -458,8 +458,10 @@ class TBPTTTrainer(Trainer):
         steps: int,
         *,
         metrics: Mapping[str, Metric] | None = None,
+        callback: FitCallback | None = None,
     ) -> History:
-        """Train until ``self.step == steps`` (a resumed trainer continues where it stopped).
+        """Train until ``self.step == steps`` (a resumed trainer continues where it stopped), or
+        until ``callback`` returns True (P1.11; :mod:`hsn.train.loop`, "Hooks").
 
         ``train_ds`` and ``dev_ds`` are document datasets: the loader is built here so that its
         position can be checkpointed and restored (P0.5). Every record of the returned history is a
@@ -690,9 +692,16 @@ class TBPTTTrainer(Trainer):
                     self.step,
                     " ".join(f"{k} {v:.4f}" for k, v in result.items() if isinstance(v, float)),
                 )
+            saved = False
             if self.step % train.ckpt_every == 0 or self.step == steps:
                 path = self.save(self.run_dir, loader, state)
                 history.checkpoints.append(str(path))
+                saved = True
+            if callback is not None and self.step < steps and callback(self, history):
+                if not saved:
+                    history.checkpoints.append(str(self.save(self.run_dir, loader, state)))
+                logger.info("stopped by callback at step %d of %d", self.step, steps)
+                break
         self._carried_state = state.detach()
         synchronize(device)
         memory = memory_stats(device)
