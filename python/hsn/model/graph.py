@@ -41,12 +41,13 @@ the checkpoint's topology first (never reinterpreted by shape). Replacing the to
 
 Windows (P1.10a). The edge weights depend on the parameters only, so a window of positions
 (:meth:`hsn.model.hsn.HSN.forward`) computes them once: inside :meth:`CellGraph.window` the padded
-weights and their dtype casts are built on first use and reused by every message call of the
-window, and dropped when the window ends. A cached value is bound to the ``edge_logit`` object, its
-in-place version counter and the grad mode it was built under; a use that sees any of them changed
-raises ``RuntimeError`` rather than serving a stale weight. Outside a window every call recomputes,
-as before. The cache never outlives a window, so ``torch.func.functional_call`` and replaced
-parameters are always read fresh.
+weights are built on first use and reused by every message call of the window, and dropped when the
+window ends (a cast to the message dtype under autocast still runs per call, so that the window's
+gradient contributions are summed in the weights' dtype). A cached value is bound to the
+``edge_logit`` object, its in-place version counter and the grad mode it was built under; a use
+that sees any of them changed raises ``RuntimeError`` rather than serving a stale weight. Outside a
+window every call recomputes, as before. The cache never outlives a window, so
+``torch.func.functional_call`` and replaced parameters are always read fresh.
 """
 
 from __future__ import annotations
@@ -217,9 +218,11 @@ class CellGraph(nn.Module):
         return self._cached("padded", self._build_padded_weights)
 
     def _padded_weights_as(self, dtype: torch.dtype) -> Tensor:
-        """:meth:`_padded_weights` cast to ``dtype`` (the message dtype under autocast), once per
-        window per dtype."""
-        return self._cached(f"padded:{dtype}", lambda: self._padded_weights().to(dtype))
+        """:meth:`_padded_weights` in ``dtype`` (the message dtype under autocast). The cast runs
+        per call, never cached: a cached low-precision copy used at every position would sum the
+        window's gradient contributions in that precision (bf16), where the per-call cast sums
+        them in the weights' own dtype, as before P1.10a. A no-op when the dtypes agree."""
+        return self._padded_weights().to(dtype)
 
     def _build_padded_weights(self) -> Tensor:
         logit = self.edge_logit
