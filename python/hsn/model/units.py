@@ -157,14 +157,16 @@ class UnitBank(nn.Module):
             )
         return self._window_w1[1]
 
-    def forward_all(self, v: Tensor) -> Tensor:
+    def forward_all(self, v: Tensor, *, w1_flat: Tensor | None = None) -> Tensor:
         """Dense reference: every unit on every cell, ``v [B, N, 4d] -> [B, N, M, d]``.
 
         ``out[b, n, j] = F_j(v[b, n])``. Materialises ``[M, B·N, H]`` hidden values: the first
         layer is one ``addmm`` against ``W1`` laid out ``[4d, M·H]``, the second one ``baddbmm``
         per unit (P1.10c, module docstring). The result is a ``[B, N, M, d]`` view of the
         ``[M, B·N, d]`` output. Under autocast the matmuls and bias adds run in the autocast dtype,
-        as :meth:`forward_selected`'s ``addmm`` does.
+        as :meth:`forward_selected`'s ``addmm`` does. ``w1_flat`` (P2.8, a compiled window) is the
+        window's ``[4d, M·H]`` layout (:class:`~hsn.model.cell.WindowConsts`) instead of the window
+        cache, the same values.
         """
         if v.ndim != 3 or v.shape[-1] != self.in_dim:
             raise ValueError(
@@ -172,7 +174,8 @@ class UnitBank(nn.Module):
             )
         B, N = int(v.shape[0]), int(v.shape[1])
         M, H, P = self.n_units, self.hidden, B * N
-        hidden = torch.addmm(self.b1.reshape(M * H), v.reshape(P, self.in_dim), self._w1_flat())
+        w1 = self._w1_flat() if w1_flat is None else w1_flat
+        hidden = torch.addmm(self.b1.reshape(M * H), v.reshape(P, self.in_dim), w1)
         hidden = self.act(hidden).view(P, M, H).transpose(0, 1)  # [M, P, H]
         out = torch.baddbmm(self.b2[:, None, :], hidden, self.W2)  # [M, P, d]
         return out.view(M, B, N, self.d).permute(1, 2, 0, 3)
@@ -236,6 +239,33 @@ class UnitBank(nn.Module):
             0, order, torch.arange(n_pairs, device=order.device)
         )
         return out_sorted.index_select(0, inverse)
+
+    def forward_static(
+        self, v: Tensor, unit_idx: Tensor, *, w1_flat: Tensor | None = None
+    ) -> Tensor:
+        """The capturable grouped pass (P2.8): ``out[p] = F_{unit_idx[p]}(v[p])``, ``[P, 4d] ->
+        [P, d]``, with static shapes and no host synchronisation. Every unit runs on every pair
+        (:meth:`forward_all` on the ``P`` pairs, ``M``× the FLOPs of :meth:`forward_selected` on
+        them), then a ``gather`` picks each pair's unit, so the shapes do not depend on which units
+        are present. The unselected units' outputs get exact-zero gradients. ``unit_idx`` must lie
+        in ``[0, M)`` (not checked: the indices come from :meth:`Router.select`, and checking
+        their values would synchronise). Agrees with :meth:`forward_selected` to rounding (the
+        matmuls have other shapes). ``w1_flat`` as in :meth:`forward_all`."""
+        if v.ndim != 2 or v.shape[1] != self.in_dim:
+            raise ValueError(
+                f"forward_static expects v [P, {self.in_dim}], got shape {tuple(v.shape)}"
+            )
+        if unit_idx.dtype not in _INDEX_DTYPES:
+            raise TypeError(f"unit_idx must be int64 or int32, got dtype {unit_idx.dtype}")
+        if unit_idx.ndim != 1 or unit_idx.shape[0] != v.shape[0]:
+            raise ValueError(
+                f"unit_idx must be [P] with P = {v.shape[0]} rows of v, got shape "
+                f"{tuple(unit_idx.shape)}"
+            )
+        P = int(v.shape[0])
+        every = self.forward_all(v.reshape(1, P, self.in_dim), w1_flat=w1_flat)[0]  # [P, M, d]
+        index = unit_idx.to(torch.int64)[:, None, None].expand(P, 1, self.d)
+        return every.gather(1, index).squeeze(1)
 
     # ----------------------------------------------------------------------------------------------
     # Accounting and metadata

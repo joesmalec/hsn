@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn.config import load_hardware_profile
 from hsn.device import DeviceContext, resolve, synchronize
 from hsn.profiler import (
@@ -64,7 +65,7 @@ def _cuda_ctx() -> DeviceContext:
     if not torch.cuda.is_available():
         pytest.skip("no cuda device on this machine")
     try:
-        return resolve(load_hardware_profile("rtx3060"))
+        return resolve(load_hardware_profile(CUDA_PROFILE))
     except (
         ValueError
     ):  # a pre-Ampere card cannot honour the bf16 policy; counting needs no autocast

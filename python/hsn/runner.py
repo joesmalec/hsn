@@ -9,6 +9,7 @@ assumed"), §2.10 (cost arithmetic), Track E (evidence packages).
     hsn run     --config configs/<x>.yaml --seeds 0,1,2,3,4 --profile cpu --out runs/
     hsn rerun   runs/<run_id> [--tolerance 0]     # retrains from the resolved config; exact on cpu
     hsn package --gate G0 --runs runs/<a> runs/<b> ... --out evidence/G0.zip
+    hsn sweep   <command> ...                     # P1.11 sweeps (docs/sweeps.md)
 
 The runner wires config (P0.2) → device (P0.3) → data (P0.4) → model (the registry below: the P0.5
 baselines and, since P1.9, the P1.5 HSN) → trainer (:func:`make_trainer`: the P1.7 TBPTT trainer for
@@ -77,6 +78,7 @@ from hsn.profiler import (
     ProfileReport,
 )
 from hsn.train.amp import autocast_ctx
+from hsn.train.compile import compile_window
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
 from hsn.train.probes import choose_probe_position, probe_window, window_split
 from hsn.train.tbptt import TBPTTTrainer
@@ -248,6 +250,9 @@ def make_power_meter(cfg: RunConfig, choice: PowerChoice) -> PowerMeter:
 
 PROFILE_SEGMENTS: dict[str, str] = {
     "startup": "first window of the pass (warm-up; P0.6 standalone segment)",
+    "compile": "P2.8, only with hardware.compile_mode != none (HSN): the first two windows of the "
+    "pass, which compile the window and record its CUDA Graphs (P0.6 standalone segment; never in "
+    "the steady-state segments)",
     "shared_path": "the complete forward pass of the model (every cell of the dense HSN, or the "
     "dense baseline): training pass with the task cross-entropy, serving pass in eval mode under "
     "no_grad; the HSN prediction term is not part of this profiled loss (P2.13 profiles the HSN "
@@ -328,6 +333,11 @@ def profile_run(
     AdamW at ``train.lr`` without loss scaling, so its losses are not results. With
     ``train.lambda_u > 0`` (an HSN) every profiled training step also times one P2.3 counterfactual
     probe of its window under the ``probe`` segment (:data:`PROFILE_SEGMENTS`).
+
+    P2.8: with ``hardware.compile_mode`` other than ``none`` an HSN runs the compiled window
+    (:func:`hsn.train.compile.compile_window`, as its trainer does) in both passes; the windows
+    that compile or record a CUDA Graph (the first two of each pass) are timed as the ``compile``
+    segment instead of ``startup``, so compile time never enters the steady-state segments.
     """
     if steps < 1:
         raise ValueError(f"steps must be >= 1, got {steps}")
@@ -353,13 +363,25 @@ def profile_run(
     max_norm = cfg.train.grad_clip if cfg.train.grad_clip > 0.0 else math.inf
     replica.train()
     api = cast(SequenceModel, replica)
+    forward: Callable[..., Any] = replica
+    warm_windows = 1
+    if ctx.compile_enabled and isinstance(replica, HSN):  # P2.8: the trainer's window
+        forward = compile_window(
+            replica, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
+        )
+        warm_windows = 2  # compile, then (CUDA Graphs) record
+    first = "compile" if warm_windows > 1 else "startup"
     state: Any = api.init_state(batch_size, device)
-    window = _to_device(next(loader), device)
-    with train_prof.segment("startup", tokens=_n_tokens(window)):
-        with autocast_ctx(ctx):
-            logits, state, _ = replica(window["tokens"], window["context"], state, window["reset"])
-        _window_loss(logits, window).backward()  # type: ignore[no-untyped-call]
-    optimizer.zero_grad(set_to_none=True)
+    for _ in range(warm_windows):
+        window = _to_device(next(loader), device)
+        state = _detach(state)
+        with train_prof.segment(first, tokens=_n_tokens(window)):
+            with autocast_ctx(ctx):
+                logits, state, _ = forward(
+                    window["tokens"], window["context"], state, window["reset"]
+                )
+            _window_loss(logits, window).backward()  # type: ignore[no-untyped-call]
+        optimizer.zero_grad(set_to_none=True)
     counterfactual = isinstance(replica, HSN) and cfg.train.lambda_u > 0.0
     for index in range(steps):
         window = _to_device(next(loader), device)
@@ -369,7 +391,7 @@ def profile_run(
             assert isinstance(replica, HSN)
             _profile_probe(replica, cfg, ctx, train_ds, window, state, train_prof, index)
         with train_prof.segment("shared_path", tokens=tokens), autocast_ctx(ctx):
-            logits, state, _ = replica(window["tokens"], window["context"], state, window["reset"])
+            logits, state, _ = forward(window["tokens"], window["context"], state, window["reset"])
             loss = _window_loss(logits, window)
         with train_prof.segment("backward", tokens=tokens):
             loss.backward()  # type: ignore[no-untyped-call]
@@ -393,14 +415,14 @@ def profile_run(
     )
     state = api.init_state(batch_size, device)
     with torch.no_grad():
-        for index in range(steps + 1):
+        for index in range(steps + warm_windows):
             try:
                 window = _to_device(next(dev_loader), device)
             except StopIteration:
                 break
-            name = "startup" if index == 0 else "shared_path"
+            name = first if index < warm_windows else "shared_path"
             with serve_prof.segment(name, tokens=_n_tokens(window)), autocast_ctx(ctx):
-                _, state, _ = replica(window["tokens"], window["context"], state, window["reset"])
+                _, state, _ = forward(window["tokens"], window["context"], state, window["reset"])
     synchronize(device)
     return train_prof.report(), serve_prof.report()
 
@@ -851,12 +873,20 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NAME=PATH",
         help="extra file to include at the package root (e.g. decision.json=...)",
     )
+
+    sweep = sub.add_parser("sweep", help="experiment sweeps (P1.11; python -m hsn.experiments)")
+    sweep.add_argument("args", nargs=argparse.REMAINDER, help="hsn.experiments.cli arguments")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point of the ``hsn`` console script; returns the exit code."""
-    args = _parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["sweep"]:  # P1.11: everything after "sweep" belongs to hsn.experiments.cli
+        from hsn.experiments.cli import main as sweep_main
+
+        return sweep_main(raw[1:])
+    args = _parser().parse_args(raw)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "run":

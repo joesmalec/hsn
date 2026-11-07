@@ -34,7 +34,15 @@ from torch.profiler import ProfilerActivity, profile, record_function, supported
 
 from hsn.device import DeviceContext, synchronize
 
-__all__ = ["CUDA_METHOD", "UNSUPPORTED", "LaunchCounter", "count_launches", "supported"]
+__all__ = [
+    "CUDA_METHOD",
+    "HOST_LAUNCH_CALLS",
+    "UNSUPPORTED",
+    "LaunchCounter",
+    "count_launches",
+    "host_launches",
+    "supported",
+]
 
 #: Report value for "this backend cannot count launches" (and for "not counted").
 UNSUPPORTED = -1
@@ -43,6 +51,26 @@ CUDA_METHOD = "torch.profiler kernel events"
 _LAUNCH_ACTIVITIES = frozenset({"kernel", "gpu_memcpy", "gpu_memset"})
 _ACTIVITIES = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 _warmed_up = False
+#: P2.8: the host-side CUDA runtime and driver calls that put work on the device queue (kernel
+#: launches from PyTorch and from Triton, CUDA Graph launches, async copies and memsets). Under
+#: CUDA Graphs the device still runs every kernel (the device events above), but the host issues
+#: one graph launch for them: this is the count L1 reduces.
+HOST_LAUNCH_CALLS = frozenset(
+    {
+        "cudaLaunchKernel",
+        "cudaLaunchKernelExC",
+        "cuLaunchKernel",
+        "cuLaunchKernelEx",
+        "cudaGraphLaunch",
+        "cudaMemcpyAsync",
+        "cudaMemsetAsync",
+    }
+)
+
+
+def host_launches(events: list[FunctionEvent]) -> int:
+    """The host launch calls (:data:`HOST_LAUNCH_CALLS`) among a profile's events (P2.8)."""
+    return sum(1 for e in events if e.device_type == DeviceType.CPU and e.name in HOST_LAUNCH_CALLS)
 
 
 def supported(device: torch.device) -> bool:

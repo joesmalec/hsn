@@ -601,14 +601,19 @@ def auxiliary_terms(
 
 
 def grad_norm_report(
-    model: nn.Module, parts: Mapping[str, Tensor], *, scale: float = 1.0
+    model: nn.Module,
+    parts: Mapping[str, Tensor],
+    *,
+    scale: float = 1.0,
+    retain_graph: bool = True,
 ) -> dict[str, float]:
     """``{"term_grad_norm/<term>": ‖∂term/∂θ‖₂}`` over the trainable parameters of ``model`` for
     every 0-dim term tensor in ``parts`` (module docstring). Each norm is taken with
     ``torch.autograd.grad`` on ``scale · term`` (``retain_graph=True``, so the graph stays usable
     for the training backward; ``.grad`` is never touched) and divided by ``scale``, the fp16 loss
     scale (1.0 otherwise). A term that requires no grad or reaches no parameter reports 0.0; a
-    non-finite norm is reported as it is."""
+    non-finite norm is reported as it is. ``retain_graph=False`` (P2.8: one term of a compiled
+    pass, whose CUDA-Graph backward runs once) frees the graph."""
     if not isinstance(model, nn.Module):
         raise TypeError(f"grad_norm_report needs an nn.Module, got {type(model).__name__}")
     if not isinstance(parts, Mapping):
@@ -630,7 +635,7 @@ def grad_norm_report(
             report[key] = 0.0
             continue
         scaled = term * scale if scale != 1.0 else term
-        grads = torch.autograd.grad(scaled, params, retain_graph=True, allow_unused=True)
+        grads = torch.autograd.grad(scaled, params, retain_graph=retain_graph, allow_unused=True)
         norms = [torch.linalg.vector_norm(g.detach().float()) for g in grads if g is not None]
         if not norms:
             report[key] = 0.0

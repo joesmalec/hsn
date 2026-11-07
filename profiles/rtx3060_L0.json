@@ -1,0 +1,173 @@
+{
+ "level": "L0",
+ "profile": "rtx3060",
+ "tag": "",
+ "git_revision": "0814235b38bba190120f5514ea21b08229482856",
+ "torch": "2.15.0+cu132",
+ "config": "configs/experiments/g1_ref_a1.yaml",
+ "overrides": [
+  "model.routing=topk",
+  "train.gate_mode=ste"
+ ],
+ "config_hash": "aab321ecb0ced2b65efbd108ddf188b5bcb83db6efca889d53e87ceba8bce24f",
+ "routing": "topk",
+ "gate_mode": "ste",
+ "batch": 16,
+ "unroll": 256,
+ "precision": "bf16",
+ "autocast": "torch.bfloat16",
+ "compile_mode": "none",
+ "block": null,
+ "card": {
+  "status": "idle",
+  "gpu_processes": [
+   [],
+   [
+    {
+     "pid": "63697",
+     "memory": "984 MiB",
+     "name": ".venv/bin/python"
+    }
+   ]
+  ]
+ },
+ "compile": {
+  "warm_steps": 3,
+  "warm_wall_s": 8.37,
+  "compile_seconds": 0.0,
+  "compile_steps": 0,
+  "startup_step_s": 2.612,
+  "note": "compile (cold: inductor's graph caches off) and CUDA Graph recording; never inside the steady-state numbers"
+ },
+ "train_step": {
+  "steps": 60,
+  "repeats": 3,
+  "wall_ms_p50": 1629.049,
+  "wall_ms_p95": 1970.383,
+  "wall_ms_p50_by_repeat": [
+   1837.1,
+   1513.329,
+   1629.387
+  ],
+  "tokens_per_s": 1899.5,
+  "launches_host": 118371,
+  "kernels_device": 117744,
+  "device_ms": 229.751,
+  "gpu_busy_fraction": 0.141,
+  "bytes": {
+   "peak": 858029056,
+   "reserved": 866123776
+  },
+  "launch_definitions": {
+   "launches_host": [
+    "cuLaunchKernel",
+    "cuLaunchKernelEx",
+    "cudaGraphLaunch",
+    "cudaLaunchKernel",
+    "cudaLaunchKernelExC",
+    "cudaMemcpyAsync",
+    "cudaMemsetAsync"
+   ],
+   "kernels_device": [
+    "gpu_memcpy",
+    "gpu_memset",
+    "kernel"
+   ]
+  }
+ },
+ "serving_step": [
+  {
+   "batch": 1,
+   "tokens": 200,
+   "latency_ms_p50": 4.5675,
+   "latency_ms_p95": 4.6994,
+   "launches_host_per_token": 299,
+   "compile_s": 0.0
+  },
+  {
+   "batch": 16,
+   "tokens": 200,
+   "latency_ms_p50": 4.6562,
+   "latency_ms_p95": 4.7857,
+   "launches_host_per_token": 304,
+   "compile_s": 0.0
+  }
+ ],
+ "segments": {
+  "shared_path": {
+   "kernels_device": 7491.0,
+   "device_ms": 18.034,
+   "share_of_step": 0.0111
+  },
+  "scorer": {
+   "kernels_device": 37900.0,
+   "device_ms": 61.389,
+   "share_of_step": 0.0377
+  },
+  "messages": {
+   "kernels_device": 33816.0,
+   "device_ms": 64.523,
+   "share_of_step": 0.0396
+  },
+  "selected_cells": {
+   "kernels_device": 17152.0,
+   "device_ms": 30.096,
+   "share_of_step": 0.0185
+  },
+  "decode": {
+   "kernels_device": 19.0,
+   "device_ms": 0.388,
+   "share_of_step": 0.0002
+  },
+  "loss": {
+   "kernels_device": 65.0,
+   "device_ms": 0.153,
+   "share_of_step": 0.0001
+  },
+  "optimizer": {
+   "kernels_device": 295.0,
+   "device_ms": 0.834,
+   "share_of_step": 0.0005
+  },
+  "grad_accumulation": {
+   "kernels_device": 13034.0,
+   "device_ms": 36.163,
+   "share_of_step": 0.0222
+  },
+  "other": {
+   "kernels_device": 7317.0,
+   "device_ms": 16.86,
+   "share_of_step": 0.0103
+  }
+ },
+ "attribution": {
+  "method": "L0: torch.profiler Python stacks (backward through sequence_nr); segment from the HSN frames of the stack",
+  "kernels_total": 117089,
+  "unattributed_kernels": 5909,
+  "unattributed_device_ms": 13.698,
+  "unattributed_top": {
+   "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<": 3082,
+   "void at::native::_scatter_gather_elementwise_kernel<128, 8, ": 1024,
+   "void at::native::vectorized_elementwise_kernel<2, at::native": 779,
+   "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<": 512,
+   "void at::native::tensor_kernel_scan_innermost_dim<float, std": 256,
+   "void at::native::bitonicSortKVInPlace<2, -1, 16, 16, long, l": 256
+  },
+  "other_top_ms": {
+   "(no host) void at::native::reduce_kernel<512, 1, at::native:": 7.087,
+   "(no host) void at::native::reduce_kernel<128, 4, at::native:": 2.181,
+   "(no host) void at::native::_scatter_gather_elementwise_kerne": 1.915,
+   "eager hsn.py:1061 _selection_record / aten::copy_": 1.156,
+   "(no host) void at::native::bitonicSortKVInPlace<2, -1, 16, 1": 1.046,
+   "(no host) void at::native::vectorized_elementwise_kernel<2, ": 1.026,
+   "eager hsn.py:1061 _selection_record / aten::any": 0.72,
+   "(no host) void at::native::tensor_kernel_scan_innermost_dim<": 0.443,
+   "eager (no hsn frame) / aten::copy_": 0.275,
+   "eager hsn.py:786 forward / aten::cat": 0.268,
+   "eager hsn.py:1080 _window_epilogue / aten::abs": 0.208,
+   "eager hsn.py:274 _stack_record / aten::cat": 0.12
+  },
+  "bytes_note": "allocator peak/reserved per step only; not separable per segment inside one window; DRAM traffic not measured"
+ },
+ "decision": "(L0 shares, not the decision) L2 justified: no \u2014 messages is 4.0% of step time at L0"
+}

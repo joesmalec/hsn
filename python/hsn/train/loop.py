@@ -27,6 +27,14 @@ the end the dev set is evaluated (:func:`hsn.eval.evaluate.evaluate_windows`); e
 returns a :class:`History` with one record per step, every evaluation, the model's parameter
 report and the *measured* numbers the run manifest needs (plan §0.5: measured, not assumed).
 
+**Hooks (P1.11).** ``fit(..., callback=f)`` calls ``f(trainer, history)`` once per step, after the
+step's evaluation and checkpoint; when it returns True before the last step, the trainer writes a
+checkpoint (unless that step already wrote one) and stops there (the sweep harness's early-stop
+rules, :mod:`hsn.experiments`). The step it stops at is not a statistics step of the TBPTT trainer
+(those key on the last step of ``fit``). :attr:`Trainer.eval_batch` (``None`` = ``train.batch``)
+sets the number of parallel streams of :meth:`Trainer.evaluate` only; training is unaffected and
+the per-document metrics change by rounding at most.
+
 **Search budget.** :class:`SearchBudget` counts hyperparameter-search trials against
 ``train.search_trials`` so that every method in the baseline ladder gets the same number of
 trials (paper §12); recording a trial beyond the budget raises.
@@ -51,7 +59,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -87,6 +95,7 @@ from hsn.train.lazy_adam import build_lazy_adamw
 __all__ = [
     "SCHEDULES",
     "BudgetExhaustedError",
+    "FitCallback",
     "History",
     "SearchBudget",
     "SequenceModel",
@@ -101,6 +110,8 @@ logger = logging.getLogger("hsn.train")
 
 Batch = dict[str, Tensor]
 SCHEDULES: tuple[str, ...] = ("constant", "cosine", "linear")
+# P1.11: called once per step after evaluation and checkpoint; True stops the fit there
+FitCallback = Callable[["Trainer", "History"], bool]
 _WINDOW_FIELDS = ("tokens", "targets", "context", "loss_mask", "reset", "dep", "doc")
 
 
@@ -412,12 +423,22 @@ class Trainer:
         set_deterministic(train.deterministic)
         seed_everything(cfg.seed)
         self.model.to(device=ctx.device, dtype=ctx.master_dtype)
+        if ctx.compile_enabled and type(self) is Trainer:
+            # P2.8: hardware.compile_mode compiles the HSN window (TBPTTTrainer); a baseline runs
+            # eager and its history says so (measured["compiled_windows"] = 0)
+            logger.warning(
+                "hardware.compile_mode=%s compiles the HSN training window only; %s trains eager",
+                cfg.hardware.compile_mode,
+                type(self.model).__name__,
+            )
         self.optimizer = self._make_optimizer()
         self.scheduler = self._make_scheduler()
         self.scaler = make_grad_scaler(ctx)
         self.step = 0
         self._loader_state: dict[str, Any] | None = None
         self._carried_state: Any = None
+        # P1.11: parallel streams of evaluate() (None = train.batch); a harness setting, not config
+        self.eval_batch: int | None = None
 
     # construction ----------------------------------------------------------------------------
 
@@ -460,10 +481,14 @@ class Trainer:
         segment: AbstractContextManager[object] = self.profiler.segment(name, tokens=tokens)
         return segment
 
-    def _loader(self, ds: ByteDataset, *, shuffle: bool, epochs: int | None) -> StreamLoader:
+    def _loader(
+        self, ds: ByteDataset, *, shuffle: bool, epochs: int | None, batch: int | None = None
+    ) -> StreamLoader:
+        if batch is not None and batch < 1:
+            raise ValueError(f"loader batch must be >= 1, got {batch}")
         return StreamLoader(
             ds,
-            batch=self.cfg.train.batch,
+            batch=self.cfg.train.batch if batch is None else batch,
             unroll=self.cfg.train.unroll,
             seed=self.cfg.seed,
             shuffle=shuffle,
@@ -494,16 +519,23 @@ class Trainer:
                 )
 
     def _forward(
-        self, batch: Batch, state: Any, **model_kwargs: Any
+        self,
+        batch: Batch,
+        state: Any,
+        *,
+        window: Callable[..., Any] | None = None,
+        **model_kwargs: Any,
     ) -> tuple[Tensor, Any, dict[str, Any]]:
         """The model over one device window; ``model_kwargs`` go to its forward. This trainer's
         own :meth:`fit` passes none, so a baseline's forward is called exactly as before; only the
         HSN trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`, P1.10b) passes ``reset_columns`` from
-        the CPU window."""
+        the CPU window, and (P2.8) ``window``, a compiled window called in place of the model's
+        forward with the same arguments."""
         tokens = batch["tokens"]
         B, T = tokens.shape
+        fn = self.model if window is None else window
         with self._segment("forward", tokens=B * T), autocast_ctx(self.ctx):
-            logits, new_state, info = self.model(
+            logits, new_state, info = fn(
                 tokens, batch["context"], state, batch["reset"], **model_kwargs
             )
         V = self.cfg.model.vocab_size
@@ -523,8 +555,10 @@ class Trainer:
         steps: int,
         *,
         metrics: Mapping[str, Metric] | None = None,
+        callback: FitCallback | None = None,
     ) -> History:
-        """Train until ``self.step == steps`` (so a resumed trainer continues where it stopped)."""
+        """Train until ``self.step == steps`` (so a resumed trainer continues where it stopped), or
+        until ``callback`` (module docstring, "Hooks") returns True."""
         train = self.cfg.train
         if steps < 1:
             raise ValueError(f"steps must be >= 1, got {steps}")
@@ -651,9 +685,16 @@ class Trainer:
                     self.step,
                     " ".join(f"{k} {v:.4f}" for k, v in result.items() if isinstance(v, float)),
                 )
+            saved = False
             if self.step % train.ckpt_every == 0 or self.step == steps:
                 path = self.save(self.run_dir, loader, state)
                 history.checkpoints.append(str(path))
+                saved = True
+            if callback is not None and self.step < steps and callback(self, history):
+                if not saved:
+                    history.checkpoints.append(str(self.save(self.run_dir, loader, state)))
+                logger.info("stopped by callback at step %d of %d", self.step, steps)
+                break
         synchronize(device)
         stats = memory_stats(device)
         history.measured = {
@@ -665,6 +706,7 @@ class Trainer:
             "train_seconds": train_seconds,
             "tokens": float(total_tokens),
             "steps": float(self.step),
+            "compiled_windows": 0.0,  # P2.8: the generic trainer never compiles
         }
         return history
 
@@ -693,10 +735,10 @@ class Trainer:
             if group not in names:
                 names.append(group)
             ids.append(names.index(group))
-        loader = self._loader(ds, shuffle=False, epochs=1)
+        loader = self._loader(ds, shuffle=False, epochs=1, batch=self.eval_batch)
         with self._segment("evaluate"):
             result = evaluate_windows(
-                self.model,
+                self._eval_model(),
                 loader,
                 metrics if metrics is not None else DEFAULT_METRICS,
                 device=self.ctx.device,
@@ -706,6 +748,11 @@ class Trainer:
             )
         result["n_docs"] = len(ds)
         return result
+
+    def _eval_model(self) -> Any:
+        """What :meth:`evaluate` runs over the windows: the model itself (P2.8: the HSN trainer
+        hands its compiled window when it has one)."""
+        return self.model
 
     # checkpoints -----------------------------------------------------------------------------
 

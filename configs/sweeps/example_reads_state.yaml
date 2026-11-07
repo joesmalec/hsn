@@ -1,0 +1,83 @@
+# Example sweep (docs/sweeps.md): arms in the style of the audit's queue9 at the open recipe R*
+# (batch 32, lr 1e-3, the 5(b) recipe), three seeds each, through the reads-state protocol.
+# Every rule is fixed here, before any run: it is stored in the database at enqueue.
+#
+#   python -m hsn.experiments expand  configs/sweeps/example_reads_state.yaml
+#   python -m hsn.experiments enqueue configs/sweeps/example_reads_state.yaml
+#   python -m hsn.experiments report  --sweep example_reads_state
+
+name: example_reads_state
+description: GRU width controls, HSN width, top-K routing and cell identity at R*, three seeds
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    # every CUDA arm pins its compile mode: P2.8's compiled step (needs P2.8 merged); the arms
+    # that must stay eager (the baselines, the variants) pin none below
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.001
+    - train.steps=3000
+    - train.eval_every=500
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+families:
+  gru: # the GRU baseline with the HSN recipe's schedule keys, so that the two match
+    config: configs/baselines/gru_2m.yaml
+    overrides:
+      - train.warmup_steps=200
+      - train.weight_decay=0.01
+      - train.schedule=cosine
+      - train.grad_clip=1.0
+      - baseline.gru.n_layers=1
+      - hardware.compile_mode=none
+protocol:
+  name: reads_state
+  diag_every: 500 # diagnostics on 4 dev documents every 500 steps (memory_open reads them)
+  diag_docs: 32 # trained_state on 32 dev documents
+  eval_batch: 128 # evaluation in 128 parallel streams (rounding only)
+  probe_batch: 64 # edit-probe rows per forward (rounding only)
+constants:
+  chance: 0.0208333 # 1 / 48 value symbols
+seeds: [0, 1, 2]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state, group: {min_agree: 2}} # a finding: 2 of 3 seeds agree
+    memory_open: {preset: memory_open} # hsn only; every multiple of 500 from step 500
+    cells_apart: {preset: cells_apart} # hsn only; trained model at answers
+  early_stop:
+    # stop an HSN arm at step 1,500 when it is still at chance and its memory is shut; the
+    # grad share is a one-step sample (about 7x step-to-step spread), so this reads the gate
+    - name: fail_early
+      applies_to: {family: [hsn]}
+      at_steps: [1500]
+      outcome: fail_early
+      when:
+        all:
+          - metric: "eval:delayed/in_range/accuracy"
+            steps: {at: 1500}
+            op: "<="
+            value: "chance + 0.01"
+          - metric: "diag:gate/p50"
+            steps: {from: 1000, to: 1500}
+            agg: median
+            op: "<"
+            value: 0.01
+arms:
+  - name: gru_control
+    family: gru
+    grid: {baseline.gru.d_model: [128, 256, 384]}
+    seeds: [0]
+  - name: hsn_d128
+    family: hsn
+    overrides: [model.d=128]
+  - name: hsn_topk4_ste
+    family: hsn
+    overrides: [model.routing=topk, model.k_select=4, train.gate_mode=ste]
+  - name: hsn_cell_embed
+    family: hsn
+    variant: {name: cell_embed, offset_std: 0.5}
+    overrides: [hardware.compile_mode=none] # variants run eager only

@@ -39,6 +39,7 @@ environments = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]  # P2.8: tests/cards.py (the card-agnostic CUDA profile) for every test dir
 addopts = "-ra --strict-markers"
 markers = [
   "cuda: needs a CUDA device; skipped when absent",
