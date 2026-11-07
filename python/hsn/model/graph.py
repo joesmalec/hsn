@@ -261,34 +261,55 @@ class CellGraph(nn.Module):
 
     # -- messages ---------------------------------------------------------------------------------
 
-    def messages_dense(self, h_prev: Tensor, V: nn.Linear) -> Tensor:
+    def messages_dense(
+        self, h_prev: Tensor, V: nn.Linear, *, weights: Tensor | None = None
+    ) -> Tensor:
         """``m [B, N, d]`` for every cell from the previous round's states ``h_prev [B, N, d]``:
         ``V`` is applied once to all cells, then each cell sums its weighted sources in slot order
         over the padded view. (P1.10c measured a dense-adjacency contraction ``A · V(h)``
         instead and kept this one: the contraction sums each row over all ``N`` columns, so rows
         with their edges at different columns round differently. From the zero state that gives
         the edge logits rounding-noise gradients, 1.6e-22 in fp64, where the slot-order sum keeps
-        them exactly 0 and the cells exactly symmetric.)"""
-        if self._window_cache is None:  # P1.10e: inside a window the caller validated h_prev
-            self._check_h(h_prev)
-        Vh: Tensor = V(h_prev)  # [B, N, d]
-        weights = self._padded_weights_as(Vh.dtype)  # [N, D_max]
-        sources = Vh[:, self._pad_src]  # [B, N, D_max, d]
-        return (sources * weights[None, :, :, None]).sum(dim=2)
+        them exactly 0 and the cells exactly symmetric.)
 
-    def messages_selected(self, h_prev: Tensor, V: nn.Linear, cell_idx: Tensor) -> Tensor:
+        ``weights`` (P2.8, a compiled window): the window's padded weights ``[N, D_max]``
+        (:class:`~hsn.model.cell.WindowConsts`) instead of the window cache, cast per call like
+        the cached ones; ``h_prev`` is not checked then (the window validated it)."""
+        if weights is None:
+            if self._window_cache is None:  # P1.10e: inside a window the caller validated h_prev
+                self._check_h(h_prev)
+            Vh: Tensor = V(h_prev)  # [B, N, d]
+            w = self._padded_weights_as(Vh.dtype)  # [N, D_max]
+        else:
+            Vh = V(h_prev)
+            w = weights.to(Vh.dtype)
+        sources = Vh[:, self._pad_src]  # [B, N, D_max, d]
+        return (sources * w[None, :, :, None]).sum(dim=2)
+
+    def messages_selected(
+        self,
+        h_prev: Tensor,
+        V: nn.Linear,
+        cell_idx: Tensor,
+        *,
+        weights: Tensor | None = None,
+        validate: bool = True,
+    ) -> Tensor:
         """``m [B, K, d]`` for the cells ``cell_idx [B, K]`` only (int64, in ``[0, N)``; repeats
         are allowed). ``V`` is still applied once to all ``N`` cells — any cell may be a source —
         and only the selected rows gather. The range check synchronises with the device once per
-        call (P2.8 may gate it, as for :meth:`CellGraphState.with_delta`)."""
+        call; ``validate=False`` (P2.8, the capturable round, whose indices come from
+        :meth:`Router.select`) skips it and keeps the shape, dtype and device checks. ``weights``
+        as in :meth:`messages_dense`."""
         B, _, d = self._check_h(h_prev)
-        K = self._check_cell_idx(cell_idx, B)
+        K = self._check_cell_idx(cell_idx, B, check_values=validate)
         D = self._max_in_degree
         Vh: Tensor = V(h_prev)  # [B, N, d]
-        weights = self._padded_weights_as(Vh.dtype)[cell_idx]  # [B, K, D_max]
+        padded = self._padded_weights_as(Vh.dtype) if weights is None else weights.to(Vh.dtype)
+        weights_sel = padded[cell_idx]  # [B, K, D_max]
         source_idx = self._pad_src[cell_idx].reshape(B, K * D, 1).expand(B, K * D, d)
         sources = Vh.gather(1, source_idx).reshape(B, K, D, d)
-        return (sources * weights[..., None]).sum(dim=2)
+        return (sources * weights_sel[..., None]).sum(dim=2)
 
     # -- topology ---------------------------------------------------------------------------------
 
@@ -393,7 +414,7 @@ class CellGraph(nn.Module):
         B, _, d = (int(n) for n in h_prev.shape)
         return B, self.n_cells, d
 
-    def _check_cell_idx(self, cell_idx: Tensor, B: int) -> int:
+    def _check_cell_idx(self, cell_idx: Tensor, B: int, *, check_values: bool = True) -> int:
         if not isinstance(cell_idx, Tensor):
             raise TypeError(f"cell_idx must be a torch.Tensor, got {type(cell_idx).__name__}")
         if cell_idx.dtype != _INDEX_DTYPE:
@@ -407,6 +428,8 @@ class CellGraph(nn.Module):
                 f"cell_idx must live on the graph's device {self.indices.device}, got "
                 f"{cell_idx.device}"
             )
+        if not check_values:  # P2.8: the capturable round (no host synchronisation)
+            return int(cell_idx.shape[1])
         lowest, highest = (int(v) for v in torch.stack([cell_idx.min(), cell_idx.max()]).tolist())
         if lowest < 0 or highest >= self.n_cells:
             raise IndexError(

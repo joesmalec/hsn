@@ -149,12 +149,22 @@ def gather_concat(u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor
     )
 
 
-def grouped_unit_mlp(v: Tensor, unit_idx: Tensor, bank: UnitBank) -> Tensor:
+def grouped_unit_mlp(
+    v: Tensor,
+    unit_idx: Tensor,
+    bank: UnitBank,
+    *,
+    static: bool = False,
+    w1_flat: Tensor | None = None,
+) -> Tensor:
     """``out [P, d]``: ``out[p] = F_{unit_idx[p]}(v[p])`` through the P1.2 grouped pass
     (:meth:`UnitBank.forward_selected`, which sorts the pairs by unit, runs one matmul pair per
     present unit and restores the order; values outside ``[0, M)`` raise ``IndexError`` there).
     ``v`` is ``[P, 4d]``; ``unit_idx [P]`` int64 (or int32). The output has the autocast dtype under
-    autocast and ``v``'s dtype otherwise."""
+    autocast and ``v``'s dtype otherwise. ``static=True`` (P2.8, the capturable round) runs
+    :meth:`UnitBank.forward_static` instead (every unit on the pairs, then a gather: static
+    shapes, no host-side histogram, indices not checked), with the window's ``w1_flat`` when
+    given; it agrees with the grouped pass to rounding."""
     if not isinstance(bank, UnitBank):
         raise TypeError(f"bank must be a UnitBank, got {type(bank).__name__}")
     v_t = _check_tensor("v", v)
@@ -168,22 +178,38 @@ def grouped_unit_mlp(v: Tensor, unit_idx: Tensor, bank: UnitBank) -> Tensor:
         raise ValueError(
             f"v lives on {v_t.device} but the unit bank on {bank.W1.device}; move the module"
         )
+    if static:
+        return bank.forward_static(v_t, idx, w1_flat=w1_flat)
+    if w1_flat is not None:
+        raise ValueError("w1_flat is only used by the static pass (static=True)")
     return bank.forward_selected(v_t, idx)
 
 
-def csr_messages(h: Tensor, graph: CellGraph, V: nn.Linear, cell_idx: Tensor) -> Tensor:
+def csr_messages(
+    h: Tensor,
+    graph: CellGraph,
+    V: nn.Linear,
+    cell_idx: Tensor,
+    *,
+    weights: Tensor | None = None,
+    validate: bool = True,
+) -> Tensor:
     """``m [B, K, d]``: the neighbour messages of the selected cells from the **pre-round** states
     ``h [B, N, d]`` (the chunk's pitfall: never the states already updated in this round), through
     the P1.4 CSR path (:meth:`CellGraph.messages_selected`: ``V`` once over all cells, a padded
     gather of each selected cell's sources, weights ``a_ij``). ``cell_idx [B, K]`` is int64 in
-    ``[0, N)`` (checked there, one device synchronisation). The messages have ``V(h)``'s dtype."""
+    ``[0, N)`` (checked there, one device synchronisation, unless ``validate=False``: P2.8's
+    capturable round). ``weights`` are a compiled window's padded edge weights (P2.8). The
+    messages have ``V(h)``'s dtype."""
     if not isinstance(graph, CellGraph):
         raise TypeError(f"graph must be a CellGraph, got {type(graph).__name__}")
     if not isinstance(V, nn.Linear):
         raise TypeError(
             f"V must be an nn.Linear (the d × d message projection), got {type(V).__name__}"
         )
-    return graph.messages_selected(h, V, cell_idx)
+    if weights is None and validate:
+        return graph.messages_selected(h, V, cell_idx)
+    return graph.messages_selected(h, V, cell_idx, weights=weights, validate=validate)
 
 
 def selection_mask(cell_idx: Tensor, valid: Tensor, n_cells: int) -> Tensor:

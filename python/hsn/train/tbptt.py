@@ -118,9 +118,20 @@ window loop::
   (``train.unroll`` without a cut); ``state_abs_max``, ``eps_mean`` and ``alpha_entropy`` are over
   the computed positions.
 
+* **Compiled windows (P2.8).** With ``hardware.compile_mode`` other than ``none`` (resolved into
+  ``DeviceContext.compile_enabled``) the training windows run through
+  :func:`hsn.train.compile.compile_window` (blocks of positions compiled with ``torch.compile``,
+  CUDA Graphs on CUDA; its scope is checked at construction), except on statistics steps, whose
+  extra per-term backward passes run the eager window. Compiled windows keep one fixed ``T``, so
+  the trailing cut is off (every window computes ``train.unroll`` columns, the pre-P1.10d
+  behaviour, equal to the cut one). A step during which a window compiled or recorded a graph is
+  a *compile step*: its wall time goes to ``measured["compile_seconds"]`` (and
+  ``measured["compile_steps"]``) and stays out of ``train_seconds`` and ``tokens_per_s``; its step
+  record still carries its wall time. Evaluation and the probes stay eager.
+
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
 non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
-P1.7 entries raise (plan §4.3: errors over silence). ``torch.compile`` stays off.
+P1.7 entries raise (plan §4.3: errors over silence).
 """
 
 from __future__ import annotations
@@ -164,6 +175,7 @@ from hsn.train.checkpoint import (
     save_checkpoint,
     unpack_cell_state,
 )
+from hsn.train.compile import CompiledWindow, compile_window
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
 from hsn.train.loop import History, StepRecord, StreamLoader, Trainer
 from hsn.train.probes import (
@@ -280,7 +292,18 @@ class TBPTTTrainer(Trainer):
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
         # P1.10d: the trailing-padding cut (exact in math under dense routing only, to rounding in
         # floats since P1.10a; module docstring)
-        self._cut_enabled = cfg.data.align_docs and cfg.model.routing == "dense"
+        # P2.8: the compiled training window (None: eager windows), built before the cut decision
+        # (a compiled window keeps one fixed T)
+        self._compiled: CompiledWindow | None = None
+        if ctx.compile_enabled:
+            window = compile_window(
+                model, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
+            )
+            if isinstance(window, CompiledWindow):  # MPS without compile support: eager
+                self._compiled = window
+        self._cut_enabled = (
+            cfg.data.align_docs and cfg.model.routing == "dense" and self._compiled is None
+        )
         self._cut_pending = False  # the carried state comes from a cut window
 
     # P2.2 ------------------------------------------------------------------------------------
@@ -529,10 +552,15 @@ class TBPTTTrainer(Trainer):
         reset_peak(device)
         train_seconds = 0.0
         total_tokens = 0
+        compile_seconds = 0.0  # P2.8: the steps during which a window compiled or recorded
+        compile_steps = 0
         while self.step < steps:
             started = time.perf_counter()
             next_step = self.step + 1
             stats_step = next_step % train.stats_every == 0 or next_step == steps
+            # P2.8: plain steps run the compiled window; a statistics step runs the eager one
+            window_fn = None if stats_step else self._compiled
+            compiled_before = self._compiled.compile_seconds if self._compiled is not None else 0.0
             term_norms: dict[str, float] = {}
             self.optimizer.zero_grad(set_to_none=True)
             part_sums: dict[str, float] = {}
@@ -571,7 +599,9 @@ class TBPTTTrainer(Trainer):
                 # reset can be missing; a check against that same CPU mask would be the same
                 # expression. (On an accelerator forward cannot check them without the copy.)
                 reset_columns = window["reset"][:, :cut].any(dim=0).nonzero().flatten().tolist()
-                logits, state, info = self._forward(fwd, state, reset_columns=reset_columns)
+                logits, state, info = self._forward(
+                    fwd, state, window=window_fn, reset_columns=reset_columns
+                )
                 window_active = self._window_active_units(info)
                 if window_active is not None:
                     active = window_active if active is None else active | window_active
@@ -637,8 +667,15 @@ class TBPTTTrainer(Trainer):
             if self.scaler is None and not math.isfinite(mean_total):
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
             seconds = time.perf_counter() - started
-            train_seconds += seconds
-            total_tokens += tokens_in_step
+            compiled_now = self._compiled is not None and (
+                self._compiled.compile_seconds > compiled_before
+            )
+            if compiled_now:  # P2.8: compile time is never a steady-state number
+                compile_seconds += seconds
+                compile_steps += 1
+            else:
+                train_seconds += seconds
+                total_tokens += tokens_in_step
             stats = {
                 "state_abs_max": state_abs_max,
                 "eps_mean": eps_sum / n_windows,
@@ -707,6 +744,8 @@ class TBPTTTrainer(Trainer):
             "steps": float(self.step),
             "windows": float(self.windows),
             "resyncs": float(self.resyncs),
+            "compile_seconds": compile_seconds,
+            "compile_steps": float(compile_steps),
         }
         return history
 

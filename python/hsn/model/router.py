@@ -123,6 +123,18 @@ the selection (an unselected cell written with the given unit) or removed from i
 dropped), with ``cell_mask``, ``unit_weights``, ``alpha`` and ``cost`` kept consistent so that the
 sparse and the masked round execute the same counterfactual. An edited selection may exceed the
 budget: it is a training probe, charged to the training budget, never a routing decision.
+
+**Static K (P2.8).** Every sparse mode returns exactly ``K = k_max`` (``model.k_select``) slots
+per row, whatever the budget, ``k_min`` or gate: slots that are not selected (a budget-truncated
+suffix, a short fixed route, a greedy walk that stopped early) are padded with ``valid=False``,
+cell 0, unit 0 and ``α = 0``. Cell 0 is the in-range sentinel: every executor ignores a padded
+slot's indices (:meth:`hsn.model.cell.PDGCell.step_sparse` zeroes them before the gathers and
+:func:`hsn.kernels.native.gated_delta_update` routes them to a discarded row), so the shapes of a
+position never depend on the data and a compiled window or a CUDA Graph can capture it
+(``model.static_k = true``, the only supported value: :meth:`Router.from_config` refuses
+``false``). ``dense`` mode has ``K = N``, and only the P2.3 probes' :meth:`Router.with_candidate`
+widens a selection by one column. The dense step's cost (:meth:`CostTable.dense_cost`) is a
+Python float read once at construction, so a position never reduces the CPU cost table.
 """
 
 from __future__ import annotations
@@ -863,6 +875,9 @@ class Router(nn.Module):
         self.cost_table_hash = costs.hash
         self.cost_source = costs.source
         self.max_pair_cost = costs.max_pair_cost()
+        #: P2.8: the dense step's cost, once (CostTable.dense_cost reduces a CPU tensor, which a
+        #: compiled or captured position must not do); the table never changes after construction.
+        self._dense_cost = costs.dense_cost()
         self._unit_costs: list[float] = [float(v) for v in costs.unit.tolist()]
         self.register_buffer("cost_table", costs.unit.to(torch.float32), persistent=False)
         self._tap: RouterTap | None = None  # P2.3: armed by intercept()
@@ -876,6 +891,12 @@ class Router(nn.Module):
         construction."""
         if not isinstance(cfg, ModelConfig):
             raise TypeError(f"from_config needs a ModelConfig, got {type(cfg).__name__}")
+        if not cfg.static_k:
+            raise NotImplementedError(
+                "model.static_k=false (a selection trimmed to a data-dependent K) is not "
+                "implemented: every mode pads to K = model.k_select with valid=False (P2.8), which "
+                "is what graph capture and torch.compile need; set model.static_k=true"
+            )
         if scorer is None:
             scorer = Scorer(cfg, unroll=unroll)
         router = cls(scorer, cost_table_from_config(cfg), lambda_cost=cfg.lambda_cost)
@@ -1234,7 +1255,7 @@ class Router(nn.Module):
         alpha = probs.gather(2, units.unsqueeze(-1)).squeeze(-1)
         cells = torch.arange(N, device=device).unsqueeze(0).expand(B, N).clone()
         valid = torch.ones(B, N, dtype=torch.bool, device=device)
-        cost = torch.full((B,), self.costs.dense_cost(), dtype=torch.float32, device=device)
+        cost = torch.full((B,), self._dense_cost, dtype=torch.float32, device=device)
         return Selection(
             cell_idx=cells,
             unit_idx=units,
@@ -1507,7 +1528,7 @@ class Router(nn.Module):
                     else hard_mask
                 )
         cost = self._executed_cost(units, valid)
-        dense_cost = self.costs.dense_cost()
+        dense_cost = self._dense_cost
         if gate == "soft" and scored:  # every cell executes in the warm-up
             cost = torch.full_like(cost, dense_cost)
         if dense is not None:

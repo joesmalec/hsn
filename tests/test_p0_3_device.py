@@ -115,10 +115,14 @@ def test_p0_3_unavailable_device_raises() -> None:
             resolve(load_hardware_profile(name))
 
 
-def test_p0_3_compile_mode_rejected() -> None:
+def test_p0_3_compile_mode_resolves() -> None:
+    """P2.8: ``compile_mode`` other than ``none`` resolves with ``compile_enabled`` set (the
+    training window and the serving step compile, :mod:`hsn.train.compile`); ``none`` (every
+    shipped profile) leaves it off."""
     cpu = load_hardware_profile("cpu")
-    with pytest.raises(NotImplementedError, match="P2.8"):
-        resolve(cpu.model_copy(update={"compile_mode": "reduce-overhead"}))
+    assert not resolve(cpu).compile_enabled
+    for mode in ("reduce-overhead", "max-autotune"):
+        assert resolve(cpu.model_copy(update={"compile_mode": mode})).compile_enabled
 
 
 def test_p0_3_dtype_policy_mismatch_raises() -> None:

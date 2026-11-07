@@ -51,7 +51,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -494,16 +494,23 @@ class Trainer:
                 )
 
     def _forward(
-        self, batch: Batch, state: Any, **model_kwargs: Any
+        self,
+        batch: Batch,
+        state: Any,
+        *,
+        window: Callable[..., Any] | None = None,
+        **model_kwargs: Any,
     ) -> tuple[Tensor, Any, dict[str, Any]]:
         """The model over one device window; ``model_kwargs`` go to its forward. This trainer's
         own :meth:`fit` passes none, so a baseline's forward is called exactly as before; only the
         HSN trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`, P1.10b) passes ``reset_columns`` from
-        the CPU window."""
+        the CPU window, and (P2.8) ``window``, a compiled window called in place of the model's
+        forward with the same arguments."""
         tokens = batch["tokens"]
         B, T = tokens.shape
+        fn = self.model if window is None else window
         with self._segment("forward", tokens=B * T), autocast_ctx(self.ctx):
-            logits, new_state, info = self.model(
+            logits, new_state, info = fn(
                 tokens, batch["context"], state, batch["reset"], **model_kwargs
             )
         V = self.cfg.model.vocab_size

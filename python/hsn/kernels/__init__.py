@@ -47,10 +47,25 @@ class KernelOps(Protocol):
         self, u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor
     ) -> Tensor: ...
 
-    def grouped_unit_mlp(self, v: Tensor, unit_idx: Tensor, bank: UnitBank) -> Tensor: ...
+    def grouped_unit_mlp(
+        self,
+        v: Tensor,
+        unit_idx: Tensor,
+        bank: UnitBank,
+        *,
+        static: bool = False,
+        w1_flat: Tensor | None = None,
+    ) -> Tensor: ...
 
     def csr_messages(
-        self, h: Tensor, graph: CellGraph, V: nn.Linear, cell_idx: Tensor
+        self,
+        h: Tensor,
+        graph: CellGraph,
+        V: nn.Linear,
+        cell_idx: Tensor,
+        *,
+        weights: Tensor | None = None,
+        validate: bool = True,
     ) -> Tensor: ...
 
     def gated_delta_update(
