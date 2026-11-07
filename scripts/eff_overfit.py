@@ -26,7 +26,8 @@ Variants (HSN only; installed on the built instance, no repository code changes,
   ``N(0, 0.02^2)``, bias 0; ``u`` is not read).
 * ``gru_cell_direct_input`` (W2): ``gru_cell`` whose update reads ``emb(x_t) + ctx_emb(ctx_t)``
   (width ``d``, the GRU baseline's input) instead of ``norm([u; eps; h_i; m_i])``; E, P, S and
-  ``eps`` still run and feed the decoder and the prediction loss.
+  ``eps`` still run and feed the decoder and the prediction loss. Retired with P1.10a (it
+  patched ``HSN._shared_path``, which ``forward`` no longer calls per position): it now raises.
 * ``linear_head`` (V1): the PDG model with ``D([q; u])`` replaced by ``Linear(LayerNorm(q))``
   as in ``gru_cell_linear_head``.
 * ``decoder_fc1_fan_in`` (V2): the PDG model with the decoder's first layer at the A1 fan-in
@@ -302,22 +303,17 @@ def install_variant(model: nn.Module, variant: str, seed: int, offset_std: float
             model.decoder = LinearHead(d, model.cfg.vocab_size)
             record["decoder"] = "LayerNorm(q) -> Linear(d, V)"
         return record
-    if variant in ("gru_cell", "gru_cell_linear_head", "gru_cell_direct_input"):
-        direct = variant == "gru_cell_direct_input"
-        # PyTorch's default initialisation (as nn.GRU in gru_2m); the direct variant reads width d
-        gru = nn.GRUCell(d if direct else 4 * d, d)
+    if variant == "gru_cell_direct_input":
+        # W2 (5 Nov, result in evidence/EFF/AUDIT.md) patched HSN._shared_path, which HSN.forward
+        # no longer calls per position since P1.10a: installed now, it would silently do nothing
+        raise NotImplementedError(
+            "--variant gru_cell_direct_input is retired: it patches HSN._shared_path, which "
+            "HSN.forward no longer calls per position (P1.10a)"
+        )
+    if variant in ("gru_cell", "gru_cell_linear_head"):
+        # PyTorch's default initialisation (as nn.GRU in gru_2m)
+        gru = nn.GRUCell(4 * d, d)
         cell.gru_update = gru
-        if direct:
-            # W2: the cell reads emb(x_t) + ctx_emb(ctx_t), the GRU baseline's input, instead of
-            # norm([u; eps; h_i; m_i]); E, P, S and eps still run and feed the decoder and L_pred
-            original_shared_path = model._shared_path
-
-            def shared_path(x_t: Tensor, ctx_t: Tensor, state: Any) -> Any:
-                out = original_shared_path(x_t, ctx_t, state)
-                cell._direct_input = model.byte_emb(x_t) + model.ctx_emb(ctx_t)
-                return out
-
-            model._shared_path = shared_path  # type: ignore[method-assign]
 
         def step_dense(
             u: Tensor, eps: Tensor, state: Any, alpha: Tensor
@@ -325,29 +321,26 @@ def install_variant(model: nn.Module, variant: str, seed: int, offset_std: float
             B, NN, dd = cell._check_inputs(u, eps, state, alpha)
             with cell.graph.step():
                 h_prev = state.h
-                if direct:
-                    x_in = cell._direct_input.to(h_prev.dtype)  # [B, d]
-                    v = x_in[:, None, :].expand(B, NN, dd)
-                    info: dict[str, Tensor] = {"v": v, "h_prev": h_prev}
-                    width = dd
-                else:
-                    m = cell.graph.messages_dense(h_prev, cell.V)
-                    v_raw = torch.cat(
-                        [
-                            u[:, None, :].expand(B, NN, dd),
-                            eps[:, None, :].expand(B, NN, dd),
-                            h_prev,
-                            m,
-                        ],
-                        dim=-1,
-                    )
-                    v = cell.norm(v_raw)
-                    info = {"m": m, "v": v, "v_raw": v_raw, "h_prev": h_prev}
-                    width = 4 * dd
+                m = cell.graph.messages_dense(h_prev, cell.V)
+                v_raw = torch.cat(
+                    [
+                        u[:, None, :].expand(B, NN, dd),
+                        eps[:, None, :].expand(B, NN, dd),
+                        h_prev,
+                        m,
+                    ],
+                    dim=-1,
+                )
+                v = cell.norm(v_raw)
+                info: dict[str, Tensor] = {"m": m, "v": v, "v_raw": v_raw, "h_prev": h_prev}
+                width = 4 * dd
                 with torch.autocast(device_type=h_prev.device.type, enabled=False):
                     h_new = cell.gru_update(
                         v.reshape(B * NN, width).to(h_prev.dtype), h_prev.reshape(B * NN, dd)
                     ).reshape(B, NN, dd)
+            # the GRU has no write gate b: NaN, so forward(capture=True) works and the
+            # diagnostics report no gate quantiles
+            info["b"] = torch.full_like(h_new, math.nan)
             return h_new, info
 
         cell.step_dense = step_dense
@@ -498,73 +491,30 @@ def window_state_stats(model: HSN, w: dict[str, Tensor]) -> dict[str, float]:
     positions, the write gate ``b`` quantiles over the written cells at valid positions, and for a
     routed model the per-cell write shares.
 
-    The state is read from each ``HSN.step`` output (every routing mode), the gate from the
-    round's ``info["b"]``: ``step_dense`` (every cell) or ``step_sparse`` (its written slots,
-    ``info["valid"]``). A variant whose round reports no gate gives no gate quantiles."""
-    cell = model.cell
-    states: list[Tensor] = []
-    gates: list[tuple[Tensor, Tensor | None]] = []
-    selected: list[Tensor] = []
-    originals = {
-        (model, "step"): model.step,
-        (cell, "step_dense"): cell.step_dense,
-        (cell, "step_sparse"): cell.step_sparse,
-    }
-    patched = {key: key[1] in vars(key[0]) for key in originals}  # instance attribute before?
-
-    def step(*args: Any, **kwargs: Any) -> Any:
-        out = originals[(model, "step")](*args, **kwargs)
-        states.append(out.state.h.detach())
-        return out
-
-    def dense(*args: Any, **kwargs: Any) -> Any:
-        h_new, info = originals[(cell, "step_dense")](*args, **kwargs)
-        if info.get("b") is not None:
-            gates.append((info["b"].detach(), None))
-        return h_new, info
-
-    def sparse(*args: Any, **kwargs: Any) -> Any:
-        h_new, info = originals[(cell, "step_sparse")](*args, **kwargs)
-        gates.append((info["b"].detach(), info["valid"].detach()))
-        selected.append(info["selected"].detach())
-        return h_new, info
-
+    Reads ``HSN.forward(..., capture=True)`` (P1.10a): ``cell_states [B, T, N, d]`` (h after each
+    position), ``cell_gates`` (the gate of each written cell, NaN elsewhere) and ``cell_written``
+    ``[B, T, N]``, in every routing mode. A variant whose round has no gate (the GRU-cell variants
+    report NaN) gives no gate quantiles."""
     was_training = model.training
     model.eval()
-    model.step = step  # type: ignore[method-assign]
-    cell.step_dense = dense  # type: ignore[method-assign]
-    cell.step_sparse = sparse  # type: ignore[method-assign]
     try:
-        model(w["tokens"], w["context"], model.init_state(int(w["tokens"].shape[0])), w["reset"])
+        B = int(w["tokens"].shape[0])
+        _, _, info = model(w["tokens"], w["context"], model.init_state(B), w["reset"], capture=True)
     finally:
-        for (obj, name), original in originals.items():
-            if patched[(obj, name)]:
-                setattr(obj, name, original)
-            else:
-                delattr(obj, name)
         model.train(was_training)
-    T = int(w["tokens"].shape[1])
-    if len(states) != T or (gates and len(gates) != T):
-        raise RuntimeError(
-            f"window_state_stats: captured {len(states)} states and {len(gates)} gates for "
-            f"{T} positions (one round per position expected)"
-        )
-    h = torch.stack(states, dim=1).float()  # [B, T, N, d]
+    h = info["cell_states"].float()  # [B, T, N, d]
     valid = w["doc"] >= 0  # [B, T]
     out: dict[str, float] = {}
     for tag, mask in (("answer", w["loss_mask"].bool()), ("valid", valid)):
         if bool(mask.any()):
             out.update({f"{k}/{tag}": v for k, v in cell_stats(h[mask]).items()})
-    if gates:
-        b = torch.stack([g[0] for g in gates], dim=1).float()[valid]  # [P, N or K, d]
-        slots = gates[0][1]
-        if slots is not None:
-            written = torch.stack([g[1] for g in gates], dim=1)[valid]  # type: ignore[misc]
-            b = b[written]  # [S, d]
-        if b.numel():
-            out.update(_quantiles(b.reshape(-1)))
-    if selected:
-        writes = torch.stack(selected, dim=1)[valid].float().sum(0)  # [N]
+    written = info["cell_written"][valid]  # [P, N]
+    gates = info["cell_gates"].float()[valid][written]  # [S, d]
+    gates = gates[~torch.isnan(gates)]
+    if gates.numel():
+        out.update(_quantiles(gates))
+    if model.cfg.routing != "dense":
+        writes = written.float().sum(0)  # [N]
         share = writes / writes.sum().clamp_min(1)
         out.update({"write_share/min": float(share.min()), "write_share/max": float(share.max())})
     return out
