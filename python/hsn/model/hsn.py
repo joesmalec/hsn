@@ -21,6 +21,14 @@ For every position ``t`` (:meth:`HSN.step`; ``q = q_{t−1}`` is the carried sum
             h_t = m ⊙ h_cand + (1 − m) ⊙ h[t−1],  m = sel.cell_mask;  q_t the exact mean
     logits = D([q_t ; u_t])     the UPDATED summary
 
+P1.10a: :meth:`HSN.forward` runs the same position body, but does the work that depends on the
+inputs and parameters only once per window — ``emb``, ``E`` and ``z*`` over ``[B, T]`` before the
+loop, the position-independent scorer features and the edge weights once, ``D`` over the stacked
+``[q_t ; u_t]`` after the loop, and the statistics from the stacks. Only ``P``, ``ε``, ``S``, the
+scorer and the round run per position. :meth:`HSN.step` stays the per-position reference; the
+window matches it to rounding (batched matmuls round differently from per-position ones), not bit
+for bit. ``forward(..., capture=True)`` returns the per-position cell states and gates.
+
 The dense reference uses the same linear scorer as the sparse model, with ``α = softmax(logits)``
 over all units and every cell updated (Appendix H.5), so the measured parameter count is exactly
 Appendix C.1: :meth:`HSN.param_report` lists the twelve C.1 rows plus amendment A1's ``cell_norm``
@@ -82,8 +90,9 @@ called until P2.7), no custom kernels (P2.9–P2.11), no ``torch.compile`` (P2.8
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, Self
+from typing import Literal, NamedTuple, Self
 
 import torch
 import torch.nn.functional as F
@@ -146,6 +155,42 @@ class StepOutput:
     n_rounds: int
     aux: dict[str, Tensor]
     selection: Selection | None = None
+
+
+class _RoundResult(NamedTuple):
+    """One position's round: the updated state and, when captured, the gate ``b`` of the written
+    cells (``[B, N, d]``, NaN where not written; detached) and the written mask (bool
+    ``[B, N]``)."""
+
+    state: CellGraphState
+    gate: Tensor | None = None
+    written: Tensor | None = None
+
+
+def _gate_of_written(b: Tensor, written: Tensor) -> Tensor:
+    """The detached gate ``b [B, N, d]`` of the written cells (bool ``[B, N]``), NaN elsewhere."""
+    return b.detach().masked_fill(~written[:, :, None], float("nan"))
+
+
+def _gate_of_slots(b: Tensor, cell_idx: Tensor, valid: Tensor, n_cells: int) -> Tensor:
+    """The sparse round's per-slot gate ``b [B, K, d]`` laid out per cell, ``[B, N, d]``: the
+    valid slots' values at their cells, NaN at every cell no slot wrote. Padded slots go to a dummy
+    row ``N`` that is cut off (valid cells are distinct within a row)."""
+    B, K, d = (int(n) for n in b.shape)
+    index = torch.where(valid, cell_idx, torch.full_like(cell_idx, n_cells))
+    wide = b.new_full((B, n_cells + 1, d), float("nan"))
+    return wide.scatter(1, index[:, :, None].expand(B, K, d), b.detach())[:, :n_cells]
+
+
+def _window_positions(pos: Tensor, reset: Tensor) -> Tensor:
+    """The session position before each step of a window, int64 ``[B, T]``, from the start
+    positions ``pos [B]`` and the window's ``reset [B, T]`` (no host synchronisation): ``t − s``
+    after the last reset ``s <= t`` of a row, ``pos + t`` in a row without one. Every round
+    advances ``pos`` by exactly one, so this holds in every routing mode."""
+    T = int(reset.shape[1])
+    steps = torch.arange(T, dtype=torch.int64, device=reset.device)
+    last = torch.where(reset, steps, torch.full_like(steps, -1)).cummax(dim=1).values
+    return torch.where(last >= 0, steps - last, pos[:, None] + steps)
 
 
 class HSN(nn.Module):
@@ -305,42 +350,30 @@ class HSN(nn.Module):
         # dtype, the fp32 master precision of §3.7. Without autocast these casts are no-ops.
         u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)
 
-        selection: Selection | None = None
         with self.cell.graph.step():
             with profiler_segment(profiler, "scorer", B):
                 feats = self.scorer.features(
                     u_s, eps_s, state, ctx_t, budget_frac=cfg.budget, round_idx=0, ema=None
                 )
-                unit_logits = self.router(feats).to(state.dtype)  # [B, N, M]
-                if mode == "dense":
-                    alpha = torch.softmax(unit_logits, dim=-1)
-                else:
-                    selection = self._select(unit_logits, state, dense_rows)
-            if mode == "dense":
-                h_new, _ = self.cell.step_dense(u_s, eps_s, state, alpha)
-                new_state = self._write_dense(state, h_new)
-                cost = torch.ones((), dtype=state.dtype, device=state.device)
-            else:
-                assert selection is not None
-                if mode == "masked" or self._gate() == "soft":
-                    # the soft warm-up executes every cell with a fractional weight: masked path
-                    new_state, cost = self._masked_round(u_s, eps_s, state, selection)
-                else:
-                    new_state, cost = self._sparse_round(
-                        u_s, eps_s, state, selection, unit_logits, profiler, dense_rows
-                    )
+                unit_logits, alpha, selection = self._score(feats, state, mode, dense_rows)
+            new_state = self._update(
+                u_s, eps_s, state, mode, alpha, selection, unit_logits, profiler, dense_rows
+            ).state
+        if selection is None:
+            cost = torch.ones((), dtype=state.dtype, device=state.device)
+        else:
+            cost = selection.cost.detach().mean().to(state.dtype)
 
         with profiler_segment(profiler, "decode", B):
             logits = self.decoder(torch.cat([new_state.q, u], dim=-1))  # the updated q_t
 
         with torch.no_grad():
-            if mode != "dense":
-                alpha = torch.softmax(unit_logits, dim=-1)
+            probs = alpha if alpha is not None else torch.softmax(unit_logits, dim=-1)
             log_alpha = F.log_softmax(unit_logits, dim=-1)
             aux = {
                 "state_abs_max": new_state.h.abs().amax(),
                 "eps_abs_mean": eps.abs().mean(),
-                "alpha_entropy": -(alpha * log_alpha).sum(dim=-1).mean(),
+                "alpha_entropy": -(probs * log_alpha).sum(dim=-1).mean(),
             }
         return StepOutput(
             logits=logits,
@@ -404,6 +437,66 @@ class HSN(nn.Module):
             dense_rows=dense_rows,
         )
 
+    def _score(
+        self, feats: Tensor, state: CellGraphState, mode: StepMode, dense_rows: Tensor | None
+    ) -> tuple[Tensor, Tensor | None, Selection | None]:
+        """The scorer logits ``[B, N, M]`` (state dtype) of the features, then either the dense
+        mixing weights ``α = softmax(logits)`` (dense mode; no selection) or the routed
+        :class:`~hsn.model.router.Selection` of this step (``α`` is ``None``)."""
+        unit_logits = self.router(feats).to(state.dtype)  # [B, N, M]
+        if mode == "dense":
+            return unit_logits, torch.softmax(unit_logits, dim=-1), None
+        return unit_logits, None, self._select(unit_logits, state, dense_rows)
+
+    def _update(
+        self,
+        u_s: Tensor,
+        eps_s: Tensor,
+        state: CellGraphState,
+        mode: StepMode,
+        alpha: Tensor | None,
+        selection: Selection | None,
+        unit_logits: Tensor,
+        profiler: Profiler | None,
+        dense_rows: Tensor | None,
+        capture: bool = False,
+        dense_counters: tuple[Tensor, Tensor] | None = None,
+    ) -> _RoundResult:
+        """The round of one position on ``state``: the dense reference, the masked round (mode
+        ``masked`` or the soft warm-up) or the sparse round, shared by :meth:`step` and
+        :meth:`forward` so that the two cannot drift apart. With ``capture`` the result also carries
+        the gate of the written cells and the written mask (:meth:`forward`'s ``capture``).
+
+        ``dense_counters`` (P1.10b, dense mode without disabled cells only) are the ``age`` and
+        ``pos`` the written state carries, computed by :meth:`forward` for the whole window; the
+        dense round writes them instead of zeroing the ages and ticking (the same values)."""
+        if mode == "dense":
+            assert alpha is not None
+            h_new, info = self.cell.step_dense(u_s, eps_s, state, alpha)
+            if dense_counters is None:
+                new_state = self._write_dense(state, h_new)
+            else:
+                age, pos = dense_counters
+                new_state = CellGraphState(h=h_new, q=h_new.mean(dim=1), age=age, pos=pos)
+            if not capture:
+                return _RoundResult(new_state)
+            enabled = self._enabled_cells(state)
+            return _RoundResult(new_state, _gate_of_written(info["b"], enabled), enabled)
+        assert selection is not None
+        if mode == "masked" or self._gate() == "soft":
+            # the soft warm-up executes every cell with a fractional weight: masked path
+            return self._masked_round(u_s, eps_s, state, selection, capture)
+        return self._sparse_round(
+            u_s, eps_s, state, selection, unit_logits, profiler, dense_rows, capture
+        )
+
+    def _enabled_cells(self, state: CellGraphState) -> Tensor:
+        """bool ``[B, N]``: every cell the dense round writes (all but ``model.disabled_cells``)."""
+        B, N = state.batch_size, state.n_cells
+        if not self.cell.disabled_cells:
+            return torch.ones(B, N, dtype=torch.bool, device=state.device)
+        return (~self.cell.disabled)[None, :].expand(B, N)
+
     def _sparse_round(
         self,
         u_s: Tensor,
@@ -413,13 +506,14 @@ class HSN(nn.Module):
         unit_logits: Tensor,
         profiler: Profiler | None,
         dense_rows: Tensor | None,
-    ) -> tuple[CellGraphState, Tensor]:
-        """The sparse round (P2.5): :meth:`PDGCell.step_sparse` on ``selection``, the tick of the
-        unselected cells, and the executed cost (the detached batch mean of ``selection.cost`` in
-        the state dtype). The rows of ``dense_rows`` (P2.2's dense fallback) run the P1.5 dense
+        capture: bool = False,
+    ) -> _RoundResult:
+        """The sparse round (P2.5): :meth:`PDGCell.step_sparse` on ``selection`` and the tick of
+        the unselected cells. The rows of ``dense_rows`` (P2.2's dense fallback) run the P1.5 dense
         step instead — the same operations as ``mode="dense"`` — and replace the sparse result row
         by row; the selection they did not execute is handed to the cell with its fallback flags
-        cleared."""
+        cleared. (The executed cost is the caller's: the detached batch mean of
+        ``selection.cost``.)"""
         executed = selection
         if dense_rows is not None:
             executed = replace(selection, dense_fallback=torch.zeros_like(selection.dense_fallback))
@@ -428,8 +522,15 @@ class HSN(nn.Module):
         selected = info["selected"]
         assert isinstance(written, CellGraphState) and isinstance(selected, Tensor)
         new_state = written.tick(selected)
+        gate: Tensor | None = None
+        if capture:
+            b, valid = info["b"], info["valid"]
+            assert isinstance(b, Tensor) and isinstance(valid, Tensor)
+            gate = _gate_of_slots(b, executed.cell_idx, valid, state.n_cells)
         if dense_rows is not None:
-            h_dense, _ = self.cell.step_dense(u_s, eps_s, state, torch.softmax(unit_logits, dim=-1))
+            h_dense, dense_info = self.cell.step_dense(
+                u_s, eps_s, state, torch.softmax(unit_logits, dim=-1)
+            )
             dense_state = self._write_dense(state, h_dense)
             rows = dense_rows
             new_state = CellGraphState(
@@ -438,21 +539,34 @@ class HSN(nn.Module):
                 age=torch.where(rows[:, None], dense_state.age, new_state.age),
                 pos=new_state.pos,  # both paths advanced it once
             )
-        return new_state, selection.cost.detach().mean().to(state.dtype)
+            if capture:
+                assert gate is not None
+                enabled = self._enabled_cells(state)
+                dense_gate = _gate_of_written(dense_info["b"], enabled)
+                gate = torch.where(rows[:, None, None], dense_gate, gate)
+                selected = torch.where(rows[:, None], enabled, selected)
+        if not capture:
+            return _RoundResult(new_state)
+        return _RoundResult(new_state, gate, selected)
 
     def _masked_round(
-        self, u_s: Tensor, eps_s: Tensor, state: CellGraphState, selection: Selection
-    ) -> tuple[CellGraphState, Tensor]:
+        self,
+        u_s: Tensor,
+        eps_s: Tensor,
+        state: CellGraphState,
+        selection: Selection,
+        capture: bool = False,
+    ) -> _RoundResult:
         """The P2.2 routed round on the dense path (module docstring): every cell computes its
         candidate with the selection's unit weights, ``h_new = m·h_cand + (1 − m)·h_prev`` (exactly
         ``h_cand`` where ``m = 1`` and ``h_prev`` where ``m = 0``), ``q`` the exact mean, the ages
         reset on the cells whose weight is non-zero (the hard decision and every cell of a
-        dense-fallback row in the hard modes; every cell in the soft warm-up). Returns the state
-        and the executed cost."""
+        dense-fallback row in the hard modes; every cell in the soft warm-up)."""
         alpha = selection.unit_weights.to(state.dtype)
-        h_cand, _ = self.cell.step_dense(u_s, eps_s, state, alpha)
+        h_cand, info = self.cell.step_dense(u_s, eps_s, state, alpha)
         mask = selection.cell_mask.to(state.dtype)[:, :, None]
-        h_new = mask * h_cand + (1 - mask) * state.h
+        # P1.10c: m·h_cand + (1 − m)·h_prev in one op; exactly h_cand / h_prev at m = 1 / 0
+        h_new = torch.lerp(state.h, h_cand, mask)
         if self.cell.disabled_cells:  # a soft m would move a disabled cell by an ulp
             h_new = torch.where(self.cell.disabled[None, :, None], state.h, h_new)
         updated = selection.cell_mask.detach() > 0
@@ -460,7 +574,9 @@ class HSN(nn.Module):
             updated = updated & ~self.cell.disabled[None, :]
         written = state.with_dense(h_new)  # q: the exact mean (every age zeroed, restored below)
         new_state = replace(written, age=state.age.masked_fill(updated, 0)).tick(updated)
-        return new_state, selection.cost.detach().mean().to(state.dtype)
+        if not capture:
+            return _RoundResult(new_state)
+        return _RoundResult(new_state, _gate_of_written(info["b"], updated), updated)
 
     def _prediction_target(self, emb: Tensor) -> Tensor:
         """``z_target [B, d]`` for the prediction loss, detached in both modes: the byte
@@ -490,7 +606,14 @@ class HSN(nn.Module):
     # -- a window of positions --------------------------------------------------------------------
 
     def forward(
-        self, tokens: Tensor, ctx: Tensor, state: CellGraphState, reset: Tensor
+        self,
+        tokens: Tensor,
+        ctx: Tensor,
+        state: CellGraphState,
+        reset: Tensor,
+        *,
+        capture: bool = False,
+        reset_columns: Sequence[int] | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """Run positions ``0 .. T−1`` of ``tokens [B, T]`` / ``ctx [B, T]`` from ``state``.
 
@@ -500,74 +623,196 @@ class HSN(nn.Module):
         (``[B, T, d]``, autograd intact except for the target) and the per-position statistics
         ``state_abs_max``, ``eps_abs_mean``, ``alpha_entropy``, ``cost`` (the model dtype) and
         ``n_rounds`` (int64), each ``[T]``. With a sparse ``model.routing`` (every position runs
-        :meth:`step` with ``mode=None``) the window's selections are stacked too: detached
-        ``cell_idx`` and ``unit_idx`` (int64 ``[B, T, K]``), ``valid`` (bool ``[B, T, K]``) and
-        ``cost_per_row`` (fp32 ``[B, T]``), the router's decisions as charged (the one case where a
-        valid slot is not written is a selected cell of the ``model.disabled_cells`` test hook; a
-        dense-fallback row ran the dense step instead of its slots), plus P2.2's ``expected_cost
-        [T]`` (the differentiable batch-mean expected cost, fp32), ``route_log_prob [B]`` (the
-        REINFORCE log-probability summed over the positions; zeros unless the gate is
-        ``reinforce``), ``explored [T]`` (fraction of rows with an explored slot), ``refreshed [T]``
-        (mean refreshed slots per row) and ``dense_fallback [T]`` (fraction of rows that ran
-        dense), and P2.4's ``unit_logits [B, T, N, M]`` (the scorer's logits of every position in
-        the state dtype, autograd intact: the balance term's input). In training the dense
-        fallback is drawn here, once per row per window, with probability ``train.p_dense``.
+        the routed round of :meth:`step` with ``mode=None``) the window's selections are stacked
+        too: detached ``cell_idx`` and ``unit_idx`` (int64 ``[B, T, K]``), ``valid`` (bool
+        ``[B, T, K]``) and ``cost_per_row`` (fp32 ``[B, T]``), the router's decisions as charged
+        (the one case where a valid slot is not written is a selected cell of the
+        ``model.disabled_cells`` test hook; a dense-fallback row ran the dense step instead of its
+        slots), plus P2.2's ``expected_cost [T]`` (the differentiable batch-mean expected cost,
+        fp32), ``route_log_prob [B]`` (the REINFORCE log-probability summed over the positions;
+        zeros unless the gate is ``reinforce``), ``explored [T]`` (fraction of rows with an explored
+        slot), ``refreshed [T]`` (mean refreshed slots per row) and ``dense_fallback [T]`` (fraction
+        of rows that ran dense), and P2.4's ``unit_logits [B, T, N, M]`` (the scorer's logits of
+        every position in the state dtype, autograd intact: the balance term's input). In training
+        the dense fallback is drawn here, once per row per window, with probability
+        ``train.p_dense``.
+
+        ``capture=True`` (off by default, and then free) adds the per-position cell states and
+        gates, detached, for diagnostics:
+
+        * ``cell_states [B, T, N, d]`` (state dtype): ``h`` after position ``t``;
+        * ``cell_gates [B, T, N, d]`` (state dtype): the gate ``b`` with which each *written* cell
+          was updated at ``t``, NaN at every cell that position did not write;
+        * ``cell_written`` (bool ``[B, T, N]``): the cells position ``t`` wrote — in the dense
+          round every enabled cell (all but ``model.disabled_cells``); in the masked round (mode
+          ``masked`` or the soft warm-up) the cells with ``cell_mask > 0`` minus the disabled
+          ones; in the sparse round the selected valid slots (``info["selected"]`` of
+          :meth:`PDGCell.step_sparse`); in a dense-fallback row every enabled cell.
+
+        The masked and the sparse round of the same selection agree on the written cells.
+
+        ``reset_columns`` (P1.10b) are the positions at which the per-position reset runs, a
+        strictly increasing sequence of ints in ``[0, T)`` that must contain every column where
+        ``reset`` has a True (extra columns are allowed and change nothing). ``None`` derives them
+        from ``reset``: free on the CPU, one device-to-host copy per window on an accelerator. A
+        trainer passes them from the CPU batch it uploads, so no copy is needed. **Contract:** the
+        list must cover every reset column. It is checked only when ``reset`` is on the CPU (a list
+        that omits one raises ``ValueError``); on an accelerator it cannot be checked without the
+        copy it saves, and an omitted column would silently skip that reset and carry the state
+        across a document boundary. Derive it from the CPU copy of the same mask, as
+        :class:`~hsn.train.tbptt.TBPTTTrainer` does, or pass ``None``.
+
+        P1.10a: the work that depends on the inputs and parameters only runs once for the window —
+        the byte and context embeddings, ``E`` and the prediction target over ``[B, T]``, the
+        position-independent scorer features (:meth:`Scorer.window_scalars`), the edge weights
+        (:meth:`PDGCell.window`), and after the loop the decoder over the stacked ``[q_t ; u_t]``
+        and the statistics from the stacks. The loop runs, per position, the reset, ``ẑ_t =
+        P(q_{t−1})``, ``ε_t``, ``u_t = S([z_t ; q_{t−1} ; ctx_t])``, the scorer and the round
+        (:meth:`step`'s, shared code). ``E`` now runs before the loop in wall-clock order; global
+        rule 2 is an information rule and still holds: ``ẑ_t`` reads ``q_{t−1}`` only (the P1.8
+        leakage test). The batched matmuls round differently from :meth:`step`'s per-position ones
+        (the GEMM row count changes), so ``forward`` matches stepping to rounding (fp64 1e-12,
+        ``test_p1_10_forward_matches_stepwise_reference``), not bit for bit.
+
+        P1.10b: the reset runs only at the reset columns, and the dense round (``model.routing``
+        dense, no ``model.disabled_cells``) keeps no per-position ``age`` / ``pos`` bookkeeping: it
+        writes every cell, so the age before position ``t`` is the start age (after a reset at 0)
+        at ``t = 0`` and 0 afterwards, and ``pos`` follows from the reset mask. The states of every
+        position still carry those values (views of the window's counters), and the reset there
+        masks ``h`` and ``q`` only (``age`` and ``pos`` already account for it). Bit for bit the
+        same as the per-position bookkeeping.
         """
         B, T = self._check_window_inputs(tokens, ctx, state, reset)
+        if not isinstance(capture, bool):
+            raise TypeError(f"capture must be a bool, got {capture!r}")
+        resets_at = [False] * T
+        for column in self._reset_columns(reset, reset_columns):
+            resets_at[column] = True
+        cfg = self.cfg
+        mode: StepMode = "dense" if cfg.routing == "dense" else "sparse"
         dense_rows: Tensor | None = None
-        if self.cfg.routing != "dense" and self.training:
+        if cfg.routing != "dense" and self.training:
             p_dense = self.schedule.p_dense(self.train_step)
             if p_dense > 0.0:  # a CPU draw: the same rows on every backend, replayed by a resume
                 drawn = torch.rand(B) < p_dense
                 if bool(drawn.any()):  # a host-side check: no device synchronisation
                     dense_rows = drawn.to(state.device)
-        logits: list[Tensor] = []
-        stacks: dict[str, list[Tensor]] = {
-            "z": [],
-            "z_hat": [],
-            "z_target": [],
-            "eps": [],
-            "u": [],
-        }
-        stats: dict[str, list[Tensor]] = {
-            "state_abs_max": [],
-            "eps_abs_mean": [],
-            "alpha_entropy": [],
-        }
-        costs: list[Tensor] = []
-        rounds: list[int] = []
+
+        # The window-invariant work: functions of the inputs and the parameters only.
+        emb = self.byte_emb(tokens)  # [B, T, d]
+        z = self.encoder(emb)
+        z_target = self._prediction_target(emb)  # detached; a function of x_t only
+        context = self.ctx_emb(ctx)  # [B, T, context_dim]
+        positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
+        scalars = self.scorer.window_scalars(
+            ctx, positions, budget_frac=cfg.budget, round_idx=0, dtype=state.dtype
+        )  # [B, T, N, 7]
+        # P1.10b: the dense round writes every cell, so its counters are known for the window
+        dense_window = mode == "dense" and not self.cell.disabled_cells
+        if dense_window:
+            start_age = state.age.masked_fill(reset[:, 0, None], 0) if resets_at[0] else state.age
+            age_feature = torch.zeros(B, T, cfg.n_cells, dtype=state.dtype, device=state.device)
+            age_feature[:, 0] = start_age.to(state.dtype) / self.scorer.age_max
+            scalars = torch.cat([age_feature[..., None], scalars], dim=-1)  # [B, T, N, 8]
+            zero_age = torch.zeros_like(state.age)
+            positions_after = positions + 1
+        # unbind: one backward node for the whole window instead of a slice backward per position
+        z_steps, ctx_steps, scalar_steps = z.unbind(1), context.unbind(1), scalars.unbind(1)
+
+        z_hats: list[Tensor] = []
+        epss: list[Tensor] = []
+        us: list[Tensor] = []
+        qs: list[Tensor] = []
+        hs: list[Tensor] = []
+        unit_logits_steps: list[Tensor] = []
+        gates: list[Tensor] = []
+        written: list[Tensor] = []
         selections: list[Selection] = []
-        with self.cell.graph.step():
+        with self.cell.window():
             for t in range(T):
-                state = state.reset(reset[:, t])
-                out = self.step(tokens[:, t], ctx[:, t], state, dense_rows=dense_rows)
-                state = out.state
-                logits.append(out.logits)
-                for name in stacks:
-                    stacks[name].append(getattr(out, name))
-                for name in stats:
-                    stats[name].append(out.aux[name])
-                costs.append(out.cost)
-                rounds.append(out.n_rounds)
-                if out.selection is not None:
-                    selections.append(out.selection)
+                if dense_window:
+                    h, q = state.h, state.q
+                    if resets_at[t]:  # age and pos already account for the reset
+                        h = h.masked_fill(reset[:, t, None, None], 0)
+                        q = q.masked_fill(reset[:, t, None], 0)
+                    state = CellGraphState(
+                        h=h, q=q, age=start_age if t == 0 else zero_age, pos=positions[:, t]
+                    )
+                elif resets_at[t]:
+                    state = state.reset(reset[:, t])
+                q_prev = state.q
+                z_t = z_steps[t]
+                z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
+                eps = z_t - z_hat
+                u = self.shared(torch.cat([z_t, q_prev, ctx_steps[t]], dim=-1))
+                u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)  # P1.7: see step
+                age = None if dense_window else state.age  # dense: a column of the scalars
+                feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalar_steps[t])
+                unit_logits, alpha, selection = self._score(feats, state, mode, dense_rows)
+                result = self._update(
+                    u_s,
+                    eps_s,
+                    state,
+                    mode,
+                    alpha,
+                    selection,
+                    unit_logits,
+                    None,
+                    dense_rows,
+                    capture,
+                    (zero_age, positions_after[:, t]) if dense_window else None,
+                )
+                state = result.state
+                z_hats.append(z_hat)
+                epss.append(eps)
+                us.append(u)
+                qs.append(state.q)
+                hs.append(state.h.detach())
+                unit_logits_steps.append(unit_logits.detach())
+                if selection is not None:
+                    selections.append(selection)
+                if capture:
+                    assert result.gate is not None and result.written is not None
+                    gates.append(result.gate)
+                    written.append(result.written)
+
+        if dense_window:
+            state = replace(state, pos=positions_after[:, -1].contiguous())
+        u_window = torch.stack(us, dim=1)
+        logits = self.decoder(torch.cat([torch.stack(qs, dim=1), u_window], dim=-1))  # updated q_t
+        eps_window = torch.stack(epss, dim=1)
         info: dict[str, Tensor] = {
-            name: torch.stack(values, dim=1) for name, values in stacks.items()
+            "z": z,
+            "z_hat": torch.stack(z_hats, dim=1),
+            "z_target": z_target,
+            "eps": eps_window,
+            "u": u_window,
         }
-        info.update({name: torch.stack(values) for name, values in stats.items()})
-        info["cost"] = torch.stack(costs).to(self.dtype)
-        info["n_rounds"] = torch.tensor(rounds, dtype=torch.int64, device=state.device)
+        with torch.no_grad():
+            h_window = torch.stack(hs, dim=1)  # [B, T, N, d]
+            unit_window = torch.stack(unit_logits_steps, dim=1)  # [B, T, N, M]
+            probs = torch.softmax(unit_window, dim=-1)
+            log_probs = F.log_softmax(unit_window, dim=-1)
+            info["state_abs_max"] = h_window.abs().amax(dim=(0, 2, 3))
+            info["eps_abs_mean"] = eps_window.abs().mean(dim=(0, 2))
+            info["alpha_entropy"] = -(probs * log_probs).sum(dim=-1).mean(dim=(0, 2))
         if selections:
             if len(selections) != T:
                 raise RuntimeError(
                     f"{len(selections)} of {T} positions ran a routed round; every position of a "
                     "window runs the same mode (the dense fallback is a flag on the selection)"
                 )
+            cost_per_row = torch.stack([sel.cost.detach() for sel in selections], dim=1)
+            info["cost"] = cost_per_row.mean(dim=0).to(state.dtype).to(self.dtype)
+        else:
+            info["cost"] = torch.ones(T, dtype=self.dtype, device=state.device)
+        info["n_rounds"] = torch.ones(T, dtype=torch.int64, device=state.device)
+        if selections:
             info["cell_idx"] = torch.stack([sel.cell_idx for sel in selections], dim=1)
             info["unit_idx"] = torch.stack([sel.unit_idx for sel in selections], dim=1)
             info["valid"] = torch.stack([sel.valid for sel in selections], dim=1)
             info["unit_logits"] = torch.stack([sel.logits for sel in selections], dim=1)  # P2.4
-            info["cost_per_row"] = torch.stack([sel.cost.detach() for sel in selections], dim=1)
+            info["cost_per_row"] = cost_per_row
             info["expected_cost"] = torch.stack([sel.expected_cost.mean() for sel in selections])
             info["route_log_prob"] = torch.stack([sel.log_prob for sel in selections], dim=1).sum(
                 dim=1
@@ -581,7 +826,11 @@ class HSN(nn.Module):
             info["dense_fallback"] = torch.stack(
                 [sel.dense_fallback.float().mean() for sel in selections]
             )
-        return torch.stack(logits, dim=1), state, info
+        if capture:
+            info["cell_states"] = h_window
+            info["cell_gates"] = torch.stack(gates, dim=1)
+            info["cell_written"] = torch.stack(written, dim=1)
+        return logits, state, info
 
     # -- accounting -------------------------------------------------------------------------------
 
@@ -681,6 +930,38 @@ class HSN(nn.Module):
         B = state.batch_size
         self._check_ids("x_t", x_t, (B,), state.device)
         self._check_ids("ctx_t", ctx_t, (B,), state.device)
+
+    @staticmethod
+    def _reset_columns(reset: Tensor, columns: Sequence[int] | None) -> list[int]:
+        """The columns at which :meth:`forward` resets (``reset_columns``, module docstring):
+        derived from ``reset`` when ``None`` (one device-to-host copy on an accelerator),
+        validated otherwise."""
+        T = int(reset.shape[1])
+        if columns is None:
+            derived: list[int] = reset.any(dim=0).nonzero().flatten().tolist()
+            return derived
+        if isinstance(columns, str | bytes) or not isinstance(columns, Sequence):
+            raise TypeError(
+                f"reset_columns must be a sequence of ints or None, got {type(columns).__name__}"
+            )
+        listed = list(columns)
+        for column in listed:
+            if isinstance(column, bool) or not isinstance(column, int):
+                raise TypeError(f"reset_columns must hold ints, got {column!r}")
+        if any(b <= a for a, b in zip(listed, listed[1:], strict=False)):
+            raise ValueError(f"reset_columns must be strictly increasing, got {listed}")
+        if listed and (listed[0] < 0 or listed[-1] >= T):
+            raise ValueError(f"reset_columns must lie in [0, T) = [0, {T}), got {listed}")
+        if reset.device.type == "cpu":  # the superset check is free here
+            needed = reset.any(dim=0)
+            needed[listed] = False
+            missing = needed.nonzero().flatten().tolist()
+            if missing:
+                raise ValueError(
+                    f"reset has resets at columns {missing} that reset_columns omits; it must "
+                    "contain every column where some row resets"
+                )
+        return listed
 
     def _check_window_inputs(
         self, tokens: Tensor, ctx: Tensor, state: CellGraphState, reset: Tensor

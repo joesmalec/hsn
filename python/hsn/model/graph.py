@@ -25,24 +25,36 @@ the constant number of non-empty rows and carries no gradient, so the sparsity p
 ``sigmoid``.
 
 Messages. ``Vh = V(h_prev)`` is computed once for all ``N`` cells (``V`` before the weighting, as
-the equation reads) and the sources are gathered from it. The CSR is mirrored into a padded view
-``[N, D_max]`` (source per slot, edge id per slot, slot mask; non-persistent buffers rebuilt
-whenever the topology changes or a state dict is loaded) so that both message paths are gather →
-multiply → sum: deterministic, no atomics, the same ops on CPU, CUDA and MPS, and no padding waste
-on the uniform-degree fixed graph. The int64 CSR buffers are what the later ``csr_messages`` kernel
-reads (P2.9 narrows them to the C ABI's int32). Both message functions read only the ``h_prev`` they
-are given — the previous round's states — and never touch a
+the equation reads). The CSR is mirrored into a padded view ``[N, D_max]`` (source per slot, edge
+id per slot, slot mask; non-persistent buffers rebuilt whenever the topology changes or a state
+dict is loaded). The selected-cell path gathers the sources from ``Vh`` and sums them (gather →
+multiply → sum): deterministic, no atomics, the same ops on CPU, CUDA and MPS. The all-cells path
+sums the same way, each row's sources in slot order, which keeps identical cells bitwise identical
+(a dense ``A · Vh`` contraction would not; :meth:`messages_dense`). :meth:`dense_adjacency` builds
+``A [N, N]`` for tests and analysis, once per window. The int64 CSR buffers are what the later
+``csr_messages`` kernel reads (P2.9 narrows them to the C ABI's int32). Both message functions read
+only the ``h_prev`` they are given — the previous round's states — and never touch a
 :class:`~hsn.model.state.CellGraphState`.
 
 State dict. ``indptr``, ``indices``, ``is_random`` and ``edge_logit`` are saved; a checkpoint with
 another edge count is refused with a message that says to call :meth:`CellGraph.set_topology` with
 the checkpoint's topology first (never reinterpreted by shape). Replacing the topology creates a new
 ``edge_logit`` parameter: an optimiser built before must have its parameter group refreshed (P4.6).
+
+Windows (P1.10a). The edge weights depend on the parameters only, so a window of positions
+(:meth:`hsn.model.hsn.HSN.forward`) computes them once: inside :meth:`CellGraph.window` the padded
+weights are built on first use and reused by every message call of the window, and dropped when the
+window ends (a cast to the message dtype under autocast still runs per call, so that the window's
+gradient contributions are summed in the weights' dtype). A cached value is bound to the
+``edge_logit`` object, its in-place version counter and the grad mode it was built under; a use
+that sees any of them changed raises ``RuntimeError`` rather than serving a stale weight. Outside a
+window every call recomputes, as before. The cache never outlives a window, so
+``torch.func.functional_call`` and replaced parameters are always read fresh.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -119,6 +131,9 @@ class CellGraph(nn.Module):
         self.edge_norm: EdgeNorm = edge_norm
         #: True while a step (round) is running; :meth:`set_topology` is refused meanwhile.
         self.in_step = False
+        #: The per-window cache of :meth:`window` (``None`` outside a window): name ->
+        #: ((edge_logit id, its version, grad mode), tensor).
+        self._window_cache: dict[str, tuple[tuple[int, int, bool], Tensor]] | None = None
 
         indptr, indices, is_random = _build_topology(n_cells, in_degree, random_edges, seed)
         _check_topology(indptr, indices, is_random, n_cells, in_degree)
@@ -164,10 +179,54 @@ class CellGraph(nn.Module):
         finally:
             self.in_step = previous
 
+    @contextmanager
+    def window(self) -> Iterator[None]:
+        """A window of steps (P1.10a, module docstring): the step guard is held, and the edge
+        weights are computed once and reused until the window ends. Windows do not nest."""
+        if self._window_cache is not None:
+            raise RuntimeError("CellGraph.window is already active; windows do not nest")
+        with self.step():
+            self._window_cache = {}
+            try:
+                yield
+            finally:
+                self._window_cache = None
+
+    def _cached(self, name: str, build: Callable[[], Tensor]) -> Tensor:
+        """``build()``, once per window under ``name`` (every call outside a window)."""
+        cache = self._window_cache
+        if cache is None:
+            return build()
+        logit = self.edge_logit
+        stamp = (id(logit), logit._version, torch.is_grad_enabled())
+        hit = cache.get(name)
+        if hit is None:
+            value = build()
+            cache[name] = (stamp, value)
+            return value
+        if hit[0] != stamp:
+            raise RuntimeError(
+                f"CellGraph.window: the cached {name!r} edge weights were built for another "
+                "edge_logit, version or grad mode; the edge logits must not change inside a window "
+                "(an in-place update, a new parameter, or a grad-mode switch between positions)"
+            )
+        return hit[1]
+
     # -- edge weights -----------------------------------------------------------------------------
 
     def _padded_weights(self) -> Tensor:
-        """``a_ij`` in the padded view ``[N, D_max]``; exactly zero on padding slots."""
+        """``a_ij`` in the padded view ``[N, D_max]``; exactly zero on padding slots. Computed once
+        per :meth:`window`."""
+        return self._cached("padded", self._build_padded_weights)
+
+    def _padded_weights_as(self, dtype: torch.dtype) -> Tensor:
+        """:meth:`_padded_weights` in ``dtype`` (the message dtype under autocast). The cast runs
+        per call, never cached: a cached low-precision copy used at every position would sum the
+        window's gradient contributions in that precision (bf16), where the per-call cast sums
+        them in the weights' own dtype, as before P1.10a. A no-op when the dtypes agree."""
+        return self._padded_weights().to(dtype)
+
+    def _build_padded_weights(self) -> Tensor:
         logit = self.edge_logit
         extended = torch.cat([logit, logit.new_zeros(1)])  # slot E: the padding sentinel
         pad = extended[self._pad_edge]
@@ -187,7 +246,11 @@ class CellGraph(nn.Module):
 
     def dense_adjacency(self) -> Tensor:
         """``A [N, N]`` with ``A[i, j] = a_ij`` for every edge ``j → i`` and 0 elsewhere (rows are
-        targets, columns sources): ``messages_dense`` equals ``einsum("ij,bjd->bid", A, V(h))``."""
+        targets, columns sources): ``messages_dense`` is ``einsum("ij,bjd->bid", A, V(h))``.
+        Built once per :meth:`window` (P1.10c), per call outside one."""
+        return self._cached("adjacency", self._build_dense_adjacency)
+
+    def _build_dense_adjacency(self) -> Tensor:
         weights = self.edge_weights()
         zeros = weights.new_zeros(self.n_cells, self.n_cells)
         return zeros.index_put((self._row, self.indices), weights)
@@ -200,10 +263,15 @@ class CellGraph(nn.Module):
 
     def messages_dense(self, h_prev: Tensor, V: nn.Linear) -> Tensor:
         """``m [B, N, d]`` for every cell from the previous round's states ``h_prev [B, N, d]``:
-        ``V`` is applied once to all cells, then each cell sums its weighted sources."""
+        ``V`` is applied once to all cells, then each cell sums its weighted sources in slot order
+        over the padded view. (P1.10c measured a dense-adjacency contraction ``A · V(h)``
+        instead and kept this one: the contraction sums each row over all ``N`` columns, so rows
+        with their edges at different columns round differently. From the zero state that gives
+        the edge logits rounding-noise gradients, 1.6e-22 in fp64, where the slot-order sum keeps
+        them exactly 0 and the cells exactly symmetric.)"""
         self._check_h(h_prev)
         Vh: Tensor = V(h_prev)  # [B, N, d]
-        weights = self._padded_weights().to(Vh.dtype)  # [N, D_max]
+        weights = self._padded_weights_as(Vh.dtype)  # [N, D_max]
         sources = Vh[:, self._pad_src]  # [B, N, D_max, d]
         return (sources * weights[None, :, :, None]).sum(dim=2)
 
@@ -216,7 +284,7 @@ class CellGraph(nn.Module):
         K = self._check_cell_idx(cell_idx, B)
         D = self._max_in_degree
         Vh: Tensor = V(h_prev)  # [B, N, d]
-        weights = self._padded_weights().to(Vh.dtype)[cell_idx]  # [B, K, D_max]
+        weights = self._padded_weights_as(Vh.dtype)[cell_idx]  # [B, K, D_max]
         source_idx = self._pad_src[cell_idx].reshape(B, K * D, 1).expand(B, K * D, d)
         sources = Vh.gather(1, source_idx).reshape(B, K, D, d)
         return (sources * weights[..., None]).sum(dim=2)
