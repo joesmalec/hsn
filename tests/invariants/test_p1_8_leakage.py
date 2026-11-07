@@ -114,6 +114,13 @@ def test_p1_8_prediction_no_leakage(
             for t in range(T):
                 out = model.step(tokens[:, t], ctx[:, t], current)
                 expect_same(out.z_hat, model.predictor(current.q), device, what="z_hat = P(q)")
-                expect_same(out.z_hat, z_hat[:, t], device, what="z_hat step vs forward")
+                # P1.10a: step vs forward agree to rounding (conftest), not bit for bit; on the
+                # CPU in fp64 only (the tiny case): the perturbed ref model in fp32 amplifies
+                # another CPU's one-ulp GEMM differences to 6.8e-4 by t = 7 (measured 6 Nov 2026,
+                # 20 seeds), so its fp32 run keeps the leakage properties above, bit for bit
+                if device.type != "cpu" or model.dtype == torch.float64:
+                    expect_same.step_vs_forward(
+                        out.z_hat, z_hat[:, t], device, what="z_hat step vs forward"
+                    )
                 current = out.state
     print(f"leakage on {device.type}: {expect_same.report()}")

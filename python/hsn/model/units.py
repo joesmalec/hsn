@@ -11,9 +11,13 @@ a cell. The weights are stacked so that every unit lives in one tensor each: ``W
 Two execution paths that compute the same function, in the same dtype (under autocast both run
 the matmuls, bias adds and activation in the autocast dtype):
 
-* :meth:`UnitBank.forward_all` is the dense reference: every unit on every cell, one ``einsum``
-  per layer, output ``[B, N, M, d]``. It materialises ``B·N·M·H`` hidden values, fine for the A.1
-  dense reference (P1.5) and unusable at scale (the chunk's pitfall).
+* :meth:`UnitBank.forward_all` is the dense reference: every unit on every cell, output
+  ``[B, N, M, d]``. It materialises ``B·N·M·H`` hidden values, fine for the A.1 dense reference
+  (P1.5) and unusable at scale (the chunk's pitfall). P1.10c: the first layer is one ``addmm`` of
+  the ``P = B·N`` inputs against ``W1`` laid out as ``[4d, M·H]`` (built once per
+  :meth:`UnitBank.window`, per call outside one), the second one ``baddbmm`` over the units with
+  the hidden values as ``[M, P, H]``; the output is a ``[B, N, M, d]`` view of ``[M, P, d]``, with
+  no per-call copy of the weights.
 * :meth:`UnitBank.forward_selected` is the grouped pass that the sparse path (P2.5) and the fused
   ``grouped_unit_mlp`` kernel (P2.9) replace: ``P`` (cell, unit) pairs with one unit each. Pairs
   are sorted by unit (stable), one matmul pair runs per *present* unit, and the outputs are
@@ -27,7 +31,8 @@ loading a checkpoint restores the versions and refuses a bank whose unit ids dif
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import Self
 
 import torch
@@ -105,6 +110,10 @@ class UnitBank(nn.Module):
         init_weight_(self.W2, init)
         self.unit_ids: list[str] = _check_unit_ids(unit_ids, n_units)
         self.versions: list[int] = _check_versions(versions, n_units)
+        #: P1.10c: ``W1`` as ``[4d, M·H]`` for the window of :meth:`window` (``None`` outside),
+        #: bound to the ``W1`` object, its version and the grad mode it was built under.
+        self._window_w1: tuple[tuple[int, int, bool], Tensor] | None = None
+        self._in_window = False
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> Self:
@@ -114,21 +123,59 @@ class UnitBank(nn.Module):
     # Execution
     # ----------------------------------------------------------------------------------------------
 
+    @contextmanager
+    def window(self) -> Iterator[None]:
+        """A window of :meth:`forward_all` calls (P1.10c; :meth:`hsn.model.cell.PDGCell.window`):
+        ``W1``'s ``[4d, M·H]`` layout is built once, on first use, and dropped at the end. A use
+        that sees ``W1`` replaced, updated in place or the grad mode switched raises. Windows do
+        not nest."""
+        if self._in_window:
+            raise RuntimeError("UnitBank.window is already active; windows do not nest")
+        self._in_window = True
+        self._window_w1 = None
+        try:
+            yield
+        finally:
+            self._in_window = False
+            self._window_w1 = None
+
+    def _w1_flat(self) -> Tensor:
+        """``W1 [M, 4d, H]`` laid out as ``[4d, M·H]`` (column ``j·H + k`` is unit ``j``'s hidden
+        ``k``): once per :meth:`window`, per call outside one."""
+        w1 = self.W1
+        if not self._in_window:
+            return w1.permute(1, 0, 2).reshape(self.in_dim, self.n_units * self.hidden)
+        stamp = (id(w1), w1._version, torch.is_grad_enabled())
+        if self._window_w1 is None:
+            flat = w1.permute(1, 0, 2).reshape(self.in_dim, self.n_units * self.hidden)
+            self._window_w1 = (stamp, flat)
+            return flat
+        if self._window_w1[0] != stamp:
+            raise RuntimeError(
+                "UnitBank.window: W1 must not change inside a window (an in-place update, a new "
+                "parameter, or a grad-mode switch between positions)"
+            )
+        return self._window_w1[1]
+
     def forward_all(self, v: Tensor) -> Tensor:
         """Dense reference: every unit on every cell, ``v [B, N, 4d] -> [B, N, M, d]``.
 
-        ``out[b, n, j] = F_j(v[b, n])``. Materialises ``[B, N, M, H]`` hidden values. The biases
-        are cast to the matmul output dtype so that autocast gives the same dtype as
-        :meth:`forward_selected` (``addmm`` casts its bias; a plain ``+`` would promote to fp32).
+        ``out[b, n, j] = F_j(v[b, n])``. Materialises ``[M, B·N, H]`` hidden values: the first
+        layer is one ``addmm`` against ``W1`` laid out ``[4d, M·H]``, the second one ``baddbmm``
+        per unit (P1.10c, module docstring). The result is a ``[B, N, M, d]`` view of the
+        ``[M, B·N, d]`` output. Under autocast the matmuls and bias adds run in the autocast dtype,
+        as :meth:`forward_selected`'s ``addmm`` does.
         """
         if v.ndim != 3 or v.shape[-1] != self.in_dim:
             raise ValueError(
                 f"forward_all expects v [B, N, {self.in_dim}], got shape {tuple(v.shape)}"
             )
-        hidden = torch.einsum("bni,mih->bnmh", v, self.W1)
-        hidden = self.act(hidden + self.b1.to(hidden.dtype))
-        out = torch.einsum("bnmh,mhd->bnmd", hidden, self.W2)
-        return out + self.b2.to(out.dtype)
+        B, N = int(v.shape[0]), int(v.shape[1])
+        M, H, P = self.n_units, self.hidden, B * N
+        hidden = torch.addmm(self.b1.reshape(M * H), v.reshape(P, self.in_dim), self._w1_flat())
+        hidden = self.act(hidden).view(P, M, H).transpose(0, 1)  # [M, P, H]
+        out = torch.baddbmm(self.b2[:, None, :], hidden, self.W2)  # [M, P, d]
+        return out.view(M, B, N, self.d).permute(1, 2, 0, 3)
 
     def forward_selected(self, v: Tensor, unit_idx: Tensor) -> Tensor:
         """Grouped pass: ``out[p] = F_{unit_idx[p]}(v[p])`` for ``P`` pairs, ``[P, 4d] -> [P, d]``.

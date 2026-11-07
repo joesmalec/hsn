@@ -30,9 +30,20 @@ def _rms(t: Tensor) -> float:
     return float(t.detach().float().pow(2).mean().sqrt())
 
 
+def _per_position_rms(out: Tensor) -> list[float]:
+    """The RMS of each position of a window-shaped ``[B, T, d]`` module output."""
+    assert out.ndim == 3, f"expected a window-shaped [B, T, d] output, got {tuple(out.shape)}"
+    return [_rms(out[:, t]) for t in range(out.shape[1])]
+
+
 def _probe(model: HSN, tokens: Tensor, ctx: Tensor) -> tuple[dict[str, float], float]:
     """RMS of every stage over the window (mean over positions) and the gradient norm of the
-    last position's top logit with respect to the embedding ``BACK`` positions earlier."""
+    last position's top logit with respect to the embedding ``BACK`` positions earlier.
+
+    P1.10a: ``HSN.forward`` embeds and encodes the whole window at once, so the embedding and
+    encoder hooks fire once with ``[B, T, d]`` outputs; the probe reads every position from them
+    (the same per-position RMS and the same gradient as with one call per position). The cell
+    stages still come from ``step_dense``, which runs once per position."""
     captured: list[Tensor] = []
     sums: dict[str, list[float]] = {k: [] for k in ("emb", *STAGES)}
 
@@ -40,11 +51,11 @@ def _probe(model: HSN, tokens: Tensor, ctx: Tensor) -> tuple[dict[str, float], f
         out = out.clone().requires_grad_(True) if not out.requires_grad else out
         out.retain_grad()
         _c.append(out)
-        sums["emb"].append(_rms(out))
+        sums["emb"].extend(_per_position_rms(out))
         return out
 
     def enc_hook(_m: Any, _i: Any, out: Tensor) -> None:
-        sums["z"].append(_rms(out))
+        sums["z"].extend(_per_position_rms(out))
 
     orig = model.cell.step_dense
 
@@ -70,13 +81,13 @@ def _probe(model: HSN, tokens: Tensor, ctx: Tensor) -> tuple[dict[str, float], f
         p = T - 1
         top = logits[:, p].max(dim=-1).values.sum()
         top.backward()
-        grad = captured[p - BACK].grad
-        grad_norm = float(grad.norm()) if grad is not None else 0.0
+        grad = captured[0].grad
+        grad_norm = float(grad[:, p - BACK].norm()) if grad is not None else 0.0
     finally:
         for h in handles:
             h.remove()
         model.cell.step_dense = orig  # type: ignore[method-assign]
-    assert len(captured) == T
+    assert len(captured) == 1 and captured[0].shape[1] == T  # one window-shaped embedding
     scales = {k: sum(v) / len(v) for k, v in sums.items()}
     return scales, grad_norm
 
