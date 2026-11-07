@@ -211,7 +211,8 @@ class CellGraphState:
     def _make(cls, h: Tensor, q: Tensor, age: Tensor, pos: Tensor) -> CellGraphState:
         """A state built without :func:`_check_layout` (P1.10e): only for internal updates whose
         result has a valid layout by construction — the functional updates below after their own
-        argument checks, and the model's window path. The public constructor still validates."""
+        argument checks, and the model's window path. The public constructor still validates. It
+        sets the four fields by hand; ``test_p1_10_make_sets_every_field`` pins the field list."""
         state = object.__new__(cls)
         object.__setattr__(state, "h", h)
         object.__setattr__(state, "q", q)

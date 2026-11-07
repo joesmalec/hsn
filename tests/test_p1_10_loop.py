@@ -16,7 +16,7 @@ import math
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -1089,6 +1089,18 @@ def test_p1_10_window_validates_once(monkeypatch: pytest.MonkeyPatch) -> None:
             torch.zeros(B, 2, dtype=torch.bool),
         )
     assert not model.cell._in_window and model.cell.graph._window_cache is None
+
+
+def test_p1_10_make_sets_every_field() -> None:
+    """``CellGraphState._make`` sets the fields one by one, so a field added to the dataclass would
+    be left unset there. The field list is pinned here: adding a field fails this test until
+    ``_make`` sets it too. A state from ``_make`` carries the same attributes as a public one."""
+    assert [f.name for f in fields(CellGraphState)] == ["h", "q", "age", "pos"]
+    h, q = torch.zeros(B, 3, 2), torch.zeros(B, 2)
+    age, pos = torch.zeros(B, 3, dtype=torch.int64), torch.zeros(B, dtype=torch.int64)
+    made, public = CellGraphState._make(h, q, age, pos), CellGraphState(h, q, age, pos)
+    assert vars(made).keys() == vars(public).keys()
+    assert all(getattr(made, f.name) is getattr(public, f.name) for f in fields(CellGraphState))
 
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
