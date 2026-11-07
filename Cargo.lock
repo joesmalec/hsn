@@ -79,6 +79,8 @@ name = "hsn-kernels"
 version = "0.1.0"
 dependencies = [
  "hsn-core",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

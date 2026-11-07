@@ -78,6 +78,21 @@ window loop::
   to :meth:`~hsn.train.lazy_adam.LazyAdamW.step`, so a unit that did not execute receives no
   optimiser update; in dense routing the record holds ``None`` and every unit updates.
 
+* **Counterfactual utility (P2.3)**, on when ``train.lambda_u > 0`` (a routed configuration;
+  the config layer refuses the rest). Each window is a probe window with probability
+  ``train.probe_fraction``, drawn (with the probe position and the candidates) from a generator
+  seeded by ``(run.seed, window counter)``, so the global RNG stream is untouched and a resume
+  replays every probe. Before the window's forward pass, under the ``probe`` profiler segment
+  (charged to the window's tokens) and the training autocast,
+  :func:`hsn.train.probes.probe_window` probes the window from its start state (training split
+  only, derived from the documents' meta) unless the step is in the soft warm-up of a scored
+  routing. The objective gains ``utility`` = ``λ_u · utility_loss`` of the probe's pairs (zero on
+  other windows, so the key is always there when the term is on) and, after the window's
+  backward, the scorer's EMA features take one step (``train.ema_decay``): the selection frequency
+  of every cell over the window's non-padding positions and, on a probe window, the mean target of
+  the measured cells. Step records then carry ``probe_windows``, ``probe_pairs`` and
+  ``probe_positions`` (rollout positions per row, summed).
+
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
 non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
 P1.7 entries raise (plan §4.3: errors over silence). ``torch.compile`` stays off.
@@ -94,6 +109,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
@@ -101,10 +117,17 @@ from hsn.config import RunConfig
 from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, memory_stats, reset_peak, synchronize
 from hsn.eval.evaluate import Metric
-from hsn.losses import assemble_terms, auxiliary_terms, grad_norm_report, total_and_parts
+from hsn.losses import (
+    assemble_terms,
+    auxiliary_terms,
+    grad_norm_report,
+    total_and_parts,
+    utility_loss,
+)
 from hsn.model.hsn import HSN
+from hsn.model.router import SCORED_MODES
 from hsn.model.state import CellGraphState
-from hsn.train.amp import autocast_name
+from hsn.train.amp import autocast_ctx, autocast_name
 from hsn.train.checkpoint import (
     capture_rng_state,
     check_q_resync,
@@ -118,6 +141,14 @@ from hsn.train.checkpoint import (
 )
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
 from hsn.train.loop import History, StepRecord, StreamLoader, Trainer
+from hsn.train.probes import (
+    ProbeResult,
+    cell_utility,
+    choose_probe_position,
+    probe_window,
+    utility_predictions,
+    window_split,
+)
 from hsn.train.schedules import SelectionSchedule
 
 __all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer"]
@@ -182,6 +213,7 @@ class TBPTTTrainer(Trainer):
         self.windows_since_resync = 0
         self.resyncs = 0
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
+        self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
 
     # P2.2 ------------------------------------------------------------------------------------
 
@@ -207,6 +239,74 @@ class TBPTTTrainer(Trainer):
         decay = self.cfg.train.reinforce_baseline_decay
         self.reinforce_baseline = decay * baseline + (1.0 - decay) * reward
         return {**terms, "reinforce": term}
+
+    # P2.3 ------------------------------------------------------------------------------------
+
+    def _probe_generator(self) -> torch.Generator:
+        """The window's probe generator, seeded by ``(run.seed, window counter)``: the probe draws
+        never touch the global RNG and a resumed run replays them (the counter is checkpointed)."""
+        seed = np.random.SeedSequence([self.cfg.seed, 0x50323033, self.windows]).generate_state(1)
+        return torch.Generator(device="cpu").manual_seed(int(seed[0]))
+
+    def _counterfactual_probe(
+        self, train_ds: ByteDataset, window: Batch, batch: Batch, state: CellGraphState
+    ) -> ProbeResult | None:
+        """The window's probe from its start ``state`` (module docstring), or ``None`` when the
+        window is not a probe window, has no loss position to probe, or the step is in the soft
+        warm-up of a scored routing (a soft gate has no hard counterfactual)."""
+        train = self.cfg.train
+        if self.cfg.model.routing in SCORED_MODES and self.hsn.schedule.gate(self.step) == "soft":
+            return None
+        generator = self._probe_generator()
+        if float(torch.rand((), generator=generator)) >= train.probe_fraction:
+            return None
+        t = choose_probe_position(batch["loss_mask"], train.probe_horizon, generator)
+        if t is None:
+            return None
+        split = window_split(train_ds, window["doc"])
+        B, T = batch["tokens"].shape
+        with self._segment("probe", tokens=B * T), autocast_ctx(self.ctx):
+            return probe_window(
+                self.hsn,
+                state,
+                {**batch, "split": split},
+                t,
+                n_probe=train.n_probe,
+                horizon=train.probe_horizon,
+                generator=generator,
+            )
+
+    def _utility_term(self, probe: ProbeResult | None) -> Tensor:
+        """``λ_u · utility_loss`` of the probe's pairs (fp32, gradient into the scorer only), or
+        a zero term when the window has no probe or the probe no valid pair."""
+        if probe is None or probe.n_pairs == 0:
+            return torch.zeros((), dtype=torch.float32, device=self.ctx.device)
+        u_pred, u_target = utility_predictions(self.hsn.router, probe)
+        return self.cfg.train.lambda_u * utility_loss(u_pred, u_target)
+
+    def _update_ema(
+        self, info: Mapping[str, Tensor], batch: Batch, probe: ProbeResult | None
+    ) -> None:
+        """One step of the scorer's EMA features after a window (module docstring)."""
+        nonpad = batch["doc"] >= 0
+        if not bool(nonpad.any()):
+            return  # a window of padding selected nothing worth counting
+        cell_idx, valid = info["cell_idx"], info["valid"]  # [B, T, K]
+        n_cells = self.hsn.cfg.n_cells
+        counts = torch.zeros(
+            *cell_idx.shape[:2], n_cells, dtype=torch.int64, device=cell_idx.device
+        )
+        selected = counts.scatter_add(2, cell_idx, valid.to(torch.int64)) > 0  # [B, T, N]
+        utility: Tensor | None = None
+        measured: Tensor | None = None
+        if probe is not None and probe.n_pairs > 0:
+            utility, measured = cell_utility(probe, n_cells)
+        scorer = self.hsn.scorer
+        scorer.load_ema(
+            scorer.ema.update(
+                selected[nonpad], utility, self.cfg.train.ema_decay, measured=measured
+            )
+        )
 
     # window helpers --------------------------------------------------------------------------
 
@@ -350,11 +450,17 @@ class TBPTTTrainer(Trainer):
             n_loss = 0
             tokens_in_step = 0
             active: Tensor | None = None  # P2.6: the units the step's windows executed
+            probe_counts = {"probe_windows": 0.0, "probe_pairs": 0.0, "probe_positions": 0.0}
             for window_index in range(n_windows):
                 window = next(loader)
                 batch = self._to_device(window)
                 state = self._window_start(state)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
+                probe = (
+                    self._counterfactual_probe(train_ds, window, batch, state)
+                    if self.counterfactual
+                    else None
+                )  # P2.3: before the forward pass, from the window-start state
                 logits, state, info = self._forward(batch, state)
                 window_active = self._window_active_units(info)
                 if window_active is not None:
@@ -364,6 +470,12 @@ class TBPTTTrainer(Trainer):
                 loss_mask = batch["loss_mask"]
                 count = int(loss_mask.sum())
                 terms = self._routing_terms(terms, info, count)
+                if self.counterfactual:  # P2.3: the utility regression
+                    terms = {**terms, "utility": self._utility_term(probe)}
+                    if probe is not None:
+                        probe_counts["probe_windows"] += 1.0
+                        probe_counts["probe_pairs"] += float(probe.n_pairs)
+                        probe_counts["probe_positions"] += float(probe.positions)
                 total, parts = total_and_parts(terms)
                 if stats_step and window_index == 0:  # P2.4: per-term gradient norms, one window
                     scale = self.scaler.get_scale() if self.scaler is not None else 1.0
@@ -389,6 +501,8 @@ class TBPTTTrainer(Trainer):
                     if self.scaler is not None:
                         scaled = self.scaler.scale(scaled)
                     scaled.backward()  # type: ignore[no-untyped-call]
+                if self.counterfactual:  # P2.3: once per window, after its selections ran
+                    self._update_ema(info, batch, probe)
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
@@ -422,6 +536,7 @@ class TBPTTTrainer(Trainer):
                 "route_cost": cost_sum / n_windows,
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
+                **(probe_counts if self.counterfactual else {}),
                 **group_norms,
                 **term_norms,
             }

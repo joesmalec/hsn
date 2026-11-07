@@ -31,7 +31,11 @@ that ``model.predictor_target=ema_encoder`` uses; a fixed-embedding target ignor
 the uniform placeholder) and ``train.reinforce_baseline_decay`` (P2.2, the EMA rate of the REINFORCE
 reward baseline; the P2.2 schedule keys ``gate_mode``, ``soft_until_step``, ``temperature_*``,
 ``epsilon_*`` and ``p_dense`` are Appendix A.3 keys that P2.2 validates and reads through
-:class:`hsn.train.schedules.SelectionSchedule`).
+:class:`hsn.train.schedules.SelectionSchedule`). The P2.3 keys ``probe_fraction``, ``n_probe``,
+``probe_horizon`` and ``ema_decay`` act only when ``train.lambda_u > 0`` (counterfactual probes,
+the utility term and the scorer's EMA features; :mod:`hsn.train.probes`), so their defaults leave
+every other configuration unchanged; such a configuration must be routed, probe at least some
+windows, keep the horizon inside the window and not run soft gates throughout.
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -687,6 +691,34 @@ class RunConfig(_StrictModel):
                     "gives an edgeless graph with nothing to shrink; drop the term"
                 )
         # --- end P2.4 ---
+        # --- P2.3: counterfactual utility (on when train.lambda_u > 0) that could not act ---
+        if train.lambda_u < 0.0:
+            raise ValueError(f"train.lambda_u must be >= 0, got {train.lambda_u}")
+        if train.lambda_u > 0.0:
+            if routing == "dense":
+                raise ValueError(
+                    "train.lambda_u > 0 regresses the scorer onto counterfactual probes of a "
+                    "selection, but model.routing=dense makes none; choose a sparse routing or set "
+                    "train.lambda_u to 0"
+                )
+            if train.probe_fraction == 0.0:
+                raise ValueError(
+                    "train.lambda_u > 0 but train.probe_fraction = 0: no window would be "
+                    "probed and the utility term would silently stay zero"
+                )
+            if train.probe_horizon > train.unroll:
+                raise ValueError(
+                    f"train.probe_horizon={train.probe_horizon} exceeds the window "
+                    f"train.unroll={train.unroll}; a probe's horizon lies inside its window"
+                )
+            if routing in ("topk", "greedy_budget") and train.gate_mode == "soft":
+                raise ValueError(
+                    f"train.lambda_u > 0 with train.gate_mode=soft: model.routing={routing!r} "
+                    "would execute soft gates for the whole run, which have no hard "
+                    "counterfactual, so no probe would ever run; use ste or reinforce (a soft "
+                    "warm-up through train.soft_until_step is fine)"
+                )
+        # --- end P2.3 ---
         return self
 
 

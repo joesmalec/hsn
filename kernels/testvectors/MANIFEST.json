@@ -1,0 +1,206 @@
+{
+  "files": [
+    {
+      "bytes": 1800,
+      "dims": {
+        "B": 2,
+        "K": 2,
+        "N": 3,
+        "d": 4
+      },
+      "op": "gather_concat",
+      "path": "tiny_gather_concat.safetensors",
+      "sha256": "121c6d645c8633fa78239c3983a0e8b132f0be560d51ffa9fc7b78cf3678c1fc",
+      "size": "tiny"
+    },
+    {
+      "bytes": 4592,
+      "dims": {
+        "H": 8,
+        "M": 2,
+        "P": 4,
+        "d": 4
+      },
+      "op": "grouped_unit_mlp",
+      "path": "tiny_grouped_unit_mlp.safetensors",
+      "sha256": "1ce043fad59f78f22e80b1877fb4b278a4e5972ada85c1d9c68ca62b589e39df",
+      "size": "tiny"
+    },
+    {
+      "bytes": 1376,
+      "dims": {
+        "B": 2,
+        "E": 6,
+        "K": 2,
+        "N": 3,
+        "d": 4
+      },
+      "op": "csr_messages",
+      "path": "tiny_csr_messages.safetensors",
+      "sha256": "ddc902e593798adb748877894511661215b6b80a9e7d16d79eb2b73d847a357c",
+      "size": "tiny"
+    },
+    {
+      "bytes": 2144,
+      "dims": {
+        "B": 2,
+        "K": 2,
+        "N": 3,
+        "d": 4
+      },
+      "op": "gated_delta_update",
+      "path": "tiny_gated_delta_update.safetensors",
+      "sha256": "20a6fd268f4da6a5e42cc0b5b3b79d28c8749501e206699f6c597c7a7ab4d593",
+      "size": "tiny"
+    },
+    {
+      "bytes": 111536,
+      "dims": {
+        "B": 4,
+        "K": 4,
+        "N": 32,
+        "d": 64
+      },
+      "op": "gather_concat",
+      "path": "ref_gather_concat.safetensors",
+      "sha256": "e3f9906b92d9a570799a2d3640a5111983c5177b81fc8405a9eb8018e83cb373",
+      "size": "ref"
+    },
+    {
+      "bytes": 10597608,
+      "dims": {
+        "H": 512,
+        "M": 8,
+        "P": 16,
+        "d": 64
+      },
+      "op": "grouped_unit_mlp",
+      "path": "ref_grouped_unit_mlp.safetensors",
+      "sha256": "331d044084efe09d47b5acadcd96681b3afc6a279bb01c1852b210b22e178166",
+      "size": "ref"
+    },
+    {
+      "bytes": 109124,
+      "dims": {
+        "B": 4,
+        "E": 128,
+        "K": 4,
+        "N": 32,
+        "d": 64
+      },
+      "op": "csr_messages",
+      "path": "ref_csr_messages.safetensors",
+      "sha256": "84472bb9d471f5ed0f01faf4eee492e0efedb2a518c5cd94a76ece33dbfe57c9",
+      "size": "ref"
+    },
+    {
+      "bytes": 158120,
+      "dims": {
+        "B": 4,
+        "K": 4,
+        "N": 32,
+        "d": 64
+      },
+      "op": "gated_delta_update",
+      "path": "ref_gated_delta_update.safetensors",
+      "sha256": "2a8360d7190e5b9b4e3bf50e06e1168f3a04ab7789ffcf2edafdf37e73cd1e01",
+      "size": "ref"
+    },
+    {
+      "bytes": 148396,
+      "dims": {
+        "B": 3,
+        "K": 5,
+        "N": 37,
+        "d": 96
+      },
+      "op": "gather_concat",
+      "path": "odd_gather_concat.safetensors",
+      "sha256": "d9c47284db85f94d46c3fe3e25fc9e7e8afe5d5842055aecc71d3e14fd53d947",
+      "size": "odd"
+    },
+    {
+      "bytes": 5003476,
+      "dims": {
+        "H": 256,
+        "M": 5,
+        "P": 15,
+        "d": 96
+      },
+      "op": "grouped_unit_mlp",
+      "path": "odd_grouped_unit_mlp.safetensors",
+      "sha256": "ceac3b81b1ed7b1d06cbb85ab03206e71aa28b264f1cf0cede18835a11c74d48",
+      "size": "odd"
+    },
+    {
+      "bytes": 172684,
+      "dims": {
+        "B": 3,
+        "E": 90,
+        "K": 5,
+        "N": 37,
+        "d": 96
+      },
+      "op": "csr_messages",
+      "path": "odd_csr_messages.safetensors",
+      "sha256": "0bd41019ace5a016a389e08432e7b2c87855f833251e2032d9b6c0687a06353e",
+      "size": "odd"
+    },
+    {
+      "bytes": 206240,
+      "dims": {
+        "B": 3,
+        "K": 5,
+        "N": 37,
+        "d": 96
+      },
+      "op": "gated_delta_update",
+      "path": "odd_gated_delta_update.safetensors",
+      "sha256": "aa374267fb67f215af6f3c9a4a09497aaf696ce96ef012060400d62d78b62d3e",
+      "size": "odd"
+    }
+  ],
+  "generator": "rust/hsn-kernels/src/vectors.rs: inputs on an f16/bf16-exact grid from SplitMix64; outputs and gradients from the CPU oracle in f64, rounded once to f32",
+  "regenerate": "HSN_WRITE_TESTVECTORS=1 cargo test -p hsn-kernels --test oracle vectors_regenerate_deterministically",
+  "sizes": {
+    "odd": {
+      "B": 3,
+      "H": 256,
+      "K": 5,
+      "M": 5,
+      "N": 37,
+      "d": 96
+    },
+    "ref": {
+      "B": 4,
+      "H": 512,
+      "K": 4,
+      "M": 8,
+      "N": 32,
+      "d": 64
+    },
+    "tiny": {
+      "B": 2,
+      "H": 8,
+      "K": 2,
+      "M": 2,
+      "N": 3,
+      "d": 4
+    }
+  },
+  "spec_version": 1,
+  "tolerances": {
+    "bf16": {
+      "atol": 0.01,
+      "rtol": 0.01
+    },
+    "f16": {
+      "atol": 0.01,
+      "rtol": 0.01
+    },
+    "f32": {
+      "atol": 0.00001,
+      "rtol": 0.00001
+    }
+  }
+}
