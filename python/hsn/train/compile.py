@@ -34,6 +34,10 @@ static (plan P2.8, "static shapes are required for graph capture"):
 
 The compiled window matches eager ``HSN.forward`` to rounding (fused kernels round differently),
 not bit for bit; ``hardware.compile_mode = none`` leaves every path eager and unchanged.
+``profile:rtx3060`` compiles by default (``reduce-overhead``, the user's decision of 7 Nov 2026);
+every other profile stays ``none`` until it is measured there. A run that must stay eager on
+rtx3060 overrides ``hardware.compile_mode=none``. The generic trainer of the baselines never
+compiles (a logged notice, ``measured["compiled_windows"] = 0``).
 
 Scope (errors over silence: anything else raises ``NotImplementedError`` when the window is
 built, and runs eager with ``compile_mode: none``):

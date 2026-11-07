@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn.config import RunConfig, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
@@ -269,7 +270,7 @@ def _restore_determinism() -> Iterator[None]:
     [
         pytest.param("cpu", "fp64", id="cpu-fp64"),
         pytest.param("cpu", "fp32", id="cpu-fp32"),
-        pytest.param("rtx3060", "fp32", id="cuda-bf16", marks=pytest.mark.cuda),
+        pytest.param(CUDA_PROFILE, "fp32", id="cuda-bf16", marks=pytest.mark.cuda),
     ],
 )
 @pytest.mark.usefixtures("_restore_determinism")
@@ -292,7 +293,7 @@ def test_p1_10_truncated_window_same_loss_and_carry(
     amplification of that noise (1.4e-5 here, 1.5e-4 on other CPUs), not the cut. Their gradients
     are compared with every other gradient; in fp64 every weight is compared at 1e-12 (1.4e-13
     measured). Unperturbed, the edge logits' gradients are exactly 0 (the dense symmetry)."""
-    if profile == "rtx3060" and not torch.cuda.is_available():
+    if profile == CUDA_PROFILE and not torch.cuda.is_available():
         pytest.skip("no CUDA device on this machine")
     ctx = _ctx(profile, master)
     exact = ctx.device.type == "cpu"  # deterministic kernels: the CPU always is

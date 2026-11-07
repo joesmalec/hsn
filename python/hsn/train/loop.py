@@ -412,6 +412,14 @@ class Trainer:
         set_deterministic(train.deterministic)
         seed_everything(cfg.seed)
         self.model.to(device=ctx.device, dtype=ctx.master_dtype)
+        if ctx.compile_enabled and type(self) is Trainer:
+            # P2.8: hardware.compile_mode compiles the HSN window (TBPTTTrainer); a baseline runs
+            # eager and its history says so (measured["compiled_windows"] = 0)
+            logger.warning(
+                "hardware.compile_mode=%s compiles the HSN training window only; %s trains eager",
+                cfg.hardware.compile_mode,
+                type(self.model).__name__,
+            )
         self.optimizer = self._make_optimizer()
         self.scheduler = self._make_scheduler()
         self.scaler = make_grad_scaler(ctx)
@@ -672,6 +680,7 @@ class Trainer:
             "train_seconds": train_seconds,
             "tokens": float(total_tokens),
             "steps": float(self.step),
+            "compiled_windows": 0.0,  # P2.8: the generic trainer never compiles
         }
         return history
 

@@ -9,7 +9,7 @@ vram_bytes: 12884901888 # 12 GiB nominal (~11.5 GiB usable); the measured value 
 vram_cap_fraction: 1.0
 unified_memory: false
 pinned_memory: true # PCIe 4.0 x16: pinned host->device ~20-25 GB/s (Appendix E.4)
-compile_mode: none # P2.8: opt-in per run (hardware.compile_mode=reduce-overhead; hsn.train.compile)
+compile_mode: reduce-overhead # P2.8 (user, 7 Nov 2026): compiled HSN windows; =none for eager
 nvcc_arch: [sm_86]
 power_meter: nvml # §3.8: NVML on GA106 is a 1 s average; cross-check against a wall meter
 recipe: # Appendix E.3 ref_a1 row (B=4, T=256); `hsn plan` (P4.3) refines it

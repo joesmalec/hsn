@@ -14,14 +14,16 @@ trainer, and wherever inductor's C++ toolchain is not available (the hosted macO
 from __future__ import annotations
 
 import functools
+import gc
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn.config import RunConfig, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
@@ -185,6 +187,21 @@ def _window(model: HSN, ctx: DeviceContext, backend: str = CPU_BACKEND) -> Compi
     window = compile_window(model, ctx, "reduce-overhead", backend=backend)
     assert isinstance(window, CompiledWindow)
     return window
+
+
+@pytest.fixture(autouse=True)
+def _release_compiled_state() -> Iterator[None]:
+    """After every test: dynamo's caches, the CUDA Graph trees and their memory pools are
+    released, so a later test of the session (a simulated VRAM cap, P0.3) sees the card as an
+    eager process would."""
+    yield
+    torch._dynamo.reset()
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+
+        reset_cudagraph_trees()
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @pytest.fixture
@@ -731,6 +748,72 @@ def test_p2_8_trainer_compile_time_separate(
             assert abs(comp.evals[0][key] - value) <= 1e-4 * max(1.0, abs(value)), key
 
 
+@pytest.mark.usefixtures("small_blocks")
+def test_p2_8_runner_profile_compile_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run manifest's profile pass (:func:`hsn.runner.profile_run`) of a compiled run uses
+    the compiled window in both passes and times its compile and recording as the P0.6
+    ``compile`` segment, never as ``startup`` or a steady-state segment; an eager run keeps
+    ``startup``."""
+    from hsn import runner
+
+    monkeypatch.setattr(
+        runner, "compile_window", functools.partial(compile_window, backend="aot_eager")
+    )
+    train, dev = ByteDataset(_docs(16)), ByteDataset(_docs(40, "dev"))  # > 4 serving windows
+    for mode in ("none", "reduce-overhead"):
+        cfg = _trainer_cfg(mode)
+        seed_everything(0)
+        model = HSN.from_config(cfg)
+        train_report, serve_report = runner.profile_run(
+            model, cfg, resolve(cfg.hardware), train, dev, steps=2
+        )
+        first = "compile" if mode != "none" else "startup"
+        other = "startup" if mode != "none" else "compile"
+        for report in (train_report, serve_report):
+            assert first in report.segments and other not in report.segments
+            assert report.segments["shared_path"].n >= 1
+
+
+def test_p2_8_rtx3060_compiles_by_default() -> None:
+    """``profile:rtx3060`` compiles by default (``reduce-overhead``, the user's decision of
+    7 Nov 2026); every other shipped profile stays eager until measured there."""
+    names = sorted(f.stem for f in (REPO / "configs" / "hardware").glob("*.yaml"))
+    assert "rtx3060" in names and "cpu" in names
+    for name in names:
+        mode = load_hardware_profile(name).compile_mode
+        assert mode == ("reduce-overhead" if name == "rtx3060" else "none"), (name, mode)
+
+
+def test_p2_8_baselines_train_eager_with_notice(caplog: pytest.LogCaptureFixture) -> None:
+    """The generic trainer (the GRU and Transformer baselines) never compiles: with a compiled
+    hardware profile it logs one notice and its history records ``compiled_windows = 0``."""
+    from hsn.runner import build_model, make_trainer
+
+    cfg = load_config(
+        REPO / "configs" / "baselines" / "gru_2m.yaml",
+        overrides=[
+            "hardware.compile_mode=reduce-overhead",
+            "baseline.gru.d_model=16",
+            "baseline.gru.n_layers=1",
+            "train.unroll=32",
+            "train.batch=2",
+            "train.micro_batch=2",
+            "train.steps=2",
+            "train.eval_every=100",
+            "train.ckpt_every=100",
+        ],
+    )
+    ctx = resolve(cfg.hardware)
+    assert ctx.compile_enabled
+    seed_everything(0)
+    with caplog.at_level(logging.WARNING, logger="hsn.train"):
+        trainer = make_trainer(build_model(cfg), cfg, ctx, run_dir=REPO / "runs" / "unused")
+    assert any("trains eager" in r.getMessage() for r in caplog.records)
+    trainer.save = lambda *a, **k: Path("/dev/null")  # type: ignore[method-assign]
+    history = trainer.fit(ByteDataset(_docs(8)), ByteDataset(_docs(4, "dev")), 2)
+    assert history.measured["compiled_windows"] == 0.0
+
+
 # --------------------------------------------------------------------------------------------------
 # CUDA
 # --------------------------------------------------------------------------------------------------
@@ -739,7 +822,7 @@ def test_p2_8_trainer_compile_time_separate(
 def _cuda_ctx() -> DeviceContext:
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device on this machine")
-    return _ctx("rtx3060")
+    return _ctx(CUDA_PROFILE)
 
 
 CUDA_CASES = [
@@ -869,7 +952,7 @@ def test_p2_8_dense_symmetry_exact_compiled_cuda(precision: str, tmp_path: Path)
         "train.ckpt_every=1000",
         "train.stats_every=10",
         "train.lr=1e-3",
-        "profile=rtx3060",
+        f"profile={CUDA_PROFILE}",
         "hardware.compile_mode=reduce-overhead",
         f"hardware.autocast_dtype={precision}",
     ]
@@ -896,7 +979,7 @@ def test_p2_8_compiled_statistics_step_cuda(tmp_path: Path) -> None:
     for mode in ("none", "reduce-overhead"):
         cfg = _trainer_cfg(
             mode,
-            "profile=rtx3060",
+            f"profile={CUDA_PROFILE}",
             "hardware.autocast_dtype=fp32",
             "train.precision=fp32",
             "train.steps=6",

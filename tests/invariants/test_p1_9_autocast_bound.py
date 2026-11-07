@@ -21,6 +21,7 @@ from collections.abc import Callable
 
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn.config import RunConfig, load_hardware_profile
 from hsn.device import resolve
 from hsn.model.hsn import HSN
@@ -31,7 +32,7 @@ ModelFactory = Callable[..., tuple[RunConfig, HSN]]
 IdsFactory = Callable[[HSN, int, int, int], tuple[Tensor, Tensor]]
 PerturbFn = Callable[..., None]
 
-cuda_param = pytest.param("rtx3060", marks=pytest.mark.cuda)
+cuda_param = pytest.param(CUDA_PROFILE, marks=pytest.mark.cuda)
 mps_param = pytest.param("m_series", marks=pytest.mark.mps)
 
 
