@@ -56,6 +56,7 @@ scatter and the ``q`` update are one kernel boundary; the tick (``age += 1`` els
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Iterator
 from contextlib import AbstractContextManager
 
 import torch
@@ -72,6 +73,18 @@ from hsn.model.units import UnitBank
 from hsn.profiler import Profiler
 
 __all__ = ["PDGCell", "profiler_segment"]
+
+
+def _mix(alpha: Tensor, unit_out: Tensor) -> Tensor:
+    """``Σ_j α_ij F_j(v_i)``: ``alpha [B, N, M]`` and ``unit_out [B, N, M, d]`` to ``[B, N, d]``.
+    One batched contraction (P1.10c) when both share a dtype; under autocast the unit outputs are
+    bf16 and the mixing weights keep the state dtype, so the promoting product and sum stay (a
+    contraction would round the weights to bf16)."""
+    if alpha.dtype != unit_out.dtype:
+        return (alpha.unsqueeze(-1) * unit_out).sum(dim=2)
+    B, N, M, d = (int(n) for n in unit_out.shape)
+    mixed = torch.matmul(alpha.reshape(B * N, 1, M), unit_out.reshape(B * N, M, d))
+    return mixed.reshape(B, N, d)
 
 
 def profiler_segment(
@@ -136,6 +149,29 @@ class PDGCell(nn.Module):
         if self.disabled_cells:
             disabled[list(self.disabled_cells)] = True
         self.register_buffer("disabled", disabled, persistent=False)
+        #: P1.10e: True inside :meth:`window`, whose caller (``HSN.forward``) validated the window
+        #: once: the rounds then skip their per-call shape / dtype / device checks.
+        self._in_window = False
+
+    # ----------------------------------------------------------------------------------------------
+    # A window of rounds (P1.10a)
+    # ----------------------------------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def window(self) -> Iterator[None]:
+        """A window of positions (:meth:`hsn.model.hsn.HSN.forward` holds it around its loop): the
+        graph's step guard is held and the work that depends on the parameters only — the edge
+        weights and the dense adjacency (:meth:`CellGraph.window`), the unit bank's ``W1`` layout
+        (:meth:`UnitBank.window`, P1.10c) — is done once for the window. The rounds themselves are
+        unchanged, and ``step_dense`` / ``step_sparse`` are still called once per position (tests
+        and diagnostics wrap them). Nothing is cached beyond the window."""
+        previous = self._in_window
+        with self.graph.window(), self.units.window():
+            self._in_window = True
+            try:
+                yield
+            finally:
+                self._in_window = previous
 
     # ----------------------------------------------------------------------------------------------
     # The dense round
@@ -153,7 +189,10 @@ class PDGCell(nn.Module):
         ``b``, ``h_prev``) for tests and the P1.5 reference check. The graph's step guard is held
         for the duration (``set_topology`` raises meanwhile).
         """
-        B, N, d = self._check_inputs(u, eps, state, alpha)
+        if self._in_window:  # P1.10e: validated once by the window's caller
+            B, N, d = (int(n) for n in state.h.shape)
+        else:
+            B, N, d = self._check_inputs(u, eps, state, alpha)
         with self.graph.step():
             h_prev = state.h
             m = self.graph.messages_dense(h_prev, self.V)  # [B, N, d]
@@ -161,15 +200,15 @@ class PDGCell(nn.Module):
                 [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_prev, m], dim=-1
             )  # [B, N, 4d]
             v = self.norm(v_raw)  # P1.5a: what the units and the gate read
-            unit_out = self.units.forward_all(v)  # [B, N, M, d]
-            mixed = (alpha.unsqueeze(-1) * unit_out).sum(dim=2)  # Σ_j α_ij F_j(v_i)
+            unit_out = self.units.forward_all(v)  # [B, N, M, d] (a view of [M, B·N, d])
+            mixed = _mix(alpha, unit_out)  # Σ_j α_ij F_j(v_i)
             # P1.9: tanh, the gate and the convex combination run in the state's dtype. Under
             # bf16 autocast W_out and the gate emit bf16; a bf16 ``1 - b`` is rounded, the weights
             # no longer sum to one and |h| compounds past the §2.3 bound over a window (measured
             # 1.33 after 256 positions on rtx3060). Without autocast the casts are no-ops.
             c = torch.tanh(self.W_out(mixed).to(h_prev.dtype))
             b = torch.sigmoid(self.gate(v).to(h_prev.dtype))
-            h_new = (1 - b) * h_prev + b * c
+            h_new = torch.lerp(h_prev, c, b)  # (1 − b) ⊙ h + b ⊙ c in one op (P1.10c)
             if self.disabled_cells:
                 h_new = torch.where(self.disabled[None, :, None], h_prev, h_new)
         info = {
@@ -215,8 +254,11 @@ class PDGCell(nn.Module):
         partition of :func:`hsn.kernels.costs.profile_dense_costs`. The graph's step guard is held
         for the duration.
         """
-        B, N, d = self._check_vectors(u, eps, state)
-        self._check_selection(sel, B, state)
+        if self._in_window:  # P1.10e: validated once by the window's caller
+            B, N, d = (int(n) for n in state.h.shape)
+        else:
+            B, N, d = self._check_vectors(u, eps, state)
+            self._check_selection(sel, B, state)
         K = sel.k
         native = kernels.ops()
         # Padded (and disabled) slots gather cell 0 and unit 0, valid indices on every backend, and

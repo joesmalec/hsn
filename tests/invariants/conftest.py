@@ -13,6 +13,15 @@ across runs (P0.8 measured MPS reruns), so the GPU variants of the same tests co
 rather than arithmetic (a disabled cell's row), which is exact on every device. Bit-exact-only
 tests (gradcheck, checkpoint resume, seed determinism) have no GPU variant.
 
+One comparison is not bit for bit on the CPU either (P1.10a): ``HSN.forward`` runs E and D over the
+window ``[B, T]`` while ``HSN.step`` runs them over ``[B]``, and BLAS rounds a GEMM differently with
+its row count, so a value of ``step`` against the same value of ``forward`` agrees to
+:data:`WINDOW_ATOL` through :meth:`SameChecker.step_vs_forward` — in fp64 only on the CPU: in fp32
+a perturbed model amplifies another CPU's one-ulp differences through the recurrence beyond any
+tight bound (measured 6 Nov 2026: 6.8e-4 on the leakage test's ``z_hat``), while fp64's 1e-16
+rounding stays far inside 1e-12. Every property the suite protects (leakage, the reset, disabled
+cells, determinism, resume) still compares runs of the same shapes, bit for bit, in every dtype.
+
 The P0.5 trainer applies ``train.deterministic`` process-wide
 (``torch.use_deterministic_algorithms``) and never resets it; a leaked flag makes later MPS
 backward passes raise (``index_put_with_accumulate_mps``). The autouse fixture restores the flag
@@ -47,6 +56,8 @@ N_DEV_DOCS = 16
 #: Tolerance of the GPU variants (the CPU profile compares bit for bit).
 DEVICE_ATOL = 1e-5
 DEVICE_RTOL = 1e-5
+#: P1.10a: ``HSN.step`` against ``HSN.forward`` on the CPU (the GEMM row count differs): fp64 only.
+WINDOW_ATOL = {torch.float64: 1e-12}
 #: The P1.7 recipe: ref_a1 shrunk to a few hundred parameters for trainer tests (real byte data,
 #: vocabulary 256, context symbols 16), with a 32-position window and a batch of 4 streams.
 TRAINER_OVERRIDES: tuple[str, ...] = (
@@ -160,6 +171,29 @@ class SameChecker:
                 rtol=DEVICE_RTOL,
                 msg=lambda m: f"{what} on {device.type}: {m}",
             )
+
+    def step_vs_forward(
+        self, actual: Tensor, expected: Tensor, device: torch.device, *, what: str = "value"
+    ) -> None:
+        """A value of ``HSN.step`` against the same value of ``HSN.forward`` (P1.10a, module
+        docstring): within :data:`WINDOW_ATOL` on the CPU, where only fp64 is compared (an fp32
+        value raises ``TypeError``: the caller decides, nothing is skipped silently), the device
+        tolerance on an accelerator. Recorded in ``worst`` like every other comparison."""
+        if device.type != "cpu":
+            self(actual, expected, device, what=what)
+            return
+        if expected.dtype not in WINDOW_ATOL:
+            raise TypeError(
+                f"{what}: step vs forward is compared on the CPU in fp64 only, got {expected.dtype}"
+            )
+        a = actual.detach().cpu()
+        e = expected.detach().cpu()
+        diff = float((a.double() - e.double()).abs().max()) if a.numel() else 0.0
+        key = (device.type, what)
+        self.worst[key] = max(self.worst.get(key, 0.0), diff)
+        torch.testing.assert_close(
+            a, e, atol=WINDOW_ATOL[e.dtype], rtol=0.0, msg=lambda m: f"{what} on cpu: {m}"
+        )
 
     def report(self) -> str:
         """One line per ``(device, what)`` with the largest difference observed."""
