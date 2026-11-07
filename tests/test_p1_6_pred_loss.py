@@ -188,10 +188,13 @@ def test_p1_6_ema_target_is_detached_and_tracks_x_t(path: Path) -> None:
     reset = torch.zeros(B, T, dtype=torch.bool)
     _, _, info = model(tokens, ctx, model.init_state(B), reset)
     assert info["z_target"].shape == (B, T, d) and not info["z_target"].requires_grad
+    # (P1.10a: forward runs the target over the window [B, T], step over [B]; the GEMMs round
+    # differently with the row count, so the two agree to rounding, fp64 1e-12 / fp32 1e-5)
+    atol = {torch.float64: 1e-12, torch.float32: 1e-5}[model.dtype]
     with torch.no_grad():
         for t in range(T):
             expected = model.ema_target(model.byte_emb(tokens[:, t]))
-            assert torch.equal(info["z_target"][:, t], expected)
+            torch.testing.assert_close(info["z_target"][:, t], expected, atol=atol, rtol=0.0)
             assert not torch.equal(
                 info["z_target"][:, t], model.encoder(model.byte_emb(tokens[:, t]))
             )

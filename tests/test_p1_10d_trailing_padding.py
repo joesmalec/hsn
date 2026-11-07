@@ -286,9 +286,12 @@ def test_p1_10_truncated_window_same_loss_and_carry(
     the window ``[B, T]``, and a cut window (``T = c``) rounds its GEMMs differently from the full
     one (``T = 32``). The tolerance is P1.10a's window tolerance (fp64 1e-12, fp32 1e-5; 1e-5
     under bf16 autocast on CUDA); integers and the reset zeros stay exact. The weights after the six
-    Adam steps take 1e-4 in fp32: an edge logit whose gradient sits near Adam's ``eps`` turns the
-    gradients' rounding (1.6e-7 measured) into update differences of 1.4e-5 at lr 1e-3 (fp64:
-    3.6e-16 and 1.4e-13, within 1e-12)."""
+    Adam steps take 1e-4 in fp32, except the edge logits: with the perturbed (non-uniform) edge
+    weights a row sums identical cell messages only to rounding, so the edge logits' gradients are
+    rounding noise of about 1e-9, near Adam's ``eps``, and their post-Adam weight measures Adam's
+    amplification of that noise (1.4e-5 here, 1.5e-4 on other CPUs), not the cut. Their gradients
+    are compared with every other gradient; in fp64 every weight is compared at 1e-12 (1.4e-13
+    measured). Unperturbed, the edge logits' gradients are exactly 0 (the dense symmetry)."""
     if profile == "rtx3060" and not torch.cuda.is_available():
         pytest.skip("no CUDA device on this machine")
     ctx = _ctx(profile, master)
@@ -360,6 +363,8 @@ def test_p1_10_truncated_window_same_loss_and_carry(
                 same(ga, gb, f"step {step} gradient {i}")
     weights_a, weights_b = cut.trainer.model.state_dict(), full.trainer.model.state_dict()
     for key, value in weights_a.items():
+        if key == "cell.graph.edge_logit" and ctx.master_dtype != torch.float64:
+            continue  # rounding-noise gradients amplified by Adam (docstring); gradients checked
         same(value, weights_b[key], f"weight {key}", weight_tol)
     moments_a = cut.trainer.optimizer.state_dict()["state"]
     moments_b = full.trainer.optimizer.state_dict()["state"]
