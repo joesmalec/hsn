@@ -302,7 +302,12 @@ def _train(
         "evals": evals,
         "diagnostics": diag.records,
         "train": train,
-        "final": _final(evals, train),
+        "final": {
+            **_final(evals, train),
+            # P1.12's non-finite-gradient guard (agreed 7 Nov): None on a checkout without it, so a
+            # rule on final:skipped_nonfinite_steps reads missing, never a false 0
+            "skipped_nonfinite_steps": measured.get("skipped_nonfinite_steps"),
+        },
         "stopped": callback.stop,
         "early_stop_log": callback.log,
         "eval_count": timer.count,

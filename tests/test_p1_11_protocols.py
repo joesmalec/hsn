@@ -151,6 +151,7 @@ def test_p1_11_reads_state_record(tiny_manifest: Path, tmp_path: Path) -> None: 
         "total_s",
     }
     assert record["walls"]["eval_s"] > 0 and record["eval_count"] == 3
+    assert "skipped_nonfinite_steps" in record["final"]  # P1.12's guard (None without it)
     compile_info = record["compile"]  # P2.8 records zeros on an eager run
     assert compile_info["mode"] == "none" and compile_info["compiled_window"] is False
     for key in ("compiled_windows", "compile_seconds", "compile_steps", "window_compile_seconds"):
