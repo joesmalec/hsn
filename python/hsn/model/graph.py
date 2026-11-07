@@ -25,13 +25,15 @@ the constant number of non-empty rows and carries no gradient, so the sparsity p
 ``sigmoid``.
 
 Messages. ``Vh = V(h_prev)`` is computed once for all ``N`` cells (``V`` before the weighting, as
-the equation reads) and the sources are gathered from it. The CSR is mirrored into a padded view
-``[N, D_max]`` (source per slot, edge id per slot, slot mask; non-persistent buffers rebuilt
-whenever the topology changes or a state dict is loaded) so that both message paths are gather →
-multiply → sum: deterministic, no atomics, the same ops on CPU, CUDA and MPS, and no padding waste
-on the uniform-degree fixed graph. The int64 CSR buffers are what the later ``csr_messages`` kernel
-reads (P2.9 narrows them to the C ABI's int32). Both message functions read only the ``h_prev`` they
-are given — the previous round's states — and never touch a
+the equation reads). The CSR is mirrored into a padded view ``[N, D_max]`` (source per slot, edge
+id per slot, slot mask; non-persistent buffers rebuilt whenever the topology changes or a state
+dict is loaded). The selected-cell path gathers the sources from ``Vh`` and sums them (gather →
+multiply → sum): deterministic, no atomics, the same ops on CPU, CUDA and MPS. The all-cells path
+sums the same way, each row's sources in slot order, which keeps identical cells bitwise identical
+(a dense ``A · Vh`` contraction would not; :meth:`messages_dense`). :meth:`dense_adjacency` builds
+``A [N, N]`` for tests and analysis, once per window. The int64 CSR buffers are what the later
+``csr_messages`` kernel reads (P2.9 narrows them to the C ABI's int32). Both message functions read
+only the ``h_prev`` they are given — the previous round's states — and never touch a
 :class:`~hsn.model.state.CellGraphState`.
 
 State dict. ``indptr``, ``indices``, ``is_random`` and ``edge_logit`` are saved; a checkpoint with
@@ -244,7 +246,11 @@ class CellGraph(nn.Module):
 
     def dense_adjacency(self) -> Tensor:
         """``A [N, N]`` with ``A[i, j] = a_ij`` for every edge ``j → i`` and 0 elsewhere (rows are
-        targets, columns sources): ``messages_dense`` equals ``einsum("ij,bjd->bid", A, V(h))``."""
+        targets, columns sources): ``messages_dense`` is ``einsum("ij,bjd->bid", A, V(h))``.
+        Built once per :meth:`window` (P1.10c), per call outside one."""
+        return self._cached("adjacency", self._build_dense_adjacency)
+
+    def _build_dense_adjacency(self) -> Tensor:
         weights = self.edge_weights()
         zeros = weights.new_zeros(self.n_cells, self.n_cells)
         return zeros.index_put((self._row, self.indices), weights)
@@ -257,7 +263,12 @@ class CellGraph(nn.Module):
 
     def messages_dense(self, h_prev: Tensor, V: nn.Linear) -> Tensor:
         """``m [B, N, d]`` for every cell from the previous round's states ``h_prev [B, N, d]``:
-        ``V`` is applied once to all cells, then each cell sums its weighted sources."""
+        ``V`` is applied once to all cells, then each cell sums its weighted sources in slot order
+        over the padded view. (P1.10c measured a dense-adjacency contraction ``A · V(h)``
+        instead and kept this one: the contraction sums each row over all ``N`` columns, so rows
+        with their edges at different columns round differently. From the zero state that gives
+        the edge logits rounding-noise gradients, 1.6e-22 in fp64, where the slot-order sum keeps
+        them exactly 0 and the cells exactly symmetric.)"""
         self._check_h(h_prev)
         Vh: Tensor = V(h_prev)  # [B, N, d]
         weights = self._padded_weights_as(Vh.dtype)  # [N, D_max]
