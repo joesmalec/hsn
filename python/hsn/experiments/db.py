@@ -29,6 +29,9 @@ than the code raises):
 * ``results``: one row per finished experiment: the compact record (no per-probe list), the
   verdicts, the early-stop record, the path of the full JSON and a few scalars;
 * ``meta``: ``paused`` and the like;
+* v2 adds ``experiments.protocol_json`` and ``experiments.config_json``: each attempt's own protocol
+  (execution parameters included) and resolved configuration (its own ``run_id``), which the child
+  runs; rows from before v2 fall back to the arm's;
 * the view ``queue``: queued experiments in FIFO order.
 
 **Guarded writes.** A child process changes its experiment only while that row is ``running`` with
@@ -207,6 +210,13 @@ MIGRATIONS: list[list[str]] = [
             train_s REAL,
             total_s REAL)""",
         "CREATE VIEW queue AS SELECT * FROM experiments WHERE status = 'queued' ORDER BY exp_id",
+    ],
+    [  # v2 (P1.11, 7 Nov 2026): the protocol (execution parameters included) and the resolved
+        # configuration of each attempt. The arm id leaves the execution-only parameters out, so
+        # two specs can enqueue one arm with different eval/probe batches; the arm row keeps the
+        # first insert's (an imported run's, for example), so the attempt carries its own.
+        "ALTER TABLE experiments ADD COLUMN protocol_json TEXT",
+        "ALTER TABLE experiments ADD COLUMN config_json TEXT",
     ],
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -494,6 +504,8 @@ def enqueue_arms(
                 status="queued",
                 timing=int(arm.timing),
                 mem_est_mib=mem_est_mib,
+                protocol_json=dumps(arm.protocol.model_dump(mode="json")),
+                config_json=dumps(arm.config.model_dump(mode="json")),
             )
             report.added.append({**entry, "exp_id": exp_id})
     return report
@@ -660,6 +672,8 @@ def _requeue_in(conn: sqlite3.Connection, exp_id: int) -> int:
         status="queued",
         timing=row["timing"],
         mem_est_mib=row["mem_est_mib"],
+        protocol_json=row["protocol_json"],
+        config_json=row["config_json"],
         requeue_of=exp_id,
     )
 

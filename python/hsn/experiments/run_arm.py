@@ -206,8 +206,9 @@ def _run(
     pid: int,
     git: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    cfg = RunConfig.model_validate(loads(arm["config_json"]))
-    protocol = loads(arm["protocol_json"])
+    # the attempt's own configuration and protocol (schema v2); older rows fall back to the arm's
+    cfg = RunConfig.model_validate(loads(exp.get("config_json") or arm["config_json"]))
+    protocol = loads(exp.get("protocol_json") or arm["protocol_json"])
     params = protocol_params(protocol)
     variant_params = loads(arm["variant_json"])
     early_stop = loads(arm["early_stop_json"])

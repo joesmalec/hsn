@@ -534,3 +534,35 @@ def test_p1_11_early_stop_evaluation() -> None:
     gone["diagnostics"] = []
     stop3, log3 = check_early_stop(rules, gone, 20, {"chance": 0.0}, "hsn")
     assert stop3 is None and log3[0]["result"] is None
+
+
+def test_p1_11_memory_open_windowed_median() -> None:
+    """The user's rule of 7 Nov: at each multiple of 500, the median over the diagnostics within
+    100 steps (9 samples at a cadence of 25, 5 at the last step) of gate p50 and the cell share."""
+    diags = [{"step": s, "gate/p50": 0.05, "grad_share/cell": 0.02} for s in range(25, 3001, 25)]
+    for d in diags:  # one-step dips below the line, as the bridge resample saw
+        if d["step"] in (500, 1000, 2975):
+            d["grad_share/cell"] = 0.004
+    rules = parse_rules(
+        {
+            "verdicts": {
+                "windowed": {"preset": "memory_open", "window": 100, "to_step": 3000},
+                "single": {"preset": "memory_open"},
+            }
+        }
+    )
+    out = evaluate_verdicts(rules, {"diagnostics": diags}, {}, "hsn")
+    assert out["windowed"]["label"] == "open" and out["single"]["label"] == "shut"
+    detail = out["windowed"]["detail"]
+    assert detail[0]["steps"] == list(range(400, 601, 25)) and detail[0]["n"] == 9
+    assert detail[-1]["steps"] == list(range(2900, 3001, 25)) and detail[-1]["n"] == 5
+    shut = [
+        dict(d, **{"grad_share/cell": 0.004}) if 1900 <= d["step"] <= 2100 else d for d in diags
+    ]
+    assert evaluate_verdicts(rules, {"diagnostics": shut}, {}, "hsn")["windowed"]["label"] == "shut"
+    with pytest.raises(RuleError, match="needs to_step"):
+        parse_rules({"verdicts": {"w": {"preset": "memory_open", "window": 100}}})
+    # at a cadence of 500 each window holds the one sample (as for exp 46)
+    sparse = [d for d in diags if d["step"] % 500 == 0]
+    single = evaluate_verdicts(rules, {"diagnostics": sparse}, {}, "hsn")["windowed"]["detail"]
+    assert all(entry["n"] == 1 for entry in single)

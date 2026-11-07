@@ -10,8 +10,9 @@
 # The expected results are fixed here, before the run (constants per arm): the same reads-state
 # verdict as the reference and final dev accuracy within +-0.03 of it ("matches_reference"); for the
 # HSN bridge also the bridge rule of 6 Nov (does not read state, memory open at every diagnostic from
-# step 1,000, dev 0.0696 +- 0.03 and loss 3.619 +- 0.05; "bridge") and, eager only, bitwise identical
-# dense cells ("cells_identical"). The compiled bridge (coordinator's request, 7 Nov) needs P2.8: on
+# step 1,000, dev 0.0696 +- 0.03 and loss 3.619 +- 0.05; "bridge_6nov") and bitwise identical dense
+# cells ("cells_identical"). The eager bridge (exp 46) missed bridge_6nov on loss (3.513); the user
+# then set the rule "bridge" (7 Nov, before the compiled bridge ran; provenance at the rule). The compiled bridge (coordinator's request, 7 Nov) needs P2.8: on
 # a checkout without it, resolving hardware.compile_mode=reduce-overhead raises, the arm fails, and
 # it is requeued by its unchanged arm id once P2.8 is merged. Both bridge arms run as timing arms
 # (alone on an idle card and an idle CPU) and give the time per reads-state experiment.
@@ -57,6 +58,9 @@ rules:
   verdicts:
     reads_state: {preset: reads_state}
     memory_open_from_1000: {preset: memory_open, from_step: 1000}
+    # the user's windowed rule (7 Nov): at each multiple of 500, the median over the diagnostics
+    # within 100 steps (9 samples at diag_every 25; one sample at diag_every 500, as exp 46 ran)
+    memory_open_windowed: {preset: memory_open, window: 100, to_step: 3000}
     matches_reference:
       cases:
         - label: pass
@@ -68,7 +72,34 @@ rules:
                 op: between
                 value: ["ref_dev - 0.03", "ref_dev + 0.03"]
       default: fail
+    # the bridge rule (user decision, 7 Nov 2026, relayed by the coordinator after exp 46 missed the
+    # 6 Nov rule's loss bound): a bridge arm, eager or compiled, is comparable with the audit's runs
+    # when it does not read state, its memory is open (windowed median), its cells are identical, and
+    # its final dev accuracy and loss lie in the range of the three eager runs of this recipe ((d)
+    # 0.0607 / 3.655 at 8b290e0, the audit's bridge 0.0696 / 3.619 at f8884ec, exp 46 0.0945 / 3.513
+    # at 4a5d120) widened by half its width on each side; the harness is validated separately by the
+    # deterministic equivalence test (configs/sweeps/p1_11_equivalence.yaml)
     bridge:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "verdict:reads_state", op: "==", value: "does not read state"}
+              - {metric: "verdict:memory_open_windowed", op: "==", value: open}
+              - {metric: "verdict:cells_identical", op: "==", value: identical}
+              - metric: "eval:delayed/in_range/accuracy"
+                steps: {at: 3000}
+                op: between
+                value: [0.044, 0.112]
+              - metric: "eval:delayed/in_range/loss"
+                steps: {at: 3000}
+                op: between
+                value: [3.44, 3.73]
+      default: fail
+    # the bridge rule of 6 Nov (audit log, before the bridge run), kept for the record: its loss
+    # bound came from the single (d)-to-bridge pair and lies below this recipe's run-to-run spread
+    bridge_6nov:
       applies_to: {family: [hsn]}
       cases:
         - label: pass
@@ -115,5 +146,6 @@ arms:
   - name: hsn_pdg_b32_lr1e-3_bridge_compiled
     family: hsn
     overrides: [train.lr=0.001, hardware.compile_mode=reduce-overhead]
+    protocol: {diag_every: 25} # the windowed memory-open rule needs diagnostics every 25 steps
     timing: true
     constants: {expect: does not read state, ref_dev: 0.0696}

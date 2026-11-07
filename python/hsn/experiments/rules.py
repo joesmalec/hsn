@@ -475,24 +475,35 @@ def _preset_reads_state(p: dict[str, Any]) -> dict[str, Any]:
 
 
 def _preset_memory_open(p: dict[str, Any]) -> dict[str, Any]:
-    steps: dict[str, int] = {"from": p.pop("from_step", 500), "every": p.pop("every", 500)}
+    """Gate p50 and the cell's gradient share at or above their thresholds at the multiples of
+    ``every`` from ``from_step``. Without ``window``: the one sample at each such step (``agg``
+    all, as registered for queue9 at a cadence of 500), or one aggregate over all of them. With
+    ``window: w`` (and ``to_step``): at each such step s, the ``agg`` (default median) over the
+    diagnostics in [s - w, s + w] (the user's windowed rule of 7 Nov, at a cadence of 25)."""
+    start, every = p.pop("from_step", 500), p.pop("every", 500)
     to_step = p.pop("to_step", None)
-    if to_step is not None:
-        steps["to"] = to_step
-    agg = p.pop("agg", "all")
+    window = p.pop("window", None)
     gate, share = p.pop("gate_p50_min", 0.01), p.pop("cell_share_min", 0.01)
+    if window is None:
+        steps: dict[str, int] = {"from": start, "every": every}
+        if to_step is not None:
+            steps["to"] = to_step
+        agg = p.pop("agg", "all")
+        atoms = [
+            _atom("diag:gate/p50", ">=", gate, steps, agg),
+            _atom("diag:grad_share/cell", ">=", share, dict(steps), agg),
+        ]
+    else:
+        if to_step is None:
+            raise RuleError("preset memory_open: window needs to_step (the last checkpoint)")
+        agg = p.pop("agg", "median")
+        atoms = []
+        for s in range(start, int(to_step) + 1, every):
+            span = {"from": s - int(window), "to": s + int(window)}
+            atoms.append(_atom("diag:gate/p50", ">=", gate, dict(span), agg))
+            atoms.append(_atom("diag:grad_share/cell", ">=", share, dict(span), agg))
     return {
-        "cases": [
-            {
-                "label": "open",
-                "when": {
-                    "all": [
-                        _atom("diag:gate/p50", ">=", gate, steps, agg),
-                        _atom("diag:grad_share/cell", ">=", share, dict(steps), agg),
-                    ]
-                },
-            }
-        ],
+        "cases": [{"label": "open", "when": {"all": atoms}}],
         "default": "shut",
         "applies_to": {"family": ["hsn"]},
     }

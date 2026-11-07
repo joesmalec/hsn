@@ -31,8 +31,8 @@ def probe_check(db: Database, exp_id: int, *, batch_rows: int = 64) -> dict[str,
 
     exp = db.experiment(exp_id)
     arm = db.arm(exp["arm_id"])
-    cfg = RunConfig.model_validate(loads(arm["config_json"]))
-    params = protocol_params(loads(arm["protocol_json"]))
+    cfg = RunConfig.model_validate(loads(exp.get("config_json") or arm["config_json"]))
+    params = protocol_params(loads(exp.get("protocol_json") or arm["protocol_json"]))
     if params.name != "reads_state":
         raise ValueError(f"experiment {exp_id} ran {params.name}, not reads_state")
     if not exp["run_dir"]:

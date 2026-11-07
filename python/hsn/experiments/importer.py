@@ -329,6 +329,8 @@ def convert(path: Path, data: dict[str, Any], *, repo: Path = REPO_ROOT) -> dict
             "card_json": dumps({"gpu_processes": data.get("gpu_processes")}),
             "imported": 1,
             "import_source": str(path),
+            "protocol_json": dumps(pdump),  # the attempt's own (schema v2)
+            "config_json": dumps(config_json),
             "times_approx": 1,
             "run_dir": str(path.parent / name) if (path.parent / name).is_dir() else None,
         },

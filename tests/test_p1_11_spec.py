@@ -28,7 +28,7 @@ GOLDEN = {
     "gru128x1_b32_lr3e-3/s0": "9dc4466c5460dab4",
     "gru64x1_b32_lr3e-3/s0": "1fd2b47d0846b270",
     "hsn_pdg_b32_lr1e-3_bridge/s0": "79b251da811d9f63",
-    "hsn_pdg_b32_lr1e-3_bridge_compiled/s0": "f6ce1da2777804a8",
+    "hsn_pdg_b32_lr1e-3_bridge_compiled/s0": "2a5a20d84b34a9d1",  # diag_every 25 (7 Nov)
 }
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

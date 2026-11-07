@@ -26,7 +26,8 @@ AUDIT = Path("/home/joe/hsn-eff/evidence/EFF")
 
 def _by_name(db: dbm.Database) -> dict[str, dict[str, object]]:
     rows = db.rows(
-        "SELECT e.*, a.family, a.variant, a.protocol, a.protocol_json, a.config_path, "
+        "SELECT e.*, a.family, a.variant, a.protocol, a.protocol_json AS arm_protocol_json, "
+        "a.config_path, "
         "r.record_json, r.verdicts_json, r.final_dev_accuracy, r.train_s FROM experiments e "
         "JOIN arms a ON a.arm_id = e.arm_id JOIN results r ON r.exp_id = e.exp_id"
     )
@@ -57,7 +58,8 @@ def test_p1_11_import_audit_jsons(tmp_path: Path) -> None:
     record = json.loads(str(bridge["record_json"]))
     assert str(bridge["commit_sha"]).startswith("f8884ec3bf") and bridge["card_status"] == "idle"
     assert bridge["config_path"] == "configs/experiments/g1_ref_a1.yaml"
-    protocol = json.loads(str(bridge["protocol_json"]))
+    protocol = json.loads(str(bridge["arm_protocol_json"]))
+    assert bridge["protocol_json"] == bridge["arm_protocol_json"], "the attempt carries its own"
     assert (
         protocol["diag_every"] == 500 and protocol["steps"] is None and protocol["diag_docs"] == 32
     )
@@ -76,7 +78,7 @@ def test_p1_11_import_audit_jsons(tmp_path: Path) -> None:
     record = json.loads(str(overfit["record_json"]))
     assert overfit["protocol"] == "overfit" and overfit["variant"] == "cell_embed_linear_head"
     assert record["overfit"]["first_ge_0.99"] == 625 and len(record["evals"]) == 24
-    assert json.loads(str(overfit["protocol_json"]))["diag_every"] == 50
+    assert json.loads(str(overfit["arm_protocol_json"]))["diag_every"] == 50
 
     # idempotent
     again = import_audit_dir(db, FIXTURES, repo=repo, log=lambda m: None)
@@ -109,6 +111,13 @@ def test_p1_11_imported_runs_do_not_block_enqueue(
     report = enqueue_spec(db, REPO / "configs" / "sweeps" / "p1_11_validation.yaml")
     assert len(report.added) == 5
     assert [m["label"] for m in report.imported_matches] == ["hsn_pdg_b32_lr1e-3_bridge/s0"]
+    # the arm row is the import's (same arm id), but the queued attempt runs the spec's protocol
+    # and configuration: evaluation at 128 streams (the bug exp 46 hit), the spec's run id
+    (bridge,) = [a for a in report.added if a["label"] == "hsn_pdg_b32_lr1e-3_bridge/s0"]
+    attempt = db.experiment(bridge["exp_id"])
+    assert json.loads(db.arm(bridge["arm_id"])["protocol_json"])["eval_batch"] is None
+    assert json.loads(attempt["protocol_json"])["eval_batch"] == 128
+    assert json.loads(attempt["config_json"])["run_id"] == attempt["run_id"]
     skipped = enqueue_spec(
         db, REPO / "configs" / "sweeps" / "p1_11_validation.yaml", skip_imported=True
     )
@@ -129,7 +138,7 @@ def test_p1_11_import_real_audit_directory() -> None:
     assert len(report.imported) == len(files) >= 40
     rows = _by_name(db)
     resample = rows["hsn_pdg_b32_lr1e-3_bridge_resample600"]
-    protocol = json.loads(str(resample["protocol_json"]))
+    protocol = json.loads(str(resample["arm_protocol_json"]))
     assert protocol["steps"] == 600 and protocol["diag_every"] == 25
     gru = rows["gru384x2_b32_lr3e-3"]
     assert json.loads(str(gru["verdicts_json"]))["reads_state"]["label"] == "reads state"

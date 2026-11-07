@@ -3,6 +3,7 @@ writes) on a database under ``tmp_path``."""
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import sqlite3
 import tempfile
@@ -22,7 +23,7 @@ def _open(path: str) -> int:
 def test_p1_11_db_schema_and_migrations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "a.sqlite"
     db = dbm.Database(path)
-    assert db.version() == dbm.SCHEMA_VERSION == 1
+    assert db.version() == dbm.SCHEMA_VERSION == 2
     names = {
         r["name"] for r in db.rows("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
     }
@@ -30,13 +31,13 @@ def test_p1_11_db_schema_and_migrations(tmp_path: Path, monkeypatch: pytest.Monk
     assert db.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     db.set_paused(True)
     assert (
-        dbm.Database(path).paused and dbm.Database(path).version() == 1
+        dbm.Database(path).paused and dbm.Database(path).version() == 2
     )  # reopening is idempotent
 
     # concurrent first opens migrate exactly once
     fresh = tmp_path / "fresh.sqlite"
     with mp.get_context("spawn").Pool(4) as pool:
-        assert pool.map(_open, [str(fresh)] * 8) == [1] * 8
+        assert pool.map(_open, [str(fresh)] * 8) == [2] * 8
 
     # a newer database raises
     newer = tmp_path / "newer.sqlite"
@@ -44,16 +45,30 @@ def test_p1_11_db_schema_and_migrations(tmp_path: Path, monkeypatch: pytest.Monk
     with pytest.raises(dbm.DatabaseError, match="schema version 99"):
         dbm.Database(newer)
 
-    # a v2 migration upgrades a populated v1 database and keeps its rows
-    db.set_meta("kept", "yes")
+    # the real v1 -> v2 step upgrades a populated v1 database (the shared database was created at
+    # v1) and keeps its rows; the attempt's own protocol and config columns appear (NULL when old)
+    v1 = tmp_path / "v1.sqlite"
+    with monkeypatch.context() as m:
+        m.setattr(dbm, "MIGRATIONS", dbm.MIGRATIONS[:1])
+        m.setattr(dbm, "SCHEMA_VERSION", 1)
+        old = dbm.Database(v1)
+        assert old.version() == 1
+        old.set_meta("kept", "yes")
+        old.close()
+    upgraded = dbm.Database(v1)
+    assert upgraded.version() == 2 and upgraded.meta("kept") == "yes"
+    columns = {r["name"] for r in upgraded.rows("PRAGMA table_info(experiments)")}
+    assert {"protocol_json", "config_json"} <= columns
+
+    # and a further (monkeypatched) step upgrades again
     db.close()
     monkeypatch.setattr(
         dbm, "MIGRATIONS", [*dbm.MIGRATIONS, ["ALTER TABLE meta ADD COLUMN note TEXT"]]
     )
-    monkeypatch.setattr(dbm, "SCHEMA_VERSION", 2)
-    upgraded = dbm.Database(path)
-    assert upgraded.version() == 2 and upgraded.meta("kept") == "yes"
-    assert "note" in {r["name"] for r in upgraded.rows("PRAGMA table_info(meta)")}
+    monkeypatch.setattr(dbm, "SCHEMA_VERSION", 3)
+    again = dbm.Database(path)
+    assert again.version() == 3 and again.meta("paused") == "1"
+    assert "note" in {r["name"] for r in again.rows("PRAGMA table_info(meta)")}
 
 
 def test_p1_11_db_refuses_tmp(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,3 +182,21 @@ def test_p1_11_guarded_child_writes(tmp_path: Path) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         with db.write() as conn:
             conn.execute("UPDATE experiments SET status = 'bogus' WHERE exp_id = ?", (exp_id,))
+
+
+def test_p1_11_attempts_carry_their_own_execution_parameters(tmp_path: Path) -> None:
+    """Two specs that differ only in an execution-only parameter enqueue the same arm; each attempt
+    carries its own (the arm row keeps the first insert's)."""
+    db = dbm.Database(db_path())
+    a = enqueue_spec(db, dry_spec(tmp_path, n=1, name="first", sleep_s=0.0))
+    b = enqueue_spec(db, dry_spec(tmp_path, n=1, name="second", sleep_s=0.25), force=True)
+    (ea,), (eb,) = a.added, b.added
+    assert ea["arm_id"] == eb["arm_id"]
+    pa = json.loads(db.experiment(ea["exp_id"])["protocol_json"])
+    pb = json.loads(db.experiment(eb["exp_id"])["protocol_json"])
+    assert (pa["sleep_s"], pb["sleep_s"]) == (0.0, 0.25)
+    assert json.loads(db.arm(ea["arm_id"])["protocol_json"])["sleep_s"] == 0.0
+    cfg = json.loads(db.experiment(eb["exp_id"])["config_json"])
+    assert cfg["run_id"] == db.experiment(eb["exp_id"])["run_id"]
+    (requeued,) = dbm.requeue(db, [eb["exp_id"]], ["queued"])
+    assert db.experiment(requeued)["protocol_json"] == db.experiment(eb["exp_id"])["protocol_json"]
