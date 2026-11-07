@@ -988,3 +988,89 @@ def test_p1_10_dense_cells_stay_symmetric_from_zero_state(
     assert torch.equal(final.h, final.h[:, :1].expand_as(final.h))
     grad = model.cell.graph.edge_logit.grad
     assert grad is not None and not bool(grad.any()), float(grad.abs().max())
+
+
+# --------------------------------------------------------------------------------------------------
+# P1.10e: hot-loop Python
+# --------------------------------------------------------------------------------------------------
+
+
+def test_p1_10_window_validates_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``forward`` validates the window once: in the dense window the states are built without
+    ``CellGraphState``'s layout check, a constant number of checks per window whatever ``T`` (the
+    public constructor and every public method still validate), and the rounds skip their per-call
+    input checks inside the window; outside it ``step``, ``step_dense`` and ``messages_dense``
+    still refuse bad inputs, and a bad window still raises before anything runs."""
+    import hsn.model.state as state_module
+
+    calls = [0]
+    check = state_module._check_layout
+
+    def counted(*args: Any, **kwargs: Any) -> None:
+        calls[0] += 1
+        check(*args, **kwargs)
+
+    monkeypatch.setattr(state_module, "_check_layout", counted)
+    model = _build(CASES[0])
+    m = model.cfg
+    per_window = []
+    for length in (4, 12):
+        generator = torch.Generator(device="cpu").manual_seed(length)
+        tokens = torch.randint(0, m.vocab_size, (B, length), generator=generator)
+        ctx = torch.randint(0, m.n_context, (B, length), generator=generator)
+        reset = torch.zeros(B, length, dtype=torch.bool)
+        reset[:, 0] = True
+        state = model.init_state(B)
+        calls[0] = 0
+        model(tokens, ctx, state, reset)
+        per_window.append(calls[0])
+    assert per_window[0] == per_window[1], per_window  # independent of T
+    assert calls[0] <= 2, per_window
+
+    # outside a window everything is still checked
+    state = model.init_state(B)
+    with pytest.raises(ValueError, match="layout|shape"):
+        CellGraphState(h=state.h, q=state.q[:, :1], age=state.age, pos=state.pos)
+    with pytest.raises(ValueError, match="u must have shape"):
+        model.cell.step_dense(
+            torch.zeros(B, m.d + 1, dtype=model.dtype),
+            torch.zeros(B, m.d, dtype=model.dtype),
+            state,
+            torch.full((B, m.n_cells, m.n_units), 1.0 / m.n_units, dtype=model.dtype),
+        )
+    with pytest.raises(ValueError, match="h_prev must have shape"):
+        model.cell.graph.messages_dense(state.h[:, :1], model.cell.V)
+    with pytest.raises(TypeError, match="x_t"):
+        model.step(torch.zeros(B), torch.zeros(B, dtype=torch.int64), state)
+    with pytest.raises(ValueError, match="reset must have shape"):
+        model(
+            torch.zeros(B, 3, dtype=torch.int64),
+            torch.zeros(B, 3, dtype=torch.int64),
+            state,
+            torch.zeros(B, 2, dtype=torch.bool),
+        )
+    assert not model.cell._in_window and model.cell.graph._window_cache is None
+
+
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+def test_p1_10_internal_states_pass_layout_check(
+    case: Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every state the window builds without the layout check (``CellGraphState._make``) would pass
+    it: the public constructor's ``_check_layout`` is run on each one, in every routing mode."""
+    import hsn.model.state as state_module
+
+    made = [0]
+    original = CellGraphState._make.__func__  # type: ignore[attr-defined]
+
+    def checked(cls: type[CellGraphState], h: Tensor, q: Tensor, age: Tensor, pos: Tensor) -> Any:
+        state_module._check_layout(h, q, age, pos, where="CellGraphState._make")
+        made[0] += 1
+        return original(cls, h, q, age, pos)
+
+    monkeypatch.setattr(CellGraphState, "_make", classmethod(checked))
+    model = _build(case)
+    tokens, ctx, state, reset = _inputs(model)
+    logits, final, _ = _run(lambda: model(tokens, ctx, state, reset))
+    assert made[0] >= T
+    state_module._check_layout(final.h, final.q, final.age, final.pos, where="final")

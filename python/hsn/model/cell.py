@@ -149,6 +149,9 @@ class PDGCell(nn.Module):
         if self.disabled_cells:
             disabled[list(self.disabled_cells)] = True
         self.register_buffer("disabled", disabled, persistent=False)
+        #: P1.10e: True inside :meth:`window`, whose caller (``HSN.forward``) validated the window
+        #: once: the rounds then skip their per-call shape / dtype / device checks.
+        self._in_window = False
 
     # ----------------------------------------------------------------------------------------------
     # A window of rounds (P1.10a)
@@ -162,8 +165,13 @@ class PDGCell(nn.Module):
         (:meth:`UnitBank.window`, P1.10c) — is done once for the window. The rounds themselves are
         unchanged, and ``step_dense`` / ``step_sparse`` are still called once per position (tests
         and diagnostics wrap them). Nothing is cached beyond the window."""
+        previous = self._in_window
         with self.graph.window(), self.units.window():
-            yield
+            self._in_window = True
+            try:
+                yield
+            finally:
+                self._in_window = previous
 
     # ----------------------------------------------------------------------------------------------
     # The dense round
@@ -181,7 +189,10 @@ class PDGCell(nn.Module):
         ``b``, ``h_prev``) for tests and the P1.5 reference check. The graph's step guard is held
         for the duration (``set_topology`` raises meanwhile).
         """
-        B, N, d = self._check_inputs(u, eps, state, alpha)
+        if self._in_window:  # P1.10e: validated once by the window's caller
+            B, N, d = (int(n) for n in state.h.shape)
+        else:
+            B, N, d = self._check_inputs(u, eps, state, alpha)
         with self.graph.step():
             h_prev = state.h
             m = self.graph.messages_dense(h_prev, self.V)  # [B, N, d]
@@ -243,8 +254,11 @@ class PDGCell(nn.Module):
         partition of :func:`hsn.kernels.costs.profile_dense_costs`. The graph's step guard is held
         for the duration.
         """
-        B, N, d = self._check_vectors(u, eps, state)
-        self._check_selection(sel, B, state)
+        if self._in_window:  # P1.10e: validated once by the window's caller
+            B, N, d = (int(n) for n in state.h.shape)
+        else:
+            B, N, d = self._check_vectors(u, eps, state)
+            self._check_selection(sel, B, state)
         K = sel.k
         native = kernels.ops()
         # Padded (and disabled) slots gather cell 0 and unit 0, valid indices on every backend, and

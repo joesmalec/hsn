@@ -477,7 +477,7 @@ class HSN(nn.Module):
                 new_state = self._write_dense(state, h_new)
             else:
                 age, pos = dense_counters
-                new_state = CellGraphState(h=h_new, q=h_new.mean(dim=1), age=age, pos=pos)
+                new_state = CellGraphState._make(h=h_new, q=h_new.mean(dim=1), age=age, pos=pos)
             if not capture:
                 return _RoundResult(new_state)
             enabled = self._enabled_cells(state)
@@ -533,7 +533,7 @@ class HSN(nn.Module):
             )
             dense_state = self._write_dense(state, h_dense)
             rows = dense_rows
-            new_state = CellGraphState(
+            new_state = CellGraphState._make(
                 h=torch.where(rows[:, None, None], dense_state.h, new_state.h),
                 q=torch.where(rows[:, None], dense_state.q, new_state.q),
                 age=torch.where(rows[:, None], dense_state.age, new_state.age),
@@ -573,7 +573,9 @@ class HSN(nn.Module):
         if self.cell.disabled_cells:
             updated = updated & ~self.cell.disabled[None, :]
         written = state.with_dense(h_new)  # q: the exact mean (every age zeroed, restored below)
-        new_state = replace(written, age=state.age.masked_fill(updated, 0)).tick(updated)
+        new_state = CellGraphState._make(
+            h=written.h, q=written.q, age=state.age.masked_fill(updated, 0), pos=written.pos
+        ).tick(updated)
         if not capture:
             return _RoundResult(new_state)
         return _RoundResult(new_state, _gate_of_written(info["b"], updated), updated)
@@ -601,7 +603,9 @@ class HSN(nn.Module):
         if not self.cell.disabled_cells:
             return updated.tick(torch.ones_like(state.age, dtype=torch.bool))
         enabled = (~self.cell.disabled)[None, :].expand_as(state.age)
-        return replace(updated, age=state.age.masked_fill(enabled, 0)).tick(enabled)
+        return CellGraphState._make(
+            h=updated.h, q=updated.q, age=state.age.masked_fill(enabled, 0), pos=updated.pos
+        ).tick(enabled)
 
     # -- a window of positions --------------------------------------------------------------------
 
@@ -728,6 +732,10 @@ class HSN(nn.Module):
         gates: list[Tensor] = []
         written: list[Tensor] = []
         selections: list[Selection] = []
+        # P1.10e: the submodules and bound methods of the loop, looked up once per call (never at
+        # construction: experiments replace modules, and functional_call swaps parameters)
+        predictor, shared, assemble = self.predictor, self.shared, self.scorer._assemble
+        score, update = self._score, self._update
         with self.cell.window():
             for t in range(T):
                 if dense_window:
@@ -735,21 +743,21 @@ class HSN(nn.Module):
                     if resets_at[t]:  # age and pos already account for the reset
                         h = h.masked_fill(reset[:, t, None, None], 0)
                         q = q.masked_fill(reset[:, t, None], 0)
-                    state = CellGraphState(
+                    state = CellGraphState._make(
                         h=h, q=q, age=start_age if t == 0 else zero_age, pos=positions[:, t]
                     )
                 elif resets_at[t]:
                     state = state.reset(reset[:, t])
                 q_prev = state.q
                 z_t = z_steps[t]
-                z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
+                z_hat = predictor(q_prev)  # from the carried summary only (global rule 2)
                 eps = z_t - z_hat
-                u = self.shared(torch.cat([z_t, q_prev, ctx_steps[t]], dim=-1))
+                u = shared(torch.cat([z_t, q_prev, ctx_steps[t]], dim=-1))
                 u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)  # P1.7: see step
                 age = None if dense_window else state.age  # dense: a column of the scalars
-                feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalar_steps[t])
-                unit_logits, alpha, selection = self._score(feats, state, mode, dense_rows)
-                result = self._update(
+                feats = assemble(u_s, eps_s, state.h, age, scalar_steps[t])
+                unit_logits, alpha, selection = score(feats, state, mode, dense_rows)
+                result = update(
                     u_s,
                     eps_s,
                     state,
@@ -777,7 +785,9 @@ class HSN(nn.Module):
                     written.append(result.written)
 
         if dense_window:
-            state = replace(state, pos=positions_after[:, -1].contiguous())
+            state = CellGraphState._make(
+                h=state.h, q=state.q, age=state.age, pos=positions_after[:, -1].contiguous()
+            )
         u_window = torch.stack(us, dim=1)
         logits = self.decoder(torch.cat([torch.stack(qs, dim=1), u_window], dim=-1))  # updated q_t
         eps_window = torch.stack(epss, dim=1)

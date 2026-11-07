@@ -207,6 +207,18 @@ class CellGraphState:
     def __post_init__(self) -> None:
         _check_layout(self.h, self.q, self.age, self.pos, where="CellGraphState")
 
+    @classmethod
+    def _make(cls, h: Tensor, q: Tensor, age: Tensor, pos: Tensor) -> CellGraphState:
+        """A state built without :func:`_check_layout` (P1.10e): only for internal updates whose
+        result has a valid layout by construction — the functional updates below after their own
+        argument checks, and the model's window path. The public constructor still validates."""
+        state = object.__new__(cls)
+        object.__setattr__(state, "h", h)
+        object.__setattr__(state, "q", q)
+        object.__setattr__(state, "age", age)
+        object.__setattr__(state, "pos", pos)
+        return state
+
     # -- shape and placement ----------------------------------------------------------------------
 
     @property
@@ -262,7 +274,7 @@ class CellGraphState:
                 self.batch_size, self.n_cells, self.width, self.device, self.dtype
             )
         self._check_mask(mask, (self.batch_size,), "mask")
-        return CellGraphState(
+        return CellGraphState._make(
             h=self.h.masked_fill(mask[:, None, None], 0),
             q=self.q.masked_fill(mask[:, None], 0),
             age=self.age.masked_fill(mask[:, None], 0),
@@ -284,7 +296,7 @@ class CellGraphState:
         h = self.h.scatter(1, index, h_new)
         q = self.q + (h_new - h_old).sum(dim=1) / self.n_cells
         age = self.age.scatter(1, cell_idx, 0)
-        return CellGraphState(h=h, q=q, age=age, pos=self.pos)
+        return CellGraphState._make(h=h, q=q, age=age, pos=self.pos)
 
     def with_dense(self, h_new: Tensor) -> CellGraphState:
         """Replace every cell by ``h_new [B, N, d]``: ``q`` is the exact mean (every cell changed,
@@ -296,14 +308,14 @@ class CellGraphState:
                 f"h_new must have shape {tuple(self.h.shape)}, got {tuple(h_new.shape)}"
             )
         self._check_like_h(h_new, "h_new")
-        return CellGraphState(
+        return CellGraphState._make(
             h=h_new, q=h_new.mean(dim=1), age=torch.zeros_like(self.age), pos=self.pos
         )
 
     def tick(self, selected_mask: Tensor) -> CellGraphState:
         """End of a round: ``age += 1`` where ``selected_mask [B, N]`` is false; ``pos += 1``."""
         self._check_mask(selected_mask, (self.batch_size, self.n_cells), "selected_mask")
-        return CellGraphState(
+        return CellGraphState._make(
             h=self.h,
             q=self.q,
             age=self.age + (~selected_mask).to(_INDEX_DTYPE),
@@ -343,7 +355,7 @@ class CellGraphState:
 
     def detach(self) -> CellGraphState:
         """The same values without autograd history (the state carried between TBPTT windows)."""
-        return CellGraphState(
+        return CellGraphState._make(
             h=self.h.detach(), q=self.q.detach(), age=self.age.detach(), pos=self.pos.detach()
         )
 
