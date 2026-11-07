@@ -537,19 +537,29 @@ def _symmetry(window: Callable[..., Window], model: HSN, b: int, t: int) -> tupl
     return float((h - h[:, :1]).abs().max()), float(grad.abs().max())
 
 
+#: macOS (CPU, fp32): the platform BLAS rounds identical cells apart by an ulp or two with or
+#: without compilation, so there the symmetry is bounded, as in P1.10
+#: (``tests/test_p1_10_loop.py::MACOS_SYMMETRY_BOUND``, fp32): (cell spread, edge gradient).
+MACOS_SYMMETRY_BOUND_FP32 = (2e-6, 4e-12)
+
+
 @pytest.mark.usefixtures("small_blocks")
 def test_p2_8_dense_symmetry_exact_compiled() -> None:
     """The dense reference's 32 cells stay bitwise identical from the zero state and the edge
     logits get exactly zero gradient through the compiled window (the efficiency audit's finding
-    1; the running experiments depend on it): ``ref_a1``, CPU, fp32."""
+    1; the running experiments depend on it): ``ref_a1``, CPU, fp32. Exact on Linux (and on CUDA,
+    the CUDA test); bounded on macOS, where the eager reference is not exact either."""
     cfg = load_config(REF_A1, overrides=["train.unroll=16"])
     seed_everything(0)
     model = HSN.from_config(cfg)
     model.train()
-    spread, edge = _symmetry(_window(model, _ctx()), model, 2, 16)
-    assert spread == 0.0 and edge == 0.0
-    spread, edge = _symmetry(model, model, 2, 16)  # the eager reference, for the record
-    assert spread == 0.0 and edge == 0.0
+    for window in (_window(model, _ctx()), model):  # compiled, then the eager reference
+        spread, edge = _symmetry(window, model, 2, 16)
+        if sys.platform == "darwin":
+            spread_bound, edge_bound = MACOS_SYMMETRY_BOUND_FP32
+            assert spread <= spread_bound and edge <= edge_bound, (spread, edge)
+        else:
+            assert spread == 0.0 and edge == 0.0, (spread, edge)
 
 
 # --------------------------------------------------------------------------------------------------
