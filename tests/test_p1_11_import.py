@@ -90,6 +90,8 @@ def test_p1_11_import_audit_jsons(tmp_path: Path) -> None:
     # report --imported answers "what has been run"
     table = format_markdown(build_report(db, sweep=IMPORT_SWEEP, per_seed=True))
     assert "hsn_pdg_b32_lr1e-3_bridge" in table and "does not read state" in table
+    labels = {row["label"] for row in build_report(db, imported=True, per_seed=True).rows}
+    assert labels == set(rows), "an imported run is reported under its own name"
     assert len(build_report(db, imported=False).rows) == 0
 
 
@@ -131,5 +133,10 @@ def test_p1_11_import_real_audit_directory() -> None:
     assert protocol["steps"] == 600 and protocol["diag_every"] == 25
     gru = rows["gru384x2_b32_lr3e-3"]
     assert json.loads(str(gru["verdicts_json"]))["reads_state"]["label"] == "reads state"
+    # two imported runs of one arm (the bridge and queue8 (d): same recipe, two commits) keep
+    # their own names in a per-seed report
+    labels = [row["label"] for row in build_report(db, imported=True, per_seed=True).rows]
+    assert "hsn_pdg_b32_lr1e-3_bridge" in labels and "hsn_pdg_b32_lr1e-3" in labels
+    assert rows["hsn_pdg_b32_lr1e-3_bridge"]["arm_id"] == rows["hsn_pdg_b32_lr1e-3"]["arm_id"]
     unresolved = [f for f in report.flagged if any("not resolvable" in x for x in f["flags"])]
     assert not unresolved, unresolved

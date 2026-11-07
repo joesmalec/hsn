@@ -93,7 +93,7 @@ def test_p1_11_end_to_end_cpu_sweep(tmp_path: Path, tiny_manifest: Path) -> None
     expanded = _run("expand", str(spec))
     assert "3 arms" in expanded and "hsn_stop/s0" in expanded
     added = _run("enqueue", str(spec))
-    assert "3 added, 0 skipped" in added
+    assert "(spec version 1): 3 added, 0 skipped" in added
     assert "0 added, 3 skipped" in _run("enqueue", str(spec))
 
     root = tmp_path / "runs"

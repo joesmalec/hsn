@@ -118,6 +118,17 @@ class _Watch:
         return "idle"
 
 
+def _seen(table: dict[str, dict[str, Any]], pid: int, now: float, **fields: Any) -> None:
+    """Record one sighting of a foreign process: first and last time seen, how many looks, and
+    the largest memory / CPU figure seen."""
+    entry = table.setdefault(str(pid), {"pid": pid, "first": now, "looks": 0, **fields})
+    entry["last"] = now
+    entry["looks"] += 1
+    for key in ("used_mib", "cpu"):
+        if key in fields:
+            entry[key] = max(float(entry.get(key) or 0.0), float(fields[key]))
+
+
 def _log(message: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} worker: {message}", flush=True)
 
@@ -277,7 +288,9 @@ class Worker:
         timing_live = any(r["timing"] for r in running)
         head = self.db.queued()[:1]
         timing_waiting = bool(head) and bool(head[0]["timing"])
+        fresh_cpu = False
         if (timing_live or timing_waiting) and now - self.last_cpu >= CPU_EVERY_S:
+            fresh_cpu = True
             hogs = self.machine.cpu_hogs()
             self.cpu_hogs = (
                 None
@@ -307,12 +320,10 @@ class Worker:
             if r["pgid"] is not None:
                 w.peak_mib = max(w.peak_mib, by_group.get(int(r["pgid"]), 0.0))
             for p in foreign:
-                w.foreign.setdefault(f"{p.pid}", {**p.to_json(), "time": now})
-            if r["timing"]:
+                _seen(w.foreign, p.pid, now, name=p.name, used_mib=p.used_mib)
+            if r["timing"] and fresh_cpu:
                 for pid, pct, cmd in self.cpu_hogs or []:
-                    w.cpu_foreign.setdefault(
-                        f"{pid}", {"pid": pid, "cpu": pct, "name": cmd, "time": now}
-                    )
+                    _seen(w.cpu_foreign, pid, now, name=cmd, cpu=pct)
             w.own_with.update(e for e in running_ids if e != exp_id)
             if now - w.flushed >= FLUSH_EVERY_S:
                 self._flush(exp_id)
@@ -408,9 +419,10 @@ class Worker:
         decision = decision_box.get("d")
         if claimed is None:
             reason = getattr(decision, "reason", "")
-            if reason and reason != self.last_wait and reason != "queue empty":
+            kind = re.sub(r"\d+", "#", reason)  # a changing MiB figure is not a new reason
+            if reason and kind != self.last_wait and reason != "queue empty":
                 self.log(f"waiting: {reason}")
-            self.last_wait = reason
+            self.last_wait = kind
             return None
         if isinstance(decision, Launch) and decision.bypassed_head:
             self.head_bypassed += 1

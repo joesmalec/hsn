@@ -202,13 +202,17 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
                 ["label", "arm id", "existing", "exp"],
             )
         )
+    row = db.row(
+        "SELECT COUNT(*) AS n FROM sweeps WHERE name = ? AND id <= ?", (spec.name, report.sweep_id)
+    )
+    version = int(row["n"]) if row else 1
     for m in report.imported_matches:
         print(
             f"note: {m['label']} matches imported exp {m['exp_id']} "
             "(not skipped; --skip-imported skips it)"
         )
     print(
-        f"sweep {spec.name} (version {report.sweep_id}): {len(report.added)} added, "
+        f"sweep {spec.name} (spec version {version}): {len(report.added)} added, "
         f"{len(report.skipped)} skipped"
     )
     return 0

@@ -113,7 +113,8 @@ def _select(
     if statuses is not None:
         rows = [r for r in rows if r["status"] in statuses]
     for r in rows:
-        r["label"] = labels.get((r["sweep_id"], r["arm_id"]), r["label"])
+        if not r["imported"]:  # an imported run keeps its own name (one arm can hold several)
+            r["label"] = labels.get((r["sweep_id"], r["arm_id"]), r["label"])
     return rows
 
 
@@ -241,7 +242,7 @@ def build_report(
     overrides = _distinct_overrides(rows)
     per = []
     for r in rows:
-        if r["arm_id"] in label_by_arm:
+        if r["arm_id"] in label_by_arm and not r["imported"]:
             r["label"] = label_by_arm[r["arm_id"]]
         labels = _verdict_labels(r, rules, constants_by_arm.get(r["arm_id"]))
         for name in labels:

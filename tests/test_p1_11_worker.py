@@ -358,3 +358,21 @@ def test_p1_11_worker_watches_only_its_children_and_orphans(tmp_path: Path) -> N
     card, _by_group = worker.observe()
     assert card.present is False  # the fake machine: a CPU host
     assert worker.watch[b].samples == 1
+
+
+def test_p1_11_foreign_sightings_are_counted() -> None:
+    from hsn.experiments.worker import _seen
+
+    table: dict[str, dict[str, Any]] = {}
+    _seen(table, 42, 100.0, name="dracut", cpu=60.0)
+    _seen(table, 42, 130.0, name="dracut", cpu=94.0)
+    _seen(table, 7, 130.0, name="python", used_mib=800.0)
+    assert table["42"] == {
+        "pid": 42,
+        "first": 100.0,
+        "last": 130.0,
+        "looks": 2,
+        "name": "dracut",
+        "cpu": 94.0,
+    }
+    assert table["7"]["looks"] == 1 and table["7"]["used_mib"] == 800.0
