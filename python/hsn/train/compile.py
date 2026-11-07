@@ -230,7 +230,7 @@ def _block(
     c_b: Tensor,
     s_b: Tensor,
     r_b: Tensor,
-    dense_in: tuple[Tensor, Tensor, Tensor, Tensor] | None,
+    dense_in: tuple[Tensor, Tensor] | None,
     dense_rows: Tensor | None,
     consts: WindowConsts,
     mode: StepMode,
@@ -239,8 +239,10 @@ def _block(
     """A block of consecutive positions (the compile unit): :meth:`HSN._position` at every column
     of ``z_b`` / ``c_b`` / ``s_b`` (``[B, n, …]``) with the column's reset ``r_b[:, i]``, the
     capturable round and the window's constants. ``dense_in`` are the P1.10b dense window's
-    ``(first_age, zero_age, pos [B, n], pos_after [B, n])``. Returns the final state and the
-    block's per-position stacks."""
+    ``(pos [B, n], pos_after [B, n])``: its ages are ``age`` at the block's first position (the
+    window's start age in the first block, zeros after) and zeros afterwards, made here, so that
+    no tensor is passed twice (dynamo specialises on aliased inputs). Returns the final state and
+    the block's per-position stacks."""
     state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
     n = int(z_b.shape[1])
     z_hats: list[Tensor] = []
@@ -250,11 +252,13 @@ def _block(
     hs: list[Tensor] = []
     logit_steps: list[Tensor] = []
     records: list[dict[str, Tensor]] = []
+    zero_age = torch.zeros_like(age) if dense_in is not None else None
     for i in range(n):
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
         if dense_in is not None:
-            first_age, zero_age, pos_b, after_b = dense_in
-            counters = (first_age if i == 0 else zero_age, pos_b[:, i], zero_age, after_b[:, i])
+            assert zero_age is not None
+            pos_b, after_b = dense_in
+            counters = (age if i == 0 else zero_age, pos_b[:, i], zero_age, after_b[:, i])
         result = model._position(
             state,
             r_b[:, i],
@@ -281,8 +285,8 @@ def _block(
     out = {
         "h": state.h,
         "q": state.q,
-        "age": state.age,
-        "pos": state.pos,
+        "age": state.age.contiguous(),
+        "pos": state.pos.contiguous(),  # one stride for every block (dense: a view of [B, T])
         "z_hat": torch.stack(z_hats, dim=1),
         "eps": torch.stack(epss, dim=1),
         "u": torch.stack(us, dim=1),
@@ -393,16 +397,23 @@ class CompiledWindow:
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age, pos = state.h, state.q, state.age, state.pos
+        if pro.counters is not None:  # the dense window: the first block starts at the start age
+            age = pro.counters[0]
+        if torch.is_grad_enabled() and not (h.requires_grad or q.requires_grad):
+            # One graph for every block: the later blocks receive a state that requires grad, so
+            # the first block's detached carried state becomes a leaf that does too (its gradient
+            # is computed and dropped). Otherwise the first block is a second graph to compile.
+            h = h.detach().requires_grad_(True)
+            q = q.detach().requires_grad_(True)
         blocks: list[dict[str, Tensor]] = []
         with model.cell.window():
             consts = model.cell.window_consts()
             for start in range(0, T, blk):
                 cols = slice(start, start + blk)
-                dense_in: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
+                dense_in: tuple[Tensor, Tensor] | None = None
                 if pro.counters is not None:
-                    start_age, zero_age, positions, positions_after = pro.counters
-                    first_age = start_age if start == 0 else zero_age
-                    dense_in = (first_age, zero_age, positions[:, cols], positions_after[:, cols])
+                    _, _, positions, positions_after = pro.counters
+                    dense_in = (positions[:, cols], positions_after[:, cols])
                 out = self._block(
                     model,
                     h,

@@ -59,7 +59,8 @@ state dict keys are ``router.scorer.*``). ``StepOutput.cost`` is the executed co
 the dense step as a detached 0-dim tensor (1.0 dense; the batch mean of ``Selection.cost``
 otherwise, so reading it costs no host synchronisation; the sparse round itself synchronises three
 times per position in the index checks of ``messages_selected``, ``forward_selected`` and
-``gated_delta_update``, which P2.8 gates) and ``StepOutput.selection`` the executed
+``gated_delta_update``; P2.8's capturable round skips them, ``static=True`` below) and
+``StepOutput.selection`` the executed
 :class:`~hsn.model.router.Selection` (``None`` dense). A :class:`~hsn.profiler.Profiler` passed to
 ``step`` times the P0.6 segments ``shared_path``, ``scorer``, ``messages`` / ``selected_cells``
 (sparse round only; the dense cell step is partitioned by
@@ -84,8 +85,16 @@ by branching that row to ``step_dense``, inside the masked round through an all-
 charged the dense cost in ``Selection.cost``. The masked path computes every cell, so its
 throughput is not a sparse-efficiency number.
 
+P2.8 (launch-overhead reduction, :mod:`hsn.train.compile`): :meth:`HSN.forward` is three pieces —
+:meth:`HSN._window_prologue` (the window-invariant work), :meth:`HSN._position` (the loop body:
+reset, ``P``, ``ε``, ``S``, the scorer and the round) and :meth:`HSN._window_epilogue` (the decoder,
+the statistics, ``info``) — which the compiled window reuses: it compiles blocks of
+:meth:`HSN._position` with ``static=True`` (the capturable sparse round: no host synchronisation,
+the unit bank's static pass) and the window's constants passed as tensors
+(:class:`~hsn.model.cell.WindowConsts`). The eager path is unchanged, bit for bit.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
-called until P2.7), no custom kernels (P2.9–P2.11), no ``torch.compile`` (P2.8); ``n_rounds`` is 1.
+called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
 
 from __future__ import annotations

@@ -39,8 +39,10 @@ distinctness among valid slots, as :meth:`CellGraphState.with_delta` does) unles
 ``validate=False``; :func:`csr_messages` inherits the range check of ``messages_selected`` and
 :func:`grouped_unit_mlp` the unit histogram of ``forward_selected``. :func:`gather_concat` never
 synchronises: it relies on the backend's own bounds check of ``gather`` (cpu and cuda raise; MPS
-does not), which is why the composed round runs ``csr_messages`` on the same indices first. P2.8 may
-gate these checks.
+does not), which is why the composed round runs ``csr_messages`` on the same indices first. P2.8's
+capturable round turns them off (``csr_messages(..., validate=False)``,
+``grouped_unit_mlp(..., static=True)``, ``gated_delta_update(..., validate=False)``), since its
+indices come from :meth:`hsn.model.router.Router.select`.
 """
 
 from __future__ import annotations
