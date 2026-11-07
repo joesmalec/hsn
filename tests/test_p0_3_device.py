@@ -97,7 +97,7 @@ def test_p0_3_cuda_profiles_resolve(name: str) -> None:
     assert ctx.supports_bf16 is True
     assert ctx.master_dtype is torch.float32
     assert ctx.vram_bytes == torch.cuda.mem_get_info(ctx.device)[1] > 0
-    assert ctx.compile_enabled is False
+    assert ctx.compile_enabled is (name == "rtx3060")  # P2.8: rtx3060 compiles by default
     assert ctx.profile == name
 
 
@@ -115,10 +115,14 @@ def test_p0_3_unavailable_device_raises() -> None:
             resolve(load_hardware_profile(name))
 
 
-def test_p0_3_compile_mode_rejected() -> None:
+def test_p0_3_compile_mode_resolves() -> None:
+    """P2.8: ``compile_mode`` other than ``none`` resolves with ``compile_enabled`` set (the
+    training window and the serving step compile, :mod:`hsn.train.compile`); ``none`` (every
+    shipped profile) leaves it off."""
     cpu = load_hardware_profile("cpu")
-    with pytest.raises(NotImplementedError, match="P2.8"):
-        resolve(cpu.model_copy(update={"compile_mode": "reduce-overhead"}))
+    assert not resolve(cpu).compile_enabled
+    for mode in ("reduce-overhead", "max-autotune"):
+        assert resolve(cpu.model_copy(update={"compile_mode": mode})).compile_enabled
 
 
 def test_p0_3_dtype_policy_mismatch_raises() -> None:

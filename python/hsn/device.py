@@ -83,7 +83,7 @@ class DeviceContext:
     supports_bf16: bool
     unified_memory: bool
     vram_bytes: int  # measured device memory, never the profile's nominal number
-    compile_enabled: bool = False  # torch.compile stays off until P2.8
+    compile_enabled: bool = False  # P2.8: hardware.compile_mode != none (hsn.train.compile)
     profile: str
 
 
@@ -97,13 +97,9 @@ def resolve(profile: HardwareConfig) -> DeviceContext:
 
     Raises ``RuntimeError`` when the device is unavailable, ``ValueError`` when the profile asks for
     something the device cannot do (bf16 autocast without bf16 support, autocast on the CPU, fp64 on
-    MPS, a non-unified MPS/CPU profile) and ``NotImplementedError`` for ``compile_mode != none``.
+    MPS, a non-unified MPS/CPU profile). ``compile_enabled`` is ``compile_mode != none`` (P2.8: the
+    training window and the serving step compile, :mod:`hsn.train.compile`).
     """
-    if profile.compile_mode != "none":
-        raise NotImplementedError(
-            f"profile {profile.name!r} sets compile_mode={profile.compile_mode!r}; torch.compile "
-            "stays off until P2.8 (set hardware.compile_mode=none)"
-        )
     if profile.device == "cuda":
         device, supports_bf16, vram_bytes = _resolve_cuda(profile)
     elif profile.device == "mps":
@@ -142,7 +138,7 @@ def resolve(profile: HardwareConfig) -> DeviceContext:
         supports_bf16=supports_bf16,
         unified_memory=profile.unified_memory,
         vram_bytes=vram_bytes,
-        compile_enabled=False,
+        compile_enabled=profile.compile_mode != "none",
         profile=profile.name,
     )
 

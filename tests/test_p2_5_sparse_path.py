@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn import kernels
 from hsn.config import RunConfig, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
@@ -855,7 +856,7 @@ def test_p2_5_profiler_segments(device_type: str) -> None:
     shared segments on the dense path; the ``scorer`` segment never nests in itself; the P2.1
     dense cost profile runs on the same device (it compares ``mps`` with ``mps:0``)."""
     device = _device(device_type)
-    profile_name = {"cpu": "cpu", "cuda": "rtx3060", "mps": "m_series"}[device_type]
+    profile_name = {"cpu": "cpu", "cuda": CUDA_PROFILE, "mps": "m_series"}[device_type]
     ctx = resolve(load_hardware_profile(profile_name))
     B, T = 3, 4
     _, dense_model = _model(REF_A1)
@@ -909,7 +910,7 @@ def test_p2_5_trains_with_tbptt(
 @pytest.mark.parametrize(
     "profile",
     [
-        pytest.param("rtx3060", marks=pytest.mark.cuda),
+        pytest.param(CUDA_PROFILE, marks=pytest.mark.cuda),
         pytest.param("m_series", marks=pytest.mark.mps),
     ],
 )
@@ -931,6 +932,7 @@ def test_p2_5_amp_sparse_runs(
     assert ctx.autocast_dtype is not None
     cfg = _train_config(
         f"profile={profile}",
+        "hardware.compile_mode=none",  # the eager sparse kernels, whatever the profile default
         "train.steps=4",
         "train.eval_every=2",
         "train.ckpt_every=4",

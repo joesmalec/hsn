@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn.baselines.gru import GRUBaseline
 from hsn.baselines.transformer import TransformerBaseline
 from hsn.config import RunConfig, dump_resolved, load_config, load_hardware_profile
@@ -49,7 +50,7 @@ SPEC = load_dataset_spec(REPO / "configs" / "data" / "synthetic_v1.yaml")
 UNROLL = 32  # the tiny window every test uses
 N_DOCS = 64
 
-cuda_param = pytest.param("rtx3060", marks=pytest.mark.cuda)
+cuda_param = pytest.param(CUDA_PROFILE, marks=pytest.mark.cuda)
 mps_param = pytest.param("m_series", marks=pytest.mark.mps)
 
 
@@ -574,7 +575,7 @@ def test_p0_5_autocast_policy_on_cpu() -> None:
         supports_bf16=True,
         unified_memory=False,
         vram_bytes=1,
-        profile="rtx3060",
+        profile=CUDA_PROFILE,
     )
     fp16 = DeviceContext(
         device=torch.device("mps"),

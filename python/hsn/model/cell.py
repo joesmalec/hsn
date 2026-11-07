@@ -58,6 +58,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
+from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -72,7 +73,19 @@ from hsn.model.state import CellGraphState
 from hsn.model.units import UnitBank
 from hsn.profiler import Profiler
 
-__all__ = ["PDGCell", "profiler_segment"]
+__all__ = ["PDGCell", "WindowConsts", "profiler_segment"]
+
+
+class WindowConsts(NamedTuple):
+    """The per-window constants of the cell (P2.8): the padded edge weights ``[N, D_max]``
+    (:meth:`CellGraph._padded_weights`) and ``W1`` laid out ``[4d, M·H]``
+    (:meth:`UnitBank._w1_flat`), built eagerly once per window by :meth:`PDGCell.window_consts`
+    and handed to a compiled window as tensors. The rounds read them instead of the window caches,
+    whose stamps (object id, version counter) a compiler would specialise on, and the softmax of
+    the edge weights keeps its eager backward (the exact zero edge gradient of identical cells)."""
+
+    edge_weights: Tensor
+    w1_flat: Tensor
 
 
 def _mix(alpha: Tensor, unit_out: Tensor) -> Tensor:
@@ -173,12 +186,27 @@ class PDGCell(nn.Module):
             finally:
                 self._in_window = previous
 
+    def window_consts(self) -> WindowConsts:
+        """The :class:`WindowConsts` of this window (P2.8): the same tensors the rounds of the
+        window read from the caches. Only inside :meth:`window`."""
+        if not self._in_window:
+            raise RuntimeError("PDGCell.window_consts is only available inside PDGCell.window()")
+        return WindowConsts(
+            edge_weights=self.graph._padded_weights(), w1_flat=self.units._w1_flat()
+        )
+
     # ----------------------------------------------------------------------------------------------
     # The dense round
     # ----------------------------------------------------------------------------------------------
 
     def step_dense(
-        self, u: Tensor, eps: Tensor, state: CellGraphState, alpha: Tensor
+        self,
+        u: Tensor,
+        eps: Tensor,
+        state: CellGraphState,
+        alpha: Tensor,
+        *,
+        consts: WindowConsts | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """One synchronous round for every cell: ``(h_new [B, N, d], info)``.
 
@@ -188,19 +216,25 @@ class PDGCell(nn.Module):
         tensors of the equations above (``m``, ``v``, ``unit_out [B, N, M, d]``, ``mixed``, ``c``,
         ``b``, ``h_prev``) for tests and the P1.5 reference check. The graph's step guard is held
         for the duration (``set_topology`` raises meanwhile).
+
+        ``consts`` (P2.8, a compiled window only) are the window's edge weights and ``W1`` layout,
+        read instead of the window caches (the same values); the inputs are not checked then (the
+        window validated them).
         """
-        if self._in_window:  # P1.10e: validated once by the window's caller
+        if self._in_window or consts is not None:  # P1.10e: validated once by the window
             B, N, d = (int(n) for n in state.h.shape)
         else:
             B, N, d = self._check_inputs(u, eps, state, alpha)
+        weights = None if consts is None else consts.edge_weights
+        w1_flat = None if consts is None else consts.w1_flat
         with self.graph.step():
             h_prev = state.h
-            m = self.graph.messages_dense(h_prev, self.V)  # [B, N, d]
+            m = self.graph.messages_dense(h_prev, self.V, weights=weights)  # [B, N, d]
             v_raw = torch.cat(
                 [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_prev, m], dim=-1
             )  # [B, N, 4d]
             v = self.norm(v_raw)  # P1.5a: what the units and the gate read
-            unit_out = self.units.forward_all(v)  # [B, N, M, d] (a view of [M, B·N, d])
+            unit_out = self.units.forward_all(v, w1_flat=w1_flat)  # [B, N, M, d] ([M, B·N, d])
             mixed = _mix(alpha, unit_out)  # Σ_j α_ij F_j(v_i)
             # P1.9: tanh, the gate and the convex combination run in the state's dtype. Under
             # bf16 autocast W_out and the gate emit bf16; a bf16 ``1 - b`` is rounded, the weights
@@ -235,6 +269,8 @@ class PDGCell(nn.Module):
         sel: Selection,
         *,
         profiler: Profiler | None = None,
+        static: bool = False,
+        consts: WindowConsts | None = None,
     ) -> tuple[Tensor, dict[str, Tensor | CellGraphState]]:
         """One round for the ``K`` selected cells of ``sel``: ``(h_new [B, K, d], info)``.
 
@@ -253,8 +289,16 @@ class PDGCell(nn.Module):
         ``tanh`` and the update: two entries), and ``selected_cells`` (the unit bank), the
         partition of :func:`hsn.kernels.costs.profile_dense_costs`. The graph's step guard is held
         for the duration.
+
+        ``static=True`` (P2.8) is the capturable round of a compiled window: no host
+        synchronisation (the index checks of the messages and of the update are skipped, since
+        :meth:`Router.select` guarantees in-range, distinct valid slots) and the unit bank's static
+        pass (:meth:`UnitBank.forward_static`: every unit on the ``B·K`` pairs, then a gather)
+        instead of the grouped pass with its host-side histogram. The messages, the gate and the
+        update are the same ops; the unit outputs agree to rounding. ``consts`` as in
+        :meth:`step_dense`.
         """
-        if self._in_window:  # P1.10e: validated once by the window's caller
+        if self._in_window or consts is not None or static:  # validated by the caller (P1.10e)
             B, N, d = (int(n) for n in state.h.shape)
         else:
             B, N, d = self._check_vectors(u, eps, state)
@@ -269,17 +313,33 @@ class PDGCell(nn.Module):
             valid = valid & ~self.disabled[cells]
             cells = torch.where(valid, cells, torch.zeros_like(cells))
         units = torch.where(valid, sel.unit_idx, torch.zeros_like(sel.unit_idx))
+        weights = None if consts is None else consts.edge_weights
+        w1_flat = None if consts is None else consts.w1_flat
         with self.graph.step():
             with profiler_segment(profiler, "messages", B):
                 h_prev = state.h
-                m = native.csr_messages(h_prev, self.graph, self.V, cells)  # [B, K, d]
+                if static or weights is not None:  # P2.8: no range check, window weights
+                    m = native.csr_messages(
+                        h_prev, self.graph, self.V, cells, weights=weights, validate=not static
+                    )
+                else:
+                    m = native.csr_messages(h_prev, self.graph, self.V, cells)  # [B, K, d]
                 v_raw = native.gather_concat(u, eps, h_prev, m, cells)  # [B, K, 4d]
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
-                unit_out = native.grouped_unit_mlp(
-                    v.reshape(B * K, 4 * d), units.reshape(B * K), self.units
-                ).reshape(B, K, d)
+                if static:  # P2.8: every unit on the pairs, then a gather (no histogram)
+                    unit_out = native.grouped_unit_mlp(
+                        v.reshape(B * K, 4 * d),
+                        units.reshape(B * K),
+                        self.units,
+                        static=True,
+                        w1_flat=w1_flat,
+                    ).reshape(B, K, d)
+                else:
+                    unit_out = native.grouped_unit_mlp(
+                        v.reshape(B * K, 4 * d), units.reshape(B * K), self.units
+                    ).reshape(B, K, d)
             # The second per-cell entry of a position carries no tokens (profile_dense_costs does
             # the same), so the segment's tokens stay one count per position.
             with profiler_segment(profiler, "messages", 0):
@@ -287,7 +347,9 @@ class PDGCell(nn.Module):
                 # path's mixing does; W_out recasts under autocast.
                 mixed = sel.alpha.unsqueeze(-1) * unit_out  # α_i F_j(v_i)
                 c = torch.tanh(self.W_out(mixed).to(state.dtype))  # P1.9: see step_dense
-                new_state = native.gated_delta_update(state, cells, c, b, valid)
+                new_state = native.gated_delta_update(
+                    state, cells, c, b, valid, validate=not static
+                )
         h_old = v_raw[..., 2 * d : 3 * d]  # the gathered h[cell] slice of the raw v
         h_new = torch.where(valid.unsqueeze(-1), (1 - b) * h_old + b * c, h_old).to(state.dtype)
         info: dict[str, Tensor | CellGraphState] = {

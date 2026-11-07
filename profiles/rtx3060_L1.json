@@ -1,0 +1,169 @@
+{
+ "level": "L1",
+ "profile": "rtx3060",
+ "tag": "",
+ "git_revision": "0814235b38bba190120f5514ea21b08229482856",
+ "torch": "2.15.0+cu132",
+ "config": "configs/experiments/g1_ref_a1.yaml",
+ "overrides": [
+  "model.routing=topk",
+  "train.gate_mode=ste"
+ ],
+ "config_hash": "09a60399b6a985e77a840aa0bcf1570b2cfa9158ac55d8a89732ec0f0d787a3c",
+ "routing": "topk",
+ "gate_mode": "ste",
+ "batch": 16,
+ "unroll": 256,
+ "precision": "bf16",
+ "autocast": "torch.bfloat16",
+ "compile_mode": "reduce-overhead",
+ "block": 16,
+ "card": {
+  "status": "idle",
+  "gpu_processes": [
+   [],
+   [
+    {
+     "pid": "64802",
+     "memory": "1038 MiB",
+     "name": ".venv/bin/python"
+    }
+   ]
+  ]
+ },
+ "compile": {
+  "warm_steps": 3,
+  "warm_wall_s": 130.366,
+  "compile_seconds": 130.04,
+  "compile_steps": 2,
+  "startup_step_s": 61.63,
+  "note": "compile (cold: inductor's graph caches off) and CUDA Graph recording; never inside the steady-state numbers"
+ },
+ "train_step": {
+  "steps": 60,
+  "repeats": 3,
+  "wall_ms_p50": 90.825,
+  "wall_ms_p95": 91.694,
+  "wall_ms_p50_by_repeat": [
+   90.615,
+   90.808,
+   91.169
+  ],
+  "tokens_per_s": 31336.0,
+  "launches_host": 1316,
+  "kernels_device": 31715,
+  "device_ms": 83.191,
+  "gpu_busy_fraction": 0.9159,
+  "bytes": {
+   "peak": 152208896,
+   "reserved": 736100352
+  },
+  "launch_definitions": {
+   "launches_host": [
+    "cuLaunchKernel",
+    "cuLaunchKernelEx",
+    "cudaGraphLaunch",
+    "cudaLaunchKernel",
+    "cudaLaunchKernelExC",
+    "cudaMemcpyAsync",
+    "cudaMemsetAsync"
+   ],
+   "kernels_device": [
+    "gpu_memcpy",
+    "gpu_memset",
+    "kernel"
+   ]
+  }
+ },
+ "serving_step": [
+  {
+   "batch": 1,
+   "tokens": 200,
+   "latency_ms_p50": 0.3819,
+   "latency_ms_p95": 0.398,
+   "launches_host_per_token": 2,
+   "compile_s": 3.758
+  },
+  {
+   "batch": 16,
+   "tokens": 200,
+   "latency_ms_p50": 0.3663,
+   "latency_ms_p95": 0.3788,
+   "launches_host_per_token": 2,
+   "compile_s": 3.444
+  }
+ ],
+ "segments": {
+  "shared_path": {
+   "kernels_device": 6013.1,
+   "device_ms": 16.622,
+   "share_of_step": 0.183
+  },
+  "scorer": {
+   "kernels_device": 7489.2,
+   "device_ms": 13.076,
+   "share_of_step": 0.144
+  },
+  "messages": {
+   "kernels_device": 8557.6,
+   "device_ms": 16.741,
+   "share_of_step": 0.1843
+  },
+  "selected_cells": {
+   "kernels_device": 3189.1,
+   "device_ms": 24.452,
+   "share_of_step": 0.2692
+  },
+  "decode": {
+   "kernels_device": 19.0,
+   "device_ms": 0.388,
+   "share_of_step": 0.0043
+  },
+  "loss": {
+   "kernels_device": 65.0,
+   "device_ms": 0.153,
+   "share_of_step": 0.0017
+  },
+  "optimizer": {
+   "kernels_device": 295.0,
+   "device_ms": 0.834,
+   "share_of_step": 0.0092
+  },
+  "grad_accumulation": {
+   "kernels_device": 340.0,
+   "device_ms": 1.482,
+   "share_of_step": 0.0163
+  },
+  "other": {
+   "kernels_device": 5558.9,
+   "device_ms": 15.535,
+   "share_of_step": 0.171
+  }
+ },
+ "attribution": {
+  "method": "L1: inductor kernel provenance (origin-node stack traces) in a pass of the same kernels without CUDA Graphs; eager parts by Python stacks; segment from the HSN frames of the stack",
+  "kernels_total": 31527,
+  "unattributed_kernels": 789,
+  "unattributed_device_ms": 1.113,
+  "unattributed_top": {
+   "void at::native::vectorized_elementwise_kernel<2, at::native": 779,
+   "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<": 10
+  },
+  "other_top_ms": {
+   "eager (no hsn frame) / aten::scatter_reduce_": 5.891,
+   "eager (no hsn frame) / aten::_index_put_impl_": 1.718,
+   "eager (no hsn frame) / aten::_assert_async": 1.179,
+   "(no host) void at::native::vectorized_elementwise_kernel<2, ": 1.053,
+   "eager compile.py:227 _block_2 / aten::scatter_reduce_": 0.861,
+   "eager (no hsn frame) / aten::aminmax": 0.774,
+   "compile.py:268 _block_0 | compile.py:268 _block_2 | compile.py:269 _block_0": 0.398,
+   "hsn.py:277 _stack_record": 0.35,
+   "eager (no hsn frame) / aten::lt": 0.331,
+   "hsn.py:1073 _selection_record | hsn.py:277 _stack_record": 0.327,
+   "eager (no hsn frame) / aten::ge": 0.313,
+   "eager compile.py:443 joined / aten::cat": 0.256
+  },
+  "bytes_note": "allocator peak/reserved per step only; not separable per segment inside one window; DRAM traffic not measured"
+ },
+ "decision": "L2 justified: yes \u2014 selected_cells is 26.9% of step time after L1"
+}
