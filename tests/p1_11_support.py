@@ -161,3 +161,39 @@ def fake_repo(root: Path, *, manifest: bytes | None = None) -> Path:
     target = repo / "data" / "synthetic_v1" / "manifest.json"
     target.write_bytes(GOLDEN_MANIFEST.read_bytes() if manifest is None else manifest)
     return repo
+
+
+def dry_spec(root: Path, *, n: int = 4, name: str = "dry", **protocol: Any) -> Path:
+    """A spec of ``n`` dry-run arms (no training, no data) of the tiny HSN on ``profile:cpu``."""
+    raw = {
+        "name": name,
+        "base": {
+            "config": str(REF_A1),
+            "overrides": [*TINY_HSN_OVERRIDES, *train_overrides(steps=4, eval_every=2)],
+        },
+        "protocol": {"name": "dry_run", **protocol},
+        "seeds": list(range(n)),
+        "arms": [{"name": "a", "family": "hsn"}],
+    }
+    return write_yaml(root / f"{name}.yaml", raw)
+
+
+def enqueue_spec(db: Any, path: Path, **kwargs: Any) -> Any:
+    """Expand ``path`` and enqueue its arms into ``db`` (what the CLI's ``enqueue`` does)."""
+    from hsn.experiments.db import enqueue_arms
+    from hsn.experiments.rules import parse_rules
+    from hsn.experiments.spec import digest, expand, load_spec
+
+    spec, text = load_spec(path)
+    arms = expand(spec)
+    rules = parse_rules(spec.rules)
+    return enqueue_arms(
+        db,
+        name=spec.name,
+        spec_hash=digest(spec.model_dump(mode="json")),
+        spec_text=text,
+        spec_path=str(path),
+        rules_json={"verdicts": rules.verdicts_json(), "early_stop": rules.early_stop_json()},
+        arms=arms,
+        **kwargs,
+    )
