@@ -1,0 +1,151 @@
+# P1.11 validation sweep: the harness's reads-state protocol must reproduce the verdicts of four
+# audit runs (JSONs in /home/joe/hsn-eff/evidence/EFF/reads_state/, branch hsn-efficiency). The
+# recipe is the one those runs recorded: the 5(b) recipe at batch 32 (configs/experiments/
+# g1_ref_a1.yaml: bf16 autocast, weight decay 0.01, cosine schedule, 200 warm-up steps, grad_clip 1.0)
+# on delayed/in_range alone, 3,000 steps, dev evaluation every 500 steps, statistics every 100,
+# diagnostics every 500 steps on 4 dev documents, trained_state on 32, seed 0; the GRU controls add
+# the same schedule keys to configs/baselines/gru_2m.yaml at lr 3e-3. New here: evaluation at 128
+# parallel streams and the batched edit probe (64 rows), which change rounding only.
+#
+# The expected results are fixed here, before the run (constants per arm): the same reads-state
+# verdict as the reference and final dev accuracy within +-0.03 of it ("matches_reference"); for the
+# HSN bridge also the bridge rule of 6 Nov (does not read state, memory open at every diagnostic from
+# step 1,000, dev 0.0696 +- 0.03 and loss 3.619 +- 0.05; "bridge_6nov") and bitwise identical dense
+# cells ("cells_identical"). The eager bridge (exp 46) missed bridge_6nov on loss (3.513); the user
+# then set the rule "bridge" (7 Nov, before the compiled bridge ran; provenance at the rule). The compiled bridge (coordinator's request, 7 Nov) needs P2.8: on
+# a checkout without it, resolving hardware.compile_mode=reduce-overhead raises, the arm fails, and
+# it is requeued by its unchanged arm id once P2.8 is merged. Both bridge arms run as timing arms
+# (alone on an idle card and an idle CPU) and give the time per reads-state experiment.
+#
+#   python -m hsn.experiments enqueue configs/sweeps/p1_11_validation.yaml
+#   python -m hsn.experiments worker --exit-when-empty
+#   python -m hsn.experiments report --spec configs/sweeps/p1_11_validation.yaml --per-seed
+
+name: p1_11_validation
+description: P1.11 validation of the reads-state protocol against four audit runs
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=none # pinned: profile:rtx3060 compiles by default once P2.8 is merged
+    - train.batch=32
+    - train.micro_batch=32
+    - train.steps=3000
+    - train.eval_every=500
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+families:
+  gru:
+    config: configs/baselines/gru_2m.yaml
+    overrides:
+      - train.warmup_steps=200
+      - train.weight_decay=0.01
+      - train.schedule=cosine
+      - train.grad_clip=1.0
+      - train.lr=0.003
+protocol:
+  name: reads_state
+  diag_every: 500
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+constants:
+  chance: 0.0208333 # 1 / 48 value symbols
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    memory_open_from_1000: {preset: memory_open, from_step: 1000}
+    # the user's windowed rule (7 Nov): at each multiple of 500, the median over the diagnostics
+    # within 100 steps (9 samples at diag_every 25; one sample at diag_every 500, as exp 46 ran)
+    memory_open_windowed: {preset: memory_open, window: 100, to_step: 3000}
+    matches_reference:
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "verdict:reads_state", op: "==", value: expect}
+              - metric: "eval:delayed/in_range/accuracy"
+                steps: {at: 3000}
+                op: between
+                value: ["ref_dev - 0.03", "ref_dev + 0.03"]
+      default: fail
+    # the bridge rule (user decision, 7 Nov 2026, relayed by the coordinator after exp 46 missed the
+    # 6 Nov rule's loss bound): a bridge arm, eager or compiled, is comparable with the audit's runs
+    # when it does not read state, its memory is open (windowed median), its cells are identical, and
+    # its final dev accuracy and loss lie in the range of the three eager runs of this recipe ((d)
+    # 0.0607 / 3.655 at 8b290e0, the audit's bridge 0.0696 / 3.619 at f8884ec, exp 46 0.0945 / 3.513
+    # at 4a5d120) widened by half its width on each side; the harness is validated separately by the
+    # deterministic equivalence test (configs/sweeps/p1_11_equivalence.yaml)
+    bridge:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "verdict:reads_state", op: "==", value: "does not read state"}
+              - {metric: "verdict:memory_open_windowed", op: "==", value: open}
+              - {metric: "verdict:cells_identical", op: "==", value: identical}
+              - metric: "eval:delayed/in_range/accuracy"
+                steps: {at: 3000}
+                op: between
+                value: [0.044, 0.112]
+              - metric: "eval:delayed/in_range/loss"
+                steps: {at: 3000}
+                op: between
+                value: [3.44, 3.73]
+      default: fail
+    # the bridge rule of 6 Nov (audit log, before the bridge run), kept for the record: its loss
+    # bound came from the single (d)-to-bridge pair and lies below this recipe's run-to-run spread
+    bridge_6nov:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "verdict:reads_state", op: "==", value: "does not read state"}
+              - {metric: "verdict:memory_open_from_1000", op: "==", value: open}
+              - metric: "eval:delayed/in_range/accuracy"
+                steps: {at: 3000}
+                op: between
+                value: [0.0396, 0.0996]
+              - metric: "eval:delayed/in_range/loss"
+                steps: {at: 3000}
+                op: between
+                value: [3.569, 3.669]
+      default: fail
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+arms:
+  - name: gru384x2_b32_lr3e-3
+    family: gru
+    constants: {expect: reads state, ref_dev: 0.7347}
+  - name: gru128x1_b32_lr3e-3
+    family: gru
+    overrides: [baseline.gru.d_model=128, baseline.gru.n_layers=1]
+    constants: {expect: reads state, ref_dev: 0.6124}
+  - name: gru64x1_b32_lr3e-3
+    family: gru
+    overrides: [baseline.gru.d_model=64, baseline.gru.n_layers=1]
+    constants: {expect: does not read state, ref_dev: 0.0193}
+  - name: hsn_pdg_b32_lr1e-3_bridge
+    family: hsn
+    overrides: [train.lr=0.001]
+    timing: true
+    constants: {expect: does not read state, ref_dev: 0.0696}
+  - name: hsn_pdg_b32_lr1e-3_bridge_compiled
+    family: hsn
+    overrides: [train.lr=0.001, hardware.compile_mode=reduce-overhead]
+    protocol: {diag_every: 25} # the windowed memory-open rule needs diagnostics every 25 steps
+    timing: true
+    constants: {expect: does not read state, ref_dev: 0.0696}

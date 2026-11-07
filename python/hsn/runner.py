@@ -9,6 +9,7 @@ assumed"), §2.10 (cost arithmetic), Track E (evidence packages).
     hsn run     --config configs/<x>.yaml --seeds 0,1,2,3,4 --profile cpu --out runs/
     hsn rerun   runs/<run_id> [--tolerance 0]     # retrains from the resolved config; exact on cpu
     hsn package --gate G0 --runs runs/<a> runs/<b> ... --out evidence/G0.zip
+    hsn sweep   <command> ...                     # P1.11 sweeps (docs/sweeps.md)
 
 The runner wires config (P0.2) → device (P0.3) → data (P0.4) → model (the registry below: the P0.5
 baselines and, since P1.9, the P1.5 HSN) → trainer (:func:`make_trainer`: the P1.7 TBPTT trainer for
@@ -872,12 +873,20 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NAME=PATH",
         help="extra file to include at the package root (e.g. decision.json=...)",
     )
+
+    sweep = sub.add_parser("sweep", help="experiment sweeps (P1.11; python -m hsn.experiments)")
+    sweep.add_argument("args", nargs=argparse.REMAINDER, help="hsn.experiments.cli arguments")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point of the ``hsn`` console script; returns the exit code."""
-    args = _parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["sweep"]:  # P1.11: everything after "sweep" belongs to hsn.experiments.cli
+        from hsn.experiments.cli import main as sweep_main
+
+        return sweep_main(raw[1:])
+    args = _parser().parse_args(raw)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "run":
