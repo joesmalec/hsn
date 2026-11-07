@@ -633,10 +633,10 @@ def main() -> None:
 
     # warm-up (compile and record at L1), then the timed plain steps
     started = time.perf_counter()
+    reset_peak(ctx.device)  # the peak covers the warm-up too: L1's CUDA Graph pools are made there
     warm = trainer.fit(train_ds, dev_ds, args.warm)
     warm_s = time.perf_counter() - started
     horizon = args.warm + args.repeats * args.steps + 1  # the last step of a fit is a stats step
-    reset_peak(ctx.device)
     history = trainer.fit(train_ds, dev_ds, horizon)
     memory = memory_stats(ctx.device)
     timed = [
