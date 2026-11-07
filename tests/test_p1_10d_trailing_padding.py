@@ -21,7 +21,7 @@ from hsn.config import RunConfig, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
 from hsn.device import DeviceContext, resolve, seed_everything, set_deterministic
-from hsn.model.hsn import HSN, StepOutput
+from hsn.model.hsn import HSN
 from hsn.model.state import CellGraphState
 from hsn.runner import build_model, make_trainer
 from hsn.train import tbptt
@@ -162,9 +162,9 @@ def _script(
     seen: list[int] = []
     original = trainer._forward
 
-    def forward(batch: Batch, state: Any) -> Any:
+    def forward(batch: Batch, state: Any, **kwargs: Any) -> Any:
         seen.append(int(batch["tokens"].shape[1]))
-        return original(batch, state)
+        return original(batch, state, **kwargs)
 
     monkeypatch.setattr(trainer, "_loader", lambda *args, **kwargs: _Scripted(windows))
     monkeypatch.setattr(trainer, "evaluate", lambda *args, **kwargs: {})
@@ -181,7 +181,8 @@ def _script(
 class _Run:
     """What one training run computed: per window (``windows``) the computed columns, the reset
     mask, the state handed in and returned, the logits and the info; every position's state in
-    order (``positions``); the gradients of every step before clipping (``grads``)."""
+    order (``positions``: the state after position ``t`` of each window); the gradients of every
+    step before clipping (``grads``)."""
 
     trainer: TBPTTTrainer
     steps: list[TBPTTStepRecord] = field(default_factory=list)
@@ -197,10 +198,23 @@ def _train(
     trainer = TBPTTTrainer(model, cfg, ctx, run_dir=run_dir)
     run = _Run(trainer)
     original_forward = trainer._forward
+    # P1.10a: HSN.forward no longer calls HSN.step per position; the state after position t is
+    # the state the dense round at t + 1 reads (these windows reset at t = 0 only), and the carry
+    rounds: list[CellGraphState] = []
+    original_dense = model.cell.step_dense
 
-    def forward(batch: Batch, state: CellGraphState) -> Any:
+    def step_dense(u: Tensor, eps: Tensor, state: CellGraphState, alpha: Tensor) -> Any:
+        rounds.append(_copy(state))
+        return original_dense(u, eps, state, alpha)
+
+    def forward(batch: Batch, state: CellGraphState, **kwargs: Any) -> Any:
         first = len(run.positions)
-        logits, new_state, info = original_forward(batch, state)
+        assert not bool(batch["reset"][:, 1:].any()), "a reset after t = 0 inside the window"
+        rounds.clear()
+        logits, new_state, info = original_forward(batch, state, **kwargs)
+        assert len(rounds) == int(batch["tokens"].shape[1])
+        run.positions.extend(rounds[1:])
+        run.positions.append(_copy(new_state))
         run.windows.append(
             {
                 "T": int(batch["tokens"].shape[1]),
@@ -214,13 +228,6 @@ def _train(
         )
         return logits, new_state, info
 
-    original_step = model.step
-
-    def step(*args: Any, **kwargs: Any) -> StepOutput:
-        out = original_step(*args, **kwargs)
-        run.positions.append(_copy(out.state))
-        return out
-
     params = list(model.parameters())
     original_clip = torch.nn.utils.clip_grad_norm_
 
@@ -229,7 +236,7 @@ def _train(
         return original_clip(*args, **kwargs)
 
     trainer._forward = forward  # type: ignore[method-assign]
-    model.step = step  # type: ignore[method-assign]
+    model.cell.step_dense = step_dense  # type: ignore[method-assign]
     trainer.evaluate = lambda *args, **kwargs: {}  # type: ignore[method-assign]
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(torch.nn.utils, "clip_grad_norm_", clip)
@@ -271,14 +278,26 @@ def test_p1_10_truncated_window_same_loss_and_carry(
 ) -> None:
     """Six steps of two windows each, every window cut (documents of 16 to 28 positions in a
     32-position window), against the same run with the cut patched away: the same losses, parts,
-    gradients, weights and optimiser moments (bit for bit on the CPU, at 1e-5 under bf16 autocast
-    on CUDA), the same logits and info stacks on the computed columns, a carry out of every cut
-    window equal to the uncut window's state at the cut, and after the next window's reset the
-    same (zero) start state, although the raw carries differ."""
+    gradients, weights and optimiser moments, the same logits and info stacks on the computed
+    columns, a carry out of every cut window equal to the uncut window's state at the cut, and after
+    the next window's reset the same (zero) start state, although the raw carries differ.
+
+    The floats agree to rounding, not bit for bit: since P1.10a ``HSN.forward`` runs E and D over
+    the window ``[B, T]``, and a cut window (``T = c``) rounds its GEMMs differently from the full
+    one (``T = 32``). The tolerance is P1.10a's window tolerance (fp64 1e-12, fp32 1e-5; 1e-5
+    under bf16 autocast on CUDA); integers and the reset zeros stay exact. The weights after the six
+    Adam steps take 1e-4 in fp32, except the edge logits: with the perturbed (non-uniform) edge
+    weights a row sums identical cell messages only to rounding, so the edge logits' gradients are
+    rounding noise of about 1e-9, near Adam's ``eps``, and their post-Adam weight measures Adam's
+    amplification of that noise (1.4e-5 here, 1.5e-4 on other CPUs), not the cut. Their gradients
+    are compared with every other gradient; in fp64 every weight is compared at 1e-12 (1.4e-13
+    measured). Unperturbed, the edge logits' gradients are exactly 0 (the dense symmetry)."""
     if profile == "rtx3060" and not torch.cuda.is_available():
         pytest.skip("no CUDA device on this machine")
     ctx = _ctx(profile, master)
-    exact = ctx.device.type == "cpu"
+    exact = ctx.device.type == "cpu"  # deterministic kernels: the CPU always is
+    tol = 1e-12 if exact and ctx.master_dtype == torch.float64 else 1e-5
+    weight_tol = tol if exact and ctx.master_dtype == torch.float64 else 1e-4
     cfg = _config(
         "train.steps=6",
         "train.stats_every=3",
@@ -288,16 +307,18 @@ def test_p1_10_truncated_window_same_loss_and_carry(
     )
     docs = _docs(SHORT, 48)
 
-    def same(a: Any, b: Any, what: str) -> None:
+    def same(a: Any, b: Any, what: str, within: float | None = None) -> None:
         if not isinstance(a, Tensor):  # a module's extra state
             assert a == b, what
-        elif exact:
+        elif not a.is_floating_point():
             assert a.dtype == b.dtype and torch.equal(a, b), what
         else:
-            torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5, msg=what)
+            assert a.dtype == b.dtype, what
+            bound = tol if within is None else within
+            torch.testing.assert_close(a, b, atol=bound, rtol=bound, msg=lambda m: f"{what}: {m}")
 
     def same_float(a: float, b: float, what: str) -> None:
-        assert (a == b) if exact else a == pytest.approx(b, rel=1e-5, abs=1e-6), (what, a, b)
+        assert a == pytest.approx(b, rel=tol, abs=tol), (what, a, b)
 
     cut = _train(cfg, ctx, docs, tmp_path / "cut", 6)
     with pytest.MonkeyPatch.context() as patch:
@@ -329,8 +350,8 @@ def test_p1_10_truncated_window_same_loss_and_carry(
             same_float(a.stats[name], b.stats[name], f"step {a.step} stat {name}")
         assert a.stats["window_positions"] == sum(columns[2 * index : 2 * index + 2]) / 2
         assert b.stats["window_positions"] == UNROLL
-        if exact:  # a maximum over a prefix of the same positions
-            assert a.stats["state_abs_max"] <= b.stats["state_abs_max"]
+        if exact:  # a maximum over a prefix of the same positions (to rounding)
+            assert a.stats["state_abs_max"] <= b.stats["state_abs_max"] + tol
     assert any(key.startswith("term_grad_norm/") for key in cut.steps[2].stats)
 
     # the gradients of every step (before clipping), the weights and the optimiser moments
@@ -342,7 +363,9 @@ def test_p1_10_truncated_window_same_loss_and_carry(
                 same(ga, gb, f"step {step} gradient {i}")
     weights_a, weights_b = cut.trainer.model.state_dict(), full.trainer.model.state_dict()
     for key, value in weights_a.items():
-        same(value, weights_b[key], f"weight {key}")
+        if key == "cell.graph.edge_logit" and ctx.master_dtype != torch.float64:
+            continue  # rounding-noise gradients amplified by Adam (docstring); gradients checked
+        same(value, weights_b[key], f"weight {key}", weight_tol)
     moments_a = cut.trainer.optimizer.state_dict()["state"]
     moments_b = full.trainer.optimizer.state_dict()["state"]
     for index, entry in moments_a.items():
@@ -493,9 +516,9 @@ def test_p1_10_full_windows_when_routed_or_unaligned(
     seen: list[tuple[int, int]] = []
     original = trainer._forward
 
-    def forward(batch: Batch, state: Any) -> Any:
+    def forward(batch: Batch, state: Any, **kwargs: Any) -> Any:
         seen.append((int(batch["tokens"].shape[1]), trailing_cut(batch)))
-        return original(batch, state)
+        return original(batch, state, **kwargs)
 
     monkeypatch.setattr(trainer, "_forward", forward)
     history = trainer.fit(ds, ds, 3)
@@ -541,9 +564,9 @@ def test_p1_10_baselines_keep_full_windows(
     seen: list[tuple[int, int]] = []
     original = trainer._forward
 
-    def forward(batch: Batch, state: Any) -> Any:
+    def forward(batch: Batch, state: Any, **kwargs: Any) -> Any:
         seen.append((int(batch["tokens"].shape[1]), trailing_cut(batch)))
-        return original(batch, state)
+        return original(batch, state, **kwargs)
 
     monkeypatch.setattr(trainer, "_forward", forward)
     ds = ByteDataset(_docs(SHORT, 16))

@@ -56,6 +56,7 @@ scatter and the ``q`` update are one kernel boundary; the tick (``age += 1`` els
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Iterator
 from contextlib import AbstractContextManager
 
 import torch
@@ -136,6 +137,20 @@ class PDGCell(nn.Module):
         if self.disabled_cells:
             disabled[list(self.disabled_cells)] = True
         self.register_buffer("disabled", disabled, persistent=False)
+
+    # ----------------------------------------------------------------------------------------------
+    # A window of rounds (P1.10a)
+    # ----------------------------------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def window(self) -> Iterator[None]:
+        """A window of positions (:meth:`hsn.model.hsn.HSN.forward` holds it around its loop): the
+        graph's step guard is held and the work that depends on the parameters only (the edge
+        weights, :meth:`CellGraph.window`) is done once for the window. The rounds themselves are
+        unchanged, and ``step_dense`` / ``step_sparse`` are still called once per position (tests
+        and diagnostics wrap them). Nothing is cached beyond the window."""
+        with self.graph.window():
+            yield
 
     # ----------------------------------------------------------------------------------------------
     # The dense round
