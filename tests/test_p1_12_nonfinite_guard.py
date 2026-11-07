@@ -35,6 +35,9 @@ from hsn.config import RunConfig, load_config
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
 from hsn.device import resolve, seed_everything
+from hsn.experiments.protocols import ArmRun, run_protocol
+from hsn.experiments.rules import evaluate_verdicts, parse_rules
+from hsn.experiments.spec import protocol_params
 from hsn.losses import assemble_terms
 from hsn.model.hsn import HSN
 from hsn.train import compile as compile_mod
@@ -42,6 +45,12 @@ from hsn.train import loop, tbptt
 from hsn.train.compile import compile_window
 from hsn.train.loop import History, Trainer
 from hsn.train.tbptt import TBPTTStepRecord, TBPTTTrainer
+from p1_11_support import (
+    TINY_HSN_OVERRIDES,
+    disk_overrides,
+    restore_determinism,  # noqa: F401  (fixture)
+    tiny_manifest,  # noqa: F401  (fixture)
+)
 from torch import Tensor
 
 REPO = Path(__file__).resolve().parents[1]
@@ -160,12 +169,32 @@ def _inf(grad: Tensor) -> Tensor:
     return torch.full_like(grad, math.inf)
 
 
+def _poison(
+    kind: str | None,
+    out: Mapping[str, Tensor],
+    batch: Mapping[str, Tensor],
+    cfg: RunConfig,
+    extras: Mapping[str, Tensor] | None,
+) -> dict[str, Tensor]:
+    """:func:`hsn.losses.assemble_terms` of one window, poisoned by ``kind``: ``nan_objective``
+    multiplies the task term by NaN; ``inf_gradient`` keeps the objective finite and returns an
+    infinite gradient for the logits; ``None`` leaves it alone."""
+    if kind == INF_GRADIENT:
+        logits = out["logits"] * 1.0
+        logits.register_hook(_inf)
+        return assemble_terms({**out, "logits": logits}, batch, cfg, extras)
+    terms = assemble_terms(out, batch, cfg, extras)
+    if kind == NAN_OBJECTIVE:
+        return {**terms, "task": terms["task"] * math.nan}
+    assert kind is None, kind
+    return terms
+
+
 def _plant(monkeypatch: pytest.MonkeyPatch, trainer: Trainer, plan: Mapping[int, str]) -> None:
-    """Poison the objective of the TBPTT trainer's windows at the steps of ``plan`` (step -> kind):
-    ``nan_objective`` multiplies the task term by NaN; ``inf_gradient`` keeps the objective finite
-    and returns an infinite gradient for the logits. The trainer assembles its objective eagerly
-    (outside the compiled blocks), so the poison reaches every parameter through the backward,
-    compiled blocks included. Each call wraps the real :func:`hsn.losses.assemble_terms`."""
+    """Poison the objective of the TBPTT trainer's windows at the steps of ``plan`` (step -> kind,
+    :func:`_poison`). The trainer assembles its objective eagerly (outside the compiled blocks), so
+    the poison reaches every parameter through the backward, compiled blocks included. Each call
+    wraps the real :func:`hsn.losses.assemble_terms`."""
 
     def planted(
         out: Mapping[str, Tensor],
@@ -173,16 +202,26 @@ def _plant(monkeypatch: pytest.MonkeyPatch, trainer: Trainer, plan: Mapping[int,
         cfg: RunConfig,
         extras: Mapping[str, Tensor] | None = None,
     ) -> dict[str, Tensor]:
-        kind = plan.get(trainer.step + 1)  # the windows of step n run while trainer.step == n - 1
-        if kind == INF_GRADIENT:
-            logits = out["logits"] * 1.0
-            logits.register_hook(_inf)
-            return assemble_terms({**out, "logits": logits}, batch, cfg, extras)
-        terms = assemble_terms(out, batch, cfg, extras)
-        if kind == NAN_OBJECTIVE:
-            return {**terms, "task": terms["task"] * math.nan}
-        assert kind is None, kind
-        return terms
+        # the windows of step n run while trainer.step == n - 1
+        return _poison(plan.get(trainer.step + 1), out, batch, cfg, extras)
+
+    monkeypatch.setattr(tbptt, "assemble_terms", planted)
+
+
+def _plant_by_call(monkeypatch: pytest.MonkeyPatch, plan: Mapping[int, str]) -> None:
+    """:func:`_plant` for a trainer built out of reach (a sweep protocol builds its own): ``plan``
+    maps the n-th call of the TBPTT trainer's assembly to a kind. On the eager path with one
+    window per step (``train.grad_accum = 1``) the n-th call is step n's window."""
+    calls = [0]
+
+    def planted(
+        out: Mapping[str, Tensor],
+        batch: Mapping[str, Tensor],
+        cfg: RunConfig,
+        extras: Mapping[str, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
+        calls[0] += 1
+        return _poison(plan.get(calls[0]), out, batch, cfg, extras)
 
     monkeypatch.setattr(tbptt, "assemble_terms", planted)
 
@@ -513,6 +552,61 @@ def test_p1_12_checkpoint_counters(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     bad = _rewrite(gru_path, tmp_path / "gru_bad.pt", skipped_nonfinite=-1)
     with pytest.raises(ValueError, match="skipped_nonfinite"):
         _gru_trainer(gru_cfg, tmp_path / "gru_bad").resume(bad)
+
+
+# --------------------------------------------------------------------------------------------------
+# P1.11's run record
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("restore_determinism")
+def test_p1_12_sweep_record_carries_skips(
+    tiny_manifest: Path,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The count reaches P1.11's run record (the field agreed with P1.11): a ``train_eval`` arm
+    with an infinite gradient at step 2 of 4 completes, its record carries
+    ``final.skipped_nonfinite_steps = 1`` (and ``measured``), its ``train`` series shows the
+    skipped step's norm as missing, and a verdict rule on ``final:skipped_nonfinite_steps`` reads
+    it."""
+    cfg = load_config(REF_A1, [*TINY_HSN_OVERRIDES, *disk_overrides(tiny_manifest, steps=4)])
+    arm = ArmRun(
+        cfg=cfg,
+        family="hsn",
+        variant="pdg",
+        variant_params={},
+        params=protocol_params({"name": "train_eval"}),
+        run_dir=tmp_path / "arm",
+        rules=parse_rules(None),
+        constants={},
+    )
+    _plant_by_call(monkeypatch, {2: INF_GRADIENT})
+    record = run_protocol(arm)
+    assert record["final"]["steps"] == 4 and record["stopped"] is None
+    assert record["final"]["skipped_nonfinite_steps"] == 1.0
+    assert record["measured"]["skipped_nonfinite_steps"] == 1.0
+    assert [t["grad_norm"] is None for t in record["train"]] == [False, True, False, False]
+    rules = parse_rules(
+        {
+            "verdicts": {
+                "guard": {
+                    "cases": [
+                        {
+                            "label": "skipped",
+                            "when": {
+                                "metric": "final:skipped_nonfinite_steps",
+                                "op": ">",
+                                "value": 0,
+                            },
+                        }
+                    ],
+                    "default": "clean",
+                }
+            }
+        }
+    )
+    assert evaluate_verdicts(rules, record, {}, "hsn")["guard"]["label"] == "skipped"
 
 
 # --------------------------------------------------------------------------------------------------
