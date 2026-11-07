@@ -39,8 +39,9 @@ window loop::
   one-at-a-time rule is the configuration's and the assembly's.
 * **Statistics.** Every :class:`TBPTTStepRecord` carries the λ-weighted loss ``parts`` (mean over
   the step's windows), the model's own statistics from ``info`` (``state_abs_max`` over the step,
-  ``eps_mean`` = mean |ε| and ``alpha_entropy``, means over positions and windows) and the global
-  gradient norm before clipping. Every ``train.stats_every`` steps (and at the last step) the record
+  ``eps_mean`` = mean |ε| and ``alpha_entropy``, means over windows and over the positions each
+  window computes: a window cut by P1.10d excludes its all-padding tail) and the global gradient
+  norm before clipping. Every ``train.stats_every`` steps (and at the last step) the record
   also carries ``grad_norm/<group>``, the pre-clip norm per parameter group, one group per top-level
   submodule of the model (``byte_emb``, ``ctx_emb``, ``encoder``, ``predictor``, ``shared``,
   ``cell``, ``router``, ``decoder``; a group without gradients, such as ``halting`` while
@@ -92,6 +93,26 @@ window loop::
   of every cell over the window's non-padding positions and, on a probe window, the mean target of
   the measured cells. Step records then carry ``probe_windows``, ``probe_pairs`` and
   ``probe_positions`` (rollout positions per row, summed).
+
+* **Trailing padding (P1.10d).** Under ``data.align_docs`` every document starts at a window
+  boundary, so a window whose rows have all ended their documents is padding in every row from some
+  column ``c`` on, and the next window resets every row at ``t = 0``. The trainer then computes only
+  the columns ``[0, c)`` (:func:`trailing_cut`, from the CPU window: no device synchronisation).
+  This is exact under dense routing: the columns before ``c`` run the same operations on the same
+  inputs, every dense-routing term (task over ``loss_mask``, pred and the variance floor over
+  ``doc >= 0``, graph over the parameters) gets exact zeros from the padding tail, and the carried
+  state, which is the state at column ``c − 1`` instead of after the padding, is zeroed by the next
+  window's reset (:meth:`~hsn.model.state.CellGraphState.reset` fills ``h``, ``q``, ``age`` and
+  ``pos``). The trainer checks that reset: a window that follows a cut window and does not reset
+  every row at ``t = 0`` raises before anything reads the carried state, and the check survives a
+  checkpoint (``extra["cut_pending"]``). Routed runs (masked and sparse rounds) keep full windows,
+  because there the padding tail is not inert: the cost and balance terms average over every
+  position, the REINFORCE log-probability sums over them, :class:`~hsn.train.lazy_adam.LazyAdamW`
+  steps the units any position executed, and the selection's random draws are taken per position.
+  The probes of P2.3 run only in routed runs and always see the full window.
+  ``stats["window_positions"]`` is the mean number of columns a step's windows computed
+  (``train.unroll`` without a cut); ``state_abs_max``, ``eps_mean`` and ``alpha_entropy`` are over
+  the computed positions.
 
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
 non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
@@ -151,7 +172,7 @@ from hsn.train.probes import (
 )
 from hsn.train.schedules import SelectionSchedule
 
-__all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer"]
+__all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer", "trailing_cut"]
 
 logger = logging.getLogger("hsn.train.tbptt")
 
@@ -160,14 +181,53 @@ Batch = dict[str, Tensor]
 STAT_KEYS: tuple[str, ...] = ("state_abs_max", "eps_mean", "alpha_entropy")
 
 
+def trailing_cut(window: Mapping[str, Tensor]) -> int:
+    """The number of leading columns of a loader ``window`` the trainer computes (P1.10d, module
+    docstring): ``T``, or ``c = 1 +`` the last column where some row holds a document position
+    (``doc >= 0``) when that is before ``T``, so that ``[c, T)`` is padding in every row.
+
+    Reads the CPU window only (``doc``, ``loss_mask``, ``reset``, each ``[B, T]``), so the cut costs
+    no device synchronisation. A window without any document position keeps ``T`` (there is no
+    column to cut after). A loss position or a reset inside the padding tail is a malformed window
+    and raises."""
+    doc = window["doc"]
+    if not isinstance(doc, Tensor) or doc.ndim != 2 or doc.dtype != torch.int64:
+        raise TypeError("trailing_cut needs the window's int64 [B, T] document index 'doc'")
+    if doc.device.type != "cpu":
+        raise ValueError(
+            "trailing_cut reads the CPU window (no device synchronisation), got doc on "
+            f"{doc.device}"
+        )
+    T = int(doc.shape[1])
+    columns = (doc >= 0).any(dim=0).nonzero().flatten()
+    if columns.numel() == 0:
+        return T
+    cut = int(columns[-1]) + 1
+    if cut < T:
+        for key in ("loss_mask", "reset"):
+            if bool(window[key][:, cut:].any()):
+                raise ValueError(
+                    f"the window holds a {key} position in its padding tail [{cut}, {T}), where "
+                    "doc = -1 in every row: a malformed window"
+                )
+    return cut
+
+
+def _columns(batch: Batch, cut: int) -> Batch:
+    """The first ``cut`` columns of every ``[B, T]`` window tensor (views, no copy)."""
+    return {key: value[:, :cut] for key, value in batch.items()}
+
+
 @dataclass
 class TBPTTStepRecord(StepRecord):
     """A P0.5 :class:`~hsn.train.loop.StepRecord` (``loss`` is the task cross-entropy over the
     step's loss positions) plus the P1.7 statistics: ``total`` (the assembled objective, mean over
     the step's windows), ``parts`` (every λ-weighted term, same mean), ``stats`` (the
-    :data:`STAT_KEYS` every step and ``grad_norm/<group>`` on stats steps), the resync counters
-    after the step and, in a routed run, ``active_units`` (P2.6: the sorted ids of the units the
-    step's windows executed; ``None`` in dense routing, where every unit runs)."""
+    :data:`STAT_KEYS` every step — over the positions the windows computed, which exclude a
+    trailing-padding tail cut by P1.10d — ``window_positions``, the mean number of columns
+    computed per window, and ``grad_norm/<group>`` on stats steps), the resync counters after the
+    step and, in a routed run, ``active_units`` (P2.6: the sorted ids of the units the step's
+    windows executed; ``None`` in dense routing, where every unit runs)."""
 
     total: float = math.nan
     parts: dict[str, float] = field(default_factory=dict)
@@ -214,6 +274,9 @@ class TBPTTTrainer(Trainer):
         self.resyncs = 0
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
+        # P1.10d: the trailing-padding cut (exact under dense routing only; module docstring)
+        self._cut_enabled = cfg.data.align_docs and cfg.model.routing == "dense"
+        self._cut_pending = False  # the carried state comes from a cut window
 
     # P2.2 ------------------------------------------------------------------------------------
 
@@ -309,6 +372,26 @@ class TBPTTTrainer(Trainer):
         )
 
     # window helpers --------------------------------------------------------------------------
+
+    def _window_cut(self, window: Batch) -> int:
+        """The columns of the CPU ``window`` this window computes (P1.10d, module docstring):
+        :func:`trailing_cut` under dense routing with ``data.align_docs``, ``T`` otherwise. Raises
+        when the previous window was cut and this one does not reset every row at ``t = 0``: such a
+        row would continue from the state at the cut instead of the state after the padding the
+        uncut window computes, so the cut would no longer be exact."""
+        T = int(window["doc"].shape[1])
+        if self._cut_pending and not bool(window["reset"][:, 0].all()):
+            rows = (~window["reset"][:, 0]).nonzero().flatten().tolist()
+            raise RuntimeError(
+                f"window {self.windows + 1} follows a window cut at its trailing padding "
+                f"(P1.10d), but rows {rows} do not reset at t = 0: they would continue from the "
+                "state at the cut, not from the state after the padding an uncut window computes. "
+                "The cut relies on data.align_docs windows that start a document in every row "
+                "after a window where every row ended one."
+            )
+        cut = trailing_cut(window) if self._cut_enabled else T
+        self._cut_pending = cut < T
+        return cut
 
     def _window_start(self, state: CellGraphState) -> CellGraphState:
         """The state a window starts from: detached, and with ``q`` recomputed exactly every
@@ -407,6 +490,15 @@ class TBPTTTrainer(Trainer):
             history.autocast,
             json.dumps(report, sort_keys=True),
         )
+        if self._cut_enabled:
+            logger.info("trailing-padding cut (P1.10d): on (dense routing, data.align_docs)")
+        else:
+            logger.info(
+                "trailing-padding cut (P1.10d): off (%s): every window computes all its columns",
+                "data.align_docs=false"
+                if not self.cfg.data.align_docs
+                else f"model.routing={self.cfg.model.routing}",
+            )
         loader = self._loader(train_ds, shuffle=True, epochs=None)
         if self._loader_state is not None:
             loader.load_state_dict(self._loader_state)
@@ -449,11 +541,17 @@ class TBPTTTrainer(Trainer):
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
             tokens_in_step = 0
+            positions_sum = 0  # P1.10d: the columns the step's windows computed
             active: Tensor | None = None  # P2.6: the units the step's windows executed
             probe_counts = {"probe_windows": 0.0, "probe_pairs": 0.0, "probe_positions": 0.0}
             for window_index in range(n_windows):
                 window = next(loader)
+                cut = self._window_cut(window)  # P1.10d: from the CPU window, no device sync
+                positions_sum += cut
                 batch = self._to_device(window)
+                # the columns the model computes: device views of the window (the probes of P2.3,
+                # routed runs only, read the full window)
+                fwd = batch if cut == window["doc"].shape[1] else _columns(batch, cut)
                 state = self._window_start(state)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
                 probe = (
@@ -461,13 +559,13 @@ class TBPTTTrainer(Trainer):
                     if self.counterfactual
                     else None
                 )  # P2.3: before the forward pass, from the window-start state
-                logits, state, info = self._forward(batch, state)
+                logits, state, info = self._forward(fwd, state)
                 window_active = self._window_active_units(info)
                 if window_active is not None:
                     active = window_active if active is None else active | window_active
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
-                terms = assemble_terms({"logits": logits, **info}, batch, self.cfg, extras)
-                loss_mask = batch["loss_mask"]
+                terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
+                loss_mask = fwd["loss_mask"]
                 count = int(loss_mask.sum())
                 terms = self._routing_terms(terms, info, count)
                 if self.counterfactual:  # P2.3: the utility regression
@@ -482,7 +580,7 @@ class TBPTTTrainer(Trainer):
                     term_norms = grad_norm_report(self.model, terms, scale=scale)
                 tokens_in_step += int((window["doc"] >= 0).sum())
                 if count > 0:
-                    flat_targets = batch["targets"][loss_mask]
+                    flat_targets = fwd["targets"][loss_mask]
                     correct += (logits[loss_mask].float().argmax(dim=-1) == flat_targets).sum()
                     loss_sum += parts["task"] * count
                     n_loss += count
@@ -502,7 +600,7 @@ class TBPTTTrainer(Trainer):
                         scaled = self.scaler.scale(scaled)
                     scaled.backward()  # type: ignore[no-untyped-call]
                 if self.counterfactual:  # P2.3: once per window, after its selections ran
-                    self._update_ema(info, batch, probe)
+                    self._update_ema(info, fwd, probe)
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
@@ -534,6 +632,7 @@ class TBPTTTrainer(Trainer):
                 "eps_mean": eps_sum / n_windows,
                 "alpha_entropy": entropy_sum / n_windows,
                 "route_cost": cost_sum / n_windows,
+                "window_positions": positions_sum / n_windows,
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
                 **(probe_counts if self.counterfactual else {}),
@@ -614,6 +713,7 @@ class TBPTTTrainer(Trainer):
             "carried_state": pack_cell_state(state),
             "q_resync": q_resync_counter(self.windows, self.windows_since_resync, self.resyncs),
             "reinforce_baseline": self.reinforce_baseline,  # P2.2 (None unless reinforce ran)
+            "cut_pending": self._cut_pending,  # P1.10d: the next window must reset every row
         }
         save_checkpoint(
             path,
@@ -672,5 +772,10 @@ class TBPTTTrainer(Trainer):
                 f"{path} has no reinforce_baseline (written before P2.2) but train.gate_mode="
                 "reinforce needs it to continue the same objective"
             )
+        # P1.10d: a checkpoint written before the trailing cut never cut a window
+        pending = extra.get("cut_pending", False)
+        if not isinstance(pending, bool):
+            raise ValueError(f"{path}: cut_pending must be a bool, got {pending!r}")
+        self._cut_pending = pending
         self.step = int(loaded["step"])
         return self.step
