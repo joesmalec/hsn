@@ -493,11 +493,19 @@ class Trainer:
                     "allow_test=True only from one"
                 )
 
-    def _forward(self, batch: Batch, state: Any) -> tuple[Tensor, Any, dict[str, Any]]:
+    def _forward(
+        self, batch: Batch, state: Any, **model_kwargs: Any
+    ) -> tuple[Tensor, Any, dict[str, Any]]:
+        """The model over one device window; ``model_kwargs`` go to its forward. This trainer's
+        own :meth:`fit` passes none, so a baseline's forward is called exactly as before; only the
+        HSN trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`, P1.10b) passes ``reset_columns`` from
+        the CPU window."""
         tokens = batch["tokens"]
         B, T = tokens.shape
         with self._segment("forward", tokens=B * T), autocast_ctx(self.ctx):
-            logits, new_state, info = self.model(tokens, batch["context"], state, batch["reset"])
+            logits, new_state, info = self.model(
+                tokens, batch["context"], state, batch["reset"], **model_kwargs
+            )
         V = self.cfg.model.vocab_size
         if not isinstance(logits, Tensor) or tuple(logits.shape) != (B, T, V):
             got = tuple(logits.shape) if isinstance(logits, Tensor) else type(logits).__name__
