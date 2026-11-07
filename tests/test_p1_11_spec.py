@@ -235,3 +235,12 @@ def test_p1_11_spec_requires_built_data(tmp_path: Path) -> None:
     ids = _ids(tmp_path, raw, repo=repo)  # a dry run needs no data
     assert len(ids) == 6
     assert SweepSpec.model_validate(yaml.safe_load(yaml.safe_dump(raw))).name == "unit"
+
+
+@pytest.mark.parametrize(
+    "path", sorted((REPO / "configs" / "sweeps").glob("*.yaml")), ids=lambda p: p.name
+)
+def test_p1_11_committed_specs_expand(path: Path, tmp_path: Path) -> None:
+    spec, _ = load_spec(path)
+    arms = expand(spec, repo=fake_repo(tmp_path))
+    assert arms and len({a.arm_id for a in arms}) == len(arms)
