@@ -32,9 +32,29 @@ report and the *measured* numbers the run manifest needs (plan §0.5: measured, 
 trials (paper §12); recording a trial beyond the budget raises.
 
 **Guards.** The test split is refused unless a caller says ``allow_test=True`` (gate scripts only;
-chunk "Do not"). Shape mismatches, unknown schedules, a non-finite loss under bf16/fp32, a
-checkpoint from another configuration and features that belong to later chunks (micro-batching,
-P4.3) raise instead of being reinterpreted (plan §4.3: errors over silence).
+chunk "Do not"). Shape mismatches, unknown schedules, a non-finite loss under bf16/fp32 (unless its
+step was skipped, below), a checkpoint from another configuration and features that belong to later
+chunks (micro-batching, P4.3) raise instead of being reinterpreted (plan §4.3: errors over silence).
+
+**Non-finite gradients (P1.12).** Without a loss scaler (bf16 and fp32), a step whose global
+gradient norm (before clipping) is not finite is skipped (:meth:`Trainer._guard_nonfinite`): the
+gradients are zeroed (``None``), the optimiser and its state are left alone, the scheduler still
+advances (the schedule keeps its clock), the skip is counted (``skipped_nonfinite``) and logged.
+Clipping such a gradient would write non-finite values into the weights and kill the run a few
+steps later (seed 1 of the G1 gate run under bf16 on ``profile:rtx3060``: an infinite norm at step
+3,140, a NaN objective at 3,143). Under fp16 the ``GradScaler`` skips such steps itself and the
+guard is inactive. The count is in ``History.measured["skipped_nonfinite_steps"]`` and in every
+checkpoint (with the current run of consecutive skips; a checkpoint written before the guard reads
+0, a malformed count raises); the TBPTT trainer also puts it in every step record. A skipped step
+keeps its non-finite ``grad_norm`` in its record. The guard protects the weights and the optimiser
+state only: what the forward pass carries (the recurrent state, a scorer's running statistics) is
+not rolled back, and a carried state that went non-finite clears at its rows' next reset.
+**Stop rule:** a run that keeps skipping is not training, so after a skip :class:`RuntimeError` is
+raised when :data:`NONFINITE_MAX_CONSECUTIVE` steps in a row were skipped, or when at least
+:data:`NONFINITE_MIN_SKIPS` steps and more than :data:`NONFINITE_MAX_FRACTION` of the steps so far
+were skipped. The guard reads the norm the step already copied to the host for its record, so it
+adds no device synchronisation (P2.8's compiled window included: the norm, the clipping and the
+optimiser run eagerly, after the compiled backward).
 
 **Optimiser (P2.6).** ``train.optimizer=adamw`` builds ``torch.optim.AdamW`` with weight decay on
 the tensors of ``ndim >= 2`` and none on the rest; ``train.optimizer=lazy_adamw`` builds the same
@@ -85,6 +105,9 @@ from hsn.train.checkpoint import (
 from hsn.train.lazy_adam import build_lazy_adamw
 
 __all__ = [
+    "NONFINITE_MAX_CONSECUTIVE",
+    "NONFINITE_MAX_FRACTION",
+    "NONFINITE_MIN_SKIPS",
     "SCHEDULES",
     "BudgetExhaustedError",
     "History",
@@ -102,6 +125,26 @@ logger = logging.getLogger("hsn.train")
 Batch = dict[str, Tensor]
 SCHEDULES: tuple[str, ...] = ("constant", "cosine", "linear")
 _WINDOW_FIELDS = ("tokens", "targets", "context", "loss_mask", "reset", "dep", "doc")
+
+# P1.12: the non-finite-gradient guard's stop rule (module docstring). Module constants, not config
+# keys: a new key would change every configuration's hash (old checkpoints would not resume), and
+# the rule is a safety stop, not an experimental parameter. Calibration: the guarded post-A1 bf16
+# rerun of 5 Nov 2026 skipped 0 of 3,000 steps; G1 lost two of five runs to one bad step each.
+#: A run raises at this many consecutive skipped steps.
+NONFINITE_MAX_CONSECUTIVE = 10
+#: A run raises when it skipped at least NONFINITE_MIN_SKIPS steps and more than this fraction of
+#: its steps so far (30 of a 3,000-step run, 120 of 12,000).
+NONFINITE_MAX_FRACTION = 0.01
+NONFINITE_MIN_SKIPS = 10
+
+
+def _skipped_counter(extra: Mapping[str, Any], key: str, path: str) -> int:
+    """A count of the non-finite-gradient guard from a checkpoint's ``extra``: absent in
+    checkpoints written before the guard (P1.12), then 0; otherwise a non-negative int."""
+    value = extra.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{path}: {key} must be a non-negative int, got {value!r}")
+    return value
 
 
 # --------------------------------------------------------------------------------------------------
@@ -424,6 +467,10 @@ class Trainer:
         self.scheduler = self._make_scheduler()
         self.scaler = make_grad_scaler(ctx)
         self.step = 0
+        # P1.12: optimiser steps skipped by the non-finite-gradient guard, and the current run of
+        # consecutive ones (the stop rule's)
+        self.skipped_nonfinite = 0
+        self._skip_streak = 0
         self._loader_state: dict[str, Any] | None = None
         self._carried_state: Any = None
 
@@ -467,6 +514,62 @@ class Trainer:
             return contextlib.nullcontext()
         segment: AbstractContextManager[object] = self.profiler.segment(name, tokens=tokens)
         return segment
+
+    def _guard_nonfinite(self, grad_norm: float, step: int) -> bool:
+        """The non-finite-gradient guard (P1.12, module docstring) for ``step`` with the global
+        gradient norm ``grad_norm`` (before clipping). True means the step is skipped: the
+        gradients are zeroed, the skip is counted and logged, and the caller leaves the optimiser
+        alone (it still advances the scheduler). Raises (the stop rule) when the run keeps
+        skipping. Under fp16 the ``GradScaler`` skips such steps itself: the guard returns False
+        and touches nothing."""
+        if self.scaler is not None:
+            return False
+        if math.isfinite(grad_norm):
+            self._skip_streak = 0
+            return False
+        self.optimizer.zero_grad(set_to_none=True)
+        self.skipped_nonfinite += 1
+        self._skip_streak += 1
+        skipped = self.skipped_nonfinite
+        logger.warning(
+            "step %d: gradient norm %s is not finite; optimizer step skipped (%d skipped so far)",
+            step,
+            grad_norm,
+            skipped,
+        )
+        if self._skip_streak >= NONFINITE_MAX_CONSECUTIVE:
+            raise RuntimeError(
+                f"step {step}: {self._skip_streak} consecutive optimizer steps skipped for a "
+                f"non-finite gradient norm (limit {NONFINITE_MAX_CONSECUTIVE}); {skipped} of "
+                f"{step} steps skipped so far. The run is not training: stopping (P1.12 stop rule)"
+            )
+        if skipped >= NONFINITE_MIN_SKIPS and skipped > NONFINITE_MAX_FRACTION * step:
+            raise RuntimeError(
+                f"step {step}: {skipped} of {step} steps skipped for a non-finite gradient norm "
+                f"(more than {NONFINITE_MAX_FRACTION:.0%} of the steps, and at least "
+                f"{NONFINITE_MIN_SKIPS}). The run is not training reliably: stopping (P1.12 stop "
+                "rule)"
+            )
+        return True
+
+    def _guard_extra(self) -> dict[str, int]:
+        """The guard's counts for a checkpoint's ``extra`` (P1.12)."""
+        return {
+            "skipped_nonfinite": self.skipped_nonfinite,
+            "skipped_nonfinite_streak": self._skip_streak,
+        }
+
+    def _restore_guard(self, extra: Mapping[str, Any], path: str) -> None:
+        """The guard's counts from a checkpoint's ``extra``: 0 when written before the guard;
+        a malformed count, or more consecutive skips than skips, raises."""
+        skipped = _skipped_counter(extra, "skipped_nonfinite", path)
+        streak = _skipped_counter(extra, "skipped_nonfinite_streak", path)
+        if streak > skipped:
+            raise ValueError(
+                f"{path}: skipped_nonfinite_streak={streak} exceeds skipped_nonfinite={skipped}"
+            )
+        self.skipped_nonfinite = skipped
+        self._skip_streak = streak
 
     def _loader(self, ds: ByteDataset, *, shuffle: bool, epochs: int | None) -> StreamLoader:
         return StreamLoader(
@@ -621,16 +724,17 @@ class Trainer:
                     self.scaler.unscale_(self.optimizer)
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
+                skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                else:
+                elif not skipped:
                     self.optimizer.step()
                 self.scheduler.step()
             self.step += 1
             mean_loss = float(loss_sum) / n_loss if n_loss else float("nan")
             accuracy = float(correct) / n_loss if n_loss else float("nan")
-            if self.scaler is None and n_loss and not math.isfinite(mean_loss):
+            if self.scaler is None and n_loss and not math.isfinite(mean_loss) and not skipped:
                 raise RuntimeError(f"loss is {mean_loss} at step {self.step}")
             seconds = time.perf_counter() - started
             train_seconds += seconds
@@ -681,6 +785,7 @@ class Trainer:
             "tokens": float(total_tokens),
             "steps": float(self.step),
             "compiled_windows": 0.0,  # P2.8: the generic trainer never compiles
+            "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
         }
         return history
 
@@ -738,6 +843,7 @@ class Trainer:
             "model_name": self.cfg.model_name,
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "carried_state": _map_state(detach_state(state), lambda t: t.cpu()),
+            **self._guard_extra(),  # P1.12
         }
         save_checkpoint(
             path,
@@ -769,6 +875,7 @@ class Trainer:
         if loaded["loader_state"] is None:
             raise ValueError(f"{path} has no loader state")
         self._loader_state = dict(loaded["loader_state"])
+        self._restore_guard(extra, str(path))  # P1.12
         device = self.ctx.device
         self._carried_state = _map_state(extra.get("carried_state"), lambda t: t.to(device))
         self.step = int(loaded["step"])
