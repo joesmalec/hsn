@@ -292,6 +292,9 @@ class Worker:
         if (timing_live or timing_waiting) and now - self.last_cpu >= CPU_EVERY_S:
             fresh_cpu = True
             hogs = self.machine.cpu_hogs()
+            # groups read after top's 3-s sample, so that a process our arm spawned meanwhile (an
+            # inductor compile worker, in the arm's process group) is ours, not foreign
+            groups = {**groups, **self.machine.process_groups()}
             self.cpu_hogs = (
                 None
                 if hogs is None

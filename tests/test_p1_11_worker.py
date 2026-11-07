@@ -376,3 +376,41 @@ def test_p1_11_foreign_sightings_are_counted() -> None:
         "cpu": 94.0,
     }
     assert table["7"]["looks"] == 1 and table["7"]["used_mib"] == 800.0
+
+
+def test_p1_11_cpu_watch_counts_the_arms_process_group(tmp_path: Path) -> None:
+    """A process our arm spawned between the process-group look and top's sample (an inductor
+    compile worker, say) is in the arm's group: never a foreign CPU user."""
+    db = dbm.Database(db_path())
+    enqueue_spec(db, dry_spec(tmp_path, n=1))
+    (a,) = _claim_all(db)
+    _set(db, a, pid=1000, pgid=1000, timing=1)
+    looks = {"n": 0}
+
+    class Machine:
+        host = staticmethod(machine.host)
+        pid_alive = staticmethod(lambda pid, start=None: True)
+
+        @staticmethod
+        def read_gpu() -> machine.GpuReading:
+            return machine.GpuReading(present=False, ok=True)
+
+        @staticmethod
+        def process_groups() -> dict[int, int]:
+            looks["n"] += 1
+            # the compile worker 2001 appears only in the second look (after top)
+            return {1000: 1000} if looks["n"] == 1 else {1000: 1000, 2001: 1000}
+
+        @staticmethod
+        def classify(*args: Any, **kwargs: Any) -> Any:
+            return machine.classify(*args, **kwargs)
+
+        @staticmethod
+        def cpu_hogs() -> list[tuple[int, float, str]]:
+            return [(2001, 340.0, "python"), (3003, 95.0, "dracut")]
+
+    worker = Worker(db, tmp_path / "runs", WorkerOptions(), machine=Machine(), log=lambda m: None)
+    worker.watch[a] = __import__("hsn.experiments.worker", fromlist=["_Watch"])._Watch()
+    worker.observe()
+    assert worker.cpu_hogs == [(3003, 95.0, "dracut")]
+    assert set(worker.watch[a].cpu_foreign) == {"3003"}
