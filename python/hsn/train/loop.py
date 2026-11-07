@@ -496,8 +496,10 @@ class Trainer:
     def _forward(
         self, batch: Batch, state: Any, **model_kwargs: Any
     ) -> tuple[Tensor, Any, dict[str, Any]]:
-        """The model over one device window; ``model_kwargs`` go to its forward (P1.10b: the
-        HSN trainer passes ``reset_columns`` from the CPU window)."""
+        """The model over one device window; ``model_kwargs`` go to its forward. This trainer's
+        own :meth:`fit` passes none, so a baseline's forward is called exactly as before; only the
+        HSN trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`, P1.10b) passes ``reset_columns`` from
+        the CPU window."""
         tokens = batch["tokens"]
         B, T = tokens.shape
         with self._segment("forward", tokens=B * T), autocast_ctx(self.ctx):

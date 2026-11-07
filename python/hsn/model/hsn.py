@@ -654,9 +654,12 @@ class HSN(nn.Module):
         strictly increasing sequence of ints in ``[0, T)`` that must contain every column where
         ``reset`` has a True (extra columns are allowed and change nothing). ``None`` derives them
         from ``reset``: free on the CPU, one device-to-host copy per window on an accelerator. A
-        trainer passes them from the CPU batch it uploads, so no copy is needed. On the CPU a list
-        that omits a reset column raises; on an accelerator that is the caller's contract (checking
-        it would cost the copy it saves).
+        trainer passes them from the CPU batch it uploads, so no copy is needed. **Contract:** the
+        list must cover every reset column. It is checked only when ``reset`` is on the CPU (a list
+        that omits one raises ``ValueError``); on an accelerator it cannot be checked without the
+        copy it saves, and an omitted column would silently skip that reset and carry the state
+        across a document boundary. Derive it from the CPU copy of the same mask, as
+        :class:`~hsn.train.tbptt.TBPTTTrainer` does, or pass ``None``.
 
         P1.10a: the work that depends on the inputs and parameters only runs once for the window —
         the byte and context embeddings, ``E`` and the prediction target over ``[B, T]``, the

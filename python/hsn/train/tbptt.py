@@ -564,8 +564,12 @@ class TBPTTTrainer(Trainer):
                     if self.counterfactual
                     else None
                 )  # P2.3: before the forward pass, from the window-start state
-                # P1.10b: the columns where some row resets, from the CPU window (cut like the
-                # device views), so that HSN.forward needs no device-to-host copy to find them
+                # P1.10b: the columns where some row resets, so that HSN.forward needs no
+                # device-to-host copy to find them. Correct by construction: they are read from the
+                # CPU reset of this very window, cut exactly like the device views it hands over
+                # (fwd["reset"] is window["reset"][:, :cut] on the device), so no column with a
+                # reset can be missing; a check against that same CPU mask would be the same
+                # expression. (On an accelerator forward cannot check them without the copy.)
                 reset_columns = window["reset"][:, :cut].any(dim=0).nonzero().flatten().tolist()
                 logits, state, info = self._forward(fwd, state, reset_columns=reset_columns)
                 window_active = self._window_active_units(info)

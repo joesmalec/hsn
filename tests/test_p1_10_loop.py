@@ -167,7 +167,7 @@ def _inputs(model: HSN, seed: int = 3) -> tuple[Tensor, Tensor, CellGraphState, 
     tokens = torch.randint(0, m.vocab_size, (B, T), generator=generator)
     ctx = torch.randint(0, m.n_context, (B, T), generator=generator)
     h = torch.rand(B, m.n_cells, m.d, generator=generator, dtype=torch.float64) * 1.6 - 0.8
-    state = model.init_state(B).with_dense(h)
+    state = model.init_state(B).with_dense(h.to(model.dtype))
     for _ in range(3):
         state = state.tick(torch.rand(B, m.n_cells, generator=generator) < 0.5)
     assert bool((state.age > 0).any()) and bool((state.pos > 0).all())
@@ -550,6 +550,16 @@ RESET_PATTERNS: dict[str, list[tuple[int, int]]] = {
     "every_column": [(b, t) for b in range(B) for t in range(T)],
     "last_column": [(1, T - 1)],
 }
+#: Gradients, default vs ``reset_columns=range(T)``: the no-op reset nodes change the order in which
+#: autograd sums a parameter's per-position contributions. Bound on ``max|Δg| / max|g|`` per
+#: parameter, by dtype, where a gradient below :data:`NOISE_FLOOR` times the model's largest one is
+#: held to that floor instead: such a gradient is itself rounding noise (the edge logits when every
+#: row starts from zeros, so that the cells are symmetric: about 1e-18 in fp64, 0 against 1e-9 in
+#: fp32). Measured 6 Nov 2026 over every case, mask and parameter below, relative to that scale:
+#: fp64 2.5e-15 (largest absolute 9.9e-14), fp32 1.1e-6 (largest absolute 5.3e-5, on
+#: ``byte_emb.weight`` with gradients up to 69); the bounds are at least 10x those.
+REORDER_TOL = {torch.float64: 1e-13, torch.float32: 2e-5}
+NOISE_FLOOR = 1e-3
 RESET_CASES = [
     case
     for case in CASES
@@ -595,29 +605,43 @@ def _recording_states(model: HSN) -> Iterator[list[CellGraphState]]:
         del cell.step_dense, cell.step_sparse
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32], ids=["fp64", "fp32"])
 @pytest.mark.parametrize("pattern", list(RESET_PATTERNS))
 @pytest.mark.parametrize("case", RESET_CASES, ids=[case.name for case in RESET_CASES])
-def test_p1_10_reset_columns_equal_per_position_reset(case: Case, pattern: str) -> None:
+def test_p1_10_reset_columns_equal_per_position_reset(
+    case: Case, pattern: str, dtype: torch.dtype
+) -> None:
     """Resetting only at the columns where some row resets (the default, from ``reset``) equals
     resetting at every column (``reset_columns=range(T)``, the per-position reset) bit for bit —
     logits, the final state and every ``info`` key — for reset masks from none to every position,
     in the dense window (whose ``age`` / ``pos`` come from the window counters), the disabled-cell
-    hook, the masked round and the sparse round; the parameter gradients agree to the fp64
-    gradient tolerance (the no-op reset nodes change the order in which autograd sums a
-    parameter's per-position contributions). Both equal the per-position reference (stepping) to
-    the fp64 tolerance, the counters exactly, and every round reads the same state as the
-    reference's round does (the window keeps the per-position states truthful)."""
-    model = _build(case)
+    hook, the masked round and the sparse round, in fp64 and fp32; the parameter gradients agree
+    to :data:`REORDER_TOL` (the no-op reset nodes change the order in which autograd sums a
+    parameter's per-position contributions). In fp64 both also equal the per-position reference
+    (stepping) to 1e-12, the counters exactly, and every round reads the same state as the
+    reference's round does (the window keeps the per-position states truthful); stepping against
+    the window is not compared in fp32, where the GEMM row counts' rounding is amplified by the
+    recurrence beyond any tight bound."""
+    model = _build(case).to(dtype)
     tokens, ctx, state, _ = _inputs(model)
     reset = _reset_mask(RESET_PATTERNS[pattern])
     with _recording_states(model) as seen:
         default = _run(lambda: model(tokens, ctx, state, reset))
     every = _run(lambda: model(tokens, ctx, state, reset, reset_columns=range(T)))
     _assert_matches(default, every, exact=True)
-    for g, g_e in zip(_grads(model, default), _grads(model, every), strict=True):
-        assert (g is None) == (g_e is None)
+    names = [name for name, p in model.named_parameters() if p.requires_grad]
+    grads, grads_every = _grads(model, default), _grads(model, every)
+    largest = max(float(g.abs().max()) for g in grads_every if g is not None)
+    for name, g, g_e in zip(names, grads, grads_every, strict=True):
+        assert (g is None) == (g_e is None), name
         if g is not None and g_e is not None:
-            torch.testing.assert_close(g, g_e, atol=GRAD_TOL, rtol=GRAD_TOL)
+            scale = max(float(g_e.abs().max()), NOISE_FLOOR * largest)
+            worst = float((g - g_e).abs().max())
+            assert worst <= REORDER_TOL[dtype] * scale, (name, worst, scale)
+    final = default[1]
+    assert final.pos.is_contiguous() and final.age.is_contiguous()
+    if dtype != torch.float64:
+        return
     with _recording_states(model) as seen_ref:
         ref = _run(lambda: _stepwise(model, tokens, ctx, state, reset))
     _assert_matches(default, ref)
@@ -626,8 +650,6 @@ def test_p1_10_reset_columns_equal_per_position_reset(case: Case, pattern: str) 
         assert torch.equal(got.age, want.age) and torch.equal(got.pos, want.pos), k
         _close(got.h, want.h, f"round {k} h")
         _close(got.q, want.q, f"round {k} q")
-    final = default[1]
-    assert final.pos.is_contiguous() and final.age.is_contiguous()
 
 
 def test_p1_10_reset_columns_validated() -> None:
