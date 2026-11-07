@@ -26,6 +26,17 @@ mps_param = pytest.param("mps", marks=pytest.mark.mps)
 DEVICES = ["cpu", cuda_param, mps_param]
 
 AUX_KEYS = ("state_abs_max", "eps_abs_mean", "alpha_entropy")
+#: P1.10a: ``HSN.forward`` runs E and D over the window ``[B, T]``, ``HSN.step`` over ``[B]``; the
+#: GEMM rounds differently with the row count, so forward-vs-step and cross-T comparisons hold to
+#: these tolerances (fp64, fp32; P2.5's parity tolerance) instead of bit for bit. Same-shape
+#: comparisons stay bit-exact.
+WINDOW_ATOL = {torch.float64: 1e-12, torch.float32: 1e-5}
+
+
+def _close_window(actual: Tensor, expected: Tensor) -> None:
+    """``actual`` equals ``expected`` to the forward-vs-step tolerance of their dtype."""
+    atol = WINDOW_ATOL[expected.dtype]
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=0.0)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -611,7 +622,7 @@ def test_p1_5_shapes(device_type: str) -> None:
         reset = torch.zeros(B, T, dtype=torch.bool, device=device)
         logits, final, info_w = model(tokens, ctx, state, reset)
         assert logits.shape == (B, T, V) and logits.dtype == dtype
-        assert torch.equal(logits[:, 0], out.logits)  # the window starts with the same step
+        _close_window(logits[:, 0], out.logits)  # the window starts with the same step
         assert (final.pos == T).all() and final.h.shape == (B, N, d)
         for name in ("z", "z_hat", "eps", "u"):
             assert info_w[name].shape == (B, T, d), name
@@ -755,9 +766,11 @@ def test_p1_5_matches_pure_python_reference_tiny_fp64() -> None:
         reset = torch.zeros(B, T, dtype=torch.bool)
         reset[1, 2] = True
         logits, final, info = model(tokens, ctx, state, reset)
-        assert torch.equal(logits[:, 2], out.logits) and torch.equal(final.h, out.state.h)
-        assert torch.equal(final.q, out.state.q) and torch.equal(final.age, out.state.age)
-        assert torch.equal(info["u"][:, 2], out.u)
+        _close_window(logits[:, 2], out.logits)
+        _close_window(final.h, out.state.h)
+        _close_window(final.q, out.state.q)
+        assert torch.equal(final.age, out.state.age) and torch.equal(final.pos, out.state.pos)
+        _close_window(info["u"][:, 2], out.u)
 
     # the feature builder alone, with the P2.3 averages, a spent budget and the age/pos counters
     cfg, model = _model(TINY)
@@ -861,13 +874,14 @@ def test_p1_5_reset_restarts_state() -> None:
         logits_one, state_one, _ = model(tokens, ctx, dirty, reset_one)
         assert torch.equal(logits_one[[0, 2]], logits_dirty[[0, 2]])
         assert torch.equal(logits_one[1, :2], logits_dirty[1, :2])
-        # (the same batch size, so the comparison is bit-exact rather than GEMM-path dependent)
+        # (P1.10a: forward runs E and D over [B, T], so windows of 4 and 2 positions round their
+        # GEMMs differently: equal to the window tolerance, not bit for bit)
         logits_tail, state_tail, _ = model(
             tokens[:, 2:], ctx[:, 2:], model.init_state(B), torch.zeros(B, 2, dtype=torch.bool)
         )
-        assert torch.equal(logits_one[1, 2:], logits_tail[1])
-        assert torch.equal(state_one.h[1], state_tail.h[1])
-        assert torch.equal(state_one.q[1], state_tail.q[1])
+        _close_window(logits_one[1, 2:], logits_tail[1])
+        _close_window(state_one.h[1], state_tail.h[1])
+        _close_window(state_one.q[1], state_tail.q[1])
         assert int(state_one.pos[1]) == 2 and (state_one.pos[[0, 2]] == dirty.pos[[0, 2]] + T).all()
 
 
