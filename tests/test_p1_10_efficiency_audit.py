@@ -192,6 +192,47 @@ def test_p1_10_cell_identity_variant_breaks_symmetry() -> None:
     assert float((final.h - final.h[:, :1]).abs().amax()) > 0.0
 
 
+@pytest.mark.parametrize("routing", ["dense", "topk"])
+def test_p1_10_state_stats_cover_routed_models(routing: str) -> None:
+    eo = _load_script("eff_overfit")
+    torch.manual_seed(0)
+    run = load_config(REPO / "configs" / "ref_a1.yaml", overrides=[f"model.routing={routing}"])
+    model = HSN.from_config(run).float()
+    model.train()
+    B, T, N = 2, 8, run.model.n_cells
+    reset = torch.zeros(B, T, dtype=torch.bool)
+    reset[:, 0] = True
+    loss_mask = torch.zeros(B, T, dtype=torch.bool)
+    loss_mask[:, 3::2] = True
+    doc = torch.zeros(B, T, dtype=torch.int64)
+    doc[1, -2:] = -1  # trailing padding in one row
+    window = {
+        "tokens": torch.randint(0, run.model.vocab_size, (B, T)),
+        "context": torch.randint(0, run.model.n_context, (B, T)),
+        "reset": reset,
+        "loss_mask": loss_mask,
+        "doc": doc,
+    }
+    out = eo.window_state_stats(model, window)
+    assert model.training, "the model's mode is restored"
+    assert "step" not in vars(model) and "step_dense" not in vars(model.cell)
+    assert "step_sparse" not in vars(model.cell), "the wrapped methods are removed again"
+    for tag in ("answer", "valid"):
+        assert 1.0 <= out[f"rank_pr/{tag}"] <= N
+        assert 0.0 <= out[f"live_cells/{tag}"] <= N
+    assert 0.0 <= out["gate/p10"] <= out["gate/p50"] <= out["gate/p90"] <= 1.0
+    if routing == "dense":
+        # the zero-state symmetry (finding 1): every cell live and parallel
+        assert out["live_cells/valid"] == N
+        assert out["rank_pr/valid"] == pytest.approx(1.0, abs=1e-4)
+        assert "write_share/max" not in out
+    else:
+        # K of N cells written per position: cells start apart, and some are never written
+        assert out["live_cells/valid"] < N
+        assert out["rank_pr/valid"] > 1.5
+        assert 0.0 <= out["write_share/min"] <= out["write_share/max"] <= 1.0
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(

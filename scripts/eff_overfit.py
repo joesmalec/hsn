@@ -447,57 +447,141 @@ class Diagnostics:
 
     @torch.no_grad()
     def state_stats(self) -> dict[str, float]:
-        model = self.model
-        if not isinstance(model, HSN) or self.window is None:
+        if not isinstance(self.model, HSN) or self.window is None:
             return {}
-        w = self.window
-        captured: list[tuple[Tensor, Tensor | None]] = []
-        cell = model.cell
-        original = cell.step_dense
+        return window_state_stats(self.model, self.window)
 
-        def capture(u: Tensor, eps: Tensor, state: Any, alpha: Tensor) -> Any:
-            h_new, info = original(u, eps, state, alpha)
-            captured.append((h_new.detach(), info.get("b")))
-            return h_new, info
 
-        cell.step_dense = capture
-        was_training = model.training
-        model.eval()
-        try:
-            state = model.init_state(int(w["tokens"].shape[0]))
-            model(w["tokens"], w["context"], state, w["reset"])
-        finally:
-            cell.step_dense = original
-            model.train(was_training)
-        h = torch.stack([c[0] for c in captured], dim=1).float()  # [B, T, N, d]
-        valid = w["doc"] >= 0  # [B, T]
-        answer = w["loss_mask"]
-        out: dict[str, float] = {}
-        for tag, mask in (("answer", answer), ("valid", valid)):
-            if not bool(mask.any()):
-                continue
-            hs = h[mask]  # [P, N, d]
-            unit = hs / hs.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            cos = unit @ unit.transpose(1, 2)  # [P, N, N]
-            n = cos.shape[-1]
-            off = (cos.sum(dim=(1, 2)) - cos.diagonal(dim1=1, dim2=2).sum(-1)) / (n * (n - 1))
-            out[f"diversity/{tag}"] = float((1 - off).mean())
-            out[f"sat99/{tag}"] = float((hs.abs() >= 0.99).float().mean())
-            out[f"abs_h/{tag}"] = float(hs.abs().mean())
-            out[f"cell_spread/{tag}"] = float((hs - hs[:, :1]).abs().amax())
-            # participation ratio of the [N, d] cell-state matrix: 1 when every cell holds the
-            # same direction, up to min(N, d) when the cells span independent directions
-            sv2 = torch.linalg.svdvals(hs).square()
-            pr = sv2.sum(-1).square() / sv2.square().sum(-1).clamp_min(1e-24)
-            out[f"rank_pr/{tag}"] = float(pr.mean())
-        if captured[0][1] is not None:
-            b = torch.stack([c[1] for c in captured], dim=1).float()  # type: ignore[misc]
-            bv = b[valid].reshape(-1)
-            if bv.numel() > 2_000_000:
-                bv = bv[torch.randperm(bv.numel(), device=bv.device)[:2_000_000]]
-            q = torch.quantile(bv, torch.tensor([0.1, 0.5, 0.9], device=bv.device))
-            out.update({"gate/p10": float(q[0]), "gate/p50": float(q[1]), "gate/p90": float(q[2])})
+def cell_stats(hs: Tensor) -> dict[str, float]:
+    """Statistics of the cell states ``hs [P, N, d]`` at ``P`` positions.
+
+    ``diversity`` is the mean pairwise ``1 - cos(h_i, h_j)``; cells never written sit at exactly 0
+    (cosine 0 with every cell) and inflate it, so ``live_cells`` (norm > 1e-6) and
+    ``diversity_live`` (over pairs of live cells only) are reported too. ``rank_pr`` is the
+    participation ratio of the ``[N, d]`` matrix (1 when every cell holds the same direction, up to
+    ``min(N, d)``), its mean and 90th percentile over positions."""
+    n = hs.shape[1]
+    norms = hs.norm(dim=-1)
+    unit = hs / norms.unsqueeze(-1).clamp_min(1e-12)
+    cos = unit @ unit.transpose(1, 2)  # [P, N, N]
+    off = (cos.sum(dim=(1, 2)) - cos.diagonal(dim1=1, dim2=2).sum(-1)) / (n * (n - 1))
+    sv2 = torch.linalg.svdvals(hs).square()
+    pr = sv2.sum(-1).square() / sv2.square().sum(-1).clamp_min(1e-24)
+    live = norms > 1e-6  # [P, N]
+    eye = torch.eye(n, dtype=torch.bool, device=hs.device)
+    pair = live.unsqueeze(-1) & live.unsqueeze(-2) & ~eye
+    n_pair = pair.sum(dim=(1, 2))
+    div_live = ((1 - cos) * pair).sum(dim=(1, 2)) / n_pair.clamp_min(1)
+    has_pair = n_pair > 0
+    return {
+        "diversity": float((1 - off).mean()),
+        "diversity_live": float(div_live[has_pair].mean()) if bool(has_pair.any()) else math.nan,
+        "live_cells": float(live.float().sum(-1).mean()),
+        "rank_pr": float(pr.mean()),
+        "rank_pr_p90": float(torch.quantile(pr, 0.9)),
+        "sat99": float((hs.abs() >= 0.99).float().mean()),
+        "abs_h": float(hs.abs().mean()),
+        "cell_spread": float((hs - hs[:, :1]).abs().amax()),
+    }
+
+
+def _quantiles(values: Tensor) -> dict[str, float]:
+    if values.numel() > 2_000_000:
+        values = values[torch.randperm(values.numel(), device=values.device)[:2_000_000]]
+    q = torch.quantile(values, torch.tensor([0.1, 0.5, 0.9], device=values.device))
+    return {"gate/p10": float(q[0]), "gate/p50": float(q[1]), "gate/p90": float(q[2])}
+
+
+@torch.no_grad()
+def window_state_stats(model: HSN, w: dict[str, Tensor]) -> dict[str, float]:
+    """One window from a fresh state in evaluation mode: :func:`cell_stats` at answer and valid
+    positions, the write gate ``b`` quantiles over the written cells at valid positions, and for a
+    routed model the per-cell write shares.
+
+    The state is read from each ``HSN.step`` output (every routing mode), the gate from the
+    round's ``info["b"]``: ``step_dense`` (every cell) or ``step_sparse`` (its written slots,
+    ``info["valid"]``). A variant whose round reports no gate gives no gate quantiles."""
+    cell = model.cell
+    states: list[Tensor] = []
+    gates: list[tuple[Tensor, Tensor | None]] = []
+    selected: list[Tensor] = []
+    originals = {
+        (model, "step"): model.step,
+        (cell, "step_dense"): cell.step_dense,
+        (cell, "step_sparse"): cell.step_sparse,
+    }
+    patched = {key: key[1] in vars(key[0]) for key in originals}  # instance attribute before?
+
+    def step(*args: Any, **kwargs: Any) -> Any:
+        out = originals[(model, "step")](*args, **kwargs)
+        states.append(out.state.h.detach())
         return out
+
+    def dense(*args: Any, **kwargs: Any) -> Any:
+        h_new, info = originals[(cell, "step_dense")](*args, **kwargs)
+        if info.get("b") is not None:
+            gates.append((info["b"].detach(), None))
+        return h_new, info
+
+    def sparse(*args: Any, **kwargs: Any) -> Any:
+        h_new, info = originals[(cell, "step_sparse")](*args, **kwargs)
+        gates.append((info["b"].detach(), info["valid"].detach()))
+        selected.append(info["selected"].detach())
+        return h_new, info
+
+    was_training = model.training
+    model.eval()
+    model.step = step  # type: ignore[method-assign]
+    cell.step_dense = dense  # type: ignore[method-assign]
+    cell.step_sparse = sparse  # type: ignore[method-assign]
+    try:
+        model(w["tokens"], w["context"], model.init_state(int(w["tokens"].shape[0])), w["reset"])
+    finally:
+        for (obj, name), original in originals.items():
+            if patched[(obj, name)]:
+                setattr(obj, name, original)
+            else:
+                delattr(obj, name)
+        model.train(was_training)
+    T = int(w["tokens"].shape[1])
+    if len(states) != T or (gates and len(gates) != T):
+        raise RuntimeError(
+            f"window_state_stats: captured {len(states)} states and {len(gates)} gates for "
+            f"{T} positions (one round per position expected)"
+        )
+    h = torch.stack(states, dim=1).float()  # [B, T, N, d]
+    valid = w["doc"] >= 0  # [B, T]
+    out: dict[str, float] = {}
+    for tag, mask in (("answer", w["loss_mask"].bool()), ("valid", valid)):
+        if bool(mask.any()):
+            out.update({f"{k}/{tag}": v for k, v in cell_stats(h[mask]).items()})
+    if gates:
+        b = torch.stack([g[0] for g in gates], dim=1).float()[valid]  # [P, N or K, d]
+        slots = gates[0][1]
+        if slots is not None:
+            written = torch.stack([g[1] for g in gates], dim=1)[valid]  # type: ignore[misc]
+            b = b[written]  # [S, d]
+        if b.numel():
+            out.update(_quantiles(b.reshape(-1)))
+    if selected:
+        writes = torch.stack(selected, dim=1)[valid].float().sum(0)  # [N]
+        share = writes / writes.sum().clamp_min(1)
+        out.update({"write_share/min": float(share.min()), "write_share/max": float(share.max())})
+    return out
+
+
+def git_commit() -> dict[str, Any]:
+    """The checked-out commit and the tracked files that differ from it (the code a run loads)."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=REPO, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    return {
+        "sha": git("rev-parse", "HEAD"),
+        "modified_tracked_files": git("status", "--porcelain", "--untracked-files=no").splitlines(),
+    }
 
 
 # --------------------------------------------------------------------------------------------------
@@ -524,6 +608,7 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     seen = [gpu_processes()]
+    commit = git_commit()
     overrides = recipe_overrides(
         profile=args.profile,
         lr=args.lr,
@@ -557,6 +642,7 @@ def main() -> None:
     seconds = sorted(s.seconds for s in history.steps)
     summary = {
         "name": args.name,
+        "commit": commit,
         "config": args.config,
         "overrides": overrides,
         **variant,

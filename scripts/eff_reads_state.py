@@ -58,6 +58,7 @@ from eff_overfit import (  # noqa: E402
     VARIANTS,
     Diagnostics,
     card_status,
+    git_commit,
     gpu_processes,
     install_variant,
 )
@@ -139,6 +140,7 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     seen = [gpu_processes()]
+    commit = git_commit()
     overrides = [
         f"profile={args.profile}",
         f"train.batch={args.batch}",
@@ -239,6 +241,7 @@ def main() -> None:
     seen.append(gpu_processes())
     result = {
         "name": args.name,
+        "commit": commit,
         "config": args.config,
         **variant,
         "overrides": overrides,
