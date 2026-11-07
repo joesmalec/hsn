@@ -667,6 +667,13 @@ def main() -> None:
             dynamic=False,
         )
         trainer._compiled = plain
+        # the graph window is done (timing and counts are taken): release its CUDA Graph pools,
+        # or the plain window's activations come on top of them (B32 did not fit in 12 GB)
+        from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+
+        del window
+        reset_cudagraph_trees()
+        torch.cuda.empty_cache()
         trainer.fit(train_ds, dev_ds, horizon + 4)  # compile the plain blocks
         provenance = kernel_provenance()
     with profile(
