@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1087,3 +1087,55 @@ def test_p1_10_internal_states_pass_layout_check(
     logits, final, _ = _run(lambda: model(tokens, ctx, state, reset))
     assert made[0] >= T
     state_module._check_layout(final.h, final.q, final.age, final.pos, where="final")
+
+
+SELECTION_GATES = [
+    ("topk", None),
+    ("topk", "soft"),
+    ("topk", "ste"),
+    ("topk", "reinforce"),
+    ("greedy_budget", None),
+    ("greedy_budget", "ste"),
+    ("random", None),
+    ("fixed", None),
+    ("fixed", "ste"),
+    ("dense", None),
+]
+
+
+@pytest.mark.parametrize(("mode", "gate"), SELECTION_GATES)
+def test_p1_10_dense_fallback_only_from_dense_rows(mode: str, gate: str | None) -> None:
+    """The router flags dense-fallback rows only from ``dense_rows``, never on its own, in every
+    selection mode and gate. The sparse round inside a validated window relies on it, since it no
+    longer re-checks the flags at every position (P1.10e). A tap's edit that adds such rows is
+    refused."""
+    overrides = [*SMALL, f"model.routing={mode}"]
+    if mode == "fixed":
+        overrides.append("model.fixed_route=[1, 4]")
+    model = _build(Case(mode, REF_A1, tuple(overrides)))
+    router = model.router
+    generator = torch.Generator(device="cpu").manual_seed(2)
+    N, M = model.cfg.n_cells, model.cfg.n_units
+    logits = torch.randn(B, N, M, generator=generator, dtype=torch.float64)
+    age = torch.randint(0, 5, (B, N), generator=generator)
+    kwargs: dict[str, Any] = {"gate": gate}
+    if mode in ("topk", "greedy_budget"):
+        kwargs.update(age=age, epsilon=0.3)
+    fixed = model._fixed_route if mode == "fixed" else None
+    m = model.cfg
+    torch.manual_seed(RNG_SEED)
+    plain = router.select(logits, m.budget, m.k_select, m.k_min, mode, fixed, **kwargs)
+    assert not bool(plain.dense_fallback.any())
+    if mode != "dense":
+        rows = torch.tensor([True, False, True])
+        torch.manual_seed(RNG_SEED)
+        flagged = router.select(
+            logits, m.budget, m.k_select, m.k_min, mode, fixed, dense_rows=rows, **kwargs
+        )
+        assert torch.equal(flagged.dense_fallback, rows)
+
+        def add_rows(selection: Selection) -> Selection:
+            return replace(selection, dense_fallback=torch.ones_like(selection.dense_fallback))
+
+        with router.intercept(add_rows), pytest.raises(ValueError, match="dense-fallback"):
+            router.select(logits, m.budget, m.k_select, m.k_min, mode, fixed, **kwargs)
