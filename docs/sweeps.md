@@ -71,6 +71,10 @@ arms:
 repository root.
 
 **Expansion checks.** Expansion raises on:
+- a CUDA arm that does not pin `hardware.compile_mode` in its overrides (`profile:rtx3060` compiles by
+  default once P2.8 is merged; a pin keeps the arm's id and computation independent of that default);
+- a compile mode other than `none` on a GRU or Transformer arm (P2.8 compiles the HSN window only; a baseline
+  would train eager under a compiled label);
 - a family that does not match `model_name`;
 - a variant on a baseline;
 - a variant combined with `hardware.compile_mode`;
@@ -128,12 +132,24 @@ record gives `first_ge_0.90` and `first_ge_0.99`.
 to end.
 
 **Variants.** `pdg`, `gru_cell`, `gru_cell_linear_head`, `linear_head`, `decoder_fc1_fan_in`, `cell_offset`,
-`cell_embed`, `cell_embed_linear_head`. They are installed on the built model by name and add no configuration
-keys. `gru_cell_direct_input` is retired and raises.
+`cell_embed`, `cell_embed_linear_head`. They are installed on the built model by name, before the trainer (and
+any compiled window) is built, and add no configuration keys. `gru_cell_direct_input` is retired and raises.
 
-**Compiled step.** `hardware.compile_mode` is an ordinary override: `none` or `reduce-overhead` (P2.8). Without
-P2.8, a checkout refuses any mode but `none` when the run starts, so the arm fails loudly. Once P2.8 is merged,
-requeue it.
+Variants run eager only. A variant patches the model, and a compiled path may not call what it patched (as
+P1.10a's forward stopped calling what `gru_cell_direct_input` patched), so a variant with a compile mode other
+than `none` is refused at expansion and again when the run starts. A test checks that every variant changes the
+model's logits.
+
+**Compiled step.** `hardware.compile_mode` is an ordinary override: `none` or `reduce-overhead` (P2.8), pinned in
+every CUDA arm. Without P2.8, a checkout refuses any mode but `none` when the run starts, so the arm fails
+loudly; once P2.8 is merged, requeue it. Each record holds the compile mode, whether a compiled window ran, and
+P2.8's `compile_seconds` (training steps) and `window_compile_seconds` (every compiled variant, evaluation
+included).
+
+Compiled artifacts persist between arms: the worker gives every child `TORCHINDUCTOR_CACHE_DIR`, by default
+`<db dir>/inductor-cache` (inductor's own default is under `/tmp`). Arms that differ only in learning rate, seed
+or schedule share one compiled graph. The first arm of each memory key runs alone, so it compiles cold and fills
+the cache for the arms after it.
 
 ## Rules
 

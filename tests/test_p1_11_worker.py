@@ -314,3 +314,47 @@ def test_p1_11_concurrent_workers_and_reporter(tmp_path: Path) -> None:
     assert db.row("SELECT COUNT(*) AS n FROM results")["n"] == 20  # type: ignore[index]
     assert snapshots == sorted(snapshots), "every snapshot is consistent (done never decreases)"
     assert snapshots[-1] <= 20
+
+
+def test_p1_11_cancel_matches_the_exact_experiment(tmp_path: Path) -> None:
+    db = dbm.Database(db_path())
+    enqueue_spec(db, dry_spec(tmp_path, n=1))
+    (a,) = _claim_all(db)
+    sleep = "import time; time.sleep(30)"
+
+    def fake_run_arm(exp: str) -> subprocess.Popen[bytes]:
+        # a process whose command line reads like a run-arm child of experiment `exp`
+        argv = [sys.executable, "-c", sleep, "hsn.experiments", "run-arm", "--exp", exp]
+        return subprocess.Popen(argv, start_new_session=True)
+
+    other, ours = fake_run_arm(f"{a}0"), fake_run_arm(str(a))
+    try:
+        time.sleep(0.3)
+        _set(db, a, pid=other.pid, pgid=other.pid)
+        assert not kill_experiment(db, a), "run-arm --exp N0 is another experiment"
+        assert other.poll() is None
+        _set(db, a, pid=ours.pid, pgid=ours.pid)
+        assert kill_experiment(db, a)
+        assert ours.wait(timeout=20) != 0
+    finally:
+        for proc in (other, ours):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
+def test_p1_11_worker_watches_only_its_children_and_orphans(tmp_path: Path) -> None:
+    db = dbm.Database(db_path())
+    enqueue_spec(db, dry_spec(tmp_path, n=2))
+    a, b = _claim_all(db)
+    live = os.getpid()
+    start = machine.pid_start(live)
+    # a: launched by a worker that still runs (this test process); b: by a worker that is gone
+    _set(db, a, pid=live, pid_start=start, worker=f"{machine.host()}:{live}")
+    _set(db, b, pid=live, pid_start=start, worker=f"{machine.host()}:999999999")
+    worker = _worker(db, tmp_path)
+    assert worker.recover() == []
+    assert set(worker.watch) == {b} and worker.adopted == {b}
+    card, _by_group = worker.observe()
+    assert card.present is False  # the fake machine: a CPU host
+    assert worker.watch[b].samples == 1

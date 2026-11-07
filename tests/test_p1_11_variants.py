@@ -8,6 +8,8 @@ variants on a baseline raise.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 from hsn.data.dataset import ByteDataset
@@ -90,3 +92,46 @@ def test_p1_11_offset_variants_are_seeded() -> None:
     assert isinstance(a.cell.norm, vr.CellIdentity)
     assert torch.equal(a.cell.norm.offset, b.cell.norm.offset)
     assert not torch.equal(a.cell.norm.offset, c.cell.norm.offset)
+
+
+@pytest.mark.parametrize("variant", HSN_VARIANTS)
+def test_p1_11_variant_changes_the_model(variant: str) -> None:
+    """Every variant but pdg changes the logits of the same initial model on the same input (on
+    the eager path, the only one variants run on: compiled variants are refused)."""
+    base, changed = _hsn(), _hsn()
+    vr.install_variant(changed, variant, seed=0)
+    B, T = 2, 8
+    gen = torch.Generator().manual_seed(5)
+    tokens = torch.randint(0, base.cfg.vocab_size, (B, T), generator=gen)
+    ctx = torch.randint(0, base.cfg.n_context, (B, T), generator=gen)
+    reset = torch.zeros(B, T, dtype=torch.bool)
+    reset[:, 0] = True
+    with torch.no_grad():
+        a, _, _ = base(tokens, ctx, base.init_state(B), reset)
+        b, _, _ = changed(tokens, ctx, changed.init_state(B), reset)
+    if variant == "pdg":
+        assert torch.equal(a, b)
+    else:
+        assert float((a - b).abs().max()) > 1e-6, f"{variant} left the logits unchanged"
+
+
+def test_p1_11_variants_are_refused_under_compile(tmp_path: Path) -> None:
+    from hsn.config import load_config
+    from hsn.experiments.protocols import ArmRun, run_protocol
+    from hsn.experiments.rules import parse_rules
+    from hsn.experiments.spec import protocol_params
+    from p1_11_support import REF_A1, TINY_HSN_OVERRIDES
+
+    cfg = load_config(REF_A1, [*TINY_HSN_OVERRIDES, "hardware.compile_mode=reduce-overhead"])
+    arm = ArmRun(
+        cfg=cfg,
+        family="hsn",
+        variant="gru_cell",
+        variant_params={},
+        params=protocol_params({"name": "train_eval"}),
+        run_dir=tmp_path,
+        rules=parse_rules(None),
+        constants={},
+    )
+    with pytest.raises(NotImplementedError, match="variants run eager only"):
+        run_protocol(arm)

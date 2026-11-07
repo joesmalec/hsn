@@ -25,13 +25,17 @@ Every poll (default 5 s), in this order:
 
 The memory estimate of an arm is its row's reservation (``enqueue --mem-estimate-mib``), else the
 largest recorded peak of an arm with the same memory key times :data:`MEM_MARGIN`, else unknown (the
-arm runs alone, and its peak sets the estimate). ``--exit-when-empty`` stops once nothing is queued
-and none of its children runs.
+arm runs alone, and its peak sets the estimate). Since the memory key covers what a compiled graph
+depends on (shapes, widths, routing and gate, dtypes, compile mode), the first arm of each key also
+compiles alone and fills the shared inductor cache (``TORCHINDUCTOR_CACHE_DIR``, default
+``<db dir>/inductor-cache``, persistent, unlike inductor's ``/tmp`` default) for the arms after it.
+``--exit-when-empty`` stops once nothing is queued and none of its children runs.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -74,6 +78,9 @@ class WorkerOptions:
     poll_s: float = 5.0
     omp_threads: int = 4
     claim_grace_s: float = 30.0
+    inductor_cache: Path | None = (
+        None  # None: $TORCHINDUCTOR_CACHE_DIR, else <db dir>/inductor-cache
+    )
 
 
 @dataclass
@@ -228,8 +235,8 @@ class Worker:
                     continue
                 why = f"no process recorded {age:.0f} s after the claim"
             elif self.machine.pid_alive(int(pid), row["pid_start"]):
-                if exp_id not in self.watch:
-                    self.watch[exp_id] = _Watch()
+                if exp_id not in self.watch and not self._worker_alive(row["worker"]):
+                    self.watch[exp_id] = _Watch()  # its worker is gone: watch it from here
                     self.adopted.add(exp_id)
                 continue
             else:
@@ -247,13 +254,20 @@ class Worker:
                 self._flush(exp_id, final=True)
         return gone
 
+    def _worker_alive(self, worker: str | None) -> bool:
+        """Whether the worker ``host:pid`` that launched a row still runs (on this host)."""
+        if not worker or ":" not in worker:
+            return False
+        host, _, pid = worker.rpartition(":")
+        return host == self.host and pid.isdigit() and self.machine.pid_alive(int(pid))
+
     # watch -----------------------------------------------------------------------------------
 
     def observe(self) -> tuple[Card, dict[int, float]]:
         now = time.time()
         running = self.db.running()
         reading = self.machine.read_gpu()
-        groups = self.machine.process_groups() if reading.present and reading.ok else {}
+        groups = self.machine.process_groups() if running or reading.processes else {}
         own_groups = {int(r["pgid"]) for r in running if r["pgid"] is not None}
         own, foreign, _ignored = self.machine.classify(reading.processes, own_groups, groups)
         by_group: dict[int, float] = {}
@@ -285,9 +299,9 @@ class Worker:
         running_ids = [int(r["exp_id"]) for r in running]
         for r in running:
             exp_id = int(r["exp_id"])
-            if r["host"] != self.host:
+            if exp_id not in self.watch:  # only our children and the orphans we adopted
                 continue
-            w = self.watch.setdefault(exp_id, _Watch())
+            w = self.watch[exp_id]
             w.samples += 1
             w.last = now
             if r["pgid"] is not None:
@@ -414,8 +428,11 @@ class Worker:
         run_dir = run_dir_for(self.root, sweep["name"] if sweep else None, exp["run_id"], exp_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "run.log"
+        cache = self.opt.inductor_cache or os.environ.get("TORCHINDUCTOR_CACHE_DIR")
         env = {
             **os.environ,
+            # P2.8: compiled artifacts persist across arms and reboots (inductor's default is /tmp)
+            "TORCHINDUCTOR_CACHE_DIR": str(cache or self.db.path.parent / "inductor-cache"),
             "OMP_NUM_THREADS": str(self.opt.omp_threads),
             "HSN_EXPERIMENTS_DB": str(self.db.path),
             "HSN_EXPERIMENTS_ROOT": str(self.root),
@@ -472,7 +489,8 @@ def kill_experiment(db: Database, exp_id: int, machine: Any = machine_module) ->
         return False
     pid = int(exp["pid"])
     line = machine.cmdline(pid) or ""
-    if "hsn.experiments" not in line or "run-arm" not in line or f"--exp {exp_id}" not in line:
+    ours = re.search(rf"\brun-arm --exp {exp_id}(\s|$)", line) is not None
+    if "hsn.experiments" not in line or not ours:
         return False
     try:
         os.killpg(int(exp["pgid"] or pid), signal.SIGTERM)

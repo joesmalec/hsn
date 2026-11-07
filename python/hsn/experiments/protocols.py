@@ -17,10 +17,11 @@ The order of the audit is kept: ``seed_everything(seed)``, build the model, inst
 (:mod:`hsn.experiments.variants`), build the trainer (which seeds again). New: the early-stop
 callback (:func:`hsn.experiments.rules.check_early_stop`, evaluated right after the step's
 evaluation and diagnostics), the evaluation batch, and per-phase wall times: setup, the fit, the
-trainer's training seconds without the diagnostics hooks' own time, P2.8's compile seconds, the
-evaluations (a profiler that times the trainer's ``evaluate`` segment only), the diagnostics, the
-trained state, the probe and the total. After an early stop the probe and the trained state still
-run; they are stored under ``at_stop`` and never feed a verdict.
+trainer's training seconds without the diagnostics hooks' own time, P2.8's compile seconds (the
+training steps' share, and every compiled variant's, evaluation included), the evaluations (a
+profiler that times the trainer's ``evaluate`` segment only), the diagnostics, the trained state,
+the probe and the total. After an early stop the probe and the trained state still run; they are
+stored under ``at_stop`` and never feed a verdict.
 
 The record (:func:`run_protocol`'s result; :class:`hsn.experiments.rules.RecordView` reads it) has
 ``evals`` (``step``, ``accuracy``, ``loss``, ``per_group``; reads-state runs also the audit's
@@ -209,6 +210,8 @@ def _compile_info(trainer: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
         "compiled_windows": measured.get("compiled_windows"),
         "compile_seconds": measured.get("compile_seconds"),
         "compile_steps": measured.get("compile_steps"),
+        # every compiled variant's compile + recording time, evaluation included (P2.8, 0814235)
+        "window_compile_seconds": measured.get("window_compile_seconds"),
     }
 
 
@@ -229,6 +232,14 @@ def _train(
 
     t0 = time.perf_counter()
     cfg = arm.cfg
+    if arm.variant not in ("pdg", "none") and cfg.hardware.compile_mode != "none":
+        # a variant patches the built model; a compiled path may not call what it patched (as
+        # P1.10a's forward stopped calling what gru_cell_direct_input patched): never run one
+        # compiled until it is shown to work there (spec expansion refuses it too)
+        raise NotImplementedError(
+            f"variant {arm.variant} with hardware.compile_mode={cfg.hardware.compile_mode}: "
+            "variants run eager only (hardware.compile_mode=none)"
+        )
     ctx = resolve(cfg.hardware)  # raises for a compile mode this checkout cannot run
     train_ds, dev_ds = load_datasets(cfg)
     if isinstance(params, OverfitParams):
@@ -241,7 +252,7 @@ def _train(
             dev_ds = ByteDataset(list(dev_ds.examples[: params.n_dev]))
     seed_everything(cfg.seed)
     model = build_model(cfg)
-    variant = install_variant(model, arm.variant, cfg.seed, arm.variant_params)
+    variant = install_variant(model, arm.variant, cfg.seed, arm.variant_params)  # before compile
     timer = _EvalTimer()
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
     trainer.eval_batch = params.eval_batch
@@ -260,6 +271,9 @@ def _train(
     measured = dict(history.measured)
     arm.walls["train_s"] = float(measured.get("train_seconds", 0.0)) - diag.seconds
     arm.walls["compile_s"] = float(measured.get("compile_seconds") or 0.0)
+    # all compiled variants (training, statistics and evaluation windows); eval_s includes the
+    # evaluation variant's one-off compile, so steady-state evaluation is eval_s minus its share
+    arm.walls["window_compile_s"] = float(measured.get("window_compile_seconds") or 0.0)
     arm.walls["eval_s"] = timer.seconds
     arm.walls["diag_s"] = diag.seconds
 

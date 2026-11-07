@@ -18,6 +18,7 @@ from p1_11_support import (
     REF_A1,
     TINY_GRU_OVERRIDES,
     TINY_HSN_OVERRIDES,
+    check_hsn_reads_state_record,
     disk_overrides,
     restore_determinism,  # noqa: F401  (fixture)
     tiny_manifest,  # noqa: F401  (fixture)
@@ -156,8 +157,10 @@ def test_p1_11_reads_state_record(tiny_manifest: Path, tmp_path: Path) -> None: 
         "compiled_windows": None,
         "compile_seconds": None,
         "compile_steps": None,
+        "window_compile_seconds": None,
     }
     assert [d["step"] for d in record["diagnostics"]] == [2, 4, 6]
+    check_hsn_reads_state_record(record, eval_steps=[2, 4, 6], diag_steps=[2, 4, 6])
     first = record["evals"][0]
     assert (
         set(first["dev_answer_accuracy"]) == {"kv/in_range", "delayed/in_range"}

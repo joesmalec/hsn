@@ -216,6 +216,22 @@ def test_p1_11_spec_golden_ids_of_the_validation_sweep(tmp_path: Path) -> None:
         ),
         ({"arms": [{"name": "a b"}]}, "String should match"),
         ({"families": {"ssm": {"config": "x.yaml"}}}, "unknown model families"),
+        (
+            {"arms": [{"name": "a", "overrides": ["profile=rtx3060"]}]},
+            "must pin hardware.compile_mode",
+        ),
+        (
+            {
+                "arms": [
+                    {
+                        "name": "g",
+                        "family": "gru",
+                        "overrides": ["hardware.compile_mode=reduce-overhead"],
+                    }
+                ]
+            },
+            "baseline trains eager",
+        ),
     ],
 )
 def test_p1_11_spec_rejects_bad_input(tmp_path: Path, change: dict[str, Any], match: str) -> None:
@@ -244,3 +260,22 @@ def test_p1_11_committed_specs_expand(path: Path, tmp_path: Path) -> None:
     spec, _ = load_spec(path)
     arms = expand(spec, repo=fake_repo(tmp_path))
     assert arms and len({a.arm_id for a in arms}) == len(arms)
+
+
+def test_p1_11_cuda_arms_pin_the_compile_mode(tmp_path: Path) -> None:
+    pinned = _spec(
+        arms=[{"name": "a", "overrides": ["profile=rtx3060", "hardware.compile_mode=none"]}]
+    )
+    unpinned_cpu = _spec(arms=[{"name": "a"}])
+    ids = _ids(tmp_path, pinned)
+    assert len(ids) == 2  # two seeds
+    # pinning the default changes nothing in the id: the same arm before and after a profile
+    # changes its default
+    on_cpu = _ids(tmp_path, unpinned_cpu)
+    assert set(ids.values()) != set(on_cpu.values())  # another profile is another arm
+    compiled = _spec(
+        arms=[
+            {"name": "a", "overrides": ["profile=rtx3060", "hardware.compile_mode=reduce-overhead"]}
+        ]
+    )
+    assert set(_ids(tmp_path, compiled).values()).isdisjoint(ids.values())

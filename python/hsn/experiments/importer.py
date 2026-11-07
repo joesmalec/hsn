@@ -11,8 +11,9 @@ sha256 is skipped). Per file:
   hsn); a GRU run's variant ``pdg`` is recorded as ``none`` (the audit's scripts wrote the default);
 * **config:** ``.../configs/<rel>`` maps to this repository's ``configs/<rel>``; a file without one
   takes the script's default ``configs/experiments/g1_ref_a1.yaml``, recorded as inferred; the
-  resolved configuration is today's ``load_config(config, overrides)`` (later overrides win), and
-  when that fails the raw overrides are kept and the arm id hashes them instead;
+  resolved configuration is today's ``load_config(config, overrides)`` (later overrides win) with
+  ``hardware.compile_mode=none`` pinned (every audit run was eager), and when that fails the raw
+  overrides are kept and the arm id hashes them instead;
 * **protocol parameters:** the steps actually trained are the last evaluation's step (the resample
   run trained 600 steps of a 3,000-step schedule); ``diag_every`` is the spacing of the diagnostics
   steps (0 without diagnostics); ``diag_docs`` 32 where a ``trained_state`` exists;
@@ -160,7 +161,8 @@ def convert(path: Path, data: dict[str, Any], *, repo: Path = REPO_ROOT) -> dict
     if inferred:
         flags.append(f"config inferred ({DEFAULT_CONFIG})")
     try:
-        cfg = load_config(repo / config_rel, overrides)
+        # every audit run was eager: pin it, whatever the profile's default is today
+        cfg = load_config(repo / config_rel, [*overrides, "hardware.compile_mode=none"])
         config_json: Any = cfg.model_dump(mode="json")
         resolved = True
     except (ValueError, OSError) as exc:

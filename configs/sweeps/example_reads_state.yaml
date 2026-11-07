@@ -12,6 +12,9 @@ base:
   config: configs/experiments/g1_ref_a1.yaml
   overrides:
     - profile=rtx3060
+    # every CUDA arm pins its compile mode: P2.8's compiled step (needs P2.8 merged); the arms
+    # that must stay eager (the baselines, the variants) pin none below
+    - hardware.compile_mode=reduce-overhead
     - train.batch=32
     - train.micro_batch=32
     - train.lr=0.001
@@ -30,6 +33,7 @@ families:
       - train.schedule=cosine
       - train.grad_clip=1.0
       - baseline.gru.n_layers=1
+      - hardware.compile_mode=none
 protocol:
   name: reads_state
   diag_every: 500 # diagnostics on 4 dev documents every 500 steps (memory_open reads them)
@@ -76,3 +80,4 @@ arms:
   - name: hsn_cell_embed
     family: hsn
     variant: {name: cell_embed, offset_std: 0.5}
+    overrides: [hardware.compile_mode=none] # variants run eager only

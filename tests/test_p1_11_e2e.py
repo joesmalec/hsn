@@ -24,6 +24,7 @@ from p1_11_support import (
     REPO,
     TINY_GRU_OVERRIDES,
     TINY_HSN_OVERRIDES,
+    check_hsn_reads_state_record,
     db_path,
     disk_overrides,
     isolated,  # noqa: F401  (fixture)
@@ -152,6 +153,13 @@ def test_p1_11_end_to_end_cpu_sweep(tmp_path: Path, tiny_manifest: Path) -> None
         "partial",
         "reads state",
     )
+    # the database row of an HSN arm carries the full record (all but the per-probe list)
+    stored = db.row("SELECT record_json FROM results WHERE exp_id = ?", (rows["hsn/s0"]["exp_id"],))
+    assert stored is not None
+    check_hsn_reads_state_record(
+        json.loads(stored["record_json"]), eval_steps=[2, 4], diag_steps=[2, 4]
+    )
+    assert "probes" not in json.loads(stored["record_json"])
     stopped = json.loads(Path(rows["hsn_stop/s0"]["json_path"]).read_text())
     assert stopped["stopped"]["step"] == 2 and stopped["at_stop"]["probe"]["n_probed"] > 0
 

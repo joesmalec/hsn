@@ -6,7 +6,7 @@
     expand   <spec>                      arms, labels, ids (no database)
     enqueue  <spec> [--force] [--skip-imported] [--only GLOB] [--mem-estimate-mib N]
     worker   [--max-concurrent 3] [--reserve-mib 1024] [--requeue-orphans] [--require-clean]
-             [--exit-when-empty] [--poll 5] [--idle-gap 60] [--omp-threads 4]
+             [--exit-when-empty] [--poll 5] [--idle-gap 60] [--omp-threads 4] [--inductor-cache DIR]
     status   [--sweep NAME] [--recent 10]
     cancel   EXP... | --arm ID | --sweep NAME      (queued: cancelled; running: SIGTERM)
     requeue  EXP... | --arm ID | --sweep NAME [--status failed,cancelled,stopped_early]
@@ -72,6 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--poll", type=float, default=5.0)
     p.add_argument("--idle-gap", type=float, default=60.0)
     p.add_argument("--omp-threads", type=int, default=4)
+    p.add_argument("--inductor-cache", default=None, help="compiled-artifact cache of the arms")
 
     p = sub.add_parser("status", help="queue, running and recent results")
     p.add_argument("--sweep", default=None)
@@ -226,6 +227,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         exit_when_empty=args.exit_when_empty,
         poll_s=args.poll,
         omp_threads=args.omp_threads,
+        inductor_cache=Path(args.inductor_cache) if args.inductor_cache else None,
     )
     return Worker(db, _root(args, db), options).run()
 

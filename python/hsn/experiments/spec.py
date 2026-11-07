@@ -42,7 +42,10 @@ stored record. The *group id* is the same hash without the seed (seeds of one re
 key* hashes what sets the device memory (model and baseline blocks, batch, unroll, hardware,
 variant, protocol execution parameters).
 
-**Checks at expansion** (errors over silence): a family that does not match the configuration's
+**Checks at expansion** (errors over silence): a CUDA arm that does not pin
+``hardware.compile_mode`` in its overrides (profile defaults change: ``profile:rtx3060`` compiles by
+default once P2.8 is merged), a compile mode on a baseline (P2.8 compiles the HSN window only; a
+baseline would train eager under a compiled label), a family that does not match the configuration's
 ``model_name``, a variant on a baseline, a variant other than ``pdg`` with ``hardware.compile_mode``
 set (untested under P2.8's compiled window), ``routing=random`` with the reads-state protocol (its
 evaluation draws batch-shaped random numbers, so the batched probe would not match), protocol steps
@@ -394,6 +397,7 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
             "baseline": dump["baseline"],
             "batch": cfg.train.batch,
             "unroll": cfg.train.unroll,
+            "gate_mode": cfg.train.gate_mode,  # forks a compiled graph (P2.8)
             "hardware": dump["hardware"],
             "variant": variant,
             "protocol": {
@@ -492,17 +496,34 @@ def _expand_one(
         raise SpecError(f"arm {entry.name}: {exc}") from exc
     if family not in FAMILIES:
         raise SpecError(f"arm {entry.name}: unknown model family {family!r}")
+    if cfg.hardware.device == "cuda" and not any(
+        o.split("=", 1)[0].strip() == "hardware.compile_mode" for o in overrides
+    ):
+        raise SpecError(
+            f"arm {entry.name}: a CUDA arm must pin hardware.compile_mode (none or "
+            "reduce-overhead) in its overrides: profile:rtx3060 compiles by default once P2.8 is "
+            "merged, and an unpinned arm would change its id (and what it computes) with it"
+        )
     if cfg.model_name != family:
         raise SpecError(
             f"arm {entry.name}: family {family} but the configuration's model_name is "
             f"{cfg.model_name}"
+        )
+    if family != "hsn" and cfg.hardware.compile_mode != "none":
+        # P2.8: the generic trainer ignores the compile mode and trains a baseline eager, so a
+        # record would claim a compile that never ran
+        raise SpecError(
+            f"arm {entry.name}: hardware.compile_mode={cfg.hardware.compile_mode} compiles the HSN "
+            f"training window only; a {family} baseline trains eager: pin "
+            "hardware.compile_mode=none"
         )
     variant, vparams = _variant(entry, family)
     if cfg.hardware.compile_mode != "none" and variant not in ("pdg", "none"):
         raise SpecError(
             f"arm {entry.name}: variant {variant} with hardware.compile_mode="
             f"{cfg.hardware.compile_mode} is untested (P2.8's compiled window changes the cell's "
-            "call); run variants eager"
+            "call); run variants eager: add hardware.compile_mode=none (profile:rtx3060 compiles "
+            "by default once P2.8 is merged)"
         )
     # an arm that names another protocol starts from that protocol's defaults, not the sweep's
     other = "name" in entry.protocol and entry.protocol["name"] != spec.protocol.get("name")

@@ -220,3 +220,61 @@ def disk_overrides(manifest: Path, *, steps: int = 4, eval_every: int = 2) -> li
 @pytest.fixture(scope="module")
 def tiny_manifest(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return build_tiny_data(tmp_path_factory.mktemp("tiny_data"))
+
+
+# The fields an HSN reads-state record carries for every diagnostic and for the trained model (the
+# audit's JSONs; the compiled bridge of the validation sweep is the control the first real sweep
+# reads its compiled arms against)
+STATE_KEYS = [
+    f"{stat}/{where}"
+    for where in ("answer", "valid")
+    for stat in (
+        "diversity",
+        "diversity_live",
+        "live_cells",
+        "rank_pr",
+        "rank_pr_p90",
+        "sat99",
+        "abs_h",
+        "cell_spread",
+    )
+]
+GATE_KEYS = ["gate/p10", "gate/p50", "gate/p90"]
+HSN_GROUPS = ["byte_emb", "ctx_emb", "encoder", "predictor", "shared", "cell", "router", "decoder"]
+
+
+def check_hsn_reads_state_record(
+    record: dict[str, Any], *, eval_steps: list[int], diag_steps: list[int]
+) -> None:
+    """Every field the control role needs, at every evaluation and every diagnostic."""
+    assert [e["step"] for e in record["evals"]] == eval_steps
+    for e in record["evals"]:
+        assert {"accuracy", "loss"} <= set(e) and e["per_group"]
+        for g, v in e["per_group"].items():
+            assert {"accuracy", "loss"} <= set(v)
+            assert e["dev_answer_accuracy"][g] == v["accuracy"]
+            assert e["dev_answer_loss"][g] == v["loss"]
+    assert [d["step"] for d in record["diagnostics"]] == diag_steps
+    for d in record["diagnostics"]:
+        for group in HSN_GROUPS:
+            assert f"grad_share/{group}" in d and f"update_ratio/{group}" in d, (group, sorted(d))
+        missing = [k for k in [*STATE_KEYS, *GATE_KEYS] if k not in d]
+        assert not missing, missing
+    trained = record["trained_state"]
+    missing = [
+        k
+        for k in [*STATE_KEYS, *GATE_KEYS, "edge_logit/absmax", "edge_logit/spread"]
+        if k not in trained
+    ]
+    assert not missing, missing
+    probe = record["probe"]
+    for key in (
+        "n_probed",
+        "first_query_accuracy",
+        "all",
+        "correct_before_edit",
+        "verdict",
+        "correct_follow_frac",
+    ):
+        assert key in probe, key
+    assert record["final"]["dev_loss"] == record["evals"][-1]["loss"]
