@@ -703,7 +703,7 @@ class Trainer:
         loader = self._loader(ds, shuffle=False, epochs=1)
         with self._segment("evaluate"):
             result = evaluate_windows(
-                self.model,
+                self._eval_model(),
                 loader,
                 metrics if metrics is not None else DEFAULT_METRICS,
                 device=self.ctx.device,
@@ -713,6 +713,11 @@ class Trainer:
             )
         result["n_docs"] = len(ds)
         return result
+
+    def _eval_model(self) -> Any:
+        """What :meth:`evaluate` runs over the windows: the model itself (P2.8: the HSN trainer
+        hands its compiled window when it has one)."""
+        return self.model
 
     # checkpoints -----------------------------------------------------------------------------
 

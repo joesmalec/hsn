@@ -69,11 +69,12 @@ B, T = 3, 8
 SEED_SEARCH = 64
 
 #: Compiled vs eager in fp32: 10x the largest difference measured (the efficiency audit's rule),
-#: rounded up to one digit. CPU (inductor, 7 Nov 2026, every case below over three seeds): values
-#: (logits, state, info) 7.2e-7, parameter gradients 1.14e-5.
+#: rounded up. 7 Nov 2026, every case of MODES plus top-K STE with the dense fallback, three seeds
+#: each: CPU (inductor) values (logits, state, info) 7.2e-7, parameter gradients 1.14e-5; CUDA
+#: (inductor, CUDA Graphs) values 1.45e-6, gradients 1.9e-5.
 TOL = {
     ("cpu", "fp32"): {"values": 8e-6, "grads": 1.2e-4},
-    ("cuda", "fp32"): {"values": 1e-4, "grads": 1e-3},
+    ("cuda", "fp32"): {"values": 1.5e-5, "grads": 2e-4},
 }
 
 MODES: dict[str, tuple[tuple[str, ...], bool]] = {
@@ -618,10 +619,11 @@ def test_p2_8_static_round_matches_l0_round() -> None:
 
 
 def test_p2_8_block_size() -> None:
-    """Blocks are the largest divisor of ``T`` up to 32: 32 for the A.1 unroll."""
-    assert block_size(256) == 32
+    """Blocks are the largest divisor of ``T`` up to 16: 16 for the A.1 unroll."""
+    assert block_size(256) == 16
     assert block_size(8) == 8
-    assert block_size(48) == 24
+    assert block_size(48) == 16
+    assert block_size(36) == 12
     assert block_size(37) == 1
     with pytest.raises(ValueError):
         block_size(0)
@@ -677,10 +679,12 @@ def _trainer_cfg(compile_mode: str, *overrides: str) -> RunConfig:
 def test_p2_8_trainer_compile_time_separate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A compiled run: plain steps run the compiled window and statistics steps the eager one;
-    the trailing cut is off (full windows); the steps that compiled are reported as
-    ``compile_seconds`` / ``compile_steps`` and kept out of ``train_seconds``; the losses follow
-    the eager run's to rounding."""
+    """A compiled run: every window runs the compiled window (evaluation too: the same metrics as
+    the eager evaluation to rounding), and a statistics step's per-term
+    gradient norms come from one extra compiled pass per term with a gradient path, equal to the
+    eager run's retained-backward norms to rounding; the trailing cut is off (full windows); the
+    steps that compiled are reported as ``compile_seconds`` / ``compile_steps`` and kept out of
+    ``train_seconds``; the losses follow the eager run's to rounding."""
     monkeypatch.setattr(
         tbptt, "compile_window", functools.partial(compile_window, backend="aot_eager")
     )
@@ -696,19 +700,35 @@ def test_p2_8_trainer_compile_time_separate(
         if mode != "none":
             compiled = trainer._compiled
             assert compiled is not None
-            assert compiled.calls == 3  # steps 1, 2, 4; steps 3 and 5 are statistics steps
+            # five windows, plus one pass per gradient term on statistics steps 3 and 5
+            live = sum(
+                1
+                for key, value in histories[mode].steps[2].stats.items()
+                if key.startswith("term_grad_norm/") and value > 0.0
+            )
+            assert live >= 2  # task and pred at least
+            # and the evaluation at the last step runs its windows compiled (an eval variant)
+            assert compiled.calls > 5 + 2 * live
             assert trainer.compiled_window is compiled
             assert not trainer._cut_enabled
     eager, comp = histories["none"], histories["reduce-overhead"]
     assert comp.measured["compile_steps"] >= 1.0 and comp.measured["compile_seconds"] > 0.0
     assert eager.measured["compile_steps"] == 0.0 and eager.measured["compile_seconds"] == 0.0
-    assert eager.measured["compiled_windows"] == 0.0 and comp.measured["compiled_windows"] == 3.0
+    assert eager.measured["compiled_windows"] == 0.0 and comp.measured["compiled_windows"] >= 9.0
     stamped = sum(r.seconds for r in comp.steps)
     total = comp.measured["train_seconds"] + comp.measured["compile_seconds"]
     assert abs(stamped - total) < 1e-6
     assert all(r.stats["window_positions"] == 32.0 for r in comp.steps)  # no cut when compiled
     for a, b in zip(eager.steps, comp.steps, strict=True):
         assert abs(a.total - b.total) <= 1e-4 * max(1.0, abs(a.total))
+        norms = {k: v for k, v in a.stats.items() if k.startswith("term_grad_norm/")}
+        assert list(norms) == [k for k in b.stats if k.startswith("term_grad_norm/")]
+        for key, value in norms.items():
+            assert abs(b.stats[key] - value) <= 1e-4 * max(1.0, abs(value)), key
+    assert len(eager.evals) == len(comp.evals) == 1  # the last step evaluates
+    for key, value in eager.evals[0].items():
+        if isinstance(value, float):
+            assert abs(comp.evals[0][key] - value) <= 1e-4 * max(1.0, abs(value)), key
 
 
 # --------------------------------------------------------------------------------------------------
@@ -796,7 +816,7 @@ def _launches(fn: Callable[[], Any]) -> tuple[int, int]:
 def test_p2_8_launches_drop_at_least_2x(name: str) -> None:
     """One training window (forward and backward) on CUDA issues at least 2x fewer host
     launch calls at L1 (compiled, CUDA Graphs) than at L0 (eager): ref_a1 at T = 32, in blocks of
-    4 positions to keep the compile short (the A.1 window runs blocks of 32; the profiles of
+    4 positions to keep the compile short (the A.1 window runs blocks of 16; the profiles of
     ``scripts/profile_step.py`` measure that)."""
     ctx = _cuda_ctx()
     overrides, _ = MODES[name]
@@ -863,3 +883,35 @@ def test_p2_8_dense_symmetry_exact_compiled_cuda(precision: str, tmp_path: Path)
     carried = trainer._carried_state
     assert carried is not None
     assert float((carried.h - carried.h[:, :1]).abs().max()) == 0.0
+
+
+@pytest.mark.cuda
+@pytest.mark.usefixtures("small_blocks")
+def test_p2_8_compiled_statistics_step_cuda(tmp_path: Path) -> None:
+    """On CUDA (CUDA Graphs), a statistics step's per-term gradient norms come from extra compiled
+    passes and equal the eager run's retained-backward norms to fp32 rounding; the losses and the
+    evaluation agree too."""
+    _cuda_ctx()
+    histories = {}
+    for mode in ("none", "reduce-overhead"):
+        cfg = _trainer_cfg(
+            mode,
+            "profile=rtx3060",
+            "hardware.autocast_dtype=fp32",
+            "train.precision=fp32",
+            "train.steps=6",
+            "train.stats_every=3",
+        )
+        seed_everything(0)
+        trainer = TBPTTTrainer(HSN.from_config(cfg), cfg, resolve(cfg.hardware), run_dir=tmp_path)
+        histories[mode] = trainer.fit(ByteDataset(_docs(16)), ByteDataset(_docs(4, "dev")), 6)
+    eager, comp = histories["none"], histories["reduce-overhead"]
+    assert comp.measured["compiled_windows"] > 6.0
+    for a, b in zip(eager.steps, comp.steps, strict=True):
+        assert abs(a.total - b.total) <= 1e-3 * max(1.0, abs(a.total))
+        for key, value in a.stats.items():
+            if key.startswith("term_grad_norm/"):
+                assert abs(b.stats[key] - value) <= 1e-3 * max(1.0, abs(value)), key
+    for key, value in eager.evals[0].items():
+        if isinstance(value, float):
+            assert abs(comp.evals[0][key] - value) <= 1e-3 * max(1.0, abs(value)), key

@@ -18,7 +18,11 @@ static (plan P2.8, "static shapes are required for graph capture"):
   did not finish compiling in 10 minutes, one compiled position per call left the per-position
   gradient accumulation and copies on the host (11.7k host launches per step, 0.229 s), and blocks
   of 16 to 32 positions gave 0.136 to 0.138 s per step against 0.703 s eager with 500 to 830 host
-  launches.
+  launches. With one graph per run, blocks of 16 compile in about half the time of 32 (cold
+  cache: dense 67 s against 120 s, topk 139 s against 195 s) for a step 1 to 1.4 % slower (dense
+  0.148 against 0.147 s, topk 0.091 against 0.090 s), which is faster end to end for any run up to
+  about 30,000 steps (every configured run is 3,000 to 12,000), so blocks of 16 it is. A warm
+  inductor cache (a later run of the same configuration) halves the compile again (dense 30 s).
 * **Resets as tensor ops.** A block applies the reset of every column (``masked_fill`` with the
   column's mask, the identity where it is False), so a block never depends on which columns reset
   and one graph serves every window.
@@ -44,13 +48,13 @@ built, and runs eager with ``compile_mode: none``):
 * not the fp64 master dtype (the gradchecks of ``configs/tiny_gradcheck.yaml`` stay eager: the
   chunk's "Do not").
 
-CUDA Graphs and the trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`): the trainer marks a new
-graph step per window, takes the carried state out of graph memory (a replay overwrites it),
-runs full windows (no trailing cut: one fixed ``T``), runs the statistics steps eagerly (their
-extra per-term backward passes re-enter a recorded backward graph, which CUDA Graph trees refuse)
-and refuses ``train.grad_accum > 1`` (a gradient held in ``.grad`` from one window would live in
-graph memory the next window's replay overwrites). Compile time is reported apart from the
-steady state (the ``compile`` segment, never inside step timings).
+CUDA Graphs and the trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`): the trainer marks a new graph
+step per window, takes the carried state out of graph memory (a replay overwrites it), runs full
+windows (no trailing cut: one fixed ``T``), takes a statistics step's per-term gradient norms from
+one extra compiled pass per term (several retained backwards of one recorded graph are refused by
+CUDA Graph trees) and refuses ``train.grad_accum > 1`` (a gradient held in ``.grad`` from one
+window would live in graph memory the next window's replay overwrites). Compile time is reported
+apart from the steady state (the ``compile`` segment, never inside step timings).
 
 :func:`compile_step` is the serving step (P5.2's inference path in miniature): one position under
 ``no_grad`` on a preallocated state updated in place, so that its buffers keep their addresses and
@@ -93,16 +97,16 @@ log = logging.getLogger(__name__)
 CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
 _MODES: tuple[CompileMode, ...] = ("none", "reduce-overhead", "max-autotune")
 
-#: The largest block of positions compiled as one graph (P2.8 spike: 16 and 32 tie on the step,
-#: 32 halves the host launches; larger blocks only add compile time).
-MAX_BLOCK = 32
+#: The largest block of positions compiled as one graph: 16 (module docstring: half the compile of
+#: 32 for a step about 1 % slower; larger blocks only add compile time).
+MAX_BLOCK = 16
 
 WindowOut = tuple[Tensor, CellGraphState, dict[str, Tensor]]
 
 
 def block_size(T: int) -> int:
     """The positions per compiled block for a window of ``T``: the largest divisor of ``T`` that
-    is at most :data:`MAX_BLOCK` (32 for the A.1 unroll of 256)."""
+    is at most :data:`MAX_BLOCK` (16 for the A.1 unroll of 256)."""
     if isinstance(T, bool) or not isinstance(T, int) or T < 1:
         raise ValueError(f"T must be an int >= 1, got {T!r}")
     return max(b for b in range(1, min(T, MAX_BLOCK) + 1) if T % b == 0)
