@@ -742,3 +742,223 @@ def test_p1_10_trainer_passes_reset_columns(align_docs: bool, tmp_path: Path) ->
         assert all(columns == [0] and reset.shape[1] < TRAINER_UNROLL for reset, columns in seen)
     else:
         assert any(column > 0 for _, columns in seen for column in columns)
+
+
+# --------------------------------------------------------------------------------------------------
+# P1.10c: fewer ops in the cell
+# --------------------------------------------------------------------------------------------------
+
+#: P1.8's recipe for a saturated state: every parameter scaled so that the gates saturate.
+SATURATION_SCALE = 50.0
+STEPS_10K = 10_000
+BOUND_WINDOW = 250
+
+
+@pytest.mark.parametrize(
+    ("dtype", "autocast"),
+    [
+        pytest.param(torch.float64, False, id="fp64"),
+        pytest.param(torch.float32, False, id="fp32"),
+        pytest.param(torch.float32, True, id="fp32-bf16-autocast"),
+    ],
+)
+def test_p1_10_lerp_state_bounded_10k_steps(dtype: torch.dtype, autocast: bool) -> None:
+    """The ``torch.lerp`` update keeps every coordinate of ``h`` (and of its mean ``q``) in
+    ``[−1, 1]`` through 10,000 positions of ``forward`` windows (40 × 250, random inputs, document
+    resets at 1 %), with every parameter scaled by P1.8's saturation factor so that the gates and
+    candidates saturate: the bound is reached (worst |h| > 0.99), never passed, and ``q`` stays the
+    exact mean of the cells. fp64, fp32 and fp32 under CPU bf16 autocast (the update itself runs in
+    the state dtype)."""
+    cfg = load_config(TINY)
+    seed_everything(0)
+    model = HSN.from_config(cfg).to(dtype).eval()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.mul_(SATURATION_SCALE)
+    m = cfg.model
+    generator = torch.Generator(device="cpu").manual_seed(1)
+    Bb = 4
+    state = model.init_state(Bb)
+    worst_h = worst_q = 0.0
+    context = (
+        torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+        if autocast
+        else torch.autocast(device_type="cpu", enabled=False)
+    )
+    with torch.no_grad(), context:
+        for _ in range(STEPS_10K // BOUND_WINDOW):
+            tokens = torch.randint(0, m.vocab_size, (Bb, BOUND_WINDOW), generator=generator)
+            ctx = torch.randint(0, m.n_context, (Bb, BOUND_WINDOW), generator=generator)
+            reset = torch.rand(Bb, BOUND_WINDOW, generator=generator) < 0.01
+            _, state, info = model(tokens, ctx, state, reset, capture=True)
+            states = info["cell_states"]
+            worst_h = max(worst_h, float(states.abs().max()))
+            worst_q = max(worst_q, float(states.mean(dim=2).abs().max()))
+            assert torch.isfinite(states).all()
+    assert state.h.dtype == dtype
+    assert worst_h <= 1.0 and worst_q <= 1.0, (worst_h, worst_q)
+    assert worst_h > 0.99, worst_h  # the bound is exercised, not vacuous
+    assert torch.equal(state.q, state.recompute_q())
+
+
+def _previous_step_dense(
+    cell: PDGCell, u: Tensor, eps: Tensor, state: CellGraphState, alpha: Tensor
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """The P1.10b ``PDGCell.step_dense`` (``cdc43c8`` .. ``db209bb``), verbatim: gather messages,
+    ``einsum`` units, mixing as product and sum, the update as ``(1 − b)·h + b·c``."""
+    B_, N, d = (int(n) for n in state.h.shape)
+    h_prev = state.h
+    graph = cell.graph
+    Vh = cell.V(h_prev)
+    weights = graph._padded_weights().to(Vh.dtype)
+    m = (Vh[:, graph._pad_src] * weights[None, :, :, None]).sum(dim=2)
+    v_raw = torch.cat(
+        [u[:, None, :].expand(B_, N, d), eps[:, None, :].expand(B_, N, d), h_prev, m], dim=-1
+    )
+    v = cell.norm(v_raw)
+    units = cell.units
+    hidden = torch.einsum("bni,mih->bnmh", v, units.W1)
+    hidden = units.act(hidden + units.b1.to(hidden.dtype))
+    out = torch.einsum("bnmh,mhd->bnmd", hidden, units.W2)
+    unit_out = out + units.b2.to(out.dtype)
+    mixed = (alpha.unsqueeze(-1) * unit_out).sum(dim=2)
+    c = torch.tanh(cell.W_out(mixed).to(h_prev.dtype))
+    b = torch.sigmoid(cell.gate(v).to(h_prev.dtype))
+    h_new = (1 - b) * h_prev + b * c
+    if cell.disabled_cells:
+        h_new = torch.where(cell.disabled[None, :, None], h_prev, h_new)
+    return h_new, {"m": m, "v": v, "unit_out": unit_out, "mixed": mixed, "c": c, "b": b}
+
+
+CELL_CASES = [
+    pytest.param(TINY, (), torch.float64, 0.3, id="tiny-fp64"),
+    pytest.param(TINY, ("model.disabled_cells=[1]",), torch.float64, 0.3, id="tiny-disabled-fp64"),
+    pytest.param(TINY, ("model.edge_norm=sigmoid",), torch.float64, 0.3, id="tiny-sigmoid-fp64"),
+    pytest.param(TINY, ("model.in_degree=0",), torch.float64, 0.3, id="tiny-edgeless-fp64"),
+    pytest.param(REF_A1, (), torch.float64, 0.1, id="ref-fp64"),
+    pytest.param(REF_A1, (), torch.float32, 0.1, id="ref-fp32"),
+    pytest.param(REF_A1, SMALL, torch.float32, 0.3, id="small-fp32"),
+]
+CELL_ATOL = {torch.float64: 1e-12, torch.float32: 1e-5}
+
+
+@pytest.mark.parametrize(("path", "overrides", "dtype", "scale"), CELL_CASES)
+def test_p1_10_cell_ops_match_previous_formulation(
+    path: Path, overrides: tuple[str, ...], dtype: torch.dtype, scale: float
+) -> None:
+    """The P1.10c dense round — messages as one contraction with the dense adjacency, the unit
+    bank as ``addmm`` / ``baddbmm`` on a per-window ``W1`` layout, the mixing as one contraction,
+    the update as ``torch.lerp`` — equals the P1.10b formulation (a verbatim copy) to rounding:
+    ``h_new`` and every intermediate, and the gradients of a random projection with respect to the
+    inputs and every cell parameter, at fp64 1e-12 and fp32 1e-5 (relative for the gradients), in
+    and outside a window."""
+    cfg = load_config(path, overrides=list(overrides))
+    seed_everything(0)
+    model = HSN.from_config(cfg).to(dtype)
+    generator = torch.Generator(device="cpu").manual_seed(5)
+    with torch.no_grad():
+        for p in model.cell.parameters():
+            p.add_(
+                (torch.randn(p.shape, generator=generator, dtype=torch.float64) * scale).to(dtype)
+            )
+    cell = model.cell
+    m = cfg.model
+    Bb, N, d, M = 3, m.n_cells, m.d, m.n_units
+    h = (torch.rand(Bb, N, d, generator=generator, dtype=torch.float64) * 1.6 - 0.8).to(dtype)
+    state = model.init_state(Bb).with_dense(h)
+    u = torch.randn(Bb, d, generator=generator, dtype=torch.float64).to(dtype)
+    eps = torch.randn(Bb, d, generator=generator, dtype=torch.float64).to(dtype)
+    logits = torch.randn(Bb, N, M, generator=generator, dtype=torch.float64).to(dtype)
+    atol = CELL_ATOL[dtype]
+    params = list(cell.parameters())
+
+    def run(fn: Callable[..., tuple[Tensor, dict[str, Tensor]]]) -> tuple[Any, list[Any]]:
+        leaves = [x.detach().requires_grad_(True) for x in (u, eps, state.h, logits)]
+        st = CellGraphState(h=leaves[2], q=leaves[2].mean(dim=1), age=state.age, pos=state.pos)
+        h_new, info = fn(cell, leaves[0], leaves[1], st, torch.softmax(leaves[3], dim=-1))
+        w = torch.Generator(device="cpu").manual_seed(9)
+        loss = sum(
+            (x * torch.randn(x.shape, generator=w, dtype=torch.float64).to(x.dtype)).sum()
+            for x in (h_new, info["m"], info["mixed"], info["c"], info["b"])
+        )
+        grads = torch.autograd.grad(loss, [*leaves, *params], allow_unused=True)
+        return (h_new.detach(), {k: info[k].detach() for k in ("m", "mixed", "c", "b")}), grads
+
+    def current(c: PDGCell, *args: Any) -> tuple[Tensor, dict[str, Tensor]]:
+        return c.step_dense(*args)
+
+    (h_ref, info_ref), g_ref = run(_previous_step_dense)
+    for in_window in (False, True):
+        if in_window:
+            with cell.window():
+                (h_new, info), g_new = run(current)
+        else:
+            (h_new, info), g_new = run(current)
+        _close(h_new, h_ref, f"h_new (window={in_window})", atol)
+        for key, value in info_ref.items():
+            _close(info[key], value, f"{key} (window={in_window})", atol)
+        for i, (g, g_r) in enumerate(zip(g_new, g_ref, strict=True)):
+            assert (g is None) == (g_r is None), i
+            if g is not None and g_r is not None:
+                torch.testing.assert_close(
+                    g, g_r, atol=atol, rtol=atol, msg=lambda s, i=i: f"grad {i}: {s}"
+                )
+
+
+def test_p1_10_cell_ops_bf16_autocast_bound() -> None:
+    """Under CPU bf16 autocast the P1.10c round is at least as close to the fp32 round as the P1.10b
+    formulation is. ``addmm`` / ``baddbmm`` add the biases inside the fp32 accumulator and round
+    once, where ``einsum`` and a separate bf16 add rounded twice; the mixing keeps the product and
+    sum there, so the mixing weights are not rounded to bf16. Measured 6 Nov 2026 on ref_a1 at the
+    training-regime scale, 10 seeds, |h_new − fp32|: P1.10c max 2.0e-2 / mean 5.5e-4, P1.10b max
+    2.7e-2 / mean 5.8e-4 (the two bf16 rounds differ from each other by up to 2.2e-2, mean 3.6e-4;
+    the old formulation at B and B + 1 rows is bit-identical on this CPU)."""
+    cfg = load_config(REF_A1)
+    m = cfg.model
+    errors: dict[str, list[Tensor]] = {"new": [], "old": []}
+    for seed in range(4):
+        seed_everything(0)
+        model = HSN.from_config(cfg)
+        generator = torch.Generator(device="cpu").manual_seed(5 + seed)
+        with torch.no_grad():
+            for p in model.cell.parameters():
+                p.add_(torch.randn(p.shape, generator=generator) * 0.1)
+        cell = model.cell
+        h = torch.rand(3, m.n_cells, m.d, generator=generator) * 1.6 - 0.8
+        state = model.init_state(3).with_dense(h)
+        u = torch.randn(3, m.d, generator=generator)
+        eps = torch.randn(3, m.d, generator=generator)
+        alpha = torch.softmax(torch.randn(3, m.n_cells, m.n_units, generator=generator), dim=-1)
+        with torch.no_grad():
+            exact, _ = _previous_step_dense(cell, u, eps, state, alpha)  # fp32, no autocast
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                h_new, _ = cell.step_dense(u, eps, state, alpha)
+                h_old, _ = _previous_step_dense(cell, u, eps, state, alpha)
+        assert h_new.dtype == h_old.dtype == torch.float32
+        errors["new"].append((h_new - exact).abs().flatten())
+        errors["old"].append((h_old - exact).abs().flatten())
+    new, old = torch.cat(errors["new"]), torch.cat(errors["old"])
+    assert float(new.mean()) <= 1.1 * float(old.mean()), (float(new.mean()), float(old.mean()))
+    assert float(new.max()) <= 1.5 * float(old.max()), (float(new.max()), float(old.max()))
+    assert float(new.max()) < 0.05  # bf16 rounding of a state in [−1, 1], nothing larger
+
+
+def test_p1_10_cell_layouts_cached_per_window() -> None:
+    """Inside a window the dense adjacency and the unit bank's ``W1`` layout are built once and
+    reused; outside a window every call builds them; a ``W1`` changed in place inside a window
+    raises; nothing is kept after the window."""
+    model = _build(CASES[0])
+    cell = model.cell
+    graph, units = cell.graph, cell.units
+    assert graph.dense_adjacency() is not graph.dense_adjacency()
+    assert units._w1_flat() is not units._w1_flat()
+    with cell.window():
+        assert graph.dense_adjacency() is graph.dense_adjacency()
+        assert units._w1_flat() is units._w1_flat()
+        with torch.no_grad():
+            units.W1.add_(0.1)
+        with pytest.raises(RuntimeError, match="W1 must not change inside a window"):
+            units._w1_flat()
+        with pytest.raises(RuntimeError, match="do not nest"), units.window():
+            pass
+    assert units._window_w1 is None and graph._window_cache is None

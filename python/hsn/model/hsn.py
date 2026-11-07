@@ -565,7 +565,8 @@ class HSN(nn.Module):
         alpha = selection.unit_weights.to(state.dtype)
         h_cand, info = self.cell.step_dense(u_s, eps_s, state, alpha)
         mask = selection.cell_mask.to(state.dtype)[:, :, None]
-        h_new = mask * h_cand + (1 - mask) * state.h
+        # P1.10c: m·h_cand + (1 − m)·h_prev in one op; exactly h_cand / h_prev at m = 1 / 0
+        h_new = torch.lerp(state.h, h_cand, mask)
         if self.cell.disabled_cells:  # a soft m would move a disabled cell by an ulp
             h_new = torch.where(self.cell.disabled[None, :, None], state.h, h_new)
         updated = selection.cell_mask.detach() > 0
