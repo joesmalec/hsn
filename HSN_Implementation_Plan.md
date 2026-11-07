@@ -2075,6 +2075,40 @@ are the memory-bound gather, scatter, gated update and CSR message passes (one t
 coalesced along `d`). Streams come from the host (`at::cuda::getCurrentCUDAStream()` in PyTorch; cudarc stream
 in Rust). Everything is compiled at build time; no NVRTC at run time.
 
+**Inputs from P2.8 (PR #33, 7 Nov 2026).**
+
+- **The decision.** `profiles/rtx3060_L1.json` (the G2 sparse model: g1 recipe, top-K STE, bf16
+  B16 T256) says "L2 justified: yes — selected_cells is 26.9% of step time after L1". `messages`
+  is at 18.4 %. `other` (17 %) holds about 6.7 ms of inductor `scatter_reduce` fallbacks with no
+  source frame: gather backwards and the router's `scatter_add`, most of them `messages` work.
+- **Where (b)'s share comes from.** The unit bank's share is mostly the price of static shapes.
+  The capturable round (`UnitBank.forward_static`) runs all M units on the K selected cells and
+  gathers one, so (b) running only the selected unit is the main gain.
+- **The baseline is L1.** `profile:rtx3060` compiles by default since P2.8 (CUDA Graphs, 0.091 s
+  per top-K step against 1.63 s eager). `scripts/bench_kernels.py` must compare each fused op
+  against that compiled path, not only the eager one (§12: fewer counted operations but slower is
+  a fail).
+- **The ops must work inside the compiled window:**
+  - `register_fake` shapes;
+  - no host synchronisation;
+  - static shapes;
+  - stable addresses under CUDA Graph capture.
+
+  `PDGCell.step_sparse(static=True)` is where they plug in.
+- **Measure DRAM traffic per op with Nsight Compute.** P2.8 could not, and listed it as a
+  deviation. On the `profile:rtx3060` dev box:
+  - `ncu` is installed (2026.2.1, `/usr/local/cuda/bin/ncu`; put `/usr/local/cuda/bin` on
+    `PATH`).
+  - The GPU counters were opened to non-admin users with
+    `options nvidia NVreg_RestrictProfilingToAdminUsers=0` in
+    `/etc/modprobe.d/nvidia-profiling.conf` (initramfs rebuilt; effective from the next reboot).
+    Check that `grep RmProfilingAdminOnly /proc/driver/nvidia/params` prints `0`; otherwise run
+    `ncu` under `sudo`.
+  - `ncu` replays every kernel several times to read its counters, and a step runs 20k–30k
+    kernels, so narrow it: `--kernel-name regex:...`, `--launch-skip` / `--launch-count`, or NVTX
+    ranges (`torch.cuda.nvtx.range_push`) around a few positions.
+  - Profile on an exclusive GPU slot.
+
 **Files.** `kernels/cuda/hsn_ops.cu`, `kernels/cuda/hsn_common.cuh`, `python/hsn/kernels/cuda_ext.cpp`,
 `python/hsn/kernels/ops.py`, `scripts/build_kernels.py` (nvcc + extension build), `rust/hsn-kernels/src/cuda/mod.rs`,
 `rust/hsn-kernels/build.rs` (locates the fatbin), `scripts/bench_kernels.py`, `tests/kernels/test_p2_10_cuda.py`,
