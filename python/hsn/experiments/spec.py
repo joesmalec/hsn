@@ -19,7 +19,7 @@ ids. Imports without torch.
         overrides: [train.lr=0.001]
         grid: {model.d: [64, 128]} # optional, cartesian product in the declared order
         seeds: [0, 1, 2]
-        protocol: {diag_every: 25} # merged over the sweep's protocol
+        protocol: {diag_every: 25} # merged over the sweep's protocol (unless it names another)
         timing: true
         constants: {ref_dev: 0.0696}
 
@@ -35,11 +35,12 @@ resolved configuration's non-default values (``model_dump(exclude_defaults=True)
 changed default is a code change, tracked like any code change by the recorded commit), the data
 (blake2b of the manifest file), the model family, the variant and its parameters, the protocol's
 name, version and science parameters (not the execution-only :data:`EXECUTION_ONLY` ones, which
-change speed and rounding only), and the early-stop rules that apply to the arm. The seed sits in
-the configuration. Verdict rules are not part of the id: they are pure functions of the stored
-record. The *group id* is the same hash without the seed (seeds of one recipe); the *memory key*
-hashes what sets the device memory (model and baseline blocks, batch, unroll, hardware, variant,
-protocol execution parameters).
+change speed and rounding only), and the early-stop rules that apply to the arm, with the arm's
+constants substituted (two arms whose stops differ only by a constant are different arms). The seed
+sits in the configuration. Verdict rules are not part of the id: they are pure functions of the
+stored record. The *group id* is the same hash without the seed (seeds of one recipe); the *memory
+key* hashes what sets the device memory (model and baseline blocks, batch, unroll, hardware,
+variant, protocol execution parameters).
 
 **Checks at expansion** (errors over silence): a family that does not match the configuration's
 ``model_name``, a variant on a baseline, a variant other than ``pdg`` with ``hardware.compile_mode``
@@ -63,7 +64,13 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from hsn.config import REPO_ROOT, RunConfig, config_hash, load_config
-from hsn.experiments.rules import Cadence, RuleSet, check_rules, parse_rules
+from hsn.experiments.rules import (
+    Cadence,
+    RuleSet,
+    check_rules,
+    parse_rules,
+    resolved_early_stop,
+)
 
 __all__ = [
     "EXECUTION_ONLY",
@@ -497,7 +504,11 @@ def _expand_one(
             f"{cfg.hardware.compile_mode} is untested (P2.8's compiled window changes the cell's "
             "call); run variants eager"
         )
-    protocol = protocol_params({**spec.protocol, **entry.protocol})
+    # an arm that names another protocol starts from that protocol's defaults, not the sweep's
+    other = "name" in entry.protocol and entry.protocol["name"] != spec.protocol.get("name")
+    protocol = protocol_params(
+        dict(entry.protocol) if other else {**spec.protocol, **entry.protocol}
+    )
     if protocol.name == "reads_state" and family == "hsn" and cfg.model.routing == "random":
         raise SpecError(
             f"arm {entry.name}: routing=random with reads_state: its evaluation draws batch-shaped "
@@ -508,12 +519,14 @@ def _expand_one(
         raise SpecError(f"arm {entry.name}: protocol steps {steps} > train.steps {cfg.train.steps}")
     constants = {**spec.constants, **entry.constants}
     diag_every = int(getattr(protocol, "diag_every", 0))
-    cadence = Cadence.of(steps, cfg.train.eval_every, diag_every, PROTOCOL_SOURCES[protocol.name])
+    cadence = Cadence.of(
+        steps, cfg.train.eval_every, diag_every, PROTOCOL_SOURCES[protocol.name], protocol.name
+    )
     try:
         check_rules(rules, cadence, constants, family)
     except ValueError as exc:
         raise SpecError(f"arm {label}: {exc}") from exc
-    stops = [r.to_json() for r in rules.early_stop if r.families is None or family in r.families]
+    stops = resolved_early_stop(rules, family, protocol.name, constants)
     data = data_hash(cfg, repo, required=protocol.name != "dry_run")
     pdump = protocol.model_dump(mode="json")
     arm_id, group_id = arm_identity(

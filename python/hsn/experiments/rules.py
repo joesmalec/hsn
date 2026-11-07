@@ -30,19 +30,19 @@ Atoms combine with ``{all: [...]}``, ``{any: [...]}`` and ``{not: ...}``. Evalua
 three-valued: a selected sample that is absent or NaN makes the atom *missing*; ``all`` is False if
 any part is False, else missing if any part is missing; ``any`` likewise with True.
 
-**Verdict rule.** ``{cases: [{label, when}], default, applies_to: {family: [...]}, group:
-{min_agree: n}}``: the first case whose condition holds gives the label, the default otherwise. An
-arm outside ``applies_to`` reads ``n/a (family <f>)`` (never a pass or a fail); a missing atom in a
-case reached reads ``n/a: <metric> missing ...``; an arm that stopped early reads ``stopped early:
-<outcome> @ <step>`` for every verdict. ``group.min_agree`` is read by ``report`` at seed-group
-level ("counts as a finding" when that many seeds share a label). Presets (:data:`PRESETS`) expand
-into this form at enqueue: ``reads_state``, ``memory_open``, ``cells_apart``.
+**Verdict rule.** ``{cases: [{label, when}], default, applies_to: {family: [...], protocol: [...]},
+group: {min_agree: n}}``: the first case whose condition holds gives the label, the default
+otherwise. An arm outside ``applies_to`` reads ``n/a (family <f>)`` or ``n/a (protocol <p>)`` (never
+a pass or a fail); a missing atom in a case reached reads ``n/a: <metric> missing ...``; an arm that
+stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict. ``group.min_agree`` is
+read by ``report`` at seed-group level ("counts as a finding" when that many seeds share a label).
+Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``memory_open``,
+``cells_apart``.
 
-**Early stop.** ``{name, at_steps: [n, ...], outcome, when}``: evaluated by the trainer callback
-right after step ``n``'s evaluation and diagnostics; when ``when`` holds the run stops with
-``outcome``.
-Early-stop conditions read step series only, never past ``n``. A missing atom does not stop the
-run; the evaluation is logged either way.
+**Early stop.** ``{name, at_steps: [n, ...], outcome, when, applies_to}``: evaluated by the trainer
+callback right after step ``n``'s evaluation and diagnostics; when ``when`` holds the run stops with
+``outcome``. Early-stop conditions read step series only, never past ``n``. A missing atom does not
+stop the run; the evaluation is logged either way.
 
 **Static checks** (:func:`check_rules`, at enqueue, per arm) raise on an unknown source, a source
 the protocol does not produce, an early stop that reads the future or a scalar source, an
@@ -75,6 +75,7 @@ __all__ = [
     "check_rules",
     "evaluate_verdicts",
     "parse_rules",
+    "resolved_early_stop",
 ]
 
 SERIES_SOURCES = ("eval", "diag", "train")
@@ -183,6 +184,30 @@ Cond = Atom | Combo
 
 
 @dataclass(frozen=True)
+class Scope:
+    """``applies_to``: the model families and protocols a rule is for (None: every one)."""
+
+    families: tuple[str, ...] | None = None
+    protocols: tuple[str, ...] | None = None
+
+    def excludes(self, family: str, protocol: str | None) -> str | None:
+        """Why the rule does not apply to this arm (None: it applies)."""
+        if self.families is not None and family not in self.families:
+            return f"family {family}"
+        if self.protocols is not None and protocol is not None and protocol not in self.protocols:
+            return f"protocol {protocol}"
+        return None
+
+    def to_json(self) -> dict[str, list[str]] | None:
+        out: dict[str, list[str]] = {}
+        if self.families is not None:
+            out["family"] = list(self.families)
+        if self.protocols is not None:
+            out["protocol"] = list(self.protocols)
+        return out or None
+
+
+@dataclass(frozen=True)
 class Case:
     label: str
     when: Cond
@@ -192,7 +217,7 @@ class Case:
 class VerdictRule:
     cases: tuple[Case, ...]
     default: str
-    families: tuple[str, ...] | None = None
+    scope: Scope = Scope()
     min_agree: int | None = None
 
     def to_json(self) -> dict[str, Any]:
@@ -200,8 +225,8 @@ class VerdictRule:
             "cases": [{"label": c.label, "when": c.when.to_json()} for c in self.cases],
             "default": self.default,
         }
-        if self.families is not None:
-            out["applies_to"] = {"family": list(self.families)}
+        if self.scope.to_json() is not None:
+            out["applies_to"] = self.scope.to_json()
         if self.min_agree is not None:
             out["group"] = {"min_agree": self.min_agree}
         return out
@@ -213,7 +238,7 @@ class EarlyStopRule:
     at_steps: tuple[int, ...]
     outcome: str
     when: Cond
-    families: tuple[str, ...] | None = None
+    scope: Scope = Scope()
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -222,8 +247,8 @@ class EarlyStopRule:
             "outcome": self.outcome,
             "when": self.when.to_json(),
         }
-        if self.families is not None:
-            out["applies_to"] = {"family": list(self.families)}
+        if self.scope.to_json() is not None:
+            out["applies_to"] = self.scope.to_json()
         return out
 
 
@@ -238,10 +263,19 @@ class RuleSet:
         return _topological(self.verdicts)
 
     def verdicts_json(self) -> dict[str, Any]:
-        return {name: rule.to_json() for name, rule in sorted(self.verdicts.items())}
+        return {name: rule.to_json() for name, rule in self.verdicts.items()}  # declared order
 
     def early_stop_json(self) -> list[dict[str, Any]]:
         return [r.to_json() for r in self.early_stop]
+
+    def to_json(self) -> dict[str, Any]:
+        """The expanded rules as stored at enqueue (the database sorts keys, so the declared verdict
+        order is kept in ``verdict_order``)."""
+        return {
+            "verdicts": self.verdicts_json(),
+            "verdict_order": list(self.verdicts),
+            "early_stop": self.early_stop_json(),
+        }
 
 
 # --------------------------------------------------------------------------------------------------
@@ -345,17 +379,22 @@ def parse_cond(raw: Any) -> Cond:
     )
 
 
-def _families(raw: Any) -> tuple[str, ...] | None:
+def _names(raw: Any, what: str) -> tuple[str, ...] | None:
     if raw is None:
         return None
-    if not isinstance(raw, Mapping) or set(raw) != {"family"}:
-        raise RuleError(f"applies_to must be {{family: [...]}}, got {raw!r}")
-    fams = raw["family"]
-    if isinstance(fams, str):
-        fams = [fams]
-    if not fams or not all(isinstance(f, str) for f in fams):
-        raise RuleError(f"applies_to.family must be a non-empty list of names, got {fams!r}")
-    return tuple(sorted(set(fams)))
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, Sequence) or not raw or not all(isinstance(f, str) for f in raw):
+        raise RuleError(f"applies_to.{what} must be a non-empty list of names, got {raw!r}")
+    return tuple(sorted(set(raw)))
+
+
+def _scope(raw: Any) -> Scope:
+    if raw is None:
+        return Scope()
+    if not isinstance(raw, Mapping) or not raw or set(raw) - {"family", "protocol"}:
+        raise RuleError(f"applies_to must be {{family: [...], protocol: [...]}}, got {raw!r}")
+    return Scope(_names(raw.get("family"), "family"), _names(raw.get("protocol"), "protocol"))
 
 
 def _verdict(name: str, raw: Any) -> VerdictRule:
@@ -379,7 +418,7 @@ def _verdict(name: str, raw: Any) -> VerdictRule:
     default = raw.get("default")
     if not isinstance(default, str) or not default:
         raise RuleError(f"verdict {name!r} needs a default label")
-    return VerdictRule(tuple(cases), default, _families(raw.get("applies_to")), _group(name, raw))
+    return VerdictRule(tuple(cases), default, _scope(raw.get("applies_to")), _group(name, raw))
 
 
 def _group(name: str, raw: Mapping[str, Any]) -> int | None:
@@ -524,7 +563,7 @@ def _early_stop(raw: Any) -> EarlyStopRule:
         steps,
         raw["outcome"],
         parse_cond(raw["when"]),
-        _families(raw.get("applies_to")),
+        _scope(raw.get("applies_to")),
     )
 
 
@@ -779,16 +818,20 @@ def evaluate_verdicts(
     record: Mapping[str, Any],
     constants: Mapping[str, Any],
     family: str,
+    protocol: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """``{name: {label, detail}}`` for every verdict rule on one run record."""
+    """``{name: {label, detail}}`` for every verdict rule on one run record (``protocol`` defaults
+    to the record's)."""
+    protocol = protocol if protocol is not None else record.get("protocol")
     view = RecordView(record)
     stopped = record.get("stopped")
     labels: dict[str, str] = {}
     out: dict[str, dict[str, Any]] = {}
     for name in rules.order:
         rule = rules.verdicts[name]
-        if rule.families is not None and family not in rule.families:
-            labels[name] = f"n/a (family {family})"
+        outside = rule.scope.excludes(family, protocol)
+        if outside is not None:
+            labels[name] = f"n/a ({outside})"
             out[name] = {"label": labels[name], "detail": []}
             continue
         if stopped:
@@ -818,6 +861,7 @@ def check_early_stop(
     step: int,
     constants: Mapping[str, Any],
     family: str,
+    protocol: str | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Evaluate the early-stop rules due at ``step`` on the record so far: ``(stop, log)``, where
     ``stop`` is ``{rule, step, outcome, values}`` for the first rule that holds."""
@@ -826,7 +870,7 @@ def check_early_stop(
     for rule in rules.early_stop:
         if step not in rule.at_steps:
             continue
-        if rule.families is not None and family not in rule.families:
+        if rule.scope.excludes(family, protocol) is not None:
             continue
         atoms: list[dict[str, Any]] = []
         result = _eval_cond(rule.when, view, constants, {}, step, atoms)
@@ -851,14 +895,20 @@ class Cadence:
     eval_steps: tuple[int, ...]
     diag_steps: tuple[int, ...]
     scalar_sources: tuple[str, ...]
+    protocol: str | None = None
 
     @classmethod
     def of(
-        cls, steps: int, eval_every: int, diag_every: int, scalar_sources: Iterable[str]
+        cls,
+        steps: int,
+        eval_every: int,
+        diag_every: int,
+        scalar_sources: Iterable[str],
+        protocol: str | None = None,
     ) -> Cadence:
         evals = sorted({s for s in range(eval_every, steps + 1, eval_every)} | {steps})
         diags = sorted(range(diag_every, steps + 1, diag_every)) if diag_every > 0 else []
-        return cls(steps, tuple(evals), tuple(diags), tuple(scalar_sources))
+        return cls(steps, tuple(evals), tuple(diags), tuple(scalar_sources), protocol)
 
 
 def _check_atom(
@@ -904,7 +954,8 @@ def _check_atom(
             raise RuleError(f"{where}: an early stop reads step series only, not {atom.metric}")
         if atom.source != "verdict" and atom.source not in cadence.scalar_sources:
             raise RuleError(
-                f"{where}: this protocol writes no {atom.source}: values ({atom.metric})"
+                f"{where}: protocol {cadence.protocol} writes no {atom.source}: values "
+                f"({atom.metric}); restrict the rule with applies_to: {{protocol: [...]}}"
             )
 
 
@@ -913,13 +964,13 @@ def check_rules(
 ) -> None:
     """The static checks of one arm (module docstring); raises :class:`RuleError`."""
     for name, rule in rules.verdicts.items():
-        if rule.families is not None and family not in rule.families:
+        if rule.scope.excludes(family, cadence.protocol) is not None:
             continue
         for case in rule.cases:
             for atom in _atoms(case.when):
                 _check_atom(atom, cadence, constants, f"verdict {name!r}", None)
     for stop in rules.early_stop:
-        if stop.families is not None and family not in stop.families:
+        if stop.scope.excludes(family, cadence.protocol) is not None:
             continue
         for at in stop.at_steps:
             if at not in cadence.eval_steps:
@@ -934,3 +985,30 @@ def check_rules(
                 )
             for atom in _atoms(stop.when):
                 _check_atom(atom, cadence, constants, f"early stop {stop.name!r} @ {at}", at)
+
+
+def _resolved_cond(cond: Cond, constants: Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(cond, Atom):
+        out = cond.to_json()
+        value = resolve_value(cond.value, constants)
+        out["value"] = list(value) if isinstance(value, tuple) else value
+        return out
+    if cond.kind == "not":
+        return {"not": _resolved_cond(cond.parts[0], constants)}
+    return {cond.kind: [_resolved_cond(p, constants) for p in cond.parts]}
+
+
+def resolved_early_stop(
+    rules: RuleSet, family: str, protocol: str | None, constants: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """The early-stop rules that apply to one arm, with the arm's constants substituted: what the
+    arm's id hashes (two arms whose stops differ only by a constant are different arms) and what its
+    child evaluates."""
+    out = []
+    for rule in rules.early_stop:
+        if rule.scope.excludes(family, protocol) is not None:
+            continue
+        entry = rule.to_json()
+        entry["when"] = _resolved_cond(rule.when, constants)
+        out.append(entry)
+    return out

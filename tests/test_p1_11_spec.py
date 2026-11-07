@@ -142,6 +142,16 @@ def test_p1_11_spec_expansion_is_deterministic_and_ids_stable(tmp_path: Path) ->
     stop["rules"]["early_stop"][0]["when"]["steps"] = {"at": 30}
     assert changed(stop)
     assert base["hsn/s0"] != base["hsn/s1"]
+    # an early stop that differs only by an arm constant is a different arm (the resolved value is
+    # hashed, not the constant's name)
+    by_constant = _spec()
+    by_constant["rules"]["early_stop"][0]["when"]["value"] = "cut"
+    by_constant["arms"] = [
+        {"name": "a", "family": "hsn", "constants": {"cut": 0.1}},
+        {"name": "b", "family": "hsn", "constants": {"cut": 0.2}},
+    ]
+    ids_c = _ids(tmp_path, by_constant, repo=repo)
+    assert ids_c["a/s0"] != ids_c["b/s0"]
     other_data = fake_repo(tmp_path / "other", manifest=b'{"rebuilt": true}')
     assert changed(_spec(), repo_=other_data)
 

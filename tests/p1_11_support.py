@@ -193,7 +193,30 @@ def enqueue_spec(db: Any, path: Path, **kwargs: Any) -> Any:
         spec_hash=digest(spec.model_dump(mode="json")),
         spec_text=text,
         spec_path=str(path),
-        rules_json={"verdicts": rules.verdicts_json(), "early_stop": rules.early_stop_json()},
+        rules_json=rules.to_json(),
         arms=arms,
         **kwargs,
     )
+
+
+def db_path() -> Path:
+    """The test database the ``isolated`` fixture set up."""
+    import os
+
+    return Path(os.environ["HSN_EXPERIMENTS_DB"])
+
+
+def disk_overrides(manifest: Path, *, steps: int = 4, eval_every: int = 2) -> list[str]:
+    """Overrides that train on the tiny on-disk data of :func:`build_tiny_data`."""
+    return [
+        *train_overrides(steps=steps, eval_every=eval_every),
+        f"data.manifest={manifest}",
+        "data.dataset=tiny_p1_11",
+        "data.tasks=[kv,delayed]",
+        "data.variants=[in_range]",
+    ]
+
+
+@pytest.fixture(scope="module")
+def tiny_manifest(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return build_tiny_data(tmp_path_factory.mktemp("tiny_data"))

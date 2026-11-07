@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from hsn.experiments import db as dbm
-from p1_11_support import dry_spec, enqueue_spec, isolated  # noqa: F401  (fixture)
+from p1_11_support import db_path, dry_spec, enqueue_spec, isolated  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("isolated")
 
@@ -70,8 +70,8 @@ def test_p1_11_db_refuses_tmp(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dbm.default_root(dbm.default_db_path()) == Path("~/hsn-experiments/runs").expanduser()
 
 
-def test_p1_11_fifo_order(tmp_path: Path, isolated: Path) -> None:  # noqa: F811
-    db = dbm.Database(isolated)
+def test_p1_11_fifo_order(tmp_path: Path) -> None:
+    db = dbm.Database(db_path())
     report = enqueue_spec(db, dry_spec(tmp_path, n=5))
     ids = [a["exp_id"] for a in report.added]
     assert ids == sorted(ids) and [r["exp_id"] for r in db.queued()] == ids
@@ -92,8 +92,8 @@ def test_p1_11_fifo_order(tmp_path: Path, isolated: Path) -> None:  # noqa: F811
         dbm.claim_next(db, lambda q, r: ids[2], worker="w", host="h")
 
 
-def test_p1_11_enqueue_dedup(tmp_path: Path, isolated: Path) -> None:  # noqa: F811
-    db = dbm.Database(isolated)
+def test_p1_11_enqueue_dedup(tmp_path: Path) -> None:
+    db = dbm.Database(db_path())
     spec = dry_spec(tmp_path, n=6)
     first = enqueue_spec(db, spec)
     assert len(first.added) == 6 and not first.skipped
@@ -146,8 +146,8 @@ def test_p1_11_enqueue_dedup(tmp_path: Path, isolated: Path) -> None:  # noqa: F
     assert enqueue_spec(db, changed).sweep_id != matched.sweep_id
 
 
-def test_p1_11_guarded_child_writes(tmp_path: Path, isolated: Path) -> None:  # noqa: F811
-    db = dbm.Database(isolated)
+def test_p1_11_guarded_child_writes(tmp_path: Path) -> None:
+    db = dbm.Database(db_path())
     (added,) = enqueue_spec(db, dry_spec(tmp_path, n=1)).added
     exp_id = added["exp_id"]
     assert not dbm.child_start(db, exp_id, 123), "a queued row is not the child's"
