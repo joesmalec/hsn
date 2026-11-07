@@ -162,9 +162,9 @@ def _script(
     seen: list[int] = []
     original = trainer._forward
 
-    def forward(batch: Batch, state: Any) -> Any:
+    def forward(batch: Batch, state: Any, **kwargs: Any) -> Any:
         seen.append(int(batch["tokens"].shape[1]))
-        return original(batch, state)
+        return original(batch, state, **kwargs)
 
     monkeypatch.setattr(trainer, "_loader", lambda *args, **kwargs: _Scripted(windows))
     monkeypatch.setattr(trainer, "evaluate", lambda *args, **kwargs: {})
@@ -207,11 +207,11 @@ def _train(
         rounds.append(_copy(state))
         return original_dense(u, eps, state, alpha)
 
-    def forward(batch: Batch, state: CellGraphState) -> Any:
+    def forward(batch: Batch, state: CellGraphState, **kwargs: Any) -> Any:
         first = len(run.positions)
         assert not bool(batch["reset"][:, 1:].any()), "a reset after t = 0 inside the window"
         rounds.clear()
-        logits, new_state, info = original_forward(batch, state)
+        logits, new_state, info = original_forward(batch, state, **kwargs)
         assert len(rounds) == int(batch["tokens"].shape[1])
         run.positions.extend(rounds[1:])
         run.positions.append(_copy(new_state))
@@ -516,9 +516,9 @@ def test_p1_10_full_windows_when_routed_or_unaligned(
     seen: list[tuple[int, int]] = []
     original = trainer._forward
 
-    def forward(batch: Batch, state: Any) -> Any:
+    def forward(batch: Batch, state: Any, **kwargs: Any) -> Any:
         seen.append((int(batch["tokens"].shape[1]), trailing_cut(batch)))
-        return original(batch, state)
+        return original(batch, state, **kwargs)
 
     monkeypatch.setattr(trainer, "_forward", forward)
     history = trainer.fit(ds, ds, 3)
@@ -564,9 +564,9 @@ def test_p1_10_baselines_keep_full_windows(
     seen: list[tuple[int, int]] = []
     original = trainer._forward
 
-    def forward(batch: Batch, state: Any) -> Any:
+    def forward(batch: Batch, state: Any, **kwargs: Any) -> Any:
         seen.append((int(batch["tokens"].shape[1]), trailing_cut(batch)))
-        return original(batch, state)
+        return original(batch, state, **kwargs)
 
     monkeypatch.setattr(trainer, "_forward", forward)
     ds = ByteDataset(_docs(SHORT, 16))

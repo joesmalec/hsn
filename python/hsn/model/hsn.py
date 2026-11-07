@@ -90,6 +90,7 @@ called until P2.7), no custom kernels (P2.9–P2.11), no ``torch.compile`` (P2.8
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple, Self
 
@@ -459,15 +460,24 @@ class HSN(nn.Module):
         profiler: Profiler | None,
         dense_rows: Tensor | None,
         capture: bool = False,
+        dense_counters: tuple[Tensor, Tensor] | None = None,
     ) -> _RoundResult:
         """The round of one position on ``state``: the dense reference, the masked round (mode
         ``masked`` or the soft warm-up) or the sparse round, shared by :meth:`step` and
         :meth:`forward` so that the two cannot drift apart. With ``capture`` the result also carries
-        the gate of the written cells and the written mask (:meth:`forward`'s ``capture``)."""
+        the gate of the written cells and the written mask (:meth:`forward`'s ``capture``).
+
+        ``dense_counters`` (P1.10b, dense mode without disabled cells only) are the ``age`` and
+        ``pos`` the written state carries, computed by :meth:`forward` for the whole window; the
+        dense round writes them instead of zeroing the ages and ticking (the same values)."""
         if mode == "dense":
             assert alpha is not None
             h_new, info = self.cell.step_dense(u_s, eps_s, state, alpha)
-            new_state = self._write_dense(state, h_new)
+            if dense_counters is None:
+                new_state = self._write_dense(state, h_new)
+            else:
+                age, pos = dense_counters
+                new_state = CellGraphState(h=h_new, q=h_new.mean(dim=1), age=age, pos=pos)
             if not capture:
                 return _RoundResult(new_state)
             enabled = self._enabled_cells(state)
@@ -602,6 +612,7 @@ class HSN(nn.Module):
         reset: Tensor,
         *,
         capture: bool = False,
+        reset_columns: Sequence[int] | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """Run positions ``0 .. T−1`` of ``tokens [B, T]`` / ``ctx [B, T]`` from ``state``.
 
@@ -639,6 +650,14 @@ class HSN(nn.Module):
 
         The masked and the sparse round of the same selection agree on the written cells.
 
+        ``reset_columns`` (P1.10b) are the positions at which the per-position reset runs, a
+        strictly increasing sequence of ints in ``[0, T)`` that must contain every column where
+        ``reset`` has a True (extra columns are allowed and change nothing). ``None`` derives them
+        from ``reset``: free on the CPU, one device-to-host copy per window on an accelerator. A
+        trainer passes them from the CPU batch it uploads, so no copy is needed. On the CPU a list
+        that omits a reset column raises; on an accelerator that is the caller's contract (checking
+        it would cost the copy it saves).
+
         P1.10a: the work that depends on the inputs and parameters only runs once for the window —
         the byte and context embeddings, ``E`` and the prediction target over ``[B, T]``, the
         position-independent scorer features (:meth:`Scorer.window_scalars`), the edge weights
@@ -650,10 +669,21 @@ class HSN(nn.Module):
         leakage test). The batched matmuls round differently from :meth:`step`'s per-position ones
         (the GEMM row count changes), so ``forward`` matches stepping to rounding (fp64 1e-12,
         ``test_p1_10_forward_matches_stepwise_reference``), not bit for bit.
+
+        P1.10b: the reset runs only at the reset columns, and the dense round (``model.routing``
+        dense, no ``model.disabled_cells``) keeps no per-position ``age`` / ``pos`` bookkeeping: it
+        writes every cell, so the age before position ``t`` is the start age (after a reset at 0)
+        at ``t = 0`` and 0 afterwards, and ``pos`` follows from the reset mask. The states of every
+        position still carry those values (views of the window's counters), and the reset there
+        masks ``h`` and ``q`` only (``age`` and ``pos`` already account for it). Bit for bit the
+        same as the per-position bookkeeping.
         """
         B, T = self._check_window_inputs(tokens, ctx, state, reset)
         if not isinstance(capture, bool):
             raise TypeError(f"capture must be a bool, got {capture!r}")
+        resets_at = [False] * T
+        for column in self._reset_columns(reset, reset_columns):
+            resets_at[column] = True
         cfg = self.cfg
         mode: StepMode = "dense" if cfg.routing == "dense" else "sparse"
         dense_rows: Tensor | None = None
@@ -669,13 +699,19 @@ class HSN(nn.Module):
         z = self.encoder(emb)
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         context = self.ctx_emb(ctx)  # [B, T, context_dim]
+        positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
         scalars = self.scorer.window_scalars(
-            ctx,
-            _window_positions(state.pos, reset),
-            budget_frac=cfg.budget,
-            round_idx=0,
-            dtype=state.dtype,
+            ctx, positions, budget_frac=cfg.budget, round_idx=0, dtype=state.dtype
         )  # [B, T, N, 7]
+        # P1.10b: the dense round writes every cell, so its counters are known for the window
+        dense_window = mode == "dense" and not self.cell.disabled_cells
+        if dense_window:
+            start_age = state.age.masked_fill(reset[:, 0, None], 0) if resets_at[0] else state.age
+            age_feature = torch.zeros(B, T, cfg.n_cells, dtype=state.dtype, device=state.device)
+            age_feature[:, 0] = start_age.to(state.dtype) / self.scorer.age_max
+            scalars = torch.cat([age_feature[..., None], scalars], dim=-1)  # [B, T, N, 8]
+            zero_age = torch.zeros_like(state.age)
+            positions_after = positions + 1
         # unbind: one backward node for the whole window instead of a slice backward per position
         z_steps, ctx_steps, scalar_steps = z.unbind(1), context.unbind(1), scalars.unbind(1)
 
@@ -690,14 +726,24 @@ class HSN(nn.Module):
         selections: list[Selection] = []
         with self.cell.window():
             for t in range(T):
-                state = state.reset(reset[:, t])
+                if dense_window:
+                    h, q = state.h, state.q
+                    if resets_at[t]:  # age and pos already account for the reset
+                        h = h.masked_fill(reset[:, t, None, None], 0)
+                        q = q.masked_fill(reset[:, t, None], 0)
+                    state = CellGraphState(
+                        h=h, q=q, age=start_age if t == 0 else zero_age, pos=positions[:, t]
+                    )
+                elif resets_at[t]:
+                    state = state.reset(reset[:, t])
                 q_prev = state.q
                 z_t = z_steps[t]
                 z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
                 eps = z_t - z_hat
                 u = self.shared(torch.cat([z_t, q_prev, ctx_steps[t]], dim=-1))
                 u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)  # P1.7: see step
-                feats = self.scorer._assemble(u_s, eps_s, state.h, state.age, scalar_steps[t])
+                age = None if dense_window else state.age  # dense: a column of the scalars
+                feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalar_steps[t])
                 unit_logits, alpha, selection = self._score(feats, state, mode, dense_rows)
                 result = self._update(
                     u_s,
@@ -710,6 +756,7 @@ class HSN(nn.Module):
                     None,
                     dense_rows,
                     capture,
+                    (zero_age, positions_after[:, t]) if dense_window else None,
                 )
                 state = result.state
                 z_hats.append(z_hat)
@@ -725,6 +772,8 @@ class HSN(nn.Module):
                     gates.append(result.gate)
                     written.append(result.written)
 
+        if dense_window:
+            state = replace(state, pos=positions_after[:, -1].contiguous())
         u_window = torch.stack(us, dim=1)
         logits = self.decoder(torch.cat([torch.stack(qs, dim=1), u_window], dim=-1))  # updated q_t
         eps_window = torch.stack(epss, dim=1)
@@ -877,6 +926,38 @@ class HSN(nn.Module):
         B = state.batch_size
         self._check_ids("x_t", x_t, (B,), state.device)
         self._check_ids("ctx_t", ctx_t, (B,), state.device)
+
+    @staticmethod
+    def _reset_columns(reset: Tensor, columns: Sequence[int] | None) -> list[int]:
+        """The columns at which :meth:`forward` resets (``reset_columns``, module docstring):
+        derived from ``reset`` when ``None`` (one device-to-host copy on an accelerator),
+        validated otherwise."""
+        T = int(reset.shape[1])
+        if columns is None:
+            derived: list[int] = reset.any(dim=0).nonzero().flatten().tolist()
+            return derived
+        if isinstance(columns, str | bytes) or not isinstance(columns, Sequence):
+            raise TypeError(
+                f"reset_columns must be a sequence of ints or None, got {type(columns).__name__}"
+            )
+        listed = list(columns)
+        for column in listed:
+            if isinstance(column, bool) or not isinstance(column, int):
+                raise TypeError(f"reset_columns must hold ints, got {column!r}")
+        if any(b <= a for a, b in zip(listed, listed[1:], strict=False)):
+            raise ValueError(f"reset_columns must be strictly increasing, got {listed}")
+        if listed and (listed[0] < 0 or listed[-1] >= T):
+            raise ValueError(f"reset_columns must lie in [0, T) = [0, {T}), got {listed}")
+        if reset.device.type == "cpu":  # the superset check is free here
+            needed = reset.any(dim=0)
+            needed[listed] = False
+            missing = needed.nonzero().flatten().tolist()
+            if missing:
+                raise ValueError(
+                    f"reset has resets at columns {missing} that reset_columns omits; it must "
+                    "contain every column where some row resets"
+                )
+        return listed
 
     def _check_window_inputs(
         self, tokens: Tensor, ctx: Tensor, state: CellGraphState, reset: Tensor

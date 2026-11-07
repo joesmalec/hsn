@@ -526,22 +526,20 @@ class Scorer(nn.Module):
             dim=-1,
         )  # [B, T, N, 7] in _SCALAR_FEATURES[1:] order
 
-    def _assemble(self, u: Tensor, eps: Tensor, h: Tensor, age: Tensor, scalars: Tensor) -> Tensor:
+    def _assemble(
+        self, u: Tensor, eps: Tensor, h: Tensor, age: Tensor | None, scalars: Tensor
+    ) -> Tensor:
         """``[B, N, 3d+8]`` from ``u``, ``eps`` ``[B, d]``, ``h [B, N, d]``, ``age [B, N]`` and the
         other scalars ``[B, N, 7]`` (:meth:`_scalars` at one position), unchecked: the callers
-        validated their inputs (:meth:`features` per call, :meth:`window_scalars` per window)."""
+        validated their inputs (:meth:`features` per call, :meth:`window_scalars` per window).
+        With ``age=None`` the scalars already hold the age feature in front, ``[B, N, 8]`` (the
+        dense window of P1.10b, whose ages are known in advance)."""
         B, N, d = (int(n) for n in h.shape)
-        age_feature = (age.to(u.dtype) / self.age_max)[:, :, None]  # [B, N, 1]
-        feats = torch.cat(
-            [
-                u[:, None, :].expand(B, N, d),
-                eps[:, None, :].expand(B, N, d),
-                h,
-                age_feature,
-                scalars,
-            ],
-            dim=-1,
-        )
+        parts = [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h]
+        if age is not None:
+            parts.append((age.to(u.dtype) / self.age_max)[:, :, None])  # [B, N, 1]
+        parts.append(scalars)
+        feats = torch.cat(parts, dim=-1)
         if self.exclude:
             feats = feats.masked_fill(self._excluded, 0)
         return feats

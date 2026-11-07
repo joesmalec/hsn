@@ -25,7 +25,9 @@ window loop::
   window's gradient never reaches an earlier one (plan §2.6: fixed unroll, carried detached state;
   one optimiser step is ``train.grad_accum`` windows, P0.5 semantics). Document resets are the
   loader's ``reset`` mask (True at every document start) and are applied by the model itself,
-  position by position, before the position is processed (P1.5).
+  position by position, before the position is processed (P1.5). The trainer passes the columns
+  that hold a reset, read from the CPU window, as ``reset_columns`` (P1.10b), so the model resets
+  only there without a device-to-host copy.
 * **Periodic ``q`` resync.** Every ``train.q_resync_every`` windows the summary is replaced by the
   exact mean over cells (:meth:`~hsn.model.state.CellGraphState.recompute_q`) at the window start,
   which removes the floating-point drift incremental sparse updates accumulate (P1.3 pitfall). The
@@ -98,8 +100,10 @@ window loop::
   boundary, so a window whose rows have all ended their documents is padding in every row from some
   column ``c`` on, and the next window resets every row at ``t = 0``. The trainer then computes only
   the columns ``[0, c)`` (:func:`trailing_cut`, from the CPU window: no device synchronisation).
-  This is exact under dense routing: the columns before ``c`` run the same operations on the same
-  inputs, every dense-routing term (task over ``loss_mask``, pred and the variance floor over
+  This is exact in math under dense routing (since P1.10a's window-level ``E`` / ``D`` the floats
+  agree to rounding, fp64 1e-12 and fp32 1e-5, because the GEMMs see ``[B, c]`` instead of
+  ``[B, T]``): the columns before ``c`` run the same operations on the same inputs, every
+  dense-routing term (task over ``loss_mask``, pred and the variance floor over
   ``doc >= 0``, graph over the parameters) gets exact zeros from the padding tail, and the carried
   state, which is the state at column ``c − 1`` instead of after the padding, is zeroed by the next
   window's reset (:meth:`~hsn.model.state.CellGraphState.reset` fills ``h``, ``q``, ``age`` and
@@ -274,7 +278,8 @@ class TBPTTTrainer(Trainer):
         self.resyncs = 0
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
-        # P1.10d: the trailing-padding cut (exact under dense routing only; module docstring)
+        # P1.10d: the trailing-padding cut (exact in math under dense routing only, to rounding in
+        # floats since P1.10a; module docstring)
         self._cut_enabled = cfg.data.align_docs and cfg.model.routing == "dense"
         self._cut_pending = False  # the carried state comes from a cut window
 
@@ -559,7 +564,10 @@ class TBPTTTrainer(Trainer):
                     if self.counterfactual
                     else None
                 )  # P2.3: before the forward pass, from the window-start state
-                logits, state, info = self._forward(fwd, state)
+                # P1.10b: the columns where some row resets, from the CPU window (cut like the
+                # device views), so that HSN.forward needs no device-to-host copy to find them
+                reset_columns = window["reset"][:, :cut].any(dim=0).nonzero().flatten().tolist()
+                logits, state, info = self._forward(fwd, state, reset_columns=reset_columns)
                 window_active = self._window_active_units(info)
                 if window_active is not None:
                     active = window_active if active is None else active | window_active

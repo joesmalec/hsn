@@ -21,13 +21,16 @@ from typing import Any
 
 import pytest
 import torch
-from hsn.config import load_config
-from hsn.device import seed_everything
+from hsn.config import load_config, load_hardware_profile
+from hsn.data.dataset import ByteDataset
+from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
+from hsn.device import resolve, seed_everything
 from hsn.model.cell import PDGCell
 from hsn.model.graph import CellGraph
 from hsn.model.hsn import HSN, StepMode
 from hsn.model.router import Selection
 from hsn.model.state import CellGraphState
+from hsn.train.tbptt import TBPTTTrainer
 from torch import Tensor
 
 REPO = Path(__file__).resolve().parents[1]
@@ -54,6 +57,8 @@ ATOL_FP32 = 1e-6
 GRAD_TOL = 1e-10
 B, T = 3, 6
 RNG_SEED = 1234
+SPEC = load_dataset_spec(REPO / "configs" / "data" / "synthetic_v1.yaml")
+TRAINER_UNROLL = 32
 
 
 @dataclass(frozen=True)
@@ -531,3 +536,187 @@ def test_p1_10_edge_weights_cached_per_window(routing: str) -> None:
         with pytest.raises(RuntimeError, match="do not nest"), graph.window():
             pass
     assert graph._window_cache is None
+
+
+# --------------------------------------------------------------------------------------------------
+# P1.10b: reset only where some row resets; the dense window's counters
+# --------------------------------------------------------------------------------------------------
+
+RESET_PATTERNS: dict[str, list[tuple[int, int]]] = {
+    "none": [],
+    "start_all_rows": [(b, 0) for b in range(B)],  # align_docs: every window starts a document
+    "start_some_rows": [(0, 0), (2, 0)],
+    "scattered": [(0, 2), (1, 4), (2, 2)],
+    "every_column": [(b, t) for b in range(B) for t in range(T)],
+    "last_column": [(1, T - 1)],
+}
+RESET_CASES = [
+    case
+    for case in CASES
+    if case.name
+    in (
+        "dense_tiny",
+        "dense_tiny_disabled",
+        "dense_ref_a1",
+        "masked_soft_warmup",
+        "sparse_topk_eval",
+        "sparse_ste_dense_fallback",
+    )
+]
+
+
+def _reset_mask(cells: list[tuple[int, int]]) -> Tensor:
+    reset = torch.zeros(B, T, dtype=torch.bool)
+    for b, t in cells:
+        reset[b, t] = True
+    return reset
+
+
+@contextmanager
+def _recording_states(model: HSN) -> Iterator[list[CellGraphState]]:
+    """The state every round of a window reads (the third argument of ``step_dense`` /
+    ``step_sparse``), recorded by wrapping the instance's methods."""
+    seen: list[CellGraphState] = []
+    cell = model.cell
+    dense, sparse = cell.step_dense, cell.step_sparse
+
+    def step_dense(u: Tensor, eps: Tensor, state: CellGraphState, *rest: Any, **kw: Any) -> Any:
+        seen.append(state)
+        return dense(u, eps, state, *rest, **kw)
+
+    def step_sparse(u: Tensor, eps: Tensor, state: CellGraphState, *rest: Any, **kw: Any) -> Any:
+        seen.append(state)
+        return sparse(u, eps, state, *rest, **kw)
+
+    cell.step_dense, cell.step_sparse = step_dense, step_sparse  # type: ignore[method-assign]
+    try:
+        yield seen
+    finally:
+        del cell.step_dense, cell.step_sparse
+
+
+@pytest.mark.parametrize("pattern", list(RESET_PATTERNS))
+@pytest.mark.parametrize("case", RESET_CASES, ids=[case.name for case in RESET_CASES])
+def test_p1_10_reset_columns_equal_per_position_reset(case: Case, pattern: str) -> None:
+    """Resetting only at the columns where some row resets (the default, from ``reset``) equals
+    resetting at every column (``reset_columns=range(T)``, the per-position reset) bit for bit —
+    logits, the final state and every ``info`` key — for reset masks from none to every position,
+    in the dense window (whose ``age`` / ``pos`` come from the window counters), the disabled-cell
+    hook, the masked round and the sparse round; the parameter gradients agree to the fp64
+    gradient tolerance (the no-op reset nodes change the order in which autograd sums a
+    parameter's per-position contributions). Both equal the per-position reference (stepping) to
+    the fp64 tolerance, the counters exactly, and every round reads the same state as the
+    reference's round does (the window keeps the per-position states truthful)."""
+    model = _build(case)
+    tokens, ctx, state, _ = _inputs(model)
+    reset = _reset_mask(RESET_PATTERNS[pattern])
+    with _recording_states(model) as seen:
+        default = _run(lambda: model(tokens, ctx, state, reset))
+    every = _run(lambda: model(tokens, ctx, state, reset, reset_columns=range(T)))
+    _assert_matches(default, every, exact=True)
+    for g, g_e in zip(_grads(model, default), _grads(model, every), strict=True):
+        assert (g is None) == (g_e is None)
+        if g is not None and g_e is not None:
+            torch.testing.assert_close(g, g_e, atol=GRAD_TOL, rtol=GRAD_TOL)
+    with _recording_states(model) as seen_ref:
+        ref = _run(lambda: _stepwise(model, tokens, ctx, state, reset))
+    _assert_matches(default, ref)
+    assert len(seen) == len(seen_ref) >= T
+    for k, (got, want) in enumerate(zip(seen, seen_ref, strict=True)):
+        assert torch.equal(got.age, want.age) and torch.equal(got.pos, want.pos), k
+        _close(got.h, want.h, f"round {k} h")
+        _close(got.q, want.q, f"round {k} q")
+    final = default[1]
+    assert final.pos.is_contiguous() and final.age.is_contiguous()
+
+
+def test_p1_10_reset_columns_validated() -> None:
+    """``reset_columns`` must be a strictly increasing sequence of ints in ``[0, T)`` containing
+    every column where ``reset`` has a True (checked on the CPU); extra columns are allowed."""
+    model = _build(CASES[0])
+    tokens, ctx, state, reset = _inputs(model)  # resets at columns 0 and 3
+    window = (tokens, ctx, state, reset)
+    base = model(*window)
+    for columns in ([0, 3], (0, 1, 3, 5), range(T)):
+        _assert_matches(model(*window, reset_columns=columns), base, exact=True)
+    with pytest.raises(ValueError, match=r"columns \[3\] that reset_columns omits"):
+        model(*window, reset_columns=[0])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        model(*window, reset_columns=[3, 0])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        model(*window, reset_columns=[0, 0, 3])
+    for out_of_range in ([0, 3, T], [-1, 0, 3]):
+        with pytest.raises(ValueError, match=r"\[0, T\)"):
+            model(*window, reset_columns=out_of_range)
+    for not_ints in ([0, 3.0], [True, 3]):
+        with pytest.raises(TypeError, match="ints"):
+            model(*window, reset_columns=not_ints)  # type: ignore[arg-type]
+    for not_a_sequence in (torch.tensor([0, 3]), "03", {0, 3}):
+        with pytest.raises(TypeError, match="sequence of ints"):
+            model(*window, reset_columns=not_a_sequence)  # type: ignore[arg-type]
+
+
+def _trainer_docs(length_range: tuple[int, int], n: int) -> list[Example]:
+    """kv/in_range documents of ``length_range`` bytes (the P1.10d trainer-test recipe)."""
+    task = SPEC.task("kv", "in_range")
+    task = TaskSpec.model_validate(
+        {
+            **task.model_dump(),
+            "n_train": 64,
+            "n_dev": 16,
+            "n_test": 16,
+            "length_range": list(length_range),
+            "dep_len_range": [4, 10],
+            "unroll": TRAINER_UNROLL,
+        }
+    )
+    return [generate(task, "train", i) for i in range(n)]  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("align_docs", [True, False])
+def test_p1_10_trainer_passes_reset_columns(align_docs: bool, tmp_path: Path) -> None:
+    """The TBPTT trainer passes ``reset_columns`` read from the CPU window — exactly the columns of
+    the (cut) window that hold a reset — so ``HSN.forward`` never derives them from the device mask:
+    aligned documents (every window cut after its documents, a reset at ``t = 0`` only) and packed
+    ones (resets anywhere in the window)."""
+    cfg = load_config(
+        REF_A1,
+        overrides=[
+            "model.d=8",
+            "model.context_dim=8",
+            "model.n_cells=4",
+            "model.in_degree=2",
+            "model.n_units=2",
+            "model.k_select=2",
+            "model.hidden=16",
+            "model.scorer_hidden=8",
+            f"train.unroll={TRAINER_UNROLL}",
+            "train.batch=4",
+            "train.micro_batch=4",
+            "train.steps=10",
+            "train.eval_every=10",
+            "train.ckpt_every=10",
+            f"data.align_docs={str(align_docs).lower()}",
+        ],
+    )
+    seed_everything(0)
+    model = HSN.from_config(cfg)
+    trainer = TBPTTTrainer(model, cfg, resolve(load_hardware_profile("cpu")), run_dir=tmp_path)
+    seen: list[tuple[Tensor, Any]] = []
+    original = model.forward
+
+    def forward(tokens: Tensor, ctx: Tensor, state: Any, reset: Tensor, **kwargs: Any) -> Any:
+        seen.append((reset.clone(), kwargs.get("reset_columns")))
+        return original(tokens, ctx, state, reset, **kwargs)
+
+    model.forward = forward  # type: ignore[method-assign]
+    trainer.evaluate = lambda *args, **kwargs: {}  # type: ignore[method-assign]
+    docs = ByteDataset(_trainer_docs((16, 28), 32))
+    trainer.fit(docs, docs, 3)
+    assert len(seen) == 3
+    for reset, columns in seen:
+        assert columns == reset.any(dim=0).nonzero().flatten().tolist()
+    if align_docs:
+        assert all(columns == [0] and reset.shape[1] < TRAINER_UNROLL for reset, columns in seen)
+    else:
+        assert any(column > 0 for _, columns in seen for column in columns)

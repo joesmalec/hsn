@@ -280,12 +280,12 @@ def test_p1_7_state_detached_at_window_start(
     seen: list[tuple[CellGraphState, CellGraphState]] = []
     original = trainer._forward
 
-    def spy(batch: dict[str, Tensor], state: CellGraphState) -> Any:
+    def spy(batch: dict[str, Tensor], state: CellGraphState, **kwargs: Any) -> Any:
         assert isinstance(state, CellGraphState)
         for name in ("h", "q", "age", "pos"):
             tensor = getattr(state, name)
             assert tensor.grad_fn is None and not tensor.requires_grad, name
-        logits, new_state, info = original(batch, state)
+        logits, new_state, info = original(batch, state, **kwargs)
         assert new_state.h.grad_fn is not None and new_state.h.requires_grad
         assert new_state.q.grad_fn is not None and logits.requires_grad
         seen.append((state, new_state))
@@ -344,8 +344,8 @@ def test_p1_7_reset_applied_at_doc_boundaries(
     original = trainer._forward
     checked = {"mid_reset": 0, "no_reset": 0, "reset_at_0": 0, "carried": 0}
 
-    def spy(batch: dict[str, Tensor], state: CellGraphState) -> Any:
-        logits, new_state, info = original(batch, state)
+    def spy(batch: dict[str, Tensor], state: CellGraphState, **kwargs: Any) -> Any:
+        logits, new_state, info = original(batch, state, **kwargs)
         reset = batch["reset"]
         B, T = reset.shape
         for b in range(B):
