@@ -269,7 +269,8 @@ class CellGraph(nn.Module):
         with their edges at different columns round differently. From the zero state that gives
         the edge logits rounding-noise gradients, 1.6e-22 in fp64, where the slot-order sum keeps
         them exactly 0 and the cells exactly symmetric.)"""
-        self._check_h(h_prev)
+        if self._window_cache is None:  # P1.10e: inside a window the caller validated h_prev
+            self._check_h(h_prev)
         Vh: Tensor = V(h_prev)  # [B, N, d]
         weights = self._padded_weights_as(Vh.dtype)  # [N, D_max]
         sources = Vh[:, self._pad_src]  # [B, N, D_max, d]

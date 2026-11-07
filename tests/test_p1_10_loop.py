@@ -16,7 +16,7 @@ import math
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -1027,3 +1027,153 @@ def test_p1_10_dense_cells_stay_symmetric_from_zero_state(
     assert torch.equal(states, states[:, :, :1].expand_as(states)), measured  # bit for bit
     assert torch.equal(final.h, final.h[:, :1].expand_as(final.h)), measured
     assert not bool(grad.any()), measured
+
+
+# --------------------------------------------------------------------------------------------------
+# P1.10e: hot-loop Python
+# --------------------------------------------------------------------------------------------------
+
+
+def test_p1_10_window_validates_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``forward`` validates the window once: in the dense window the states are built without
+    ``CellGraphState``'s layout check, a constant number of checks per window whatever ``T`` (the
+    public constructor and every public method still validate), and the rounds skip their per-call
+    input checks inside the window; outside it ``step``, ``step_dense`` and ``messages_dense``
+    still refuse bad inputs, and a bad window still raises before anything runs."""
+    import hsn.model.state as state_module
+
+    calls = [0]
+    check = state_module._check_layout
+
+    def counted(*args: Any, **kwargs: Any) -> None:
+        calls[0] += 1
+        check(*args, **kwargs)
+
+    monkeypatch.setattr(state_module, "_check_layout", counted)
+    model = _build(CASES[0])
+    m = model.cfg
+    per_window = []
+    for length in (4, 12):
+        generator = torch.Generator(device="cpu").manual_seed(length)
+        tokens = torch.randint(0, m.vocab_size, (B, length), generator=generator)
+        ctx = torch.randint(0, m.n_context, (B, length), generator=generator)
+        reset = torch.zeros(B, length, dtype=torch.bool)
+        reset[:, 0] = True
+        state = model.init_state(B)
+        calls[0] = 0
+        model(tokens, ctx, state, reset)
+        per_window.append(calls[0])
+    assert per_window[0] == per_window[1], per_window  # independent of T
+    assert calls[0] <= 2, per_window
+
+    # outside a window everything is still checked
+    state = model.init_state(B)
+    with pytest.raises(ValueError, match="layout|shape"):
+        CellGraphState(h=state.h, q=state.q[:, :1], age=state.age, pos=state.pos)
+    with pytest.raises(ValueError, match="u must have shape"):
+        model.cell.step_dense(
+            torch.zeros(B, m.d + 1, dtype=model.dtype),
+            torch.zeros(B, m.d, dtype=model.dtype),
+            state,
+            torch.full((B, m.n_cells, m.n_units), 1.0 / m.n_units, dtype=model.dtype),
+        )
+    with pytest.raises(ValueError, match="h_prev must have shape"):
+        model.cell.graph.messages_dense(state.h[:, :1], model.cell.V)
+    with pytest.raises(TypeError, match="x_t"):
+        model.step(torch.zeros(B), torch.zeros(B, dtype=torch.int64), state)
+    with pytest.raises(ValueError, match="reset must have shape"):
+        model(
+            torch.zeros(B, 3, dtype=torch.int64),
+            torch.zeros(B, 3, dtype=torch.int64),
+            state,
+            torch.zeros(B, 2, dtype=torch.bool),
+        )
+    assert not model.cell._in_window and model.cell.graph._window_cache is None
+
+
+def test_p1_10_make_sets_every_field() -> None:
+    """``CellGraphState._make`` sets the fields one by one, so a field added to the dataclass would
+    be left unset there. The field list is pinned here: adding a field fails this test until
+    ``_make`` sets it too. A state from ``_make`` carries the same attributes as a public one."""
+    assert [f.name for f in fields(CellGraphState)] == ["h", "q", "age", "pos"]
+    h, q = torch.zeros(B, 3, 2), torch.zeros(B, 2)
+    age, pos = torch.zeros(B, 3, dtype=torch.int64), torch.zeros(B, dtype=torch.int64)
+    made, public = CellGraphState._make(h, q, age, pos), CellGraphState(h, q, age, pos)
+    assert vars(made).keys() == vars(public).keys()
+    assert all(getattr(made, f.name) is getattr(public, f.name) for f in fields(CellGraphState))
+
+
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+def test_p1_10_internal_states_pass_layout_check(
+    case: Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every state the window builds without the layout check (``CellGraphState._make``) would pass
+    it: the public constructor's ``_check_layout`` is run on each one, in every routing mode."""
+    import hsn.model.state as state_module
+
+    made = [0]
+    original = CellGraphState._make.__func__  # type: ignore[attr-defined]
+
+    def checked(cls: type[CellGraphState], h: Tensor, q: Tensor, age: Tensor, pos: Tensor) -> Any:
+        state_module._check_layout(h, q, age, pos, where="CellGraphState._make")
+        made[0] += 1
+        return original(cls, h, q, age, pos)
+
+    monkeypatch.setattr(CellGraphState, "_make", classmethod(checked))
+    model = _build(case)
+    tokens, ctx, state, reset = _inputs(model)
+    logits, final, _ = _run(lambda: model(tokens, ctx, state, reset))
+    assert made[0] >= T
+    state_module._check_layout(final.h, final.q, final.age, final.pos, where="final")
+
+
+SELECTION_GATES = [
+    ("topk", None),
+    ("topk", "soft"),
+    ("topk", "ste"),
+    ("topk", "reinforce"),
+    ("greedy_budget", None),
+    ("greedy_budget", "ste"),
+    ("random", None),
+    ("fixed", None),
+    ("fixed", "ste"),
+    ("dense", None),
+]
+
+
+@pytest.mark.parametrize(("mode", "gate"), SELECTION_GATES)
+def test_p1_10_dense_fallback_only_from_dense_rows(mode: str, gate: str | None) -> None:
+    """The router flags dense-fallback rows only from ``dense_rows``, never on its own, in every
+    selection mode and gate. The sparse round inside a validated window relies on it, since it no
+    longer re-checks the flags at every position (P1.10e). A tap's edit that adds such rows is
+    refused."""
+    overrides = [*SMALL, f"model.routing={mode}"]
+    if mode == "fixed":
+        overrides.append("model.fixed_route=[1, 4]")
+    model = _build(Case(mode, REF_A1, tuple(overrides)))
+    router = model.router
+    generator = torch.Generator(device="cpu").manual_seed(2)
+    N, M = model.cfg.n_cells, model.cfg.n_units
+    logits = torch.randn(B, N, M, generator=generator, dtype=torch.float64)
+    age = torch.randint(0, 5, (B, N), generator=generator)
+    kwargs: dict[str, Any] = {"gate": gate}
+    if mode in ("topk", "greedy_budget"):
+        kwargs.update(age=age, epsilon=0.3)
+    fixed = model._fixed_route if mode == "fixed" else None
+    m = model.cfg
+    torch.manual_seed(RNG_SEED)
+    plain = router.select(logits, m.budget, m.k_select, m.k_min, mode, fixed, **kwargs)
+    assert not bool(plain.dense_fallback.any())
+    if mode != "dense":
+        rows = torch.tensor([True, False, True])
+        torch.manual_seed(RNG_SEED)
+        flagged = router.select(
+            logits, m.budget, m.k_select, m.k_min, mode, fixed, dense_rows=rows, **kwargs
+        )
+        assert torch.equal(flagged.dense_fallback, rows)
+
+        def add_rows(selection: Selection) -> Selection:
+            return replace(selection, dense_fallback=torch.ones_like(selection.dense_fallback))
+
+        with router.intercept(add_rows), pytest.raises(ValueError, match="dense-fallback"):
+            router.select(logits, m.budget, m.k_select, m.k_min, mode, fixed, **kwargs)

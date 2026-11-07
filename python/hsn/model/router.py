@@ -1101,6 +1101,15 @@ class Router(nn.Module):
                     f"the tap's edit changed the selection's [B, N, M] from "
                     f"{tuple(selection.logits.shape)} to {tuple(edited.logits.shape)}"
                 )
+            # P1.10e: dense-fallback rows come from ``dense_rows`` only (the sparse round relies on
+            # it inside a window, where it no longer re-checks); an edit may not add any. The usual
+            # edit (with_candidate) keeps the tensor itself, so this costs nothing then.
+            if edited.dense_fallback is not selection.dense_fallback and bool(
+                (edited.dense_fallback & ~selection.dense_fallback).any()
+            ):
+                raise ValueError(
+                    "the tap's edit added dense-fallback rows; they come from dense_rows only"
+                )
             selection = edited
         tap.selections.append(selection)
         return selection
