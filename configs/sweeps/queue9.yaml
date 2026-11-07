@@ -1,0 +1,190 @@
+# queue9, the first sweep of the P1.10 audit's follow-up plan (/home/joe/.claude/plans/steady-squishing-alpaca.md,
+# E2 to E6), on the P1.11 harness. Rules and predictions were registered in the audit log
+# (/home/joe/hsn-eff/evidence/EFF/AUDIT.md) before any run; this file carries them unchanged, plus the user's
+# 7 Nov additions (the windowed memory-open rule, the compile-path rule, the cheaper-run settings).
+#
+# Recipe: the 5(b) recipe at batch 32 and R* = lr 1e-3 (configs/experiments/g1_ref_a1.yaml: bf16 autocast,
+# weight decay 0.01, cosine schedule over 3,000 steps, 200 warm-up steps, grad_clip 1.0) on delayed/in_range,
+# dev evaluation every 500 steps, statistics every 100, trained_state on 32 dev documents, the batched edit probe.
+# HSN arms compile (P2.8, reduce-overhead) unless the arm is eager-only; GRU arms are eager (P2.8 compiles the HSN
+# window only).
+#
+# Arms and when each is enqueued (enqueue --only <label glob>; the order is the plan's):
+#   1. GRU positive controls at R* (128x1, 256x1, 384x1; the lr-3e-3 ladder's recipe at lr 1e-3). Gate for E2:
+#      E2 is enqueued only if at least one control reads state; otherwise E2 is reported and the user picks
+#      its recipe.
+#   2. E2: dense HSN d=128 at R*. Its d=64 control is P1.11's compiled bridge (exp 48, same recipe and path).
+#   3. E4: top-K, K 4 of 32, STE from step 0, at R*, compiled; lambda_u 0 (the G1 default), matched to dense.
+#   4. E5, chosen from E4's trained rank_pr/answer: < 2.0 -> e5_explore (epsilon 0.1 -> 0 over 1,000 steps;
+#      eager-only, so e4_topk4_ste_eager is enqueued with it and E5 is read against it, the user's (b) of 7 Nov);
+#      >= 2.0 -> e5_balance (P2.4's balance term, lambda_b 0.01 as P2.4 measured it; compiled).
+#   5. E6: seeds 1 and 2 of every HSN arm that reads state with seed 0 (a "reads state" counts as a finding
+#      only when at least 2 of 3 seeds agree).
+#   E1 (the lr-3e-3 onset run, 600 steps) is in queue9_onset.yaml: its 600 steps cannot carry this sweep's
+#   early stops. E7 (learned per-cell initial state) and E8 (cell decorrelation penalty) need variants that do
+#   not exist yet; they get their own spec if their conditions trigger.
+#
+# Cheaper runs (user, 7 Nov about 16:30):
+#   - the worker's persistent TORCHINDUCTOR_CACHE_DIR (the warm cache: E1 measures it against exp 48's cold
+#     189 s / 177 s);
+#   - diagnostics every 25 steps only for HSN arms (the windowed memory-open rule needs them; the harness has
+#     one cadence per arm); 500 for GRU arms, which have no gate or cells;
+#   - evaluation every 500;
+#   - early stops on a decisive signal only (below); never on dev accuracy at chance;
+#   - GRU arms share the card (timing false); HSN B32 arms (8 to 9 GB) run alone as timing arms, which also
+#     makes their times measurements.
+#
+# Early stops (HSN arms; registered 7 Nov before any run of this sweep). "Memory shut" at a checkpoint c means
+# BOTH the gate p50 and grad_share/cell medians over the 9 diagnostics in [c-200, c] are below 0.01 (a trailing
+# window: a stop rule may not read past its step). An arm stops when that holds at two consecutive checkpoints
+# from step 1,000 (stop at 1,500, 2,000 or 2,500). Justification:
+#   - at R* the memory was open at every checkpoint from 1,000 in all four dense runs ((d), the audit's bridge,
+#     P1.11's exp 46 and exp 48): cell share >= 0.018 (exp 48's windowed medians; single samples 0.022 to 0.40
+#     elsewhere), gate p50 0.012 to 0.088. Gate p50 alone came within 1.2x of 0.01 late in training (0.012 at
+#     2,500 and 3,000 in exp 46), so the rule needs both measures;
+#   - early in healthy runs the cell share dips below 0.01 while the gate stays open (resample: share 0.0006 to
+#     0.003 at steps 75 to 250, gate p50 0.08 to 0.10), so no stop before 1,500;
+#   - every shut run stayed shut and at chance to the end: the d=128 lr-3e-3 run (queue8 (b)) had gate p50
+#     0.0000 to 0.0001 and cell share 0.0001 to 0.0006 at every checkpoint 500 to 3,000, dev 0.019 to 0.023;
+#     P2.3's top-K models at lr 3e-3 ended with gate p50 0.0000 (E0). A stop therefore needs margins of 10x or
+#     more, not threshold noise;
+#   - learning onsets come late (exp 48: 0.022 at 2,000, 0.063 at 2,500; GRU 128x1 at lr 3e-3 between 1,500
+#     and 2,000), so dev accuracy is never a stop signal.
+# A non-finite objective needs no rule: the trainer raises on it (bf16 and fp32 have no loss scaler), and the
+# arm fails loudly. A stopped arm's verdicts read "stopped early: ...", never a pass; its probe and
+# trained_state are kept under at_stop.
+
+name: queue9
+description: P1.10 audit follow-up E2 to E6 at R* (B32, lr 1e-3) on delayed/in_range, with GRU positive controls
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.001
+    - train.steps=3000
+    - train.eval_every=500
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+families:
+  gru:
+    config: configs/baselines/gru_2m.yaml
+    overrides:
+      - hardware.compile_mode=none
+      - train.warmup_steps=200
+      - train.weight_decay=0.01
+      - train.schedule=cosine
+      - train.grad_clip=1.0
+protocol: {name: reads_state, diag_every: 25, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333 # 1 / 48 value symbols
+seeds: [0, 1, 2]
+rules:
+  verdicts:
+    # the audit's verdict (fixed in POST_A1_CHECKS.md before HSN's 5(c)); a finding needs 2 of 3 seeds
+    reads_state: {preset: reads_state, group: {min_agree: 2}}
+    # queue9's registered rule (6 Nov): gate p50 >= 0.01 and grad_share/cell >= 0.01 at every multiple of 500
+    # from step 500, one sample each (the cadence it was registered at)
+    memory_open: {preset: memory_open}
+    # the user's windowed rule (7 Nov): at each multiple of 500, the median over the diagnostics within 100 steps
+    memory_open_windowed: {preset: memory_open, window: 100, to_step: 3000}
+    # queue9's registered rule: rank_pr >= 2.0 and diversity_live >= 0.2 at answers on the trained model
+    cells_apart: {preset: cells_apart}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+  early_stop:
+    - name: memory_shut_1500
+      at_steps: [1500]
+      outcome: "fail-early: memory shut at 1,000 and 1,500"
+      applies_to: {family: [hsn]}
+      when:
+        all:
+          - {metric: "diag:gate/p50", steps: {from: 800, to: 1000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 800, to: 1000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:gate/p50", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+    - name: memory_shut_2000
+      at_steps: [2000]
+      outcome: "fail-early: memory shut at 1,500 and 2,000"
+      applies_to: {family: [hsn]}
+      when:
+        all:
+          - {metric: "diag:gate/p50", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:gate/p50", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+    - name: memory_shut_2500
+      at_steps: [2500]
+      outcome: "fail-early: memory shut at 2,000 and 2,500"
+      applies_to: {family: [hsn]}
+      when:
+        all:
+          - {metric: "diag:gate/p50", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:gate/p50", steps: {from: 2300, to: 2500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 2300, to: 2500, every: 25}, agg: median, op: "<", value: 0.01}
+arms:
+  # 1. GRU positive controls at R* (gate for E2); one seed each (the gate needs one control that reads state)
+  - name: gru128x1_r
+    family: gru
+    overrides: [baseline.gru.d_model=128, baseline.gru.n_layers=1]
+    protocol: {diag_every: 500}
+    timing: false
+    seeds: [0]
+  - name: gru256x1_r
+    family: gru
+    overrides: [baseline.gru.d_model=256, baseline.gru.n_layers=1]
+    protocol: {diag_every: 500}
+    timing: false
+    seeds: [0]
+  - name: gru384x1_r
+    family: gru
+    overrides: [baseline.gru.d_model=384, baseline.gru.n_layers=1]
+    protocol: {diag_every: 500}
+    timing: false
+    seeds: [0]
+  # 2. E2: does width matter inside HSN? (control: exp 48, d=64 compiled)
+  - name: e2_d128
+    family: hsn
+    overrides: [model.d=128]
+  # 3. E4: does sparse routing make HSN read state?
+  - name: e4_topk4_ste
+    family: hsn
+    overrides: [model.routing=topk, model.k_select=4, train.gate_mode=ste]
+  # 4. E4 on the eager path: enqueued only with e5_explore (E4 and E5 read on one path)
+  - name: e4_topk4_ste_eager
+    family: hsn
+    overrides: [model.routing=topk, model.k_select=4, train.gate_mode=ste, hardware.compile_mode=none]
+  # 4. E5 if E4's rank_pr/answer < 2.0: exploration (eager-only)
+  - name: e5_explore
+    family: hsn
+    overrides:
+      - model.routing=topk
+      - model.k_select=4
+      - train.gate_mode=ste
+      - hardware.compile_mode=none
+      - train.epsilon_start=0.1
+      - train.epsilon_end=0.0
+      - train.epsilon_steps=1000
+  # 4. E5 if E4's rank_pr/answer >= 2.0: P2.4's balance term
+  - name: e5_balance
+    family: hsn
+    overrides:
+      - model.routing=topk
+      - model.k_select=4
+      - train.gate_mode=ste
+      - train.aux_enabled=[balance]
+      - train.lambda_b=0.01

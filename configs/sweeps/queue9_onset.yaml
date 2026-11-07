@@ -1,0 +1,64 @@
+# queue9 E1: when does HSN's memory shut at lr 3e-3? (plan /home/joe/.claude/plans/steady-squishing-alpaca.md;
+# prediction and reading registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md, 7 Nov 08:59, before any run.)
+#
+# Dense HSN at B32, lr 3e-3, on the 3,000-step cosine schedule of the runs that shut (train.steps=3000), stopped
+# at step 600 (protocol steps), evaluation every 100 steps and diagnostics every 25. Compiled (P2.8): E1 also
+# measures the warm inductor cache (its compile_seconds / window_compile_seconds against exp 48's cold 189 s /
+# 177 s; same shapes, a different lr), so it runs as a timing arm. It is its own sweep because its 600 steps
+# cannot carry queue9.yaml's early stops (at 1,500 to 2,500); it needs none (600 steps, and its subject is the
+# shut itself).
+#
+# Shut onset (registered): the first diagnostic from which gate p50 < 0.01 holds at every later diagnostic.
+# Predicted at steps 125 to 300, with grad_share/cell < 0.01 from then on; at 600 gate p50 < 0.01, dev delayed
+# <= 0.03, dev loss >= 3.85. Reading: onset < 200 (lr still rising) means a gentler warm-up alone is unlikely to
+# save lr 3e-3; onset >= 200 with a gradual decline means one gentler-warm-up try is worth proposing; still open
+# at 600 means the shut comes later (report). The onset is read from the stored diagnostics series; the rules
+# below label the end state.
+
+name: queue9_onset
+description: P1.10 audit follow-up E1, the onset of the memory shut at lr 3e-3 (600 steps of the 3,000-step schedule)
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.003
+    - train.steps=3000
+    - train.eval_every=100
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, steps: 600, diag_every: 25, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    # queue9's registered rule at its one checkpoint here (step 500), one sample
+    memory_open: {preset: memory_open, to_step: 600}
+    # the end state: both medians over the last 5 diagnostics (500 to 600) below 0.01
+    shut_by_600:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: shut
+          when:
+            all:
+              - {metric: "diag:gate/p50", steps: {from: 500, to: 600, every: 25}, agg: median, op: "<", value: 0.01}
+              - {metric: "diag:grad_share/cell", steps: {from: 500, to: 600, every: 25}, agg: median, op: "<", value: 0.01}
+      default: not shut
+    at_chance_600:
+      cases:
+        - label: at chance
+          when:
+            all:
+              - {metric: "eval:delayed/in_range/accuracy", steps: {at: 600}, op: "<=", value: 0.03}
+              - {metric: "eval:delayed/in_range/loss", steps: {at: 600}, op: ">=", value: 3.85}
+      default: above chance
+arms:
+  - name: e1_onset_lr3e-3
+    family: hsn
