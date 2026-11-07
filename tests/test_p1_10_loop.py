@@ -840,6 +840,13 @@ CELL_CASES = [
     pytest.param(REF_A1, SMALL, torch.float32, 0.3, id="small-fp32"),
 ]
 CELL_ATOL = {torch.float64: 1e-12, torch.float32: 1e-5}
+#: Gradients, P1.10c cell vs the P1.10b formulation: the same sums in another order. Bound on
+#: ``max|Δg| / max(own max|g|, 1e-3 × the largest)`` per input and parameter (gradients reach
+#: about 35 here, so an unscaled 1e-5 is not a rounding bound). Measured 7 Nov 2026 on ref fp32:
+#: the response to ±1-ulp noise on the reformulated ops' outputs (unit bank, mixing, update) is
+#: 6.1e-7 (20 seeds); CI's ubuntu and macOS runners differ by 3.6e-7 (``norm.weight``) and 6.9e-7
+#: (``W_out.weight``) on this scale; fp64 1.7e-15. The bounds are at least 10x those.
+CELL_GRAD_TOL = {torch.float64: 1e-13, torch.float32: 1e-5}
 
 
 @pytest.mark.parametrize(("path", "overrides", "dtype", "scale"), CELL_CASES)
@@ -851,7 +858,8 @@ def test_p1_10_cell_ops_match_previous_formulation(
     the update as ``torch.lerp`` — equals the P1.10b formulation (a verbatim copy) to rounding:
     ``h_new`` and every intermediate, and the gradients of a random projection with respect to the
     inputs and every cell parameter, at fp64 1e-12 and fp32 1e-5 (relative for the gradients), in
-    and outside a window."""
+    and outside a window. Gradients are bounded relative to each one's scale
+    (:data:`CELL_GRAD_TOL`)."""
     cfg = load_config(path, overrides=list(overrides))
     seed_everything(0)
     model = HSN.from_config(cfg).to(dtype)
@@ -897,12 +905,14 @@ def test_p1_10_cell_ops_match_previous_formulation(
         _close(h_new, h_ref, f"h_new (window={in_window})", atol)
         for key, value in info_ref.items():
             _close(info[key], value, f"{key} (window={in_window})", atol)
+        present = [g for g in g_ref if g is not None and g.numel() > 0]
+        largest = max(float(g.abs().max()) for g in present)
         for i, (g, g_r) in enumerate(zip(g_new, g_ref, strict=True)):
             assert (g is None) == (g_r is None), i
-            if g is not None and g_r is not None:
-                torch.testing.assert_close(
-                    g, g_r, atol=atol, rtol=atol, msg=lambda s, i=i: f"grad {i}: {s}"
-                )
+            if g is not None and g_r is not None and g_r.numel() > 0:
+                scale = max(float(g_r.abs().max()), 1e-3 * largest)
+                worst = float((g - g_r).abs().max())
+                assert worst <= CELL_GRAD_TOL[dtype] * scale, (i, worst, scale)
 
 
 def test_p1_10_cell_ops_bf16_autocast_bound() -> None:
@@ -984,7 +994,10 @@ def test_p1_10_dense_cells_stay_symmetric_from_zero_state(
     logits, final, info = model(tokens, ctx, model.init_state(Bb), reset, capture=True)
     logits.logsumexp(-1).mean().backward()
     states = info["cell_states"]
-    assert torch.equal(states, states[:, :, :1].expand_as(states))  # every position, bit for bit
-    assert torch.equal(final.h, final.h[:, :1].expand_as(final.h))
+    spread = float((states - states[:, :, :1]).abs().max())  # every position
     grad = model.cell.graph.edge_logit.grad
-    assert grad is not None and not bool(grad.any()), float(grad.abs().max())
+    assert grad is not None
+    measured = f"cell spread {spread:.3e}, edge grad {float(grad.abs().max()):.3e}"
+    assert torch.equal(states, states[:, :, :1].expand_as(states)), measured  # bit for bit
+    assert torch.equal(final.h, final.h[:, :1].expand_as(final.h)), measured
+    assert not bool(grad.any()), measured
