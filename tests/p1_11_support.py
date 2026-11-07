@@ -144,3 +144,20 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     monkeypatch.setenv("OMP_NUM_THREADS", "2")
     yield db
+
+
+GOLDEN_MANIFEST = REPO / "configs" / "data" / "synthetic_v1.manifest.json"
+
+
+def fake_repo(root: Path, *, manifest: bytes | None = None) -> Path:
+    """A repository view for spec expansion: ``configs/`` linked to the real one and
+    ``data/synthetic_v1/manifest.json`` a copy of the committed golden manifest (the built data's
+    manifest is byte-identical to it), so arm ids can be computed where ``data/`` is not built."""
+    repo = root / "repo"
+    (repo / "data" / "synthetic_v1").mkdir(parents=True, exist_ok=True)
+    link = repo / "configs"
+    if not link.exists():
+        link.symlink_to(REPO / "configs", target_is_directory=True)
+    target = repo / "data" / "synthetic_v1" / "manifest.json"
+    target.write_bytes(GOLDEN_MANIFEST.read_bytes() if manifest is None else manifest)
+    return repo
