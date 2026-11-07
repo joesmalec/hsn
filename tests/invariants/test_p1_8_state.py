@@ -173,7 +173,8 @@ def test_p1_8_disabled_cell_unchanged(
             for i in enabled:
                 assert not torch.equal(out.state.h[:, i], stepped.h[:, i]), (t, i)
             stepped = out.state
-    expect_same(stepped.h, carried.h, device, what="h step vs forward")
+    # P1.10a: step vs forward agree to rounding (conftest), not bit for bit
+    expect_same.step_vs_forward(stepped.h, carried.h, device, what="h step vs forward")
     assert torch.equal(stepped.age, carried.age) and torch.equal(stepped.pos, carried.pos)
 
     # a reset of session 0 before position 4: its disabled cell is zero afterwards and stays zero

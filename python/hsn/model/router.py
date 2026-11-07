@@ -450,13 +450,103 @@ class Scorer(nn.Module):
             raise ValueError(f"ctx must have shape [B] = {(B,)}, got {tuple(ctx.shape)}")
         if ctx.device != state.device:
             raise ValueError(f"ctx must live on {state.device}, got {ctx.device}")
-        if (
-            isinstance(budget_frac, bool)
-            or not isinstance(budget_frac, int | float)
-            or not math.isfinite(budget_frac)
-            or budget_frac < 0.0
-        ):
-            raise ValueError(f"budget_frac must be a finite number >= 0, got {budget_frac!r}")
+        self._check_budget_frac(budget_frac)
+        self._check_round(round_idx)
+        scalars = self._scalars(
+            ctx[:, None], state.pos[:, None], budget_frac, round_idx, ema, u.dtype, u.device
+        )[:, 0]
+        return self._assemble(u, eps, state.h, state.age, scalars)
+
+    def window_scalars(
+        self,
+        ctx: Tensor,
+        pos: Tensor,
+        *,
+        budget_frac: float,
+        round_idx: int,
+        dtype: torch.dtype,
+        ema: EMAFeatures | None = None,
+    ) -> Tensor:
+        """The features of a window that do not depend on the step (P1.10a): ``[B, T, N, 7]`` in
+        ``dtype``, the scalars after ``age`` in layout order (budget, round, context, the two P2.3
+        averages, pos, one) for every position of the window. ``ctx`` are the window's context ids
+        and ``pos`` the session position before each step (int64), both ``[B, T]`` on one device.
+        :meth:`features` builds the same values from the same elementwise ops for one position."""
+        if not isinstance(ctx, Tensor) or not isinstance(pos, Tensor):
+            raise TypeError("ctx and pos must be torch.Tensors [B, T]")
+        if ctx.dtype not in _INDEX_DTYPES:
+            raise TypeError(f"ctx must be an int64 or int32 tensor of ids, got dtype {ctx.dtype}")
+        if pos.dtype != torch.int64:
+            raise TypeError(f"pos must be an int64 tensor, got dtype {pos.dtype}")
+        if ctx.ndim != 2 or pos.shape != ctx.shape:
+            raise ValueError(
+                f"ctx and pos must both be [B, T], got {tuple(ctx.shape)} and {tuple(pos.shape)}"
+            )
+        if pos.device != ctx.device:
+            raise ValueError(f"ctx lives on {ctx.device} but pos on {pos.device}")
+        if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+            raise TypeError(f"dtype must be a floating torch.dtype, got {dtype!r}")
+        self._check_budget_frac(budget_frac)
+        self._check_round(round_idx)
+        return self._scalars(ctx, pos, budget_frac, round_idx, ema, dtype, ctx.device)
+
+    def _scalars(
+        self,
+        ctx: Tensor,
+        pos: Tensor,
+        budget_frac: float,
+        round_idx: int,
+        ema: EMAFeatures | None,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        """``[B, T, N, 7]``: budget, round, context, ema_utility, ema_selected, pos, one (the
+        layout after ``age``) from ``ctx`` and ``pos`` ``[B, T]``."""
+        B, T = (int(n) for n in ctx.shape)
+        N = self.n_cells
+        budget = torch.full((B, T, N), float(budget_frac), dtype=dtype, device=device)
+        rnd = torch.full((B, T, N), round_idx / self.r_max, dtype=dtype, device=device)
+        context = (ctx.to(dtype) / self.n_context)[:, :, None].expand(B, T, N)
+        if ema is None:
+            ema = self.ema  # P2.3: the scorer's own averages (zeros until updated)
+        ema_utility = self._check_ema(ema.utility, "utility", B, N, device).to(dtype)
+        ema_selected = self._check_ema(ema.selected, "selected", B, N, device).to(dtype)
+        position = (pos.to(dtype) / self.unroll)[:, :, None].expand(B, T, N)
+        one = torch.ones(B, T, N, dtype=dtype, device=device)
+        return torch.stack(
+            [
+                budget,
+                rnd,
+                context,
+                ema_utility[:, None, :].expand(B, T, N),
+                ema_selected[:, None, :].expand(B, T, N),
+                position,
+                one,
+            ],
+            dim=-1,
+        )  # [B, T, N, 7] in _SCALAR_FEATURES[1:] order
+
+    def _assemble(self, u: Tensor, eps: Tensor, h: Tensor, age: Tensor, scalars: Tensor) -> Tensor:
+        """``[B, N, 3d+8]`` from ``u``, ``eps`` ``[B, d]``, ``h [B, N, d]``, ``age [B, N]`` and the
+        other scalars ``[B, N, 7]`` (:meth:`_scalars` at one position), unchecked: the callers
+        validated their inputs (:meth:`features` per call, :meth:`window_scalars` per window)."""
+        B, N, d = (int(n) for n in h.shape)
+        age_feature = (age.to(u.dtype) / self.age_max)[:, :, None]  # [B, N, 1]
+        feats = torch.cat(
+            [
+                u[:, None, :].expand(B, N, d),
+                eps[:, None, :].expand(B, N, d),
+                h,
+                age_feature,
+                scalars,
+            ],
+            dim=-1,
+        )
+        if self.exclude:
+            feats = feats.masked_fill(self._excluded, 0)
+        return feats
+
+    def _check_round(self, round_idx: int) -> None:
         if isinstance(round_idx, bool) or not isinstance(round_idx, int):
             raise TypeError(f"round_idx must be an int, got {round_idx!r}")
         if not 0 <= round_idx < self.r_max:
@@ -465,27 +555,15 @@ class Scorer(nn.Module):
                 "rounds already completed at this position)"
             )
 
-        dtype, device = u.dtype, u.device
-        age = state.age.to(dtype) / self.age_max  # [B, N]
-        budget = torch.full((B, N), float(budget_frac), dtype=dtype, device=device)
-        rnd = torch.full((B, N), round_idx / self.r_max, dtype=dtype, device=device)
-        context = (ctx.to(dtype) / self.n_context)[:, None].expand(B, N)
-        if ema is None:
-            ema = self.ema  # P2.3: the scorer's own averages (zeros until updated)
-        ema_utility = self._check_ema(ema.utility, "utility", B, N, state).to(dtype)
-        ema_selected = self._check_ema(ema.selected, "selected", B, N, state).to(dtype)
-        pos = (state.pos.to(dtype) / self.unroll)[:, None].expand(B, N)
-        one = torch.ones(B, N, dtype=dtype, device=device)
-        scalars = torch.stack(
-            [age, budget, rnd, context, ema_utility, ema_selected, pos, one], dim=-1
-        )  # [B, N, 8] in _SCALAR_FEATURES order
-        feats = torch.cat(
-            [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), state.h, scalars],
-            dim=-1,
-        )
-        if self.exclude:
-            feats = feats.masked_fill(self._excluded, 0)
-        return feats
+    @staticmethod
+    def _check_budget_frac(budget_frac: float) -> None:
+        if (
+            isinstance(budget_frac, bool)
+            or not isinstance(budget_frac, int | float)
+            or not math.isfinite(budget_frac)
+            or budget_frac < 0.0
+        ):
+            raise ValueError(f"budget_frac must be a finite number >= 0, got {budget_frac!r}")
 
     def forward(self, feats: Tensor) -> Tensor:
         """``feats [B, N, 3d+8] -> logits [B, N, M]``, one score per (cell, unit)."""
@@ -527,13 +605,13 @@ class Scorer(nn.Module):
             raise ValueError(f"{name} must live on {state.device}, got {x.device}")
 
     @staticmethod
-    def _check_ema(x: Tensor, name: str, B: int, N: int, state: CellGraphState) -> Tensor:
+    def _check_ema(x: Tensor, name: str, B: int, N: int, device: torch.device) -> Tensor:
         if not isinstance(x, Tensor):
             raise TypeError(f"EMAFeatures.{name} must be a torch.Tensor, got {type(x).__name__}")
         if not x.is_floating_point():
             raise ValueError(f"EMAFeatures.{name} must be floating point, got {x.dtype}")
-        if x.device != state.device:
-            raise ValueError(f"EMAFeatures.{name} must live on {state.device}, got {x.device}")
+        if x.device != device:
+            raise ValueError(f"EMAFeatures.{name} must live on {device}, got {x.device}")
         if x.shape == (N,):
             return x[None, :].expand(B, N)
         if x.shape == (B, N):
