@@ -962,3 +962,29 @@ def test_p1_10_cell_layouts_cached_per_window() -> None:
         with pytest.raises(RuntimeError, match="do not nest"), units.window():
             pass
     assert units._window_w1 is None and graph._window_cache is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32], ids=["fp64", "fp32"])
+@pytest.mark.parametrize(("Bb", "Tt"), [(2, 6), (4, 64)])
+def test_p1_10_dense_cells_stay_symmetric_from_zero_state(
+    dtype: torch.dtype, Bb: int, Tt: int
+) -> None:
+    """The loop fixes leave the dense model's cell symmetry exactly as it was (the audit's finding
+    1; until amendment A3 breaks it by design): ref_a1 from the zero state, every row reset at
+    ``t = 0``, keeps all cells bitwise identical, and the edge logits' gradient is exactly 0. The
+    messages sum each row's sources in slot order for this reason; a dense ``A · V(h)`` contraction
+    measured 1.6e-22 here in fp64 (P1.10c), which Adam would turn into drifting edge weights."""
+    torch.manual_seed(0)
+    run = load_config(REF_A1)
+    model = HSN.from_config(run).to(dtype)
+    tokens = torch.randint(0, run.model.vocab_size, (Bb, Tt))
+    ctx = torch.randint(0, run.model.n_context, (Bb, Tt))
+    reset = torch.zeros(Bb, Tt, dtype=torch.bool)
+    reset[:, 0] = True
+    logits, final, info = model(tokens, ctx, model.init_state(Bb), reset, capture=True)
+    logits.logsumexp(-1).mean().backward()
+    states = info["cell_states"]
+    assert torch.equal(states, states[:, :, :1].expand_as(states))  # every position, bit for bit
+    assert torch.equal(final.h, final.h[:, :1].expand_as(final.h))
+    grad = model.cell.graph.edge_logit.grad
+    assert grad is not None and not bool(grad.any()), float(grad.abs().max())

@@ -29,11 +29,11 @@ the equation reads). The CSR is mirrored into a padded view ``[N, D_max]`` (sour
 id per slot, slot mask; non-persistent buffers rebuilt whenever the topology changes or a state
 dict is loaded). The selected-cell path gathers the sources from ``Vh`` and sums them (gather →
 multiply → sum): deterministic, no atomics, the same ops on CPU, CUDA and MPS. The all-cells path
-(P1.10c) is one contraction ``A · Vh`` with the dense adjacency ``A [N, N]`` built from the same
-weights (zeros off the edges), once per window; it equals the gather path up to the summation order
-of floating point. The int64 CSR buffers are what the later ``csr_messages`` kernel
-reads (P2.9 narrows them to the C ABI's int32). Both message functions read only the ``h_prev`` they
-are given — the previous round's states — and never touch a
+sums the same way, each row's sources in slot order, which keeps identical cells bitwise identical
+(a dense ``A · Vh`` contraction would not; :meth:`messages_dense`). :meth:`dense_adjacency` builds
+``A [N, N]`` for tests and analysis, once per window. The int64 CSR buffers are what the later
+``csr_messages`` kernel reads (P2.9 narrows them to the C ABI's int32). Both message functions read
+only the ``h_prev`` they are given — the previous round's states — and never touch a
 :class:`~hsn.model.state.CellGraphState`.
 
 State dict. ``indptr``, ``indices``, ``is_random`` and ``edge_logit`` are saved; a checkpoint with
@@ -263,13 +263,17 @@ class CellGraph(nn.Module):
 
     def messages_dense(self, h_prev: Tensor, V: nn.Linear) -> Tensor:
         """``m [B, N, d]`` for every cell from the previous round's states ``h_prev [B, N, d]``:
-        ``V`` is applied once to all cells, then each cell sums its weighted sources, as one
-        contraction with the dense adjacency (P1.10c; :meth:`dense_adjacency`, once per window).
-        The adjacency's cast to the message dtype under autocast runs per call (see
-        :meth:`_padded_weights_as`)."""
+        ``V`` is applied once to all cells, then each cell sums its weighted sources in slot order
+        over the padded view. (P1.10c measured a dense-adjacency contraction ``A · V(h)``
+        instead and kept this one: the contraction sums each row over all ``N`` columns, so rows
+        with their edges at different columns round differently. From the zero state that gives
+        the edge logits rounding-noise gradients, 1.6e-22 in fp64, where the slot-order sum keeps
+        them exactly 0 and the cells exactly symmetric.)"""
         self._check_h(h_prev)
         Vh: Tensor = V(h_prev)  # [B, N, d]
-        return torch.einsum("ij,bjd->bid", self.dense_adjacency().to(Vh.dtype), Vh)
+        weights = self._padded_weights_as(Vh.dtype)  # [N, D_max]
+        sources = Vh[:, self._pad_src]  # [B, N, D_max, d]
+        return (sources * weights[None, :, :, None]).sum(dim=2)
 
     def messages_selected(self, h_prev: Tensor, V: nn.Linear, cell_idx: Tensor) -> Tensor:
         """``m [B, K, d]`` for the cells ``cell_idx [B, K]`` only (int64, in ``[0, N)``; repeats
