@@ -1,0 +1,269 @@
+"""Training diagnostics of the P1.10 efficiency audit (``scripts/eff_overfit.py``, ``f8884ec``).
+
+Every ``every`` optimiser steps, per top-level module of the model:
+
+* ``update_ratio/<module>`` = ``||theta_after - theta_before|| / ||theta_after||`` for that step;
+* ``grad_share/<module>`` = ``||g_module|| / ||g_total||`` of the clipped (and unscaled) gradients,
+  the plain norm ratio (not squared, so the shares do not sum to 1).
+
+For an HSN, also the state statistics of one fixed window (:func:`window_state_stats`: the first
+``n_docs`` documents, one window from a fresh state, evaluation mode, no gradients): cell
+diversity, live cells, participation ratio ``rank_pr``, saturation, mean ``|h|`` and the cell spread
+at answer and at valid positions, the write-gate quantiles, and the per-cell write shares of a
+routed model.
+
+**Hooks (P1.11).** The audit replaced ``optimizer.step``; :class:`Diagnostics` registers
+``torch.optim.Optimizer`` step pre- and post-hooks instead (agreed with the audit session, 7 Nov
+2026). The record is still taken after ``optimizer.step`` and before ``scheduler.step`` /
+``update_target``; the gradient norms are taken in the pre-hook (AdamW and LazyAdamW leave ``.grad``
+alone) and the parameters are cloned on sampled steps only. Samples are keyed by the trainer's step
+(the step being completed); the optimiser call count is recorded too, and without a loss scaler a
+difference between the two raises (a GradScaler may skip ``optimizer.step`` on non-finite fp16
+gradients, so with one the hook skips that sample). The state window runs under ``no_grad`` with
+the training mode restored and keeps nothing from the training window (P2.8: a compiled window is
+not disturbed). ``seconds`` is the wall time spent inside the hooks, which the trainer counts as
+training time; the harness subtracts it.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+
+from hsn.config import RunConfig
+from hsn.data.dataset import ByteDataset, collate_windows
+from hsn.device import DeviceContext
+from hsn.model.hsn import HSN
+
+__all__ = [
+    "Diagnostics",
+    "cell_stats",
+    "module_groups",
+    "state_window",
+    "trained_state",
+    "window_state_stats",
+]
+
+
+def module_groups(model: nn.Module) -> dict[str, list[nn.Parameter]]:
+    """Trainable parameters per top-level submodule (the audit's grouping)."""
+    groups: dict[str, list[nn.Parameter]] = {}
+    for name, child in model.named_children():
+        params = [p for p in child.parameters() if p.requires_grad]
+        if params:
+            groups[name] = params
+    return groups
+
+
+def _norm(tensors: list[Tensor]) -> float:
+    if not tensors:
+        return 0.0
+    return float(
+        torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(t.float()) for t in tensors])
+        )
+    )
+
+
+def state_window(
+    cfg: RunConfig, ctx: DeviceContext, docs: ByteDataset, n_docs: int
+) -> dict[str, Tensor]:
+    """The first ``n_docs`` documents as one window of ``train.unroll`` positions on the device."""
+    examples = [docs.examples[i] for i in range(min(n_docs, len(docs)))]
+    if not examples:
+        raise ValueError("state_window: no documents")
+    batch = collate_windows(
+        examples, cfg.train.unroll, batch=len(examples), align_docs=cfg.data.align_docs
+    )
+    T = cfg.train.unroll
+    return {k: v[:, :T].to(ctx.device) for k, v in batch.items()}
+
+
+class Diagnostics:
+    """Per-module update ratios and gradient shares on sampled optimiser steps and (HSN) the state
+    statistics of one fixed window (module docstring)."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        cfg: RunConfig,
+        ctx: DeviceContext,
+        docs: ByteDataset,
+        every: int,
+        n_docs: int = 4,
+    ) -> None:
+        if every < 1:
+            raise ValueError(f"Diagnostics every must be >= 1, got {every}")
+        self.model = model
+        self.cfg = cfg
+        self.ctx = ctx
+        self.every = every
+        self.groups = module_groups(model)
+        self.records: list[dict[str, Any]] = []
+        self.optimizer_calls = 0
+        self.seconds = 0.0
+        self.window: dict[str, Tensor] | None = (
+            state_window(cfg, ctx, docs, n_docs) if isinstance(model, HSN) else None
+        )
+        self._trainer: Any = None
+        self._scaled = False
+        self._pending: dict[str, Any] | None = None
+        self._handles: list[Any] = []
+
+    def attach(self, trainer: Any) -> None:
+        """Register the step hooks on ``trainer.optimizer`` (``trainer.step`` keys the samples)."""
+        if self._handles:
+            raise RuntimeError("Diagnostics are already attached")
+        if trainer.model is not self.model:
+            raise ValueError("the trainer trains another model than these diagnostics observe")
+        self._trainer = trainer
+        self._scaled = getattr(trainer, "scaler", None) is not None
+        optimizer = trainer.optimizer
+        self._handles.append(optimizer.register_step_pre_hook(self._pre))
+        self._handles.append(optimizer.register_step_post_hook(self._post))
+
+    def detach(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def _pre(self, optimizer: torch.optim.Optimizer, args: Any, kwargs: Any) -> None:
+        started = time.perf_counter()
+        self.optimizer_calls += 1
+        step = int(self._trainer.step) + 1  # the trainer increments its step after the update
+        if not self._scaled and step != self.optimizer_calls:
+            raise RuntimeError(
+                f"diagnostics: trainer step {step} != optimiser call {self.optimizer_calls} "
+                "without a loss scaler"
+            )
+        self._pending = None
+        if step % self.every == 0:
+            with torch.no_grad():
+                before = {n: [p.detach().clone() for p in ps] for n, ps in self.groups.items()}
+                grads = {
+                    n: [p.grad.detach() for p in ps if p.grad is not None]
+                    for n, ps in self.groups.items()
+                }
+                g_total = _norm([g for gs in grads.values() for g in gs])
+                g_group = {n: _norm(gs) for n, gs in grads.items()}
+            self._pending = {"step": step, "before": before, "g_total": g_total, "g": g_group}
+        self.seconds += time.perf_counter() - started
+
+    def _post(self, optimizer: torch.optim.Optimizer, args: Any, kwargs: Any) -> None:
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        started = time.perf_counter()
+        record: dict[str, Any] = {"step": pending["step"], "optimizer_calls": self.optimizer_calls}
+        g_total = pending["g_total"]
+        with torch.no_grad():
+            for n, ps in self.groups.items():
+                before = pending["before"][n]
+                delta = _norm([p.detach() - b for p, b in zip(ps, before, strict=True)])
+                weight = _norm([p.detach() for p in ps])
+                record[f"update_ratio/{n}"] = delta / weight if weight > 0 else math.nan
+                record[f"grad_share/{n}"] = pending["g"][n] / g_total if g_total > 0 else 0.0
+        record.update(self.state_stats())
+        self.records.append(record)
+        self.seconds += time.perf_counter() - started
+
+    @torch.no_grad()
+    def state_stats(self) -> dict[str, float]:
+        if not isinstance(self.model, HSN) or self.window is None:
+            return {}
+        return window_state_stats(self.model, self.window)
+
+
+def cell_stats(hs: Tensor) -> dict[str, float]:
+    """Statistics of the cell states ``hs [P, N, d]`` at ``P`` positions.
+
+    ``diversity`` is the mean pairwise ``1 - cos(h_i, h_j)``; cells never written sit at exactly 0
+    (cosine 0 with every cell) and inflate it, so ``live_cells`` (norm > 1e-6) and
+    ``diversity_live`` (over pairs of live cells only) are reported too. ``rank_pr`` is the
+    participation ratio of the ``[N, d]`` matrix (1 when every cell holds the same direction, up to
+    ``min(N, d)``), its mean and 90th percentile over positions."""
+    n = hs.shape[1]
+    norms = hs.norm(dim=-1)
+    unit = hs / norms.unsqueeze(-1).clamp_min(1e-12)
+    cos = unit @ unit.transpose(1, 2)  # [P, N, N]
+    off = (cos.sum(dim=(1, 2)) - cos.diagonal(dim1=1, dim2=2).sum(-1)) / (n * (n - 1))
+    sv2 = torch.linalg.svdvals(hs).square()
+    pr = sv2.sum(-1).square() / sv2.square().sum(-1).clamp_min(1e-24)
+    live = norms > 1e-6  # [P, N]
+    eye = torch.eye(n, dtype=torch.bool, device=hs.device)
+    pair = live.unsqueeze(-1) & live.unsqueeze(-2) & ~eye
+    n_pair = pair.sum(dim=(1, 2))
+    div_live = ((1 - cos) * pair).sum(dim=(1, 2)) / n_pair.clamp_min(1)
+    has_pair = n_pair > 0
+    return {
+        "diversity": float((1 - off).mean()),
+        "diversity_live": float(div_live[has_pair].mean()) if bool(has_pair.any()) else math.nan,
+        "live_cells": float(live.float().sum(-1).mean()),
+        "rank_pr": float(pr.mean()),
+        "rank_pr_p90": float(torch.quantile(pr, 0.9)),
+        "sat99": float((hs.abs() >= 0.99).float().mean()),
+        "abs_h": float(hs.abs().mean()),
+        "cell_spread": float((hs - hs[:, :1]).abs().amax()),
+    }
+
+
+def _quantiles(values: Tensor) -> dict[str, float]:
+    if values.numel() > 2_000_000:
+        values = values[torch.randperm(values.numel(), device=values.device)[:2_000_000]]
+    q = torch.quantile(values, torch.tensor([0.1, 0.5, 0.9], device=values.device))
+    return {"gate/p10": float(q[0]), "gate/p50": float(q[1]), "gate/p90": float(q[2])}
+
+
+@torch.no_grad()
+def window_state_stats(model: HSN, w: dict[str, Tensor]) -> dict[str, float]:
+    """One window from a fresh state in evaluation mode: :func:`cell_stats` at answer and valid
+    positions, the write gate ``b`` quantiles over the written cells at valid positions, and for a
+    routed model the per-cell write shares.
+
+    Reads ``HSN.forward(..., capture=True)``: ``cell_states [B, T, N, d]`` (h after each position),
+    ``cell_gates`` (the gate of each written cell, NaN elsewhere) and ``cell_written [B, T, N]``,
+    in every routing mode. A variant whose round has no gate (the GRU-cell variants report NaN)
+    gives no gate quantiles."""
+    was_training = model.training
+    model.eval()
+    try:
+        B = int(w["tokens"].shape[0])
+        _, _, info = model(w["tokens"], w["context"], model.init_state(B), w["reset"], capture=True)
+    finally:
+        model.train(was_training)
+    h = info["cell_states"].float()  # [B, T, N, d]
+    valid = w["doc"] >= 0  # [B, T]
+    out: dict[str, float] = {}
+    for tag, mask in (("answer", w["loss_mask"].bool()), ("valid", valid)):
+        if bool(mask.any()):
+            out.update({f"{k}/{tag}": v for k, v in cell_stats(h[mask]).items()})
+    written = info["cell_written"][valid]  # [P, N]
+    gates = info["cell_gates"].float()[valid][written]  # [S, d]
+    gates = gates[~torch.isnan(gates)]
+    if gates.numel():
+        out.update(_quantiles(gates))
+    if model.cfg.routing != "dense":
+        writes = written.float().sum(0)  # [N]
+        share = writes / writes.sum().clamp_min(1)
+        out.update({"write_share/min": float(share.min()), "write_share/max": float(share.max())})
+    return out
+
+
+@torch.no_grad()
+def trained_state(
+    model: nn.Module, cfg: RunConfig, ctx: DeviceContext, docs: ByteDataset, n_docs: int
+) -> dict[str, float]:
+    """The audit's ``trained_state`` (:func:`window_state_stats` on the first ``n_docs``
+    documents) plus, new in P1.11, the edge logits' absolute maximum and spread (``max - min``),
+    which are exactly 0 while the dense cells stay symmetric. ``{}`` for a non-HSN model."""
+    if not isinstance(model, HSN):
+        return {}
+    out = window_state_stats(model, state_window(cfg, ctx, docs, n_docs))
+    edge = model.cell.graph.edge_logit.detach().float()
+    out["edge_logit/absmax"] = float(edge.abs().max())
+    out["edge_logit/spread"] = float(edge.max() - edge.min())
+    return out
