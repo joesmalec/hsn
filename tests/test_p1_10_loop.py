@@ -13,6 +13,7 @@ on and off) stay bit-exact.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -842,7 +843,7 @@ CELL_CASES = [
 CELL_ATOL = {torch.float64: 1e-12, torch.float32: 1e-5}
 #: Gradients, P1.10c cell vs the P1.10b formulation: the same sums in another order. Bound on
 #: ``max|Δg| / max(own max|g|, 1e-3 × the largest)`` per input and parameter (gradients reach
-#: about 35 here, so an unscaled 1e-5 is not a rounding bound). Measured 7 Nov 2026 on ref fp32:
+#: about 35 here, so an unscaled 1e-5 is not a rounding bound). Measured 6 Nov 2026 on ref fp32:
 #: the response to ±1-ulp noise on the reformulated ops' outputs (unit bank, mixing, update) is
 #: 6.1e-7 (20 seeds); CI's ubuntu and macOS runners differ by 3.6e-7 (``norm.weight``) and 6.9e-7
 #: (``W_out.weight``) on this scale; fp64 1.7e-15. The bounds are at least 10x those.
@@ -853,13 +854,12 @@ CELL_GRAD_TOL = {torch.float64: 1e-13, torch.float32: 1e-5}
 def test_p1_10_cell_ops_match_previous_formulation(
     path: Path, overrides: tuple[str, ...], dtype: torch.dtype, scale: float
 ) -> None:
-    """The P1.10c dense round — messages as one contraction with the dense adjacency, the unit
-    bank as ``addmm`` / ``baddbmm`` on a per-window ``W1`` layout, the mixing as one contraction,
-    the update as ``torch.lerp`` — equals the P1.10b formulation (a verbatim copy) to rounding:
-    ``h_new`` and every intermediate, and the gradients of a random projection with respect to the
-    inputs and every cell parameter, at fp64 1e-12 and fp32 1e-5 (relative for the gradients), in
-    and outside a window. Gradients are bounded relative to each one's scale
-    (:data:`CELL_GRAD_TOL`)."""
+    """The P1.10c dense round — the unit bank as ``addmm`` / ``baddbmm`` on a per-window ``W1``
+    layout, the mixing as one contraction, the update as ``torch.lerp`` (the messages keep the
+    slot-order gather) — equals the P1.10b formulation (a verbatim copy) to rounding: ``h_new`` and
+    every intermediate at fp64 1e-12 and fp32 1e-5, and the gradients of a random projection with
+    respect to the inputs and every cell parameter, each bounded relative to its own scale
+    (:data:`CELL_GRAD_TOL`), in and outside a window."""
     cfg = load_config(path, overrides=list(overrides))
     seed_everything(0)
     model = HSN.from_config(cfg).to(dtype)
@@ -974,6 +974,21 @@ def test_p1_10_cell_layouts_cached_per_window() -> None:
     assert units._window_w1 is None and graph._window_cache is None
 
 
+# macOS's BLAS (Accelerate) breaks the symmetry at rounding level, and did so before this chunk.
+# CI probes of 6 Nov 2026 (draft PRs #30 and #31, closed unmerged), max over positions, as cell
+# spread / edge-logit gradient on the macos-arm64-cpu runner:
+#
+#   case          main cdc43c8         P1.10b b278063       P1.10c 42ba15b
+#   fp64 B2 T6    5.6e-17 / 3.1e-24    5.6e-17 / 6.6e-24    3.5e-17 / 6.6e-24
+#   fp64 B4 T64   3.9e-16 / 3.4e-22    3.9e-16 / 3.7e-22    2.4e-16 / 2.6e-22
+#   fp32 B2 T6    1.1e-7  / 1.6e-14    1.1e-7  / 2.1e-14    6.7e-8  / 2.5e-14
+#   fp32 B4 T64   1.6e-7  / 2.2e-13    1.6e-7  / 2.4e-13    1.6e-7  / 3.7e-13
+#
+# The ubuntu-cpu runner gave 0 / 0 on every line, and the audit measured CUDA exact. The bounds
+# are 10x the largest macOS value per dtype (the audit's rule for a measured platform bound).
+MACOS_SYMMETRY_BOUND = {torch.float64: (4e-15, 4e-21), torch.float32: (2e-6, 4e-12)}
+
+
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32], ids=["fp64", "fp32"])
 @pytest.mark.parametrize(("Bb", "Tt"), [(2, 6), (4, 64)])
 def test_p1_10_dense_cells_stay_symmetric_from_zero_state(
@@ -983,7 +998,11 @@ def test_p1_10_dense_cells_stay_symmetric_from_zero_state(
     1; until amendment A3 breaks it by design): ref_a1 from the zero state, every row reset at
     ``t = 0``, keeps all cells bitwise identical, and the edge logits' gradient is exactly 0. The
     messages sum each row's sources in slot order for this reason; a dense ``A · V(h)`` contraction
-    measured 1.6e-22 here in fp64 (P1.10c), which Adam would turn into drifting edge weights."""
+    measured 1.6e-22 here in fp64 (P1.10c), which Adam would turn into drifting edge weights.
+
+    Exact on Linux (and on CUDA, the audit's check). On macOS the platform BLAS rounds the cells
+    apart by 1 to 2 ulp with or without this chunk, so there the test bounds the spread and the
+    gradient by ``MACOS_SYMMETRY_BOUND``."""
     torch.manual_seed(0)
     run = load_config(REF_A1)
     model = HSN.from_config(run).to(dtype)
@@ -997,7 +1016,14 @@ def test_p1_10_dense_cells_stay_symmetric_from_zero_state(
     spread = float((states - states[:, :, :1]).abs().max())  # every position
     grad = model.cell.graph.edge_logit.grad
     assert grad is not None
-    measured = f"cell spread {spread:.3e}, edge grad {float(grad.abs().max()):.3e}"
+    grad_max = float(grad.abs().max())
+    measured = f"cell spread {spread:.3e}, edge grad {grad_max:.3e}"
+    if sys.platform == "darwin":
+        spread_bound, grad_bound = MACOS_SYMMETRY_BOUND[dtype]
+        final_spread = float((final.h - final.h[:, :1]).detach().abs().max())
+        assert spread <= spread_bound and final_spread <= spread_bound, measured
+        assert grad_max <= grad_bound, measured
+        return
     assert torch.equal(states, states[:, :, :1].expand_as(states)), measured  # bit for bit
     assert torch.equal(final.h, final.h[:, :1].expand_as(final.h)), measured
     assert not bool(grad.any()), measured
