@@ -233,6 +233,15 @@ def test_p1_10_state_stats_cover_routed_models(routing: str) -> None:
         assert 0.0 <= out["write_share/min"] <= out["write_share/max"] <= 1.0
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason=(
+        "Apple's Accelerate BLAS rounds identical cell rows differently (macOS CI probe, "
+        "6 Nov 2026: spread ~4e-16 fp64, edge grads ~1e-22), so the cells differ at rounding "
+        "level there and this strict xfail would pass trivially; the symmetry is bitwise on "
+        "Linux CPU and CUDA"
+    ),
+)
 @pytest.mark.xfail(
     strict=True,
     reason=(
