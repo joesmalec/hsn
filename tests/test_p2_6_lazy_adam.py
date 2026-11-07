@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn.config import RunConfig, canonical_json, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
@@ -671,7 +672,7 @@ def test_p2_6_tbptt_resume_bit_exact(
             assert torch.equal(value, other) if isinstance(value, Tensor) else value == other
 
 
-@pytest.mark.parametrize("profile", [pytest.param("rtx3060", marks=pytest.mark.cuda)])
+@pytest.mark.parametrize("profile", [pytest.param(CUDA_PROFILE, marks=pytest.mark.cuda)])
 def test_p2_6_amp_sparse_lazy_runs(
     profile: str, train_docs: list[Example], dev_docs: list[Example], tmp_path: Path
 ) -> None:
@@ -683,6 +684,7 @@ def test_p2_6_amp_sparse_lazy_runs(
     ctx = resolve(hardware)
     cfg = _lazy_config(
         f"profile={profile}",
+        "hardware.compile_mode=none",  # the eager lazy-Adam path, whatever the profile's default
         "train.steps=4",
         "train.eval_every=4",
         "train.ckpt_every=4",

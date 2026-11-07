@@ -118,9 +118,26 @@ window loop::
   (``train.unroll`` without a cut); ``state_abs_max``, ``eps_mean`` and ``alpha_entropy`` are over
   the computed positions.
 
+* **Compiled windows (P2.8).** With ``hardware.compile_mode`` other than ``none`` (resolved into
+  ``DeviceContext.compile_enabled``) the training windows run through
+  :func:`hsn.train.compile.compile_window` (blocks of positions compiled with ``torch.compile``,
+  CUDA Graphs on CUDA; its scope is checked at construction), statistics steps included: their
+  per-term gradient norms come from one extra compiled pass per term with a gradient path
+  (:meth:`TBPTTTrainer._compiled_term_norms`; a CUDA-Graph backward replays once per forward).
+  Compiled windows keep one fixed ``T``, so
+  the trailing cut is off (every window computes ``train.unroll`` columns, the pre-P1.10d
+  behaviour, equal to the cut one). A step during which a window compiled or recorded a graph is
+  a *compile step*: its wall time goes to ``measured["compile_seconds"]`` (and
+  ``measured["compile_steps"]``) and stays out of ``train_seconds`` and ``tokens_per_s``; its step
+  record still carries its wall time. ``measured["compiled_windows"]`` counts the windows that
+  ran compiled (0 in an eager run) and :attr:`TBPTTTrainer.compiled_window` is the window itself.
+  Evaluation runs the compiled window too (an evaluation-mode, no-grad variant, compiled at the
+  first evaluation; ``measured["window_compile_seconds"]`` is every variant's compile and
+  recording time, evaluation included); the probes and ``capture=True`` stay eager.
+
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
 non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
-P1.7 entries raise (plan §4.3: errors over silence). ``torch.compile`` stays off.
+P1.7 entries raise (plan §4.3: errors over silence).
 """
 
 from __future__ import annotations
@@ -143,6 +160,7 @@ from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, memory_stats, reset_peak, synchronize
 from hsn.eval.evaluate import Metric
 from hsn.losses import (
+    TERM_GRAD_NORM_PREFIX,
     assemble_terms,
     auxiliary_terms,
     grad_norm_report,
@@ -164,6 +182,7 @@ from hsn.train.checkpoint import (
     save_checkpoint,
     unpack_cell_state,
 )
+from hsn.train.compile import CompiledWindow, compile_window
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
 from hsn.train.loop import History, StepRecord, StreamLoader, Trainer
 from hsn.train.probes import (
@@ -220,6 +239,36 @@ def trailing_cut(window: Mapping[str, Tensor]) -> int:
 def _columns(batch: Batch, cut: int) -> Batch:
     """The first ``cut`` columns of every ``[B, T]`` window tensor (views, no copy)."""
     return {key: value[:, :cut] for key, value in batch.items()}
+
+
+class _CompiledEval:
+    """The model as :func:`hsn.eval.evaluate.evaluate_windows` sees it, with its windows run by
+    the compiled window (P2.8): mode switches and the state come from the model, the window from
+    :class:`~hsn.train.compile.CompiledWindow` (the carried state leaves graph memory there)."""
+
+    def __init__(self, model: HSN, window: CompiledWindow) -> None:
+        self.model = model
+        self.window = window
+
+    @property
+    def training(self) -> bool:
+        return self.model.training
+
+    def train(self, mode: bool = True) -> _CompiledEval:
+        self.model.train(mode)
+        return self
+
+    def eval(self) -> _CompiledEval:
+        self.model.eval()
+        return self
+
+    def init_state(self, B: int, device: torch.device | str | None = None) -> CellGraphState:
+        return self.model.init_state(B, device)
+
+    def __call__(
+        self, tokens: Tensor, ctx: Tensor, state: CellGraphState, reset: Tensor
+    ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
+        return self.window(tokens, ctx, state, reset)
 
 
 @dataclass
@@ -280,8 +329,33 @@ class TBPTTTrainer(Trainer):
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
         # P1.10d: the trailing-padding cut (exact in math under dense routing only, to rounding in
         # floats since P1.10a; module docstring)
-        self._cut_enabled = cfg.data.align_docs and cfg.model.routing == "dense"
+        # P2.8: the compiled training window (None: eager windows), built before the cut decision
+        # (a compiled window keeps one fixed T)
+        self._compiled: CompiledWindow | None = None
+        if ctx.compile_enabled:
+            window = compile_window(
+                model, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
+            )
+            if isinstance(window, CompiledWindow):  # MPS without compile support: eager
+                self._compiled = window
+        self._cut_enabled = (
+            cfg.data.align_docs and cfg.model.routing == "dense" and self._compiled is None
+        )
         self._cut_pending = False  # the carried state comes from a cut window
+
+    def _eval_model(self) -> Any:
+        """P2.8: evaluation runs the compiled window too when there is one (an evaluation-mode,
+        no-grad variant of it, compiled at the first evaluation); the eager model otherwise."""
+        if self._compiled is None:
+            return self.model
+        return _CompiledEval(self.hsn, self._compiled)
+
+    @property
+    def compiled_window(self) -> CompiledWindow | None:
+        """P2.8: the compiled training window (``None`` when ``hardware.compile_mode`` is
+        ``none``, or on MPS without compile support); its ``calls`` and ``compile_seconds``
+        count what ran compiled."""
+        return self._compiled
 
     # P2.2 ------------------------------------------------------------------------------------
 
@@ -343,6 +417,54 @@ class TBPTTTrainer(Trainer):
                 horizon=train.probe_horizon,
                 generator=generator,
             )
+
+    def _compiled_term_norms(
+        self,
+        fwd: Mapping[str, Tensor],
+        state: CellGraphState,
+        reset_columns: list[int],
+        probe: ProbeResult | None,
+        reference_cost: float,
+    ) -> dict[str, float]:
+        """P2.4's per-term gradient norms of a statistics step under P2.8's compiled window: one
+        extra compiled pass of the window per term with a gradient path (the window's forward from
+        the same start state, the objective assembled as for the step, one ``autograd.grad`` of
+        that term), since a CUDA-Graph backward is replayed once per forward and cannot take the
+        eager path's several retained backwards. The CPU generator is restored around the passes
+        (the dense-fallback draw of every pass and of the window itself is the same). The norms
+        equal the eager ones to rounding; the keys come in the eager report's order."""
+        cfg = self.cfg
+        graph = self.hsn.cell.graph
+        scale = self.scaler.get_scale() if self.scaler is not None else 1.0
+        rng = torch.get_rng_state()
+
+        def objective() -> dict[str, Tensor]:
+            torch.set_rng_state(rng)
+            logits, _, info = self._forward(
+                dict(fwd), state, window=self._compiled, reset_columns=reset_columns
+            )
+            extras = auxiliary_terms(info, cfg, graph, reference_cost=reference_cost)
+            terms = assemble_terms({"logits": logits, **info}, fwd, cfg, extras)
+            terms = self._routing_terms(terms, info, int(fwd["loss_mask"].sum()))
+            if self.counterfactual:
+                terms = {**terms, "utility": self._utility_term(probe)}
+            return terms
+
+        terms = objective()
+        order = list(terms)
+        live = [name for name in order if terms[name].requires_grad]
+        # the terms without a gradient path report 0.0 and need no pass
+        report = grad_norm_report(
+            self.model, {name: terms[name] for name in order if name not in live}, scale=scale
+        )
+        for index, name in enumerate(live):
+            if index > 0:
+                terms = objective()
+            single = {name: terms[name]}
+            report.update(grad_norm_report(self.model, single, scale=scale, retain_graph=False))
+        torch.set_rng_state(rng)
+        prefix = TERM_GRAD_NORM_PREFIX
+        return {f"{prefix}{name}": report[f"{prefix}{name}"] for name in order}
 
     def _utility_term(self, probe: ProbeResult | None) -> Tensor:
         """``λ_u · utility_loss`` of the probe's pairs (fp32, gradient into the scorer only), or
@@ -529,10 +651,16 @@ class TBPTTTrainer(Trainer):
         reset_peak(device)
         train_seconds = 0.0
         total_tokens = 0
+        compile_seconds = 0.0  # P2.8: the steps during which a window compiled or recorded
+        compile_steps = 0
         while self.step < steps:
             started = time.perf_counter()
             next_step = self.step + 1
             stats_step = next_step % train.stats_every == 0 or next_step == steps
+            # P2.8: every window runs the compiled window when there is one (a statistics step's
+            # per-term gradient norms come from extra compiled passes, _compiled_term_norms)
+            window_fn = self._compiled
+            compiled_before = self._compiled.compile_seconds if self._compiled is not None else 0.0
             term_norms: dict[str, float] = {}
             self.optimizer.zero_grad(set_to_none=True)
             part_sums: dict[str, float] = {}
@@ -571,7 +699,13 @@ class TBPTTTrainer(Trainer):
                 # reset can be missing; a check against that same CPU mask would be the same
                 # expression. (On an accelerator forward cannot check them without the copy.)
                 reset_columns = window["reset"][:, :cut].any(dim=0).nonzero().flatten().tolist()
-                logits, state, info = self._forward(fwd, state, reset_columns=reset_columns)
+                if stats_step and window_index == 0 and window_fn is not None:
+                    term_norms = self._compiled_term_norms(
+                        fwd, state, reset_columns, probe, reference_cost
+                    )  # P2.8: before the window's own forward pass, from the same start state
+                logits, state, info = self._forward(
+                    fwd, state, window=window_fn, reset_columns=reset_columns
+                )
                 window_active = self._window_active_units(info)
                 if window_active is not None:
                     active = window_active if active is None else active | window_active
@@ -587,7 +721,7 @@ class TBPTTTrainer(Trainer):
                         probe_counts["probe_pairs"] += float(probe.n_pairs)
                         probe_counts["probe_positions"] += float(probe.positions)
                 total, parts = total_and_parts(terms)
-                if stats_step and window_index == 0:  # P2.4: per-term gradient norms, one window
+                if stats_step and window_index == 0 and window_fn is None:  # P2.4: one window
                     scale = self.scaler.get_scale() if self.scaler is not None else 1.0
                     term_norms = grad_norm_report(self.model, terms, scale=scale)
                 tokens_in_step += int((window["doc"] >= 0).sum())
@@ -637,8 +771,15 @@ class TBPTTTrainer(Trainer):
             if self.scaler is None and not math.isfinite(mean_total):
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
             seconds = time.perf_counter() - started
-            train_seconds += seconds
-            total_tokens += tokens_in_step
+            compiled_now = self._compiled is not None and (
+                self._compiled.compile_seconds > compiled_before
+            )
+            if compiled_now:  # P2.8: compile time is never a steady-state number
+                compile_seconds += seconds
+                compile_steps += 1
+            else:
+                train_seconds += seconds
+                total_tokens += tokens_in_step
             stats = {
                 "state_abs_max": state_abs_max,
                 "eps_mean": eps_sum / n_windows,
@@ -707,6 +848,13 @@ class TBPTTTrainer(Trainer):
             "steps": float(self.step),
             "windows": float(self.windows),
             "resyncs": float(self.resyncs),
+            "compile_seconds": compile_seconds,
+            "compile_steps": float(compile_steps),
+            # P2.8: windows this trainer ran through the compiled window (0: every window eager)
+            "compiled_windows": float(self._compiled.calls if self._compiled is not None else 0),
+            "window_compile_seconds": (
+                self._compiled.compile_seconds if self._compiled is not None else 0.0
+            ),
         }
         return history
 

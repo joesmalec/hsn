@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from cards import CUDA_PROFILE
 from hsn.config import RunConfig, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
@@ -46,7 +47,7 @@ GROUPS_WITH_GRADS = {
     "decoder",
 }  # every top-level submodule but the halting head, which is not called while r_max = 1
 
-cuda_param = pytest.param("rtx3060", marks=pytest.mark.cuda)
+cuda_param = pytest.param(CUDA_PROFILE, marks=pytest.mark.cuda)
 mps_param = pytest.param("m_series", marks=pytest.mark.mps)
 
 
@@ -598,6 +599,7 @@ def test_p1_7_amp_runs(
     assert ctx.autocast_dtype is not None
     cfg = _config(
         f"profile={profile}",
+        "hardware.compile_mode=none",  # the eager AMP path, whatever the profile's default
         "train.steps=4",
         "train.eval_every=2",
         "train.ckpt_every=4",
