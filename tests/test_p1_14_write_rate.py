@@ -88,6 +88,9 @@ def test_p1_14_write_rate_in_no_rule() -> None:
     for name, preset in PRESETS.items():
         params = {"window": 100, "to_step": 1000} if name == "memory_open" else {}
         text = json.dumps(preset(params))
+        if name == "memory_writes":  # P1.15: the write-rate preset (approved), reads it by design
+            assert "diag:gate/write_rate" in text and "gate/mean" not in text
+            continue
         assert "write_rate" not in text and "gate/mean" not in text, name
 
 

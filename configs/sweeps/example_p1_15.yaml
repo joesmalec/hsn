@@ -1,0 +1,61 @@
+# Example sweep for P1.15's additions (docs/sweeps.md): probe v3 (key-addressed edits of the later
+# queries, reads_state version 3), a rule on the first/later split, the write-rate memory preset,
+# min_vocab on v2 and the gradient-spike guard. Expand-only: it shows the keys and is checked by the
+# committed-spec test; it registers no experiment of the plan.
+#
+#   python -m hsn.experiments expand configs/sweeps/example_p1_15.yaml
+
+name: example_p1_15
+description: dense HSN d=64 + cand_norm on WSD 0.2 at 2.5e-3 with probe v3, the split and the spike guard
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead # compiled dense HSN: about 0.24 s per step at B32
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.0025
+    - train.steps=9000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+families:
+  hsn:
+    overrides: [model.cand_norm=rms] # amendment A4 (opt-in)
+  gru:
+    config: configs/baselines/gru_2m.yaml
+    overrides: [train.warmup_steps=200, train.lr=0.0005, hardware.compile_mode=none]
+protocol:
+  name: reads_state
+  version: 3 # v1, v2, then probe v3 (the value edit and the key swap of every later query)
+  diag_every: 250 # 3 diagnostics in memory_writes' window (steps 1,000 to 1,500)
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (ceiling_check.py)
+seeds: [0]
+rules:
+  verdicts:
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20} # "vocabulary too small" below 20
+    reads_state_v3: {preset: reads_state_v3} # the value edit over the later queries
+    binds_keys: {preset: binds_keys} # the key swap
+    memory_writes: {preset: memory_writes} # median write rate and cell update ratio, 1,000-1,500
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "eval:split/later/accuracy", steps: {at: 9000}, op: ">", value: key_blind_later}
+      default: at or below
+arms:
+  - name: hsn_guarded
+    family: hsn
+    overrides: [train.spike_factor=100] # skip a step above 100x the running median of the norms
+  - name: hsn
+    family: hsn
+  - name: gru
+    family: gru
