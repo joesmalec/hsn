@@ -23,7 +23,8 @@ through their public signatures only:
   (``set_topology``) and ``edge_norm="sigmoid"`` with ``edge_logit = logit(a)``, so that the
   native path computes with the vector's edge weights ``a`` (the op takes normalised weights;
   their normalisation is not part of it), and the edge-weight gradient is recovered as
-  ``∂L/∂a = (∂L/∂logit) / (σ(logit)·(1 − σ(logit)))``.
+  ``∂L/∂a = (∂L/∂logit) / (σ(logit)·(1 − σ(logit)))``. The logit and this recovery run in float64
+  (on the host for MPS, which has no float64), so that they add no error of their own.
 
 Gradients come from autograd seeded with the vector's cotangents. ``hidden_saved`` and
 ``h_old_saved`` are saved-for-backward tensors of the fused ABI with no native counterpart
@@ -265,6 +266,11 @@ def _grad(name: str, t: Tensor) -> Tensor:
     return t.grad.detach()
 
 
+def _f64(t: Tensor) -> Tensor:
+    """``t`` in float64, on its own device, or on the host for MPS, which has no float64."""
+    return (t.cpu() if t.device.type == "mps" else t).double()
+
+
 def _native_gather_concat(t: Mapping[str, Tensor]) -> dict[str, Tensor]:
     u, eps, h, m = (_leaf(t[name]) for name in ("u", "eps", "h", "m"))
     v = native.gather_concat(u, eps, h, m, t["cell_idx"].long())
@@ -309,15 +315,15 @@ def _native_csr_messages(t: Mapping[str, Tensor], dims: Mapping[str, int]) -> di
     graph.set_topology(
         indptr, t["indices"].long(), torch.zeros(n_edges, dtype=torch.bool, device=device)
     )
-    a = t["a"].double()
+    a = _f64(t["a"])
     with torch.no_grad():
-        graph.edge_logit.copy_(torch.log(a) - torch.log1p(-a))
+        graph.edge_logit.copy_((torch.log(a) - torch.log1p(-a)).float())
         V.weight.copy_(t["V"])
     h = _leaf(t["h"])
     m = native.csr_messages(h, graph, V, t["cell_idx"].long())
     torch.autograd.backward(m, t["grad_m"])
-    s = torch.sigmoid(graph.edge_logit.detach().double())
-    grad_a = (_grad("edge_logit", graph.edge_logit).double() / (s * (1 - s))).float()
+    s = torch.sigmoid(_f64(graph.edge_logit.detach()))
+    grad_a = (_f64(_grad("edge_logit", graph.edge_logit)) / (s * (1 - s))).float().to(device)
     return {
         "m": m.detach(),
         "grad_h": _grad("h", h),

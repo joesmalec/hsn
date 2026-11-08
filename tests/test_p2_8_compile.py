@@ -472,6 +472,90 @@ def test_p2_8_mps_falls_back_with_notice(caplog: pytest.LogCaptureFixture) -> No
         compiled(tokens, cx, state, reset)
 
 
+def test_p2_8_mps_compiler_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MPS compiles pass the mode's inductor options with ``MPS_INDUCTOR_OPTIONS`` (no fusion, the
+    Metal buffer cap); CUDA and the CPU keep the plain ``mode`` call, and other backends theirs."""
+    import torch._inductor
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        compile_mod.torch, "compile", lambda fn, **kwargs: calls.append(kwargs) or fn
+    )
+
+    def fn(x: Tensor) -> Tensor:
+        return x
+
+    for device in ("cuda", "cpu"):
+        compile_mod._compiler("reduce-overhead", "inductor", device)(fn)
+        assert calls.pop() == {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
+    compile_mod._compiler("reduce-overhead", "inductor")(fn)  # the default is the old call
+    assert calls.pop() == {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
+    for mode in ("reduce-overhead", "max-autotune"):
+        compile_mod._compiler(mode, "inductor", "mps")(fn)  # type: ignore[arg-type]
+        got = calls.pop()
+        assert "mode" not in got and got["fullgraph"] and not got["dynamic"]
+        assert got["options"] == {
+            **torch._inductor.list_mode_options(mode),
+            "max_fusion_size": 1,
+            "max_fusion_unique_io_buffers": 24,
+        }
+    compile_mod._compiler("reduce-overhead", "aot_eager", "mps")(fn)
+    assert calls.pop() == {"backend": "aot_eager", "fullgraph": True, "dynamic": False}
+
+
+def _rel(a: Tensor, b: Tensor) -> float:
+    return float((a.float() - b.float()).abs().max()) / max(float(b.float().abs().max()), 1e-30)
+
+
+@pytest.mark.mps
+@pytest.mark.parametrize("name", ["topk_ste", "dense"])
+def test_p2_8_compiled_equals_eager_mps(name: str) -> None:
+    """On MPS the compiled g1 block (16 positions, fp32) equals eager. Values: relative to each
+    tensor's scale, at most 2e-4. Gradients: every tensor within 3e-5 of the largest gradient,
+    and within 2e-4 relative where its scale is at least 1e-3 of that (dense ``edge_logit`` is
+    zero up to Accelerate's ulp, so a relative bound means nothing there). Bounds are ten times
+    the measured worst (values 1.9e-5, gradients 1.9e-5 relative and 2.7e-6 of the largest).
+    With inductor's fusion the top-K STE block did not compile (more than Metal's 31 kernel
+    buffers) and, with the buffer cap alone, its gradients were up to 1.3e3 times eager's
+    (``MPS_INDUCTOR_OPTIONS``)."""
+    if not torch.backends.mps.is_available():
+        pytest.skip("no mps device on this machine")
+    overrides, _ = MODES[name]
+    routed = bool(overrides)
+    cfg = load_config(
+        REPO / "configs" / "experiments" / "g1_ref_a1.yaml",
+        overrides=["profile=m_series", *overrides],
+    )
+    ctx = _ctx("m_series")
+    model = _model(cfg, training=True, scale=0.3 if routed else 0.1).to(ctx.device)
+    window = compile_window(model, ctx, "reduce-overhead")
+    assert isinstance(window, CompiledWindow)
+    tokens, cx, state, reset = _inputs(model, b=2, t=16)
+    if routed:
+        reset = torch.zeros_like(reset)
+    ref = _run(lambda: model(tokens, cx, state, reset))
+    got = _run(lambda: window(tokens, cx, state, reset))
+    if routed:
+        assert _margin(ref[2], model.cfg.k_select) > MIN_MARGIN
+    (logits, final, info), (logits_r, final_r, info_r) = got, ref
+    values = [_rel(logits, logits_r), _rel(final.h, final_r.h), _rel(final.q, final_r.q)]
+    values += [_rel(info[k], v) for k, v in info_r.items() if v.is_floating_point()]
+    assert max(values) <= 2e-4, values
+    for key in ("age", "pos"):
+        assert torch.equal(getattr(final, key), getattr(final_r, key))
+    pairs = [
+        (g, r)
+        for g, r in zip(_grads(model, got), _grads(model, ref), strict=True)
+        if g is not None and r is not None
+    ]
+    scale = max(float(r.abs().max()) for _, r in pairs)
+    assert pairs and scale > 0
+    for g, r in pairs:
+        assert float((g - r).abs().max()) <= 3e-5 * scale
+        if float(r.abs().max()) >= 1e-3 * scale:
+            assert _rel(g, r) <= 2e-4, _rel(g, r)
+
+
 # --------------------------------------------------------------------------------------------------
 # Invariants with the compiled window (P1.8 subset) and the dense symmetry
 # --------------------------------------------------------------------------------------------------

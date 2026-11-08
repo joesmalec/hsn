@@ -66,6 +66,9 @@ a CUDA Graph can capture the step.
 
 MPS: ``torch.compile`` is tried there (inductor's Metal backend) and the module falls back to
 the eager path with one logged notice when compilation fails; on CPU and CUDA a failure raises.
+MPS compiles do not fuse and cap a kernel's buffers (:data:`MPS_INDUCTOR_OPTIONS`): fused, the g1
+top-K STE block's backward exceeds Metal's 31 kernel buffers and, under the cap, computes wrong
+gradients there (an inductor Metal fusion bug in torch 2.15).
 """
 
 from __future__ import annotations
@@ -87,6 +90,7 @@ from hsn.model.state import CellGraphState
 
 __all__ = [
     "MAX_BLOCK",
+    "MPS_INDUCTOR_OPTIONS",
     "CompileMode",
     "CompiledWindow",
     "ServingStep",
@@ -94,6 +98,7 @@ __all__ = [
     "check_compile_scope",
     "compile_step",
     "compile_window",
+    "mps_inductor_options",
 ]
 
 log = logging.getLogger(__name__)
@@ -104,6 +109,18 @@ _MODES: tuple[CompileMode, ...] = ("none", "reduce-overhead", "max-autotune")
 #: The largest block of positions compiled as one graph: 16 (module docstring: half the compile of
 #: 32 for a step about 1 % slower; larger blocks only add compile time).
 MAX_BLOCK = 16
+
+#: MPS inductor options, added to the compile mode's own (measured on an M4 Pro, torch 2.15,
+#: 7 Nov 2026, the g1 top-K STE block of 16 positions):
+#:
+#: * ``max_fusion_size = 1`` (no fusion): with any fusion (sizes 2 to 64) inductor's Metal backend
+#:   compiles the block's backward wrong (parameter gradients up to 1.3e3 times eager's, relative;
+#:   MPS eager matches the CPU to 9e-5); unfused it equals eager to 2e-5. Dense and the soft
+#:   warm-up compiled right fused, but one rule for every MPS compile keeps correctness first.
+#: * ``max_fusion_unique_io_buffers = 24``: a Metal kernel takes at most 31 buffer arguments, and
+#:   fused the backward did not compile ("number of constant buffers exceeds maximum supported
+#:   (31)"); kept as a guard, since one node (a wide ``cat``) can read many buffers.
+MPS_INDUCTOR_OPTIONS: dict[str, Any] = {"max_fusion_size": 1, "max_fusion_unique_io_buffers": 24}
 
 WindowOut = tuple[Tensor, CellGraphState, dict[str, Tensor]]
 
@@ -188,18 +205,34 @@ def _own_code(fn: Callable[..., Any]) -> Callable[..., Any]:
     return types.FunctionType(code, fn.__globals__, code.co_name, fn.__defaults__)
 
 
-def _compiler(mode: CompileMode, backend: Backend) -> Callable[[Callable[..., Any]], Any]:
+def _compiler(
+    mode: CompileMode, backend: Backend, device_type: str = "cuda"
+) -> Callable[[Callable[..., Any]], Any]:
     """``torch.compile`` with ``fullgraph`` (a graph break, or reaching the recompile limit,
     raises) and static shapes, on a copy of the function with its own code object
-    (:func:`_own_code`). The mode goes to inductor; other backends (tests) take none."""
+    (:func:`_own_code`). The mode goes to inductor; other backends (tests) take none. On MPS the
+    mode's inductor options are passed with :data:`MPS_INDUCTOR_OPTIONS` added
+    (``torch.compile`` takes ``mode`` or ``options``, not both); elsewhere the call is unchanged."""
 
     def wrap(fn: Callable[..., Any]) -> Any:
         own = _own_code(fn)
+        if backend == "inductor" and device_type == "mps":
+            return torch.compile(
+                own, options=mps_inductor_options(mode), fullgraph=True, dynamic=False
+            )
         if backend == "inductor":
             return torch.compile(own, mode=mode, fullgraph=True, dynamic=False)
         return torch.compile(own, backend=backend, fullgraph=True, dynamic=False)
 
     return wrap
+
+
+def mps_inductor_options(mode: str) -> dict[str, Any]:
+    """The inductor options of compile ``mode`` (``torch._inductor.list_mode_options``) with
+    :data:`MPS_INDUCTOR_OPTIONS` added."""
+    import torch._inductor
+
+    return {**torch._inductor.list_mode_options(mode), **MPS_INDUCTOR_OPTIONS}
 
 
 def _uses_cuda_graphs(ctx: DeviceContext, mode: CompileMode, backend: Backend) -> bool:
@@ -327,7 +360,7 @@ class CompiledWindow:
         self.mode = mode
         self.backend = backend
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
-        self._block = _compiler(mode, backend)(_block)
+        self._block = _compiler(mode, backend, ctx.device.type)(_block)
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
@@ -559,7 +592,7 @@ class ServingStep:
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
         self.static = mode != "none"
         self._fn: Callable[..., Tensor] = (
-            _serve if mode == "none" else _compiler(mode, backend)(_serve)
+            _serve if mode == "none" else _compiler(mode, backend, ctx.device.type)(_serve)
         )
         self.calls = 0
         self.compile_seconds = 0.0
