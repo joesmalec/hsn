@@ -614,9 +614,14 @@ def _expand_one(
             raise SpecError(f"arm {label}: {exc}") from exc
         windows = merge_windows([*explicit, *derived])
         if not windows:
-            raise SpecError(f"arm {label}: diag_dense_every set, but no rule reads a diag: window")
+            # no rule of this arm reads a diag: window (a GRU arm beside hsn-only rules, say): the
+            # single cadence, recorded as such, so that its id is the plain arm's
+            dense = 0
         protocol = protocol.model_copy(
-            update={"diag_windows": tuple((lo, hi) for lo, hi in windows)}
+            update={
+                "diag_dense_every": dense,
+                "diag_windows": tuple((lo, hi) for lo, hi in windows),
+            }
         )
     cadence = Cadence.of(
         steps,

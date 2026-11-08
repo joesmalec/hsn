@@ -180,8 +180,10 @@ def test_p1_14_mixed_cadence_in_specs(tmp_path: Path) -> None:
     }
     with pytest.raises(SpecError, match=r"reads steps \[410\] this arm does not record"):
         _spec(tmp_path, rules={"verdicts": {"off": off}}, diag_dense_every=25)
-    with pytest.raises(SpecError, match="no rule reads a diag: window"):
-        _spec(tmp_path, rules=None, diag_dense_every=25)
+    # an arm no rule reads a diag: window for keeps the single cadence, and the plain arm's id
+    no_windows = _spec(tmp_path, rules=None, diag_dense_every=25)["a/s0"]
+    assert no_windows.protocol.diag_dense_every == 0 and no_windows.protocol.diag_windows == ()
+    assert no_windows.arm_id == _spec(tmp_path, rules=None)["a/s0"].arm_id
 
 
 def test_p1_14_mixed_cadence_ids_unchanged_at_default(tmp_path: Path) -> None:

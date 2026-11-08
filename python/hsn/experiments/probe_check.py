@@ -138,7 +138,8 @@ def probe_rerun(
     checkpoint, compared document by document with the per-document probes stored in its
     ``result.json`` (``probes``, or ``at_stop.probes`` after an early stop) and with its stored
     summary; then probe v2 on the same model. Every answer that differs from the stored one is
-    listed with both top-2 margins (a near-tie under other rounding, as ``probe-check``)."""
+    listed with both top-2 margins (a near-tie under other rounding, as ``probe-check``), and so is
+    every original answer of v2's pass that differs from v1's."""
     from hsn.experiments.probe import edit_probe, edit_probe_v2, summarize, summarize_v2
 
     result = db.row("SELECT json_path FROM results WHERE exp_id = ?", (exp_id,))
@@ -172,9 +173,22 @@ def probe_rerun(
     summary = summarize(v1)
     keys = ("n_probed", "first_query_accuracy", "all", "correct_before_edit", "verdict")
     t1 = time.perf_counter()
-    v2 = edit_probe_v2(model, ctx, dev, v1=v1, batch_rows=rows)
+    v2 = edit_probe_v2(model, ctx, dev, v1=v1, batch_rows=rows, margins=True)
     v2_s = time.perf_counter() - t1
     summary_v2 = summarize_v2(v2, v1=v1)
+    # an original answer of v2's pass that differs from v1's: under a routed model the rows of a
+    # batch share the per-unit GEMMs, so another edit row changes their shapes and rounding
+    mismatches = [
+        {
+            "doc": b["doc"],
+            "v1": a["argmax_original"],
+            "v2": b["argmax_original"],
+            "margin_v1": a["margin_original"],
+            "margin_v2": b["margin_original"],
+        }
+        for a, b in zip(v1, v2, strict=True)
+        if not b["original_matches_v1"]
+    ]
     return {
         "exp_id": exp_id,
         "label": exp["label"],
@@ -189,5 +203,6 @@ def probe_rerun(
         "v1_rerun": {k: summary[k] for k in keys},
         "v1_stored": {k: stored_summary.get(k) for k in keys},
         "v2": summary_v2,
+        "v2_original_mismatches": mismatches,
         "differ": differ,
     }

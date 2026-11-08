@@ -94,10 +94,17 @@ def test_p1_14_write_rate_in_no_rule() -> None:
 @pytest.mark.usefixtures("isolated")
 def test_p1_14_report_shows_write_rate_and_step_time(tmp_path: Path) -> None:
     db = dbm.Database(db_path())
-    record = {"trained_state": {"gate/write_rate": 0.12}, "step_time": {"run_median_s": 0.2}}
+    record = {
+        "trained_state": {"gate/write_rate": 0.12},
+        "step_time": {"run_median_s": 0.2},
+        "probe_v2": {"correct_follow_frac": 0.25, "vocab_size": 18, "matched_frac": 1.0},
+    }
     for exp_id in enqueue_and_claim(db, dry_spec(tmp_path, n=2, name="wr", record=record)):
         assert run_child(db, exp_id, tmp_path / "runs") == 0
     rows = build_report(db, sweep="wr", per_seed=True).rows
     assert [(r["write_rate"], r["step_s"]) for r in rows] == [(0.12, 0.2), (0.12, 0.2)]
     (group,) = build_report(db, sweep="wr").rows
     assert group["write_rate"] == "0.120 [0.120, 0.120]" and group["step_s"] == "0.200"
+    assert [(r["v2_follow"], r["v2_vocab"], r["v2_matched"]) for r in rows] == [(0.25, 18, 1.0)] * 2
+    assert rows[0]["v2_unchanged"] is None and group["v2_unchanged"] == ""
+    assert group["v2_vocab"] == "18.000 [18.000, 18.000]"
