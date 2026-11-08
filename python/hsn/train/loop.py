@@ -25,7 +25,9 @@ the end the dev set is evaluated (:func:`hsn.eval.evaluate.evaluate_windows`); e
 ``train.ckpt_every`` steps and at the end a checkpoint is written to ``run_dir``
 (``runs/<run_id>`` unless given). ``fit``
 returns a :class:`History` with one record per step, every evaluation, the model's parameter
-report and the *measured* numbers the run manifest needs (plan §0.5: measured, not assumed).
+report and the *measured* numbers the run manifest needs (plan §0.5: measured, not assumed). P1.16:
+:attr:`Trainer.extra_ckpt_every` (a harness setting, ``None`` by default) writes a checkpoint at its
+multiples too.
 
 **Schedules.** The learning-rate factor of step ``s`` (``LambdaLR``'s count of scheduler steps, so
 optimiser step ``k`` trains at the factor of ``k - 1``) is ``(s + 1) / warmup_steps`` during the
@@ -638,6 +640,9 @@ class Trainer:
         # P1.15: labels of evaluate()'s loss positions (the reads-state harness's query slots,
         # hsn.experiments.split); a harness setting, not config. None: today's evaluation
         self.eval_position_groups: PositionGroups | None = None
+        # P1.16: an extra checkpoint every this many steps (the harness's protocol keep_every); a
+        # harness setting, not config (train.ckpt_every is unchanged). None: none
+        self.extra_ckpt_every: int | None = None
 
     # construction ----------------------------------------------------------------------------
 
@@ -1196,7 +1201,7 @@ class Trainer:
                     " ".join(f"{k} {v:.4f}" for k, v in result.items() if isinstance(v, float)),
                 )
             saved = False
-            if self.step % train.ckpt_every == 0 or self.step == steps:
+            if self.step % train.ckpt_every == 0 or self.step == steps or self._kept_step():
                 path = self.save(self.run_dir, loader, state)
                 history.checkpoints.append(str(path))
                 saved = True
@@ -1222,6 +1227,11 @@ class Trainer:
             **self._rollback_measured(),  # P1.16
         }
         return history
+
+    def _kept_step(self) -> bool:
+        """P1.16: whether this step writes a kept checkpoint (:attr:`extra_ckpt_every`)."""
+        every = self.extra_ckpt_every
+        return every is not None and every > 0 and self.step % every == 0
 
     def _spike_measured(self) -> dict[str, float]:
         """P1.15: ``skipped_spike_steps`` for ``History.measured``, only with the guard on (a rule

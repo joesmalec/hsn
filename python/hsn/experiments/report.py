@@ -22,7 +22,8 @@ attempt (``done`` or ``stopped_early``), else the latest attempt. Columns:
   for a run stored before P1.15 the ``derived`` / ``recomputed`` values of a ``split-backfill``
   file given as ``split_backfill``);
 * early stops; failures (P1.14: ``<reason> @ <last step>`` of an attempt that failed or was
-  cancelled, from its partial record); median train and total wall seconds and compile seconds;
+  cancelled, from its partial record; P1.16: ``; partial from step X (dev <acc>)`` when the attempt
+  was re-scored from a kept checkpoint); median train and total wall seconds and compile seconds;
 * card status, commits, imported.
 
 A failed attempt's verdicts read ``failed: ...`` and are never counted as a finding.
@@ -194,6 +195,19 @@ def _split_cells(
     return {**{c: entry.get(c) for c in SPLIT_COLUMNS}, "split_src": str(entry.get("tier", ""))}
 
 
+def _failure_cell(failure: Any, partial: Any) -> str:
+    """``<reason> @ <last step>``, and P1.16's ``; partial from step X (dev <acc>)`` when the
+    failed attempt was re-scored from a kept checkpoint."""
+    if not isinstance(failure, Mapping):
+        return ""
+    cell = f"{failure.get('reason')} @ {failure.get('last_step')}"
+    if isinstance(partial, Mapping) and partial.get("from_step") is not None:
+        acc = (partial.get("final") or {}).get("dev_accuracy")
+        dev = f" (dev {acc:.4f})" if isinstance(acc, int | float) else ""
+        cell += f"; partial from step {partial['from_step']}{dev}"
+    return cell
+
+
 def _per_seed_row(
     row: dict[str, Any],
     labels: dict[str, str],
@@ -236,11 +250,7 @@ def _per_seed_row(
         "write_rate": (trained or {}).get("gate/write_rate"),
         "step_s": step_time.get("run_median_s"),
         "early_stop": f"{stopped['outcome']} @ {stopped['step']}" if stopped else "",
-        "failure": (
-            f"{failure.get('reason')} @ {failure.get('last_step')}"
-            if isinstance(failure, Mapping)
-            else ""
-        ),
+        "failure": _failure_cell(failure, record.get("partial")),
         "train_s": row["train_s"] if row["train_s"] is not None else walls.get("fit_s"),
         "total_s": row["total_s"],
         "compile_s": walls.get("compile_s"),

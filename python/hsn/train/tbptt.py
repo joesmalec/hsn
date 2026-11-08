@@ -875,7 +875,7 @@ class TBPTTTrainer(Trainer):
                     " ".join(f"{k} {v:.4f}" for k, v in result.items() if isinstance(v, float)),
                 )
             saved = False
-            if self.step % train.ckpt_every == 0 or self.step == steps:
+            if self.step % train.ckpt_every == 0 or self.step == steps or self._kept_step():
                 path = self.save(self.run_dir, loader, state)
                 history.checkpoints.append(str(path))
                 saved = True

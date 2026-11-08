@@ -25,4 +25,21 @@ P1.14 added:
 - probe v2, the vocabulary-matched edit (:mod:`hsn.experiments.probe`);
 - the gate write rate (:mod:`hsn.experiments.diagnostics`);
 - finishing process groups counted as ours (:mod:`hsn.experiments.worker`).
+
+P1.15 added:
+- the first/later split of every reads_state evaluation, and its read-only backfill
+  (:mod:`hsn.experiments.split`);
+- probe v3, the key-addressed edits of the later queries (:mod:`hsn.experiments.probe`);
+- the spike guard's records, the divergence dump in the record and ``replay``
+  (:mod:`hsn.experiments.protocols`, :mod:`hsn.train.divergence`);
+- the presets ``memory_writes``, ``reads_state_v3`` and ``binds_keys``
+  (:mod:`hsn.experiments.rules`).
+
+P1.16 added:
+- the rollback's records and failure kind, kept checkpoints and the partial result of a failed arm
+  (:mod:`hsn.experiments.protocols`), the ``partial:`` rule source, the failed-verdict suffix and
+  the preset ``memory_writes_run`` (:mod:`hsn.experiments.rules`);
+- ``route-check`` (:mod:`hsn.experiments.routing`); ``probe-rerun --weights dump`` and
+  ``--key-alphabet train`` (:mod:`hsn.experiments.probe_check`); ``replay --continue-steps``;
+- the WAL switch's retry on a first open (:mod:`hsn.experiments.db`).
 """

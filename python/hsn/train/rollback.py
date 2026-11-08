@@ -224,8 +224,9 @@ class SnapshotRing:
                 self.optimizer.state.pop(p, None)
                 continue
             state = self.optimizer.state.get(p)
-            for key in [k for k in (state or {}) if k not in wanted[index]]:
-                del state[key]  # type: ignore[index]
+            if state:
+                for key in [k for k in state if k not in wanted[index]]:
+                    del state[key]
         dst: list[Tensor] = []
         src: list[Tensor] = []
         for (index, key), saved in zip(snap.keys, snap.optim, strict=True):

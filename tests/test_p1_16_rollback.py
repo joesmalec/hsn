@@ -38,6 +38,8 @@ from p1_15_support import (
     hsn_trainer,
     plant,
     plant_gru_spike,
+    plant_on_window,
+    window_tokens,
 )
 from torch import nn
 
@@ -340,6 +342,41 @@ def test_p1_16_rollback_refused_with_grad_scaler(
     )
     with pytest.raises(NotImplementedError, match="GradScaler"):
         hsn_trainer(hsn_config(4, "train.rollback_every=5"), tmp_path / "run")
+
+
+# --------------------------------------------------------------------------------------------------
+# The replay's continuation (hsn.train.divergence)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_p1_16_replay_continue_with_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From a dump of a planted spike at step 6: a continuation of 6 steps with the rollback as the
+    remedy rolls back to the dumped state (its first snapshot) and trains on to step 12; without a
+    remedy the dump's own guard skips the step; a remedy needs a continuation."""
+    from hsn.train.divergence import dump_paths, replay
+
+    cfg = hsn_config(20, *GUARD)
+    train_ds, dev_ds = datasets()
+    plant_on_window(monkeypatch, window_tokens(cfg, train_ds, 6), SPIKE)
+    trainer = hsn_trainer(cfg, tmp_path / "run")
+    trainer.fit(train_ds, dev_ds, 8)
+    (path,) = dump_paths(tmp_path / "run")
+    remedy = {"rollback": {"every": 2, "lr_mult": 0.5, "lr_steps": 2, "max_rollbacks": 3}}
+    out = replay(path, train_ds=train_ds, repeats=1, continue_steps=6, remedy=remedy)
+    (run,) = out["continuations"]
+    assert run["stopped"] is None and run["reached_step"] == 12
+    assert [(r["step"], r["restored_step"]) for r in run["rollbacks"]] == [(6, 5)]
+    assert run["steps"][0]["step"] == 6 and run["steps"][0]["decision"] == "rollback"
+    assert all(s["decision"] == "applied" for s in run["steps"][1:])
+    assert out["remedy"]["rollback"]["every"] == 2
+    plain = replay(path, train_ds=train_ds, repeats=1, continue_steps=4)
+    (skip,) = plain["continuations"]
+    assert skip["steps"][0]["decision"] == SPIKE and skip["rollbacks"] == []
+    assert skip["reached_step"] == 10
+    with pytest.raises(ValueError, match="continue_steps"):
+        replay(path, train_ds=train_ds, repeats=1, remedy=remedy)
 
 
 # --------------------------------------------------------------------------------------------------

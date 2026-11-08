@@ -59,6 +59,24 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
 - ``divergence``: the divergence dump's summary (``train.divergence_dump``, on by default: kind,
   step, norm, path; :mod:`hsn.train.divergence`), in full and partial records; ``None`` without a
   skipped step.
+
+**P1.16.**
+- The rollback (``train.rollback_*``, :mod:`hsn.train.rollback`): ``rollbacks`` (every event, in
+  full and partial records), ``final.rollbacks`` (the count; ``None`` with the rollback off), the
+  trigger steps marked ``skipped: rollback`` on their train entries, and the failure kind
+  ``rollback`` at its limit.
+- Kept checkpoints (protocol ``keep_every`` / ``keep_last``, execution-only): the trainer writes a
+  checkpoint every ``keep_every`` steps (``Trainer.extra_ckpt_every``; the configuration is
+  unchanged); after each step the newest ``keep_last`` of those stay, plus the newest one before the
+  run's first guard event (a skipped or rolled-back step), which is never pruned; a run that
+  finishes deletes them (its final checkpoint follows ``checkpoint``). When the fit fails on a guard
+  (kinds ``nonfinite``, ``spike``, ``rollback``), the newest checkpoint on disk (kept or regular)
+  before the first guard event (before the failure when there was none) is loaded into the model and
+  evaluated (with the split), its state statistics and the protocol version's probes taken, and the
+  result stored as ``partial``: ``from_step``, ``checkpoint``, ``reason``, ``final`` (the ``final``
+  keys of that evaluation), ``trained``, ``probes`` (summaries) and ``seconds``; a failure while
+  re-scoring is kept as ``partial.error`` and never hides the run's own failure. The rules label
+  such a record ``failed: … (from step X: …)`` (:mod:`hsn.experiments.rules`).
 """
 
 from __future__ import annotations
@@ -307,6 +325,52 @@ def _final(evals: list[dict[str, Any]], train: list[dict[str, Any]]) -> dict[str
     return out
 
 
+@dataclass
+class _Keeper:
+    """P1.16: prunes the kept checkpoints after each step (module docstring): the newest
+    ``keep_last`` of those at multiples of ``keep_every`` that are not regular ``ckpt_every``
+    checkpoints, and always the newest one before the first guard event."""
+
+    keep_every: int
+    keep_last: int
+    ckpt_every: int
+
+    @staticmethod
+    def on_disk(history: Any) -> list[tuple[int, Path]]:
+        """``(step, path)`` of every checkpoint of the fit still on disk, oldest first."""
+        out = set()
+        for raw in history.checkpoints:
+            path = Path(raw)
+            if path.is_file():
+                out.add((int(path.stem.split("_")[-1]), path))
+        return sorted(out)
+
+    def kept(self, history: Any) -> list[tuple[int, Path]]:
+        """The checkpoints written for ``keep_every`` alone (not regular ``ckpt_every`` ones)."""
+        return [
+            (step, path)
+            for step, path in self.on_disk(history)
+            if step % self.keep_every == 0 and step % self.ckpt_every != 0
+        ]
+
+    def prune(self, trainer: Any, history: Any) -> None:
+        kept = self.kept(history)
+        first = _first_guard_event(trainer)
+        pinned = None
+        if first is not None:
+            before = [k for k in kept if k[0] < first]
+            pinned = before[-1] if before else None
+        for entry in kept[: -self.keep_last]:
+            if entry != pinned:
+                entry[1].unlink(missing_ok=True)
+
+
+def _first_guard_event(trainer: Any) -> int | None:
+    """P1.16: the first step a guard skipped or rolled back, or None."""
+    steps = [int(s["step"]) for s in getattr(trainer, "skipped_steps", [])]
+    return min(steps) if steps else None
+
+
 class _StepCallback:
     """Progress at every evaluation; the step-time guard (P1.14) at every step; the early-stop rules
     at their steps."""
@@ -329,10 +393,13 @@ class _StepCallback:
         self.log: list[dict[str, Any]] = []
         self.started = time.perf_counter()
         self.history: Any = None  # P1.14: the live History, read back when the fit raises
+        self.keeper: _Keeper | None = None  # P1.16: kept checkpoints (protocol keep_every)
 
     def __call__(self, trainer: Any, history: Any) -> bool:
         self.history = history
         step = int(trainer.step)
+        if self.keeper is not None:
+            self.keeper.prune(trainer, history)
         evaluated = bool(history.evals) and int(history.evals[-1]["step"]) == step
         if self.guard is not None and history.steps and int(history.steps[-1].step) == step:
             # a compile or CUDA-graph recording during this step or its evaluation (P2.8)
@@ -435,6 +502,8 @@ def _train(
     timer = _EvalTimer()
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
     trainer.eval_batch = params.eval_batch
+    if params.keep_every:  # P1.16: kept checkpoints (a harness setting, not the configuration)
+        trainer.extra_ckpt_every = params.keep_every
     # P1.15: what a divergence dump needs to rebuild this arm's model (hsn.train.divergence)
     trainer.dump_notes = {
         "variant": arm.variant,
@@ -470,6 +539,8 @@ def _train(
         stats_every=cfg.train.stats_every,
     )
     callback = _StepCallback(arm, diag if sampling else None, audit_keys=audit_keys, guard=guard)
+    if params.keep_every:
+        callback.keeper = _Keeper(params.keep_every, params.keep_last, cfg.train.ckpt_every)
     arm.walls["setup_s"] = time.perf_counter() - t0
 
     arm.stage = "train"
@@ -489,6 +560,10 @@ def _train(
             skipped_nonfinite=int(getattr(trainer, "skipped_nonfinite", 0)),
             skipped_spike=int(getattr(trainer, "skipped_spike", 0)) if spike_on else None,
         )
+        if callback.keeper is not None and arm.record["failure"]["kind"] in _RESCORED:
+            arm.record["partial"] = _rescore_partial(
+                arm, params, trainer, model, cfg, ctx, dev_ds, callback, audit_keys
+            )
         raise
     arm.walls["fit_s"] = time.perf_counter() - t1
     diag.detach()
@@ -534,8 +609,10 @@ def _train(
             "skipped_nonfinite_steps": measured.get("skipped_nonfinite_steps"),
             # P1.15: the spike guard's skips; None with the guard off (the guard did not look)
             "skipped_spike_steps": measured.get("skipped_spike_steps"),
+            "rollbacks": measured.get("rollbacks"),  # P1.16: None with the rollback off
         },
         "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+        "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
         "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
         "stopped": callback.stop,
         "early_stop_log": callback.log,
@@ -596,6 +673,9 @@ def _train(
     if params.checkpoint == "none":
         for path in history.checkpoints:
             Path(path).unlink(missing_ok=True)
+    elif callback.keeper is not None:  # P1.16: a finished run keeps no mid-run kept checkpoint
+        for _step, path in callback.keeper.kept(history):
+            path.unlink(missing_ok=True)
     arm.stage = "done"
     return record
 
@@ -625,6 +705,13 @@ def _partial_training(
     measured: dict[str, Any] = {"skipped_nonfinite_steps": skipped}
     if spikes is not None:
         measured["skipped_spike_steps"] = spikes
+    rollbacks = (  # P1.16: None with the rollback off
+        float(len(getattr(trainer, "rollbacks", [])))
+        if getattr(trainer, "rollback", None) is not None
+        else None
+    )
+    if rollbacks is not None:
+        measured["rollbacks"] = rollbacks
     window = getattr(trainer, "compiled_window", None)
     compiled = {"window_compile_seconds": window.compile_seconds} if window is not None else {}
     arm.walls["eval_s"] = timer.seconds
@@ -646,8 +733,10 @@ def _partial_training(
                 **_final(evals, train),
                 "skipped_nonfinite_steps": skipped,
                 "skipped_spike_steps": spikes,
+                "rollbacks": rollbacks,  # P1.16
             },
             "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+            "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
             "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
             "stopped": None,
             "early_stop_log": list(callback.log),
@@ -656,6 +745,78 @@ def _partial_training(
             "step_time": callback.guard.summary() if callback.guard is not None else None,
         }
     )
+
+
+#: P1.16: the failure kinds after which a kept checkpoint is re-scored (the guards' stops)
+_RESCORED = ("nonfinite", "spike", "rollback")
+
+
+def _rescore_partial(
+    arm: ArmRun,
+    params: ReadsStateParams | TrainEvalParams | OverfitParams,
+    trainer: Any,
+    model: Any,
+    cfg: RunConfig,
+    ctx: Any,
+    dev_ds: Any,
+    callback: _StepCallback,
+    audit_keys: bool,
+) -> dict[str, Any] | None:
+    """P1.16: the ``partial`` block of a run that failed on a guard (module docstring), or None
+    when no kept checkpoint qualifies. Errors while re-scoring are kept in it, never raised."""
+    from hsn.experiments.diagnostics import trained_state
+    from hsn.experiments.probe import (
+        edit_probe,
+        edit_probe_v2,
+        edit_probe_v3,
+        summarize,
+        summarize_v2,
+        summarize_v3,
+    )
+    from hsn.train.checkpoint import load_checkpoint
+
+    history = callback.history
+    keeper = callback.keeper
+    if history is None or keeper is None:
+        return None
+    first = _first_guard_event(trainer)
+    limit = first if first is not None else int(trainer.step) + 1
+    candidates = [k for k in keeper.on_disk(history) if k[0] < limit]
+    if not candidates:
+        return None
+    step, path = candidates[-1]
+    reason = (
+        f"the newest kept checkpoint before the first guard event (step {first})"
+        if first is not None
+        else f"the newest kept checkpoint before the failure (step {int(trainer.step)})"
+    )
+    out: dict[str, Any] = {"from_step": step, "checkpoint": str(path), "reason": reason}
+    t0 = time.perf_counter()
+    arm.stage = "partial"
+    try:
+        load_checkpoint(path, model)  # weights only, in place (the compiled window keeps them)
+        result = trainer.evaluate(dev_ds)
+        entry = _eval_entry({"step": step, **result}, audit_keys=audit_keys)
+        train = [_train_entry(s) for s in history.steps if int(s.step) <= step]
+        out["final"] = _final([entry], train)
+        if isinstance(params, (ReadsStateParams, TrainEvalParams)):
+            out["trained"] = trained_state(model, cfg, ctx, dev_ds, params.diag_docs)
+        probes: dict[str, Any] = {}
+        if isinstance(params, ReadsStateParams):
+            v1 = edit_probe(model, ctx, dev_ds, batch_rows=params.probe_batch)
+            probes["probe"] = summarize(v1)
+            if params.version >= 2:
+                v2 = edit_probe_v2(model, ctx, dev_ds, v1=v1, batch_rows=params.probe_batch)
+                probes["probe_v2"] = summarize_v2(v2, v1=v1)
+            if params.version >= 3:
+                v3, originals = edit_probe_v3(model, ctx, dev_ds, batch_rows=params.probe_batch)
+                probes["probe_v3"] = summarize_v3(v3, originals)
+        out["probes"] = probes
+    except Exception as exc:  # a diagnostic of a failed run: never hide the run's own failure
+        out["error"] = f"{type(exc).__name__}: {exc}"[:2000]
+    arm.stage = "train"
+    out["seconds"] = round(time.perf_counter() - t0, 2)
+    return out
 
 
 def _overfit_summary(

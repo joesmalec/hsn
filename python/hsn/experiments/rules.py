@@ -20,7 +20,9 @@ their expanded form. They are experiment rules registered before the run, not ga
   ``probe_v3:<key>`` (P1.15: the key-addressed edits of reads_state version 3,
   :func:`hsn.experiments.probe.summarize_v3`: ``value/...`` and ``swap/...`` keys),
   ``overfit:<key>``, ``final:<key>`` (the last
-  evaluation flattened, ``train_loss``, ``steps``) and ``verdict:<rule>`` (another rule's label).
+  evaluation flattened, ``train_loss``, ``steps``), ``partial:<key>`` (P1.16: the same keys of a
+  failed arm's re-scored kept checkpoint, ``record["partial"]["final"]``, and ``partial:from_step``;
+  missing when there is none) and ``verdict:<rule>`` (another rule's label).
 * ``steps`` (series only) selects samples: ``{at: n}`` or ``{from: a, to: b, every: k}`` (every
   bound optional; ``every`` keeps the multiples of ``k``). Without ``steps`` every sample counts.
 * ``agg`` (series only, required unless ``steps.at``): ``all``/``any`` apply the comparison to every
@@ -45,13 +47,18 @@ group: {min_agree: n}}``: the first case whose condition holds gives the label, 
 otherwise. An arm outside ``applies_to`` reads ``n/a (family <f>)`` or ``n/a (protocol <p>)`` (never
 a pass or a fail); a missing atom in a case reached reads ``n/a: <metric> missing ...``; an arm that
 stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict, and an arm that failed
-(P1.14: a partial record with a ``failure`` block) ``failed: <reason> @ <last step>``.
+(P1.14: a partial record with a ``failure`` block) ``failed: <reason> @ <last step>``. P1.16: when
+the failed record holds a re-scored kept checkpoint (``record["partial"]``, from step X), every rule
+is also evaluated on that checkpoint's view (its evaluation, state statistics and probes, and the
+series up to X) and its label appended: ``failed: <reason> @ <last step> (from step X: <label>)``.
+The label still starts with ``failed:``: a failed arm never passes and is never a finding.
 ``group.min_agree`` is read by ``report`` at seed-group level ("counts as a finding" when that many
 seeds share a label).
 Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``reads_state_v2``
 (P1.14; P1.15: ``min_vocab`` adds "vocabulary too small"), ``memory_open``, ``cells_apart``, and
 P1.15's ``reads_state_v3`` (probe v3's value edit), ``binds_keys`` (its key swap) and
-``memory_writes`` (the write rate and the cell's update ratio over a window).
+``memory_writes`` (the write rate and the cell's update ratio over a window); P1.16's
+``memory_writes_run`` (the same in any of a run's sliding windows, for top-K and late learners).
 
 **Early stop.** ``{name, at_steps: [n, ...], outcome, when, applies_to}``: evaluated by the trainer
 callback right after step ``n``'s evaluation and diagnostics; when ``when`` holds the run stops with
@@ -99,12 +106,22 @@ __all__ = [
     "diag_schedule",
     "evaluate_verdicts",
     "parse_rules",
+    "partial_record",
     "resolved_early_stop",
     "rule_windows",
 ]
 
 SERIES_SOURCES = ("eval", "diag", "train")
-SCALAR_SOURCES = ("trained", "probe", "probe_v2", "probe_v3", "overfit", "final", "verdict")
+SCALAR_SOURCES = (
+    "trained",
+    "probe",
+    "probe_v2",
+    "probe_v3",
+    "overfit",
+    "final",
+    "partial",  # P1.16: a failed arm's re-scored kept checkpoint
+    "verdict",
+)
 SOURCES = SERIES_SOURCES + SCALAR_SOURCES
 AGGS = ("all", "any", "median", "mean", "min", "max", "first", "last")
 OPS = (">=", ">", "<=", "<", "==", "!=", "between")
@@ -119,6 +136,9 @@ SPLIT_PREFIX = "split/"
 #: P1.14: the minimum the docs recommend for a windowed rule (``min_samples`` is set per rule)
 MIN_SAMPLES_DOC = 5
 TRAIN_METRICS = ("loss", "accuracy", "grad_norm")
+#: P1.16: memory_writes_run's default thresholds (calibrated on the stored HSN runs)
+MEMORY_WRITES_RUN_RATE = 0.025
+MEMORY_WRITES_RUN_RATIO = 0.0005
 
 
 class RuleError(ValueError):
@@ -684,6 +704,53 @@ def _preset_memory_writes(p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _preset_memory_writes_run(p: dict[str, Any]) -> dict[str, Any]:
+    """P1.16: :func:`_preset_memory_writes` over a whole run. "writes" when, in **any** of the
+    sliding windows ``[s - window, s + window]`` centred at the multiples ``s`` of ``every`` from
+    ``from_step`` to ``to_step`` (required: the last centre whose window the arm still records),
+    the ``agg`` (default median) of ``gate/write_rate`` is at least ``write_rate_min`` and that of
+    ``update_ratio/cell`` at least ``update_ratio_min``, each window holding ``min_samples``
+    (default 3) diagnostics; else "no writes". ``memory_writes`` reads one early window (1,000 to
+    1,500), so it misreads runs that start writing later (exp 190) and top-K runs, whose onset
+    comes at 4,000 to 8,000 (exps 196 to 198); one window anywhere in the run reads them. A median
+    over three samples, not a single sample, so one noisy diagnostic cannot pass a run. The default
+    thresholds are calibrated on the stored HSN runs (docs/sweeps.md, "memory_writes_run")."""
+    start, every = p.pop("from_step", 500), p.pop("every", 500)
+    if "to_step" not in p:
+        raise RuleError("preset memory_writes_run needs to_step (the last window centre)")
+    stop = p.pop("to_step")
+    window = p.pop("window", 250)
+    rate, ratio = (
+        p.pop("write_rate_min", MEMORY_WRITES_RUN_RATE),
+        p.pop("update_ratio_min", MEMORY_WRITES_RUN_RATIO),
+    )
+    agg, least = p.pop("agg", "median"), p.pop("min_samples", 3)
+    if stop < start or every < 1 or window < 0:
+        raise RuleError(
+            f"preset memory_writes_run: needs from_step <= to_step, every >= 1 and window >= 0, "
+            f"got from {start}, to {stop}, every {every}, window {window}"
+        )
+    centres = range(-(-start // every) * every, stop + 1, every)
+    windows: list[Any] = []
+    for s in centres:
+        span = {"from": max(1, s - window), "to": s + window}
+        windows.append(
+            {
+                "all": [
+                    _atom("diag:gate/write_rate", ">=", rate, dict(span), agg, least),
+                    _atom("diag:update_ratio/cell", ">=", ratio, dict(span), agg, least),
+                ]
+            }
+        )
+    if not windows:
+        raise RuleError(f"preset memory_writes_run: no window centre in [{start}, {stop}]")
+    return {
+        "cases": [{"label": "writes", "when": {"any": windows}}],
+        "default": "no writes",
+        "applies_to": {"family": ["hsn"]},
+    }
+
+
 def _preset_memory_open(p: dict[str, Any]) -> dict[str, Any]:
     """Gate p50 and the cell's gradient share at or above their thresholds at the multiples of
     ``every`` from ``from_step``. Without ``window``: the one sample at each such step (``agg``
@@ -747,6 +814,7 @@ PRESETS = {
     "reads_state_v3": _preset_reads_state_v3,
     "binds_keys": _preset_binds_keys,
     "memory_writes": _preset_memory_writes,  # P1.15: write rate and the cell's update ratio
+    "memory_writes_run": _preset_memory_writes_run,  # P1.16: the same in any window of the run
     "memory_open": _preset_memory_open,  # queue9 rule: gate p50 and the cell's grad share, x500
     "cells_apart": _preset_cells_apart,  # queue9 rule: rank_pr and diversity_live, trained model
 }
@@ -927,6 +995,15 @@ class RecordView:
     def scalar(self, source: str, key: str, verdicts: Mapping[str, str]) -> Any:
         if source == "verdict":
             return verdicts.get(key)
+        if source == "partial":  # P1.16
+            partial = self.record.get("partial")
+            if not isinstance(partial, Mapping):
+                return None
+            if key == "from_step":
+                return _num(partial.get("from_step"))
+            final = partial.get("final")
+            value = final.get(key) if isinstance(final, Mapping) else None
+            return value if isinstance(value, str) else _num(value)
         block = {
             "trained": self.record.get("trained_state"),
             "probe": self.record.get("probe"),
@@ -1049,6 +1126,26 @@ def _eval_cond(
     return None if any(r is None for r in results) else False
 
 
+def partial_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """P1.16: the view of a failed record's re-scored kept checkpoint (``record["partial"]``) as a
+    record of its own: its evaluation (``final``), state statistics and probes in place of the
+    record's, the step series up to its step, no ``failure`` or ``stopped`` (``partial`` stays, so
+    ``partial:`` atoms read the same there). None without one."""
+    partial = record.get("partial")
+    if not isinstance(partial, Mapping) or partial.get("from_step") is None:
+        return None
+    upto = int(partial["from_step"])
+    out = {k: v for k, v in record.items() if k not in ("failure", "stopped")}
+    out["final"] = partial.get("final")
+    out["trained_state"] = partial.get("trained")
+    probes = partial.get("probes") or {}
+    for key in ("probe", "probe_v2", "probe_v3"):
+        out[key] = probes.get(key) if isinstance(probes, Mapping) else None
+    for key in ("evals", "diagnostics", "train"):
+        out[key] = [e for e in record.get(key) or [] if int(e["step"]) <= upto]
+    return out
+
+
 def evaluate_verdicts(
     rules: RuleSet,
     record: Mapping[str, Any],
@@ -1062,6 +1159,13 @@ def evaluate_verdicts(
     view = RecordView(record)
     stopped = record.get("stopped")
     failure = record.get("failure")
+    # P1.16: a failed record's re-scored kept checkpoint, evaluated as a record of its own
+    partial = partial_record(record) if isinstance(failure, Mapping) else None
+    partial_out = (
+        evaluate_verdicts(rules, partial, constants, family, protocol)
+        if partial is not None
+        else None
+    )
     labels: dict[str, str] = {}
     out: dict[str, dict[str, Any]] = {}
     for name in rules.order:
@@ -1074,6 +1178,14 @@ def evaluate_verdicts(
         if isinstance(failure, Mapping):  # P1.14: a failed arm's partial record never passes
             labels[name] = f"failed: {failure.get('reason')} @ {failure.get('last_step')}"
             out[name] = {"label": labels[name], "detail": []}
+            if partial_out is not None and partial is not None:  # P1.16: "from step X"
+                from_step = int(record["partial"]["from_step"])
+                labels[name] += f" (from step {from_step}: {partial_out[name]['label']})"
+                out[name] = {
+                    "label": labels[name],
+                    "detail": [],
+                    "partial": {"from_step": from_step, **partial_out[name]},
+                }
             continue
         if stopped:
             labels[name] = f"stopped early: {stopped['outcome']} @ {stopped['step']}"
