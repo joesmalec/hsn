@@ -257,8 +257,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         ).fetchall()
         recent = conn.execute(
             "SELECT e.exp_id, e.label, e.status, e.ended_at, e.card_status, r.verdicts_json, "
-            "r.final_dev_accuracy, r.total_s, e.error FROM experiments e LEFT JOIN results r "
-            "ON r.exp_id = e.exp_id "
+            "r.final_dev_accuracy, r.total_s, e.error, "
+            "json_extract(r.record_json, '$.failure.reason') AS failure_reason, "
+            "json_extract(r.record_json, '$.failure.last_step') AS failure_step "
+            "FROM experiments e LEFT JOIN results r ON r.exp_id = e.exp_id "
             "WHERE e.status IN ('done', 'failed', 'stopped_early', 'cancelled') "
             f"AND e.imported = 0{where} ORDER BY e.ended_at DESC LIMIT ?",
             [*params, args.recent],
@@ -304,6 +306,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"{k}: {v['label'] if isinstance(v, dict) else v}" for k, v in verdicts.items()
         )
         err = (r["error"] or "").strip().splitlines()[-1:] if r["status"] == "failed" else []
+        if r["failure_reason"] is not None:  # P1.14: the partial record's failure, once
+            labels = f"{r['status']} @ {r['failure_step']}: {r['failure_reason']}"
         acc = f"{r['final_dev_accuracy']:.4f}" if r["final_dev_accuracy"] is not None else ""
         rows.append(
             (

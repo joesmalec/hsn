@@ -34,8 +34,10 @@ any part is False, else missing if any part is missing; ``any`` likewise with Tr
 group: {min_agree: n}}``: the first case whose condition holds gives the label, the default
 otherwise. An arm outside ``applies_to`` reads ``n/a (family <f>)`` or ``n/a (protocol <p>)`` (never
 a pass or a fail); a missing atom in a case reached reads ``n/a: <metric> missing ...``; an arm that
-stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict. ``group.min_agree`` is
-read by ``report`` at seed-group level ("counts as a finding" when that many seeds share a label).
+stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict, and an arm that failed
+(P1.14: a partial record with a ``failure`` block) ``failed: <reason> @ <last step>``.
+``group.min_agree`` is read by ``report`` at seed-group level ("counts as a finding" when that many
+seeds share a label).
 Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``memory_open``,
 ``cells_apart``.
 
@@ -836,6 +838,7 @@ def evaluate_verdicts(
     protocol = protocol if protocol is not None else record.get("protocol")
     view = RecordView(record)
     stopped = record.get("stopped")
+    failure = record.get("failure")
     labels: dict[str, str] = {}
     out: dict[str, dict[str, Any]] = {}
     for name in rules.order:
@@ -843,6 +846,10 @@ def evaluate_verdicts(
         outside = rule.scope.excludes(family, protocol)
         if outside is not None:
             labels[name] = f"n/a ({outside})"
+            out[name] = {"label": labels[name], "detail": []}
+            continue
+        if isinstance(failure, Mapping):  # P1.14: a failed arm's partial record never passes
+            labels[name] = f"failed: {failure.get('reason')} @ {failure.get('last_step')}"
             out[name] = {"label": labels[name], "detail": []}
             continue
         if stopped:

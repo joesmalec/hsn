@@ -13,8 +13,11 @@ attempt (``done`` or ``stopped_early``), else the latest attempt. Columns:
   per arm);
 * final dev accuracy and loss (mean [min, max] over the finished seeds), first-query accuracy and
   the follow / unchanged fractions of the edit probe;
-* early stops; median train and total wall seconds and compile seconds;
+* early stops; failures (P1.14: ``<reason> @ <last step>`` of an attempt that failed or was
+  cancelled, from its partial record); median train and total wall seconds and compile seconds;
 * card status, commits, imported.
+
+A failed attempt's verdicts read ``failed: ...`` and are never counted as a finding.
 
 With a spec (``--spec``), that spec's verdict rules are evaluated again on the stored records of its
 arms, whichever sweep ran them, with the spec's constants.
@@ -163,6 +166,7 @@ def _per_seed_row(row: dict[str, Any], labels: dict[str, str], overrides: str) -
     probe = record.get("probe") or {}
     walls = record.get("walls") or {}
     stopped = record.get("stopped")
+    failure = record.get("failure")
     return {
         "label": row["label"],
         "exp": row["exp_id"],
@@ -178,6 +182,11 @@ def _per_seed_row(row: dict[str, Any], labels: dict[str, str], overrides: str) -
         "follow": probe.get("correct_follow_frac"),
         "unchanged": probe.get("correct_unchanged_frac"),
         "early_stop": f"{stopped['outcome']} @ {stopped['step']}" if stopped else "",
+        "failure": (
+            f"{failure.get('reason')} @ {failure.get('last_step')}"
+            if isinstance(failure, Mapping)
+            else ""
+        ),
         "train_s": row["train_s"] if row["train_s"] is not None else walls.get("fit_s"),
         "total_s": row["total_s"],
         "compile_s": walls.get("compile_s"),
@@ -266,6 +275,7 @@ def build_report(
             "follow",
             "unchanged",
             "early_stop",
+            "failure",
             "train_s",
             "total_s",
             "compile_s",
@@ -302,7 +312,7 @@ def build_report(
             if (
                 need is not None
                 and count >= need
-                and not label.startswith(("n/a", "stopped early"))
+                and not label.startswith(("n/a", "stopped early", "failed"))
             ):
                 cell += " (finding)"
             row[col] = cell
@@ -316,6 +326,7 @@ def build_report(
             [m["unchanged"] for m in finished if m["unchanged"] is not None], 3
         )
         row["early_stop"] = ", ".join(m["early_stop"] for m in members if m["early_stop"])
+        row["failure"] = ", ".join(m["failure"] for m in members if m["failure"])
         for key in ("train_s", "total_s", "compile_s"):
             values = [float(m[key]) for m in finished if m[key] is not None]
             row[key] = f"{statistics.median(values):.0f}" if values else ""
@@ -337,6 +348,7 @@ def build_report(
         "follow",
         "unchanged",
         "early_stop",
+        "failure",
         "train_s",
         "total_s",
         "compile_s",

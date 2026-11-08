@@ -16,7 +16,13 @@ It owns its experiment row while that row is ``running`` with its PID (guarded w
    (``done`` or ``stopped_early``).
 
 An exception marks the run ``failed`` with the traceback's tail; SIGTERM (``cancel``) marks it
-``cancelled``. When a guarded write finds the row no longer running for this PID (recovery marked it
+``cancelled``. **P1.14:** either way the child first keeps what exists: the protocol's partial
+record (evaluations, diagnostics, every completed step's train record, the early-stop log, a
+``failure`` block with the reason and the last completed step; :func:`hsn.experiments.protocols.
+failure_info`) goes to ``result.json`` and, in the same guarded transaction as the final status, to
+the results row, with every applicable verdict ``failed: <reason> @ <step>`` (never a pass). A
+failure before the protocol starts keeps a minimal record. SIGTERM is ignored during that last
+write. When a guarded write finds the row no longer running for this PID (recovery marked it
 failed), the child logs it and stops without writing anything else. Card snapshots (nvidia-smi at
 the start and the end) are taken here; the continuous card watch is the worker's.
 """
@@ -29,6 +35,7 @@ import signal
 import sys
 import time
 import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -37,7 +44,7 @@ from hsn.config import REPO_ROOT, RunConfig, dump_resolved
 from hsn.experiments import db as dbm
 from hsn.experiments import machine
 from hsn.experiments.db import Database, dumps, loads
-from hsn.experiments.protocols import ArmRun, run_protocol
+from hsn.experiments.protocols import ArmRun, failure_info, run_protocol
 from hsn.experiments.rules import RuleSet, evaluate_verdicts, parse_rules
 from hsn.experiments.spec import arm_identity, data_hash, protocol_params
 
@@ -50,6 +57,14 @@ class Cancelled(BaseException):
 
 def _on_sigterm(signum: int, frame: FrameType | None) -> None:
     raise Cancelled()
+
+
+@dataclass
+class _Attempt:
+    """What :func:`_run` built, kept for the failure path (P1.14)."""
+
+    arm_run: ArmRun | None = None
+    verdict_rules: RuleSet = field(default_factory=RuleSet)
 
 
 def run_dir_for(root: Path, sweep: str | None, run_id: str, exp_id: int) -> Path:
@@ -153,19 +168,33 @@ def main(db_path: str, exp_id: int, root: str) -> int:
         )
     signal.signal(signal.SIGTERM, _on_sigterm)
     _log(f"experiment {exp_id} ({exp['label']}, arm {exp['arm_id']}) pid {pid} commit {git['sha']}")
+    attempt = _Attempt()
     try:
-        record, verdicts, json_path = _run(db, exp, arm, sweep, constants, run_dir, pid, git)
-    except Cancelled:
-        _log(f"experiment {exp_id} cancelled (SIGTERM)")
-        dbm.child_finish(db, exp_id, pid, status="cancelled", error="cancelled (SIGTERM)")
-        return 143
+        record, verdicts, json_path = _run(
+            db, exp, arm, sweep, constants, run_dir, pid, git, attempt
+        )
     except BaseException as exc:  # noqa: BLE001 - every failure is recorded, then re-raised
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # the last write is short: let it finish
+        cancelled = isinstance(exc, Cancelled)
         tail = "".join(traceback.format_exception(exc))[-4000:]
-        _log(f"experiment {exp_id} failed:\n{tail}")
-        dbm.child_finish(db, exp_id, pid, status="failed", error=tail)
+        if cancelled:
+            _log(f"experiment {exp_id} cancelled (SIGTERM)")
+        else:
+            _log(f"experiment {exp_id} failed:\n{tail}")
+        result = _failed_result(exc, attempt, exp, arm, constants, run_dir, git)
+        ok = dbm.child_finish(
+            db,
+            exp_id,
+            pid,
+            status="cancelled" if cancelled else "failed",
+            error="cancelled (SIGTERM)" if cancelled else tail,
+            result=result,
+        )
+        if not ok:
+            _log(f"experiment {exp_id} is no longer running for pid {pid}; record left on disk")
         if isinstance(exc, KeyboardInterrupt):
             raise
-        return 1
+        return 143 if cancelled else 1
     status = "stopped_early" if record.get("stopped") else "done"
     final = record.get("final") or {}
     walls = record.get("walls") or {}
@@ -196,6 +225,61 @@ def main(db_path: str, exp_id: int, root: str) -> int:
     return 0
 
 
+def _failed_result(
+    exc: BaseException,
+    attempt: _Attempt,
+    exp: dict[str, Any],
+    arm: dict[str, Any],
+    constants: dict[str, Any],
+    run_dir: Path,
+    git: dict[str, Any],
+) -> dict[str, Any] | None:
+    """P1.14: the partial record of a failed or cancelled attempt, written to ``result.json``, and
+    the results row for it (``None`` when even that cannot be built: the status is written anyway,
+    as before P1.14)."""
+    try:
+        record: dict[str, Any] = attempt.arm_run.record if attempt.arm_run is not None else {}
+        record.setdefault("protocol", arm["protocol"])
+        record.setdefault("family", arm["family"])
+        if "failure" not in record:  # the failure came before or after the protocol
+            last = int((record.get("final") or {}).get("steps") or 0)
+            stage = attempt.arm_run.stage if attempt.arm_run is not None else "setup"
+            record["failure"] = failure_info(exc, stage=stage, last_step=last)
+        try:
+            record.setdefault("card_snapshots", {})["end"] = _snapshot()
+        except Exception:  # noqa: BLE001 - a snapshot is never worth losing the record
+            pass
+        record["arm"] = {
+            "arm_id": arm["arm_id"],
+            "group_id": arm["group_id"],
+            "label": exp["label"],
+            "exp_id": exp["exp_id"],
+            "run_id": exp["run_id"],
+            "seed": arm["seed"],
+            "constants": constants,
+        }
+        verdicts = evaluate_verdicts(
+            attempt.verdict_rules, record, constants, arm["family"], arm["protocol"]
+        )
+        full = {**_audit_fields(record, arm, git), **record, "verdicts": verdicts}
+        json_path = run_dir / "result.json"
+        json_path.write_text(json.dumps(full, indent=1, default=str), encoding="utf-8")
+        walls = record.get("walls") or {}
+        return {
+            "record": _compact(record),
+            "verdicts": verdicts,
+            "early_stop": record.get("stopped"),
+            "json_path": str(json_path),
+            "final_dev_accuracy": None,  # not a final result: the last evaluation is in the record
+            "final_dev_loss": None,
+            "train_s": walls.get("train_s"),
+            "total_s": walls.get("total_s"),
+        }
+    except Exception as err:  # noqa: BLE001 - the final status must still be written
+        _log(f"could not keep the partial record: {type(err).__name__}: {err}")
+        return None
+
+
 def _run(
     db: Database,
     exp: dict[str, Any],
@@ -205,6 +289,7 @@ def _run(
     run_dir: Path,
     pid: int,
     git: dict[str, Any],
+    attempt: _Attempt,
 ) -> tuple[dict[str, Any], dict[str, Any], Path]:
     # the attempt's own configuration and protocol (schema v2); older rows fall back to the arm's
     cfg = RunConfig.model_validate(loads(exp.get("config_json") or arm["config_json"]))
@@ -233,6 +318,7 @@ def _run(
     if sweep is not None:
         stored = loads(sweep["rules_json"]) or {}
         verdict_rules = parse_rules({"verdicts": stored.get("verdicts") or {}})
+    attempt.verdict_rules = verdict_rules
     dump_resolved(cfg, run_dir / "config.resolved.yaml")
     start_card = _snapshot()
 
@@ -242,19 +328,19 @@ def _run(
                 "the experiment row is no longer running for this process (recovered)"
             )
 
-    record = run_protocol(
-        ArmRun(
-            cfg=cfg,
-            family=arm["family"],
-            variant=arm["variant"],
-            variant_params=variant_params,
-            params=params,
-            run_dir=run_dir,
-            rules=stop_rules,
-            constants=constants,
-            on_progress=progress,
-        )
+    attempt.arm_run = ArmRun(
+        cfg=cfg,
+        family=arm["family"],
+        variant=arm["variant"],
+        variant_params=variant_params,
+        params=params,
+        run_dir=run_dir,
+        rules=stop_rules,
+        constants=constants,
+        on_progress=progress,
     )
+    attempt.arm_run.record["card_snapshots"] = {"start": start_card}
+    record = run_protocol(attempt.arm_run)
     record["card_snapshots"] = {"start": start_card, "end": _snapshot()}
     record["arm"] = {
         "arm_id": arm["arm_id"],
