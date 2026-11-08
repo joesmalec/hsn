@@ -92,8 +92,12 @@ in the P1.12 stop rule with the non-finite ones (one run of consecutive skips, o
 checkpoint (only with the guard on) and ``History.measured["skipped_spike_steps"]``; every skipped
 step, with its reason, is in :attr:`Trainer.skipped_steps`. The guard reads the same host float as
 P1.12's, so it adds no device synchronisation and leaves P2.8's captured graphs alone; under an fp16
-``GradScaler`` it is refused. :func:`spike_decision` is the pure rule (evidence scripts use it).
-Recommended factor 100: the stored runs' ordinary steps stay below about 70 times their median.
+``GradScaler`` it is refused. :func:`spike_decision` is the pure rule (evidence scripts use it). The
+factor: 100 sits at the edge of ordinary variation. On the stored runs it would skip 55 steps in 17
+of the 108 runs that did not fail, learners among them (steps of 180 to 572 times the median in exps
+65, 154, 155 and 161); exp 171's jump (7e10 times) and the peak of exp 170's burst (5e14 times) are
+caught at any factor up to about 1e10, so 1e3 to 1e4 is the safer choice for experiments (only 3
+runs skip anything at 1e4). The default stays ``None`` (off).
 
 **Divergence dumps (P1.15).** With ``train.divergence_dump`` (on by default) each step starts with
 a snapshot of what it starts from (:meth:`Trainer._take_snapshot`: the loader position, the

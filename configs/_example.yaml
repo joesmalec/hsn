@@ -70,7 +70,7 @@ train: # Appendix A.3
   decay_fraction: null # P1.13: wsd only (required there): decay (1 - sqrt, to 0) over this fraction of steps
   cell_lr_mult: 1.0 # P1.13: the HSN cell's parameter group trains at lr * cell_lr_mult
   cell_weight_decay: null # P1.13: weight decay of the cell's tensors with ndim >= 2; null = weight_decay
-  spike_factor: null # P1.15: skip a step whose grad norm > factor x the running median (null: off; rec. 100)
+  spike_factor: null # P1.15: skip a step whose grad norm > factor x the running median (null: off; 1e3-1e4)
   spike_window: 100 # P1.15: applied steps in that median (read only with spike_factor set)
   divergence_dump: true # P1.15: dump the pre-step state at the first skipped step (replay it)
   unroll: 256 # TBPTT window

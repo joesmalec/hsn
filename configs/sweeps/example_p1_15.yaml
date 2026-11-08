@@ -54,7 +54,7 @@ rules:
 arms:
   - name: hsn_guarded
     family: hsn
-    overrides: [train.spike_factor=100] # skip a step above 100x the running median of the norms
+    overrides: [train.spike_factor=1000] # skip a step above 1,000x the running median (1e3-1e4 for experiments)
   - name: hsn
     family: hsn
   - name: gru

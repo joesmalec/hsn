@@ -66,17 +66,18 @@ parses and checks them), with two edits, each on its own copy of the document:
   follows; a key-blind reader (positions and exclusion only) is unchanged, since no position or
   value moved. It says whether the read is addressed by key.
 
-Every probe records its slot and its key-blind ambiguity: the number of facts a key-blind reader
-may assign to the slot (:func:`eligible_facts`, the generator's rule and the audit's
+Every probe records its slot and its key-blind ambiguity: the number of facts a key-blind reader may
+assign to the slot (:func:`eligible_facts`, the generator's rule and the audit's
 ``ceiling_check.py``; 1 means position alone answers it). :func:`summarize_v3` reports follow /
-other / unchanged over the later queries answered correctly before the edit, overall, by slot and
-by ambiguity, for both edits, with the vocabulary and the probe pass's own first/later accuracy;
+other / unchanged over the later queries answered correctly before the edit, overall, by slot and by
+ambiguity, for both edits, with the vocabulary and the probe pass's own first/later accuracy;
 :func:`verdict_v3_value` ("no correct later queries", "vocabulary too small" below
-:data:`PROBE_V3_MIN_VOCAB`, "too few correct later queries" below :data:`PROBE_V3_MIN_CORRECT`,
-then v1's thresholds) and :func:`verdict_v3_swap` ("no swap probes", "too few swap probes", "binds
-keys", "does not bind keys", "partial", with v1's thresholds). Batching as v1 (rows truncated after
-their last scored position, fresh states, chunks by length; :func:`edit_probe_v3` with
-``reference=True`` is the per-row B = 1 loop). The probe never changes the dev documents.
+:data:`PROBE_V3_MIN_VOCAB`, "too few correct later queries" below :data:`PROBE_V3_MIN_CORRECT`, then
+v1's thresholds labelled "... (later queries)") and :func:`verdict_v3_swap` ("no swap probes", "too
+few swap probes", "binds keys", "does not bind keys", "partial", with v1's thresholds). Batching as
+v1 (rows truncated after their last scored position, fresh states, chunks by length;
+:func:`edit_probe_v3` with ``reference=True`` is the per-row B = 1 loop). The probe never changes
+the dev documents.
 """
 
 from __future__ import annotations
@@ -646,6 +647,9 @@ def summarize_v2(
 PROBE_V3_SEED = 0
 #: P1.15: below this many correct probes a v3 verdict is "too few ..."
 PROBE_V3_MIN_CORRECT = 20
+#: P1.15: the value-edit verdict's threshold labels end with this, so that "reads state" over the
+#: later queries is never read as v1's first-query verdict or as key binding (the swap's)
+LATER_SUFFIX = " (later queries)"
 #: P1.15: below this answer vocabulary the value-edit verdict is "vocabulary too small" (the
 #: overnight reading note of 8 Nov: a 4- or 5-value vocabulary makes "follows the edit" cheap)
 PROBE_V3_MIN_VOCAB = 20
@@ -1006,14 +1010,16 @@ def verdict_v3_value(
     """The value-edit verdict over the ``correct`` later queries answered correctly before the
     edit and edited: "no correct later queries" (``correct_later``, the correct later queries with
     or without an edit, default ``correct``, is 0), "vocabulary too small", "too few correct later
-    queries", then v1's thresholds."""
+    queries", then v1's thresholds, labelled for the later queries ("reads state (later queries)",
+    "does not read state (later queries)", "partial (later queries)"): a later answer read from the
+    state, which says nothing of key binding (that is the swap's verdict)."""
     if (correct if correct_later is None else correct_later) == 0:
         return "no correct later queries"
     if vocab_size < min_vocab:
         return "vocabulary too small"
     if correct < min_correct:
         return "too few correct later queries"
-    return verdict(follow, unchanged, correct)
+    return f"{verdict(follow, unchanged, correct)}{LATER_SUFFIX}"
 
 
 def verdict_v3_swap(

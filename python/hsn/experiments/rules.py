@@ -576,7 +576,9 @@ def _preset_reads_state_v3(p: dict[str, Any]) -> dict[str, Any]:
     """P1.15: probe v3's value-edit verdict over the correct later queries
     (:func:`hsn.experiments.probe.verdict_v3_value`): "no correct later queries", "vocabulary too
     small" (below ``min_vocab``, default 20), "too few correct later queries" (below
-    ``min_correct``, default 20), then v1's thresholds. Needs reads_state version 3."""
+    ``min_correct``, default 20), then v1's thresholds labelled "reads state (later queries)",
+    "does not read state (later queries)" and "partial (later queries)". Needs reads_state version
+    3."""
     follow_min, unchanged_max, follow_below = (
         p.pop("follow_min", 0.5),
         p.pop("unchanged_max", 0.1),
@@ -595,7 +597,7 @@ def _preset_reads_state_v3(p: dict[str, Any]) -> dict[str, Any]:
                 "when": _atom("probe_v3:value/correct_n", "<", min_correct),
             },
             {
-                "label": "reads state",
+                "label": "reads state (later queries)",
                 "when": {
                     "all": [
                         _atom("probe_v3:value/follow_frac", ">=", follow_min),
@@ -604,11 +606,11 @@ def _preset_reads_state_v3(p: dict[str, Any]) -> dict[str, Any]:
                 },
             },
             {
-                "label": "does not read state",
+                "label": "does not read state (later queries)",
                 "when": _atom("probe_v3:value/follow_frac", "<", follow_below),
             },
         ],
-        "default": "partial",
+        "default": "partial (later queries)",
     }
 
 
@@ -655,7 +657,10 @@ def _preset_memory_writes(p: dict[str, Any]) -> dict[str, Any]:
     ``update_ratio_min`` (default 0.001), each window holding ``min_samples`` (default 3); else "no
     writes". Healthy HSN memories write sparsely (gate p50 about 0, write rate 5 to 18 %), which
     ``memory_open``'s gate-p50 rule reads as shut; the thresholds sit between the stored runs that
-    read state and the dead ones (P1.15 plan, D5; provisional, from 17 runs)."""
+    read state and the dead ones (P1.15 plan, D5). Provisional, from 16 runs, with thin margins
+    (exp 174, dead, writes at 0.0275 against 0.025; the lowest learner, exp 128, at 0.034). Under
+    Adam ``update_ratio/cell`` scales with the learning rate, so ``update_ratio_min`` = 0.001 is
+    calibrated for lr of about 1e-3 to 2.5e-3 only: set it for other rates."""
     lo, hi = p.pop("from_step", 1000), p.pop("to_step", 1500)
     if hi < lo:
         raise RuleError(f"preset memory_writes: to_step {hi} < from_step {lo}")

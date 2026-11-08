@@ -233,8 +233,10 @@ assign to the slot (index w ≥ 1 with 2w ≥ 3·slot, not yet asked; the genera
 the edit, overall, by slot (`by_slot`) and by ambiguity (`by_ambiguity`: `single`, `multiple`), plus the
 vocabulary, the probe pass's own first/later accuracy (`pass_accuracy`) and the verdicts:
 - value edit (preset `reads_state_v3`): `no correct later queries` (none), `vocabulary too small` (below 20,
-  `min_vocab`), `too few correct later queries` (below 20 edited, `min_correct`), then v1's thresholds: reads
-  state, does not read state, partial;
+  `min_vocab`), `too few correct later queries` (below 20 edited, `min_correct`), then v1's thresholds,
+  labelled for the later queries: `reads state (later queries)`, `does not read state (later queries)`,
+  `partial (later queries)`. A later answer read from the state; it says nothing of key binding, which is the
+  swap's verdict;
 - key swap (preset `binds_keys`): `no swap probes`, `too few swap probes` (below 20), `binds keys` (follow ≥ 0.5
   and unchanged ≤ 0.1), `does not bind keys` (follow < 0.2), `partial`.
 
@@ -250,10 +252,10 @@ four):
 
 | exp | model | later-query accuracy (probe pass) | value edit: follow / other / unchanged | key swap: follow / other / unchanged | value verdict | swap verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| 136 | HSN d=64 + A4, WSD 9k | 0.604 | 535 / 140 / 5 of 680 | 2 / 4 / 671 of 677 | reads state | does not bind keys |
-| 154 | gru_2m, WSD 9k at 5e-4 | 0.604 | 532 / 139 / 9 of 680 | 0 / 1 / 676 of 677 | reads state | does not bind keys |
-| 161 | gru_2m, WSD 15k at 5e-4 | 0.607 | 544 / 130 / 10 of 684 | 0 / 0 / 681 of 681 | reads state | does not bind keys |
-| 119 | transformer_2m, 3k of 9k at 1.25e-4 | 0.239 | 92 / 153 / 24 of 269 | 0 / 1 / 265 of 266 | partial | does not bind keys |
+| 136 | HSN d=64 + A4, WSD 9k | 0.604 | 535 / 140 / 5 of 680 | 2 / 4 / 671 of 677 | reads state (later queries) | does not bind keys |
+| 154 | gru_2m, WSD 9k at 5e-4 | 0.604 | 532 / 139 / 9 of 680 | 0 / 1 / 676 of 677 | reads state (later queries) | does not bind keys |
+| 161 | gru_2m, WSD 15k at 5e-4 | 0.607 | 544 / 130 / 10 of 684 | 0 / 0 / 681 of 681 | reads state (later queries) | does not bind keys |
+| 119 | transformer_2m, 3k of 9k at 1.25e-4 | 0.239 | 92 / 153 / 24 of 269 | 0 / 1 / 265 of 266 | partial (later queries) | does not bind keys |
 
 Every model reads its later answers from its state (on queries with a single key-blind candidate the value edit
 is followed 96 to 97 % of the time by HSN and gru_2m) and none binds keys: swapping two facts' keys changes
@@ -369,13 +371,18 @@ of those runs learned anyway: gru_2m exp 161 (0.793) spiked 1.5e5 times its medi
 at chance after early spikes: the gru_2m seeds of exps 122, 123, 144 and 145, and HSN exp 170, whose burst
 reached 5e14 at steps 1,345 to 1,363. In exp 171 every step before 1,269 is at most 4.5 times its median, so
 every factor from 5 to 6e10 skips step 1,269 and nothing before it. After a first skip the stored norms are not
-a counterfactual: a guarded run's later batches meet another model. Ordinary steps stay below about 70 times
-their median, and 100 sits at the edge of that range.
+a counterfactual: a guarded run's later batches meet another model.
+
+**Choosing the factor.** 100 sits at the edge of ordinary variation: it would skip 55 steps in 17 of the 108
+runs, learners among them (exps 65, 154, 155 and 161 have steps of 180 to 572 times their median and learned).
+Exp 171's jump (7e10) and the peak of exp 170's burst (5e14) are caught at any factor up to about 1e10. For
+experiments, 1e3 to 1e4 is the safer choice: only 3 runs skip anything at 1e4. The default stays `None` (off).
 
 **The spike guard** (config, off by default):
-- `train.spike_factor` (None: off; recommended 100): skip a step whose finite pre-clip global norm exceeds the
-  factor times the median of the last `train.spike_window` (default 100) applied norms. The guard decides once
-  min(20, window) norms are known; skipped and non-finite norms never enter the history.
+- `train.spike_factor` (None: off; 1e3 to 1e4 for experiments, 100 at the edge): skip a step whose finite
+  pre-clip global norm exceeds the factor times the median of the last `train.spike_window` (default 100)
+  applied norms. The guard decides once min(20, window) norms are known; skipped and non-finite norms never
+  enter the history.
 - A skip is P1.12's skip: gradients zeroed, no optimiser step, the scheduler advances. It is counted
   (`final.skipped_spike_steps`, None with the guard off), logged, listed in `skipped_steps` with its reason, and
   marked on its train entry (`skipped: spike`, the finite norm kept).
@@ -492,11 +499,16 @@ first case that holds gives the label, the default otherwise. Special results:
 | --- | --- | --- |
 | `reads_state` | the audit's verdict on the probes answered correctly before the edit: reads state when ≥ 50 % follow the edit and ≤ 10 % are unchanged; does not read state when < 20 % follow; partial otherwise | every family |
 | `reads_state_v2` | P1.14: the same thresholds over probe v2's matched documents answered correctly before the edit, after `no matched probes` (0) and `too few matched probes` (< `min_correct`, 20). P1.15: `min_vocab: 20` adds `vocabulary too small` after `no matched probes` (absent: the expansion is P1.14's). Needs reads_state version 2 | every family |
-| `reads_state_v3` | P1.15: probe v3's value edit over the correct later queries: `no correct later queries`, `vocabulary too small` (< `min_vocab`, 20), `too few correct later queries` (< `min_correct`, 20), then v1's thresholds. Needs version 3 | every family |
+| `reads_state_v3` | P1.15: probe v3's value edit over the correct later queries: `no correct later queries`, `vocabulary too small` (< `min_vocab`, 20), `too few correct later queries` (< `min_correct`, 20), then v1's thresholds labelled `reads state (later queries)`, `does not read state (later queries)`, `partial (later queries)`. Needs version 3 | every family |
 | `binds_keys` | P1.15: probe v3's key swap: `no swap probes`, `too few swap probes` (< `min_correct`, 20), `binds keys` (follow ≥ 0.5 and unchanged ≤ 0.1), `does not bind keys` (follow < 0.2), `partial`. Needs version 3 | every family |
-| `memory_writes` | P1.15: `writes` when, over the diagnostics in `[from_step, to_step]` (1,000 to 1,500), the median `gate/write_rate` ≥ `write_rate_min` (0.025) and the median `update_ratio/cell` ≥ `update_ratio_min` (0.001), each window with `min_samples` (3); else `no writes`. Parameters also `agg`. Provisional, from 16 stored runs | hsn |
+| `memory_writes` | P1.15: `writes` when, over the diagnostics in `[from_step, to_step]` (1,000 to 1,500), the median `gate/write_rate` ≥ `write_rate_min` (0.025) and the median `update_ratio/cell` ≥ `update_ratio_min` (0.001), each window with `min_samples` (3); else `no writes`. Parameters also `agg`. Provisional (see the caveat below) | hsn |
 | `memory_open` | gate p50 ≥ 0.01 and `grad_share/cell` ≥ 0.01 at every multiple of 500 from step 500 (as registered for queue9). Parameters: `from_step`, `to_step`, `every`, `agg`, `gate_p50_min`, `cell_share_min`, `window` (with `to_step`: the median over ±window at each multiple), `min_samples` (P1.14) | hsn |
 | `cells_apart` | `rank_pr/answer` ≥ 2.0 and `diversity_live/answer` ≥ 0.2 on the trained model | hsn |
+
+**`memory_writes` caveat.** Its thresholds come from the 16 stored runs that record the write rate (exps 128 to
+174), and the margins are thin: exp 174, a dead run, writes at 0.0275 against the 0.025 threshold, and the
+lowest learner (exp 128) at 0.034. Under Adam `update_ratio/cell` scales with the learning rate, so the 0.001
+threshold is calibrated for lr of about 1e-3 to 2.5e-3 only; set `update_ratio_min` for other rates.
 
 **Early stops.** `{name, at_steps, outcome, when, applies_to}`. Each is evaluated right after the evaluation and
 diagnostics of each listed step. It may read step series only, and never past its step. Every listed step must

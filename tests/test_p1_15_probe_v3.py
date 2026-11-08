@@ -4,10 +4,10 @@ The documents are parsed and checked (the asked fact is always one the generator
 eligible); each later query gets a value edit (a vocabulary value absent from the document, on a
 copy) and a key swap (a partner not asked before, with another value, on a copy); batched equals the
 per-row loop exactly in fp64. Oracle models pin the meaning: a reader that binds keys follows both
-edits ("reads state", "binds keys"); a key-blind positional reader follows the value edit but not
-the swap ("does not bind keys"); a constant answer has too small a vocabulary. Version 3 keeps v1's
-and v2's numbers, versions 1 and 2 keep their arm ids, ``probe-rerun`` reproduces a stored v3 run,
-and ``report`` shows it.
+edits ("reads state (later queries)", "binds keys"); a key-blind positional reader follows the value
+edit but not the swap ("does not bind keys"); a constant answer has too small a vocabulary. Version
+3 keeps v1's and v2's numbers, versions 1 and 2 keep their arm ids, ``probe-rerun`` reproduces a
+stored v3 run, and ``report`` shows it.
 """
 
 from __future__ import annotations
@@ -240,8 +240,8 @@ class _Oracle(nn.Module):
 @pytest.mark.parametrize(
     ("mode", "value_verdict", "swap_verdict"),
     [
-        ("bind", "reads state", "binds keys"),
-        ("blind", "reads state", "does not bind keys"),
+        ("bind", "reads state (later queries)", "binds keys"),
+        ("blind", "reads state (later queries)", "does not bind keys"),
         ("constant", "vocabulary too small", "too few swap probes"),
     ],
 )
@@ -271,10 +271,10 @@ def test_p1_15_v3_verdicts() -> None:
     assert v(0, 0, 0, 48) == "no correct later queries"
     assert v(19, 0, 19, 5) == "vocabulary too small"
     assert v(19, 0, 19, 48) == "too few correct later queries"
-    assert v(15, 2, 20, 20) == "reads state"
-    assert v(3, 10, 20, 48) == "does not read state"
-    assert v(8, 2, 20, 48) == "partial"
-    assert v(19, 0, 19, 5, min_vocab=4, min_correct=10) == "reads state"
+    assert v(15, 2, 20, 20) == "reads state (later queries)"
+    assert v(3, 10, 20, 48) == "does not read state (later queries)"
+    assert v(8, 2, 20, 48) == "partial (later queries)"
+    assert v(19, 0, 19, 5, min_vocab=4, min_correct=10) == "reads state (later queries)"
     # correct later queries none of which could be edited: the vocabulary decides
     assert v(0, 0, 0, 1, correct_later=4) == "vocabulary too small"
     s = probe.verdict_v3_swap
