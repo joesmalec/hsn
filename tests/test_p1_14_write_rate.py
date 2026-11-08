@@ -87,6 +87,8 @@ def test_p1_14_write_rate_in_records(tmp_path: Path, tiny_manifest: Path) -> Non
 def test_p1_14_write_rate_in_no_rule() -> None:
     for name, preset in PRESETS.items():
         params = {"window": 100, "to_step": 1000} if name == "memory_open" else {}
+        if name == "memory_writes_run":  # P1.16: needs its last window centre; reads gate/p90
+            params = {"to_step": 1000}
         text = json.dumps(preset(params))
         if name == "memory_writes":  # P1.15: the write-rate preset (approved), reads it by design
             assert "diag:gate/write_rate" in text and "gate/mean" not in text

@@ -674,8 +674,8 @@ def _train(
         for path in history.checkpoints:
             Path(path).unlink(missing_ok=True)
     elif callback.keeper is not None:  # P1.16: a finished run keeps no mid-run kept checkpoint
-        for _step, path in callback.keeper.kept(history):
-            path.unlink(missing_ok=True)
+        for _step, kept in callback.keeper.kept(history):
+            kept.unlink(missing_ok=True)
     arm.stage = "done"
     return record
 

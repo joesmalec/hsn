@@ -233,9 +233,8 @@ def route_follow(
     sets, refresh = _selected(model, ctx, [(d.tokens, d.context) for d in docs], batch_rows)
     per_doc = [doc_overlaps(s, d.facts, d.queries, k) for s, d in zip(sets, docs, strict=True)]
     items = [it for it in v3_items(docs, []) if it.swap_tokens is not None]
-    swap_sets, _ = _selected(
-        model, ctx, [(it.swap_tokens, it.doc.context) for it in items], batch_rows
-    )
+    swap_rows = [(it.swap_tokens, it.doc.context) for it in items if it.swap_tokens is not None]
+    swap_sets, _ = _selected(model, ctx, swap_rows, batch_rows)
     swaps = []
     for it, s in zip(items, swap_sets, strict=True):
         assert it.swap_with is not None
