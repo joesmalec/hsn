@@ -1,0 +1,60 @@
+# Second sweep, block B: can dense HSN survive lr 3e-3? (user approval of evidence/EFF/NEXT_SWEEP_PROPOSAL.md,
+# 7 Nov 2026). Rules and predictions were registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
+#
+# E1's recipe (queue9_onset.yaml: dense d=64, B32, lr 3e-3, the 3,000-step cosine schedule, compiled,
+# diagnostics every 25) stopped at H = warm-up + 400 steps, since E1's collapse came 150 steps after the lr
+# peak. Evaluation every 200 (H is a multiple of 200). Timing arms (compile and step times are measurements).
+#   B1  train.warmup_steps=1000, H 1,400
+#   B2  train.warmup_steps=2000, H 2,400
+#   B3  train.betas=[0.9,0.98] (warm-up 200), H 600
+#   B4  model.gate_bias_init=-4.0 (warm-up 200), H 600
+#
+# Pass rule (the registered memory check): over the 9 diagnostics at [H - 200, H], the median gate p50 >= 0.01
+# and the median grad_share/cell >= 0.01. One file per horizon H (the harness checks every rule window against each arm's steps); this file:
+# H = 2400. sat99/answer over the same window is reported, not a criterion.
+
+name: sweep2_b_hsn_h2400
+description: (horizon 2400) dense HSN at lr 3e-3 with a longer warm-up, faster Adam second moments or a lower gate bias (memory check)
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.003
+    - train.steps=3000
+    - train.eval_every=200
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, diag_every: 25, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    memory_check_2400:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "diag:gate/p50", steps: {from: 2200, to: 2400, every: 25}, agg: median, op: ">=", value: 0.01}
+              - {metric: "diag:grad_share/cell", steps: {from: 2200, to: 2400, every: 25}, agg: median, op: ">=", value: 0.01}
+      default: fail
+    reads_state: {preset: reads_state}
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: b2_warmup2000
+    family: hsn
+    overrides: [train.warmup_steps=2000]
+    protocol: {steps: 2400}
