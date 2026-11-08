@@ -1,0 +1,86 @@
+# Approved by the user (via the coordinator, 8 Nov 2026 about 15:22): a no-code test of chunk P1.16 (planning in session
+# hsn-p1-16-79). Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
+# Top-K without A4 with a two-layer router scorer: exp 196's recipe (top-K k 4, STE, cand_norm none, WSD 0.2 over 9,000 at
+# lr 2.5e-3, compiled) with model.scorer=mlp (scorer_hidden 128, the default), unguarded, seeds 0 and 1; ckpt_every 9,000
+# (P1.16 may re-score the checkpoint with a "routing follows the key" diagnostic). The 0.5 s step-time guard stays on; if the
+# arm does not compile on P2.8's top-K path it is stopped and reported (no eager fallback). Question: does letting the input
+# interact with each cell's state produce key-dependent routing and any key binding (v3 swap), or faster learning?
+# Comparators: exps 196 / 197 / 198 (0.694 / 0.307 / 0.508; binds keys 0 of 3). Architecture note: design options only
+# (routing, scorer). About 0.11 s per step expected.
+
+name: s4_topk_nocand_mlp_9k
+description: "Top-K (k 4, STE) without cand_norm + MLP router scorer, d=64, WSD 0.2 over 9k at 2.5e-3, seeds 0-1"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.0025
+    - train.steps=9000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.routing=topk
+    - model.k_select=4
+    - train.gate_mode=ste
+    - model.scorer=mlp
+protocol: {name: reads_state, version: 3, steps: 9000, diag_every: 250, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state, group: {min_agree: 2}}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20, group: {min_agree: 2}}
+    reads_state_v3: {preset: reads_state_v3, group: {min_agree: 2}} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys, group: {min_agree: 2}} # the key swap: does the read follow the key
+    later_above_key_blind:
+      group: {min_agree: 2}
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    no_explosion:
+      group: {min_agree: 2}
+      cases:
+        - label: no explosion
+          when: {metric: "train:grad_norm", steps: {from: 501, to: 9000, every: 1}, agg: max, op: "<", value: 1000, min_samples: 8000}
+      default: explosion
+    beats_bar:
+      cases:
+        - label: above 0.7930
+          when:
+            all:
+              - {metric: "eval:delayed/in_range/accuracy", steps: {at: 9000}, op: ">", value: 0.7930}
+      default: not above 0.7930
+    memory_writes: {preset: memory_writes, group: {min_agree: 2}} # write rate >= 0.025 and cell update ratio >= 0.001, 1,000 to 1,500
+    cells_apart: {preset: cells_apart}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s4_topk_nocand_mlp_9k
+    family: hsn
+    seeds: [0, 1]

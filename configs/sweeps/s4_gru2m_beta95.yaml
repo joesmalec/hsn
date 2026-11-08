@@ -1,0 +1,69 @@
+# Approved by the user (via the coordinator, 8 Nov 2026 about 15:22): a no-code test of chunk P1.16 (planning in session
+# hsn-p1-16-79). Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
+# gru_2m with AdamW beta2 = 0.95: exp 154's recipe (gru_2m, WSD 0.2 over 9,000 at lr 5e-4, eager cuDNN, B32; as the T2
+# timing arm, exp 186, with probe v3) with train.betas=[0.9,0.95], unguarded, seeds 0, 1, 2. Question: does beta2 0.95 move
+# gru_2m's onset or final score as it did HSN's (exps 194 / 195: onset by 1,000 to 1,500, no burst)? Comparators: exps 154
+# (0.793), 161 (0.793), 186 (0.784); onsets 3,500 to 4,500. Comparison control (recipe only). About 0.0167 s per step.
+
+name: s4_gru2m_beta95
+description: "gru_2m WSD 0.2 over 9k at 5e-4 with AdamW beta2 0.95, seeds 0-2, timing, probe v3"
+base:
+  config: configs/baselines/gru_2m.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=none
+    - train.batch=32
+    - train.micro_batch=32
+    - train.steps=9000
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - train.warmup_steps=200
+    - train.weight_decay=0.01
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.grad_clip=1.0
+    - train.lr=0.0005
+    - train.betas=[0.9,0.95]
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, version: 3, steps: 9000, diag_every: 500, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0, 1, 2]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state, group: {min_agree: 2}}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20}
+    reads_state_v3: {preset: reads_state_v3} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys} # the key swap: does the read follow the key
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    no_explosion:
+      group: {min_agree: 2}
+      cases:
+        - label: no explosion
+          when: {metric: "train:grad_norm", steps: {from: 501, to: 9000, every: 1}, agg: max, op: "<", value: 1000, min_samples: 8000}
+      default: explosion
+    beats_bar:
+      cases:
+        - label: above 0.7930
+          when:
+            all:
+              - {metric: "eval:delayed/in_range/accuracy", steps: {at: 9000}, op: ">", value: 0.7930}
+      default: not above 0.7930
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s4_gru2m_wsd9k_beta95
+    family: gru
