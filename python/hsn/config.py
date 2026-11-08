@@ -317,6 +317,14 @@ class TrainConfig(_StrictModel):
     cell_lr_mult: float = Field(default=1.0, gt=0.0)
     cell_weight_decay: float | None = Field(default=None, ge=0.0)
     # --- end P1.13 ---
+    # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
+    # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
+    # the last spike_window applied finite norms (once min(20, spike_window) are known); counted
+    # in P1.12's stop rule. Recommended 100 (exp 171's jump was 7e10x; ordinary steps stay below
+    # about 70x). spike_window is read only with spike_factor set (the user's request, 8 Nov).
+    spike_factor: float | None = Field(default=None, gt=1.0)
+    spike_window: int = Field(default=100, ge=1)
+    # --- end P1.15 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
     micro_batch: int = Field(default=4, ge=1)
@@ -433,6 +441,13 @@ class TrainConfig(_StrictModel):
                 f"but train.schedule={self.schedule!r}; drop it or use wsd"
             )
         # --- end P1.13 ---
+        # --- P1.15: the spike window is read by the spike guard only ---
+        if self.spike_factor is None and self.spike_window != 100:
+            raise ValueError(
+                f"train.spike_window={self.spike_window} is read by the gradient-spike guard only, "
+                "but train.spike_factor is not set; drop it or set the factor"
+            )
+        # --- end P1.15 ---
         return self
 
 

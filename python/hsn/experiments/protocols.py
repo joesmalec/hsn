@@ -51,6 +51,9 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
   the trainer's ``eval_position_groups``): each evaluation entry carries ``split`` (``first``,
   ``later``, ``later/1`` to ``later/3``: accuracy, loss, ``n``), checked against the frozen
   delayed/in_range metric, and ``final`` carries it flattened (``split/<g>/<key>``).
+- The gradient-spike guard (``train.spike_factor``): ``final.skipped_spike_steps`` (``None`` with
+  the guard off), ``skipped_steps`` (every step a guard skipped, with its reason), a ``skipped``
+  mark on those train entries, and the failure kind ``spike`` when spike skips stopped the run.
 """
 
 from __future__ import annotations
@@ -134,6 +137,8 @@ def run_protocol(arm: ArmRun) -> dict[str, Any]:
 
 #: the P1.12 stop rule's messages end with this (hsn.train.loop.Trainer._guard_nonfinite)
 _NONFINITE_STOP = "P1.12 stop rule"
+#: P1.15: a stop rule message that counted spike skips names them
+_SPIKE = "gradient spike"
 
 
 def failure_info(
@@ -142,13 +147,15 @@ def failure_info(
     stage: str,
     last_step: int,
     skipped_nonfinite: int | None = None,
+    skipped_spike: int | None = None,
 ) -> dict[str, Any]:
     """The ``failure`` block of a partial record: ``kind`` (``nonfinite``: P1.12's stop rule;
-    ``step_time``: the 0.5 s rule; ``oom``; ``cancelled``: SIGTERM; ``interrupted``; ``error``),
-    a short ``reason`` (the verdicts read ``failed: <reason> @ <last_step>``), the error's type and
-    message, the traceback's tail, the stage (``setup``, ``train``, ``trained_state``, ``probe``)
-    and ``last_step``, the last completed optimiser step. Classifies by type name, so that the
-    queue side stays torch-free."""
+    ``spike``: the same rule with P1.15's spike skips among the skipped steps; ``step_time``: the
+    0.5 s rule; ``oom``; ``cancelled``: SIGTERM; ``interrupted``; ``error``), a short ``reason``
+    (the verdicts read ``failed: <reason> @ <last_step>``), the error's type and message, the
+    traceback's tail, the stage (``setup``, ``train``, ``trained_state``, ``probe``) and
+    ``last_step``, the last completed optimiser step. Classifies by type name, so that the queue
+    side stays torch-free."""
     import traceback
 
     name = type(exc).__name__
@@ -162,6 +169,8 @@ def failure_info(
         kind, reason = "step_time", first
     elif name == "OutOfMemoryError":
         kind, reason = "oom", "out of memory"
+    elif isinstance(exc, RuntimeError) and _NONFINITE_STOP in message and _SPIKE in message:
+        kind, reason = "spike", "gradient spikes or non-finite gradients (P1.12 stop)"  # P1.15
     elif isinstance(exc, RuntimeError) and _NONFINITE_STOP in message:
         kind, reason = "nonfinite", "non-finite gradients (P1.12 stop)"
     else:
@@ -178,6 +187,8 @@ def failure_info(
     }
     if skipped_nonfinite is not None:
         out["skipped_nonfinite"] = int(skipped_nonfinite)
+    if skipped_spike is not None:  # P1.15: only with the spike guard on
+        out["skipped_spike"] = int(skipped_spike)
     return out
 
 
@@ -249,6 +260,17 @@ def _train_entry(s: Any) -> dict[str, Any]:
     if nonfinite:
         out["nonfinite"] = nonfinite
     return out
+
+
+def _mark_skipped(train: list[dict[str, Any]], trainer: Any) -> list[dict[str, Any]]:
+    """P1.15: a train entry whose step a guard skipped carries ``skipped`` (``nonfinite`` or
+    ``spike``); a spike step keeps its finite ``grad_norm``, so a rule can tell it apart."""
+    reasons = {int(e["step"]): str(e["reason"]) for e in getattr(trainer, "skipped_steps", [])}
+    for entry in train:
+        reason = reasons.get(int(entry["step"]))
+        if reason is not None:
+            entry["skipped"] = reason
+    return train
 
 
 def _finite(x: float) -> float | None:
@@ -434,11 +456,13 @@ def _train(
         arm.walls["fit_s"] = time.perf_counter() - t1
         diag.detach()
         _partial_training(arm, params, trainer, callback, diag, timer, audit_keys)
+        spike_on = getattr(trainer, "spike_factor", None) is not None
         arm.record["failure"] = failure_info(
             exc,
             stage="train",
             last_step=int(trainer.step),
             skipped_nonfinite=int(getattr(trainer, "skipped_nonfinite", 0)),
+            skipped_spike=int(getattr(trainer, "skipped_spike", 0)) if spike_on else None,
         )
         raise
     arm.walls["fit_s"] = time.perf_counter() - t1
@@ -453,7 +477,7 @@ def _train(
     arm.walls["diag_s"] = diag.seconds
 
     evals = [_eval_entry(e, audit_keys=audit_keys) for e in history.evals]
-    train = [_train_entry(s) for s in history.steps]
+    train = _mark_skipped([_train_entry(s) for s in history.steps], trainer)
     if evals:  # the trainer does not call back at its last step: report it, and the phase after
         arm.on_progress(
             {
@@ -483,7 +507,10 @@ def _train(
             # P1.12's non-finite-gradient guard (agreed 7 Nov): None on a checkout without it, so a
             # rule on final:skipped_nonfinite_steps reads missing, never a false 0
             "skipped_nonfinite_steps": measured.get("skipped_nonfinite_steps"),
+            # P1.15: the spike guard's skips; None with the guard off (the guard did not look)
+            "skipped_spike_steps": measured.get("skipped_spike_steps"),
         },
+        "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
         "stopped": callback.stop,
         "early_stop_log": callback.log,
         "eval_count": timer.count,
@@ -552,8 +579,16 @@ def _partial_training(
     trainer's ``measured`` block is written only at the end of a fit, so it is not there."""
     history = callback.history
     evals = [_eval_entry(e, audit_keys=audit_keys) for e in (history.evals if history else [])]
-    train = [_train_entry(s) for s in (history.steps if history else [])]
+    train = _mark_skipped([_train_entry(s) for s in (history.steps if history else [])], trainer)
     skipped = float(getattr(trainer, "skipped_nonfinite", 0))
+    spikes = (  # P1.15: None with the guard off
+        float(getattr(trainer, "skipped_spike", 0))
+        if getattr(trainer, "spike_factor", None) is not None
+        else None
+    )
+    measured: dict[str, Any] = {"skipped_nonfinite_steps": skipped}
+    if spikes is not None:
+        measured["skipped_spike_steps"] = spikes
     window = getattr(trainer, "compiled_window", None)
     compiled = {"window_compile_seconds": window.compile_seconds} if window is not None else {}
     arm.walls["eval_s"] = timer.seconds
@@ -566,12 +601,17 @@ def _partial_training(
             "family": arm.family,
             "autocast": history.autocast if history else None,
             "param_report": history.param_report if history else None,
-            "measured": {"skipped_nonfinite_steps": skipped},
+            "measured": measured,
             "compile": _compile_info(trainer, compiled),
             "evals": evals,
             "diagnostics": list(diag.records),
             "train": train,
-            "final": {**_final(evals, train), "skipped_nonfinite_steps": skipped},
+            "final": {
+                **_final(evals, train),
+                "skipped_nonfinite_steps": skipped,
+                "skipped_spike_steps": spikes,
+            },
+            "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
             "stopped": None,
             "early_stop_log": list(callback.log),
             "eval_count": timer.count,

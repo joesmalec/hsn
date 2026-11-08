@@ -135,6 +135,12 @@ window loop::
   first evaluation; ``measured["window_compile_seconds"]`` is every variant's compile and
   recording time, evaluation included); the probes and ``capture=True`` stay eager.
 
+* **Gradient spikes (P1.15).** With ``train.spike_factor`` set, a step whose finite global gradient
+  norm exceeds that factor times the running median of the applied norms is skipped exactly like a
+  non-finite one (:meth:`~hsn.train.loop.Trainer._guard_spike`): the same host float, read after
+  the compiled backward, so no device synchronisation and nothing changes in the captured graphs;
+  ``stats["skipped_spike"]`` counts them (only with the guard on).
+
 * **Non-finite gradients (P1.12).** Without a loss scaler, a step whose global gradient norm is not
   finite is skipped by the generic trainer's guard (:mod:`hsn.train.loop`, "Non-finite gradients"):
   gradients zeroed, no optimiser step (LazyAdamW's per-unit steps included), the scheduler and
@@ -769,6 +775,8 @@ class TBPTTTrainer(Trainer):
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
+                if not skipped and self.spike_factor is not None:  # P1.15
+                    skipped = self._guard_spike(grad_norm, next_step)
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
@@ -803,6 +811,8 @@ class TBPTTTrainer(Trainer):
                 "route_cost": cost_sum / n_windows,
                 "window_positions": positions_sum / n_windows,
                 "skipped_nonfinite": float(self.skipped_nonfinite),  # P1.12: the count so far
+                # P1.15: the spike guard's count so far (only with train.spike_factor set)
+                **({"skipped_spike": float(self.skipped_spike)} if self.spike_factor else {}),
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
                 **(probe_counts if self.counterfactual else {}),
@@ -880,6 +890,7 @@ class TBPTTTrainer(Trainer):
                 self._compiled.compile_seconds if self._compiled is not None else 0.0
             ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
+            **self._spike_measured(),  # P1.15
         }
         return history
 
