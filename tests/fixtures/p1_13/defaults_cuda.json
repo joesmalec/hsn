@@ -1,0 +1,119 @@
+{
+ "about": "P1.13 golden runs of the defaults (tests/p1_13_support.py)",
+ "capture_note": "captured from an export of 8eb2f01 (git archive) via PYTHONPATH, 7 Nov 2026 19:22 MST, GPU slot 1; a second process gave identical records",
+ "cases": {
+  "hsn_dense_compiled_cuda": {
+   "carried": "0befb4884bdf085a766c01cf550b298723d62571e454c2c4712d557530ebf7c0",
+   "carried_checkpoint": "0befb4884bdf085a766c01cf550b298723d62571e454c2c4712d557530ebf7c0",
+   "groups": [
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 19,
+     "weight_decay": 0.01
+    },
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 13,
+     "weight_decay": 0.0
+    }
+   ],
+   "last_lr": [
+    "0x0.0p+0",
+    "0x0.0p+0"
+   ],
+   "model": "ca9587ab86468aa0d8062e6d19c3b5e2c8e7d439d32c1ebbb39b3bd4d8533d7e",
+   "optimizer": "b81612e84f5913c46a1f793e8d718282bb18356b5ed391b6a3f9468531c34db2",
+   "steps": [
+    {
+     "grad_norm": "0x1.b05c460000000p-2",
+     "grads": "d16e6f66da71f45242da3f70c9beb37e57ac99913d9ab1b0f57349104340c32d",
+     "loss": "0x1.62e1300000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "799c647bf14b862ee587deb5a0c3ecb52917e2efa9f17c6c6b0b9d17bfe94ff9",
+     "step": 1
+    },
+    {
+     "grad_norm": "0x1.0f55620000000p-1",
+     "grads": "7cf6771a5ba009d9e5a5343d0f235122be9f03733acafbdf6576b9c8d29279c5",
+     "loss": "0x1.62cc740000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "24570b8f6688f7c32d8ef90717ca9983131cc0eb551bad8f0b132c514dff84ce",
+     "step": 2
+    },
+    {
+     "grad_norm": "0x1.0f184e0000000p-1",
+     "grads": "47e8cc8f587674e2177a030cefeced1bf95d445b59187fa10b36362899d7acb4",
+     "loss": "0x1.628a2c0000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "21f76a59b5f0036f0da6b2fc79e41a969f0c4602a40c2ee1dd91b73c3d7edee2",
+     "step": 3
+    },
+    {
+     "grad_norm": "0x1.b7ed7e0000000p-2",
+     "grads": "2909d60befcabac90228086bb924130a82239fb84344dc525469c2bc99a0d0f8",
+     "loss": "0x1.62d4ae0000000p+2",
+     "lr": "0x1.4fa17f634f425p-9",
+     "params": "1ec9bef89b828b73f37cfb6206de8c85dc71797c0effb82f1b3c867c4fc8fbc1",
+     "step": 4
+    },
+    {
+     "grad_norm": "0x1.a15d860000000p-2",
+     "grads": "6721504c73b4e2f4800156a9641a31c7f09eb3793b67f5020bca639743988f24",
+     "loss": "0x1.627cd00000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "893aa657df7be2866451a45bb9a51bc3e1fe6d7eb233a5be8a6e96144c23cf8a",
+     "step": 5
+    },
+    {
+     "grad_norm": "0x1.40ab9e0000000p-2",
+     "grads": "d7bf8d47b02b90a10610fb300061bcc2ca0b76b24cbc91074fd752abadbe2096",
+     "loss": "0x1.6273dc0000000p+2",
+     "lr": "0x1.ccae631ac56a4p-12",
+     "params": "760700fd425211521a1fc500faeb0d7a8337f5c1cdd579d1864b199091672c77",
+     "step": 6
+    }
+   ]
+  }
+ },
+ "cross_process_reproducible": true,
+ "cuda_max_block": 8,
+ "fingerprint": {
+  "card": "NVIDIA GeForce RTX 3060",
+  "cpu_capability": "AVX2",
+  "cuda": "13.2",
+  "device": "cuda",
+  "machine": "x86_64",
+  "torch": "2.15.0+cu132"
+ },
+ "git_rev_of_capture_tree": "8edef3d4be2bbb171ea5a45991cd3347537c8c15",
+ "hsn_file": "/tmp/claude-1000/-home-joe-hsn-p1-13/6eb2c05e-6e5f-4184-8701-3d95a81c6804/scratchpad/base/python/hsn/__init__.py",
+ "repeats": 2,
+ "reproducible": true,
+ "steps": 6
+}
