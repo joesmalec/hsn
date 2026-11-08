@@ -10,8 +10,8 @@ cadence of :func:`hsn.experiments.rules.diag_schedule`), per top-level module of
 For an HSN, also the state statistics of one fixed window (:func:`window_state_stats`: the first
 ``n_docs`` documents, one window from a fresh state, evaluation mode, no gradients): cell
 diversity, live cells, participation ratio ``rank_pr``, saturation, mean ``|h|`` and the cell spread
-at answer and at valid positions, the write-gate quantiles, and the per-cell write shares of a
-routed model.
+at answer and at valid positions, the write-gate quantiles with the write rate (P1.14: the share of
+gates >= 0.5) and the mean gate, and the per-cell write shares of a routed model.
 
 **Hooks (P1.11).** The audit replaced ``optimizer.step``; :class:`Diagnostics` registers
 ``torch.optim.Optimizer`` step pre- and post-hooks instead (agreed with the audit session, 7 Nov
@@ -222,6 +222,18 @@ def cell_stats(hs: Tensor) -> dict[str, float]:
     }
 
 
+def _write_rate(values: Tensor) -> dict[str, float]:
+    """P1.14, reported next to the gate quantiles (no rule reads them): ``gate/write_rate``, the
+    share of the written cells' gate coordinates at or above 0.5 (strong writes), and
+    ``gate/mean``, the mean gate (the mean share of a written coordinate replaced per position).
+    Over every value (no subsample). A p50 near 0 with a p90 near 0.2 (exp 100) is "few but strong
+    writes" when the write rate is above 0, and "no writes" when it is 0 with a small mean."""
+    return {
+        "gate/write_rate": float((values >= 0.5).float().mean()),
+        "gate/mean": float(values.float().mean()),
+    }
+
+
 def _quantiles(values: Tensor) -> dict[str, float]:
     if values.numel() > 2_000_000:
         values = values[torch.randperm(values.numel(), device=values.device)[:2_000_000]]
@@ -232,8 +244,9 @@ def _quantiles(values: Tensor) -> dict[str, float]:
 @torch.no_grad()
 def window_state_stats(model: HSN, w: dict[str, Tensor]) -> dict[str, float]:
     """One window from a fresh state in evaluation mode: :func:`cell_stats` at answer and valid
-    positions, the write gate ``b`` quantiles over the written cells at valid positions, and for a
-    routed model the per-cell write shares.
+    positions, the write gate ``b`` quantiles over the written cells at valid positions with the
+    write rate and the mean gate (:func:`_write_rate`), and for a routed model the per-cell write
+    shares.
 
     Reads ``HSN.forward(..., capture=True)``: ``cell_states [B, T, N, d]`` (h after each position),
     ``cell_gates`` (the gate of each written cell, NaN elsewhere) and ``cell_written [B, T, N]``,
@@ -256,6 +269,7 @@ def window_state_stats(model: HSN, w: dict[str, Tensor]) -> dict[str, float]:
     gates = info["cell_gates"].float()[valid][written]  # [S, d]
     gates = gates[~torch.isnan(gates)]
     if gates.numel():
+        out.update(_write_rate(gates))
         out.update(_quantiles(gates))
     if model.cfg.routing != "dense":
         writes = written.float().sum(0)  # [N]

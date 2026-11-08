@@ -12,7 +12,8 @@ attempt (``done`` or ``stopped_early``), else the latest attempt. Columns:
   marked ``(finding)`` when the rule's ``group.min_agree`` is met (computed at group level, never
   per arm);
 * final dev accuracy and loss (mean [min, max] over the finished seeds), first-query accuracy and
-  the follow / unchanged fractions of the edit probe;
+  the follow / unchanged fractions of the edit probe; the trained model's write rate (P1.14: the
+  share of gates >= 0.5) and the median step time (P1.14: ``step_time.run_median_s``);
 * early stops; failures (P1.14: ``<reason> @ <last step>`` of an attempt that failed or was
   cancelled, from its partial record); median train and total wall seconds and compile seconds;
 * card status, commits, imported.
@@ -167,6 +168,8 @@ def _per_seed_row(row: dict[str, Any], labels: dict[str, str], overrides: str) -
     walls = record.get("walls") or {}
     stopped = record.get("stopped")
     failure = record.get("failure")
+    trained = record.get("trained_state") or (record.get("at_stop") or {}).get("trained_state")
+    step_time = record.get("step_time") or {}
     return {
         "label": row["label"],
         "exp": row["exp_id"],
@@ -181,6 +184,8 @@ def _per_seed_row(row: dict[str, Any], labels: dict[str, str], overrides: str) -
         "first_query_acc": probe.get("first_query_accuracy"),
         "follow": probe.get("correct_follow_frac"),
         "unchanged": probe.get("correct_unchanged_frac"),
+        "write_rate": (trained or {}).get("gate/write_rate"),
+        "step_s": step_time.get("run_median_s"),
         "early_stop": f"{stopped['outcome']} @ {stopped['step']}" if stopped else "",
         "failure": (
             f"{failure.get('reason')} @ {failure.get('last_step')}"
@@ -274,6 +279,8 @@ def build_report(
             "first_query_acc",
             "follow",
             "unchanged",
+            "write_rate",
+            "step_s",
             "early_stop",
             "failure",
             "train_s",
@@ -325,6 +332,11 @@ def build_report(
         row["unchanged"] = _spread(
             [m["unchanged"] for m in finished if m["unchanged"] is not None], 3
         )
+        row["write_rate"] = _spread(
+            [m["write_rate"] for m in finished if m["write_rate"] is not None], 3
+        )
+        times = [float(m["step_s"]) for m in members if m["step_s"] is not None]
+        row["step_s"] = f"{statistics.median(times):.3f}" if times else ""
         row["early_stop"] = ", ".join(m["early_stop"] for m in members if m["early_stop"])
         row["failure"] = ", ".join(m["failure"] for m in members if m["failure"])
         for key in ("train_s", "total_s", "compile_s"):
@@ -347,6 +359,8 @@ def build_report(
         "first_query_acc",
         "follow",
         "unchanged",
+        "write_rate",
+        "step_s",
         "early_stop",
         "failure",
         "train_s",
