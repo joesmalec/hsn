@@ -35,6 +35,7 @@ from hsn.config import RunConfig, load_config
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
 from hsn.device import resolve, seed_everything
+from hsn.experiments.diagnostics import Diagnostics
 from hsn.experiments.protocols import ArmRun, run_protocol
 from hsn.experiments.rules import evaluate_verdicts, parse_rules
 from hsn.experiments.spec import protocol_params
@@ -607,6 +608,32 @@ def test_p1_12_sweep_record_carries_skips(
         }
     )
     assert evaluate_verdicts(rules, record, {}, "hsn")["guard"]["label"] == "skipped"
+
+
+def test_p1_12_diagnostics_survive_a_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P1.11's diagnostics (every step) on a TBPTT run with an infinite gradient at step 3 of 5:
+    the run continues (the diagnostics compare the optimiser calls net of the guard's skips instead
+    of raising at step 4), the skipped step has no record, and the records resume at step 4."""
+    cfg = _hsn_config(5)
+    train_ds, dev_ds = _datasets()
+    trainer = _hsn_trainer(cfg, tmp_path / "run")
+    diag = Diagnostics(trainer.model, cfg, trainer.ctx, dev_ds, 1)
+    diag.attach(trainer)
+    _plant(monkeypatch, trainer, {3: INF_GRADIENT})
+    history = trainer.fit(train_ds, dev_ds, 5)
+    diag.detach()
+    assert _skipped_steps(history) == [3] and trainer.skipped_nonfinite == 1
+    assert [r["step"] for r in diag.records] == [1, 2, 4, 5]
+    assert [r["optimizer_calls"] for r in diag.records] == [1, 2, 3, 4]
+    assert diag.optimizer_calls == 4
+    # any other mismatch still raises
+    other = _hsn_trainer(cfg, tmp_path / "other")
+    strict = Diagnostics(other.model, cfg, other.ctx, dev_ds, 1)
+    strict.attach(other)
+    other.skipped_nonfinite = 1  # a count no skip produced
+    with pytest.raises(RuntimeError, match="optimiser call"):
+        other.fit(train_ds, dev_ds, 1)
+    strict.detach()
 
 
 # --------------------------------------------------------------------------------------------------
