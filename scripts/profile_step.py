@@ -34,7 +34,9 @@ What the file holds:
   op through the ``sequence_nr`` of the forward op that recorded it), at L1 inductor's kernel
   provenance (each compiled kernel's origin nodes and their stack traces), taken in an extra pass
   of the same compiled kernels without CUDA Graphs (a graph replay has no per-kernel host launch
-  to link). The innermost HSN frame that names one gives the segment (:func:`classify_frames`:
+  to link). The innermost HSN frame (a file of the package, :func:`in_package`; not torch's
+  files under a ``.venv`` inside a checkout named ``hsn``) that names one gives the segment
+  (:func:`classify_frames`:
   ``units.py`` → ``selected_cells``; the cell, graph, native ops and state updates →
   ``messages``, the P2.5 partition; the router → ``scorer``; E, P, S and the embeddings →
   ``shared_path``; the decoder → ``decode``). ``unattributed`` reports what no rule matched.
@@ -108,6 +110,7 @@ import torch
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "python"))
 
+import hsn  # noqa: E402
 from hsn.config import RunConfig, config_hash, load_config  # noqa: E402
 from hsn.device import memory_stats, reset_peak, resolve, seed_everything, synchronize  # noqa: E402
 from hsn.model.hsn import HSN  # noqa: E402
@@ -323,12 +326,30 @@ def percentile(xs: list[float], q: float) -> float:
 # --------------------------------------------------------------------------------------------------
 
 
+#: the hsn package's files as inductor's stack traces and live Python frames name them: the
+#: directory of the package that was imported (``REPO/python/hsn`` when this script imports it
+#: first; a worktree sharing another checkout's ``.venv`` gets that checkout's through ``hsn.pth``
+#: when something imported ``hsn`` before)
+PACKAGE_ROOT = str(Path(hsn.__path__[0])).replace("\\", "/") + "/"
+#: and as ``torch.profiler(with_stack=True)`` names them: it strips each file's ``sys.path`` entry
+#: (``torch.profiler.python_tracer._prefix_regex``), the package's parent
+PACKAGE_RELATIVE = "hsn/"
+
+
+def in_package(path: str) -> bool:
+    """Whether a frame's file is in the hsn package. Not any path through a directory named
+    ``hsn``: the repo's ``.venv`` lies under one when the checkout is named ``hsn``, and torch has
+    files named like HSN's (``autograd/graph.py``, ``fx/graph.py``)."""
+    norm = path.replace("\\", "/")
+    return norm.startswith(PACKAGE_ROOT) or norm.startswith(PACKAGE_RELATIVE)
+
+
 def _hsn_frames(frames: list[tuple[str, int, str]]) -> list[tuple[str, str]]:
     """``(file name, function)`` of the frames inside the ``hsn`` package, outermost first."""
     out = []
     for path, _, fn in frames:
         norm = path.replace("\\", "/")
-        if "hsn/" in norm and ("/hsn/" in norm or norm.startswith("hsn/")):
+        if in_package(norm):
             out.append((Path(norm).name, fn))
     return out
 
@@ -467,7 +488,7 @@ def innermost_label(frames: list[tuple[str, int, str]]) -> str:
     """``file:line function`` of the innermost HSN frame (for the ``other`` breakdown)."""
     for path, line, fn in reversed(frames):
         norm = path.replace("\\", "/")
-        if "/hsn/" in norm or norm.startswith("hsn/"):
+        if in_package(norm):
             return f"{Path(norm).name}:{line} {fn}"
     return "(no hsn frame)"
 
@@ -694,8 +715,6 @@ OPTIMIZER_FILES = (
 )
 #: inductor's profiling wrappers of extern calls (``trace.provenance_tracking_to_timeline``)
 EXTERN_PREFIX = "extern_kernels_"
-#: the frames the MPS segment rules read: the hsn package's own
-PACKAGE_ROOT = str(REPO / "python" / "hsn").replace("\\", "/") + "/"
 Shares = dict[str, float] | None
 
 
@@ -819,8 +838,8 @@ class MPSClassifier:
       reaches the dispatcher's Python key);
     * an op on another thread with no node: the engine's other gradient sums;
     * the optimizer step (:data:`OPTIMIZER_FILES` frames): ``optimizer``;
-    * otherwise :func:`classify_frames` of the Python stack's frames in the hsn package
-      (:data:`PACKAGE_ROOT`; the repo's ``.venv`` lies under a directory named ``hsn`` too).
+    * otherwise :func:`classify_frames` of the Python stack (its frames in the hsn package,
+      :func:`in_package`).
 
     A rule that finds nothing leaves the dispatch unattributed (``other``), as on CUDA."""
 
@@ -838,10 +857,7 @@ class MPSClassifier:
     def __call__(self, func: Any) -> tuple[Shares, str]:
         node = torch._C._current_autograd_node()
         frames = python_frames(3)  # from the frame that issued the op
-        # the segment rules read the package's own frames only: the repo's .venv lies under a
-        # directory named hsn too, and torch has files named like HSN's (autograd/graph.py)
-        own = [f for f in frames if f[0].replace("\\", "/").startswith(PACKAGE_ROOT)]
-        label = f"{innermost_label(own)} / {func}"
+        label = f"{innermost_label(frames)} / {func}"
         for _, _, fn in reversed(frames):
             if fn.startswith(EXTERN_PREFIX):
                 traces = self.provenance.get((node is not None, fn))
@@ -864,7 +880,7 @@ class MPSClassifier:
         paths = [path.replace("\\", "/") for path, _, _ in frames]
         if any(part in path for path in paths for part in OPTIMIZER_FILES):
             return {"optimizer": 1.0}, label
-        found = classify_frames(own)
+        found = classify_frames(frames)
         if found is None:
             return None, label
         self.forward.setdefault(int(torch._C._autograd._get_sequence_nr()) - 1, found)
