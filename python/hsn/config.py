@@ -35,7 +35,10 @@ reward baseline; the P2.2 schedule keys ``gate_mode``, ``soft_until_step``, ``te
 ``probe_horizon`` and ``ema_decay`` act only when ``train.lambda_u > 0`` (counterfactual probes,
 the utility term and the scorer's EMA features; :mod:`hsn.train.probes`), so their defaults leave
 every other configuration unchanged; such a configuration must be routed, probe at least some
-windows, keep the horizon inside the window and not run soft gates throughout.
+windows, keep the horizon inside the window and not run soft gates throughout. P1.16's rollback
+keys (``train.rollback_*``, :data:`ROLLBACK_KEYS`) are off by default and, at their defaults, left
+out of the hash (:data:`HASH_OMIT_AT_DEFAULT`), so every configuration written before them keeps its
+``config_hash``.
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -63,9 +66,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 __all__ = [
     "AUX_TERMS",
     "HARDWARE_PROFILE_DIR",
+    "HASH_OMIT_AT_DEFAULT",
     "MEASURED_KEYS",
     "PROFILES",
     "REPO_ROOT",
+    "ROLLBACK_KEYS",
     "BaselineConfig",
     "DataConfig",
     "FastConfig",
@@ -123,6 +128,16 @@ ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
 #: Auxiliary loss terms that ``train.aux_enabled`` may name (Appendix A.3: cost / balance / graph).
 #: P2.4 registers its term names here.
 AUX_TERMS: tuple[str, ...] = ("cost", "balance", "graph")
+
+
+#: P1.16: the rollback's keys (``train.*``), ``rollback_every`` first (None: off).
+ROLLBACK_KEYS: tuple[str, ...] = (
+    "rollback_every",
+    "rollback_skip",
+    "rollback_lr_mult",
+    "rollback_lr_steps",
+    "rollback_max",
+)
 
 
 def wsd_decay_steps(decay_fraction: float, steps: int) -> int:
@@ -332,6 +347,21 @@ class TrainConfig(_StrictModel):
     # with spike_factor set), for a deterministic replay (python/hsn/train/divergence.py)
     divergence_dump: bool = True
     # --- end P1.15 ---
+    # --- P1.16: rollback on a guard trigger (python/hsn/train/rollback.py). None: off (today's
+    # training). Every rollback_every steps the trainer keeps an in-memory snapshot of the
+    # parameters, buffers and optimiser state (a ring of two); a step the guards would skip
+    # (non-finite, or a spike with spike_factor set) restores the older snapshot in place, discards
+    # rollback_skip steps' worth of windows and starts fresh documents, and trains at lr *
+    # rollback_lr_mult for rollback_lr_steps steps. The run stops (failure kind rollback) at its
+    # rollback_max + 1-th trigger. A trigger before the first snapshot is P1.15's skip. The other
+    # four keys are read only with rollback_every set. Recommended 50 / 10 / 0.5 / 200 / 5. All five
+    # are left out of the configuration hash at their defaults (HASH_OMIT_AT_DEFAULT).
+    rollback_every: int | None = Field(default=None, ge=1)
+    rollback_skip: int = Field(default=0, ge=0)
+    rollback_lr_mult: float = Field(default=1.0, gt=0.0, le=1.0)
+    rollback_lr_steps: int = Field(default=0, ge=0)
+    rollback_max: int = Field(default=5, ge=1)
+    # --- end P1.16 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
     micro_batch: int = Field(default=4, ge=1)
@@ -455,6 +485,19 @@ class TrainConfig(_StrictModel):
                 "but train.spike_factor is not set; drop it or set the factor"
             )
         # --- end P1.15 ---
+        # --- P1.16: the rollback's other keys are read only with rollback_every set ---
+        if self.rollback_every is None:
+            ignored = [
+                f"train.{key}={getattr(self, key)}"
+                for key in ROLLBACK_KEYS[1:]
+                if getattr(self, key) != type(self).model_fields[key].default
+            ]
+            if ignored:
+                raise ValueError(
+                    f"{', '.join(ignored)} are read by the rollback only (P1.16), but "
+                    "train.rollback_every is not set; drop them or set the cadence"
+                )
+        # --- end P1.16 ---
         return self
 
 
@@ -984,10 +1027,33 @@ def load_config(path: str | Path, overrides: Sequence[str] = ()) -> RunConfig:
 # --------------------------------------------------------------------------------------------------
 
 
+#: P1.16: keys left out of :func:`canonical_json` (so of :func:`config_hash`) while they hold their
+#: schema default, so that adding them changed no existing configuration's hash: checkpoints and
+#: divergence dumps written before them still resume and replay (``Trainer.resume`` compares
+#: hashes). A configuration that sets one of them to another value hashes it as usual. Dotted paths
+#: into the dump; append only (removing a key changes the hash of every configuration that sets it).
+HASH_OMIT_AT_DEFAULT: tuple[str, ...] = tuple(f"train.{key}" for key in ROLLBACK_KEYS)
+
+
+def _hash_view(cfg: RunConfig) -> dict[str, Any]:
+    """The configuration dump :func:`canonical_json` hashes: :meth:`RunConfig.model_dump` without
+    the :data:`HASH_OMIT_AT_DEFAULT` keys that hold their default."""
+    dump = cfg.model_dump(mode="json")
+    for dotted in HASH_OMIT_AT_DEFAULT:
+        section, key = dotted.split(".")
+        schema = RunConfig.model_fields[section].annotation
+        assert isinstance(schema, type) and issubclass(schema, BaseModel)
+        default = schema.model_fields[key].default
+        if dump[section][key] == default:
+            del dump[section][key]
+    return dump
+
+
 def canonical_json(cfg: RunConfig) -> str:
-    """Canonical JSON of the resolved configuration: sorted keys, compact, ASCII, no NaN."""
+    """Canonical JSON of the resolved configuration: sorted keys, compact, ASCII, no NaN (P1.16:
+    without the :data:`HASH_OMIT_AT_DEFAULT` keys at their defaults)."""
     return json.dumps(
-        cfg.model_dump(mode="json"),
+        _hash_view(cfg),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
