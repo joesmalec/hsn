@@ -1,0 +1,56 @@
+# Overnight stage 0b (approved by the coordinator under the user's overnight mandate, 7 Nov 2026): a learning-rate
+# sweep of the transformer_2m baseline, so the "open model" bar is a tuned one. Rules and predictions registered in
+# /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
+#
+# The queue9 baseline recipe (B32, warm-up 200, weight decay 0.01, grad_clip 1.0, eval every 500, eager, sharing the
+# card), delayed/in_range, seed 0; transformer_2m at lr 1e-3, 5e-4 and 2.5e-4 on two schedules: WSD 0.2 over 3,000,
+# and 3,000 steps of a 9,000-step cosine. Comparison controls only; about 0.025 to 0.045 s per step.
+#
+# Rule (registered): the best transformer recipe is the one with the highest final dev accuracy among the arms that
+# read state; if none reads state, the one with the highest final dev. If the best lies at an edge of the grid
+# (2.5e-4 or 1e-3), one more step outward is proposed.
+
+name: overnight_s0b_transformer_lr
+description: "transformer_2m lr sweep (1e-3, 5e-4, 2.5e-4) on WSD 0.2 over 3k and 3k of a 9k cosine"
+base:
+  config: configs/baselines/transformer_2m.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=none
+    - train.batch=32
+    - train.micro_batch=32
+    - train.steps=3000
+    - train.eval_every=500
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - train.warmup_steps=200
+    - train.weight_decay=0.01
+    - train.schedule=cosine
+    - train.grad_clip=1.0
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, diag_every: 500, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: false
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s0b_tf2m_wsd
+    family: transformer
+    overrides: [train.schedule=wsd, train.decay_fraction=0.2]
+    grid: {train.lr: [0.001, 0.0005, 0.00025]}
+  - name: s0b_tf2m_3k_of_9k
+    family: transformer
+    overrides: [train.steps=9000, train.ckpt_every=9000]
+    protocol: {steps: 3000}
+    grid: {train.lr: [0.001, 0.0005, 0.00025]}
