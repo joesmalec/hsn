@@ -1,0 +1,57 @@
+# Example sweep for P1.14's additions (docs/sweeps.md): probe v2, the mixed diagnostic cadence,
+# min_samples on windowed rules and the step-time opt-in. Expand-only: it shows the keys and is
+# checked by the committed-spec test; it registers no experiment of the plan.
+#
+#   python -m hsn.experiments expand configs/sweeps/example_p1_14.yaml
+
+name: example_p1_14
+description: dense HSN at R* with probe v2 and dense diagnostics only inside the rule windows
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead # compiled dense HSN: about 0.24 s per step at B32
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.001
+    - train.steps=3000
+    - train.eval_every=500
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+families:
+  gru:
+    config: configs/baselines/gru_2m.yaml
+    overrides: [train.warmup_steps=200, baseline.gru.n_layers=1, hardware.compile_mode=none]
+protocol:
+  name: reads_state
+  version: 2 # probe v2 (the vocabulary-matched edit) after v1; v1's numbers stay in the record
+  diag_every: 500 # sparse diagnostics everywhere...
+  diag_dense_every: 25 # ...and every 25 steps inside the windows the rules below read
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    reads_state_v2: {preset: reads_state_v2} # needs version 2
+    # the user's windowed rule (7 Nov): the median over +-100 steps at each multiple of 500, with
+    # at least 5 samples in every window (9 at the dense cadence of 25)
+    memory_open_windowed: {preset: memory_open, window: 100, to_step: 3000, min_samples: 5}
+arms:
+  - name: hsn_r
+    family: hsn
+  - name: gru_r
+    family: gru
+    overrides: [baseline.gru.d_model=128]
+  - name: hsn_eager_cell_embed # eager on CUDA: refused at enqueue without the approval below
+    family: hsn
+    variant: {name: cell_embed, offset_std: 0.5}
+    overrides: [hardware.compile_mode=none]
+    protocol:
+      max_step_s: 1.0 # eager dense HSN takes about 0.73 s per step at B32
+      step_time_approval: "example only: never enqueued"

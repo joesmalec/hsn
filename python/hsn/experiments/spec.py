@@ -50,6 +50,17 @@ baseline would train eager under a compiled label), a family that does not match
 set (untested under P2.8's compiled window), ``routing=random`` with the reads-state protocol (its
 evaluation draws batch-shaped random numbers, so the batched probe would not match), protocol steps
 beyond the schedule, duplicate labels, and every check of :func:`hsn.experiments.rules.check_rules`.
+
+**P1.14 protocol keys** (approved with the P1.14 plan):
+- ``max_step_s`` and ``step_time_approval``: the step-time guard. Execution-only, so not in the id.
+- ``diag_dense_every`` and ``diag_windows``: the mixed cadence. The windows are derived from the
+  arm's rules at expansion; both keys are in the id only when not at their defaults, see
+  :data:`IDENTITY_DEFAULTS`.
+- reads_state ``version``: 2 adds probe v2. It fills the id's existing protocol-version slot, so
+  version 1 is today's payload.
+
+The step-time refusals happen at enqueue (:func:`hsn.experiments.db.enqueue_arms`), not here, so
+expansion of every existing spec is unchanged.
 """
 
 from __future__ import annotations
@@ -71,9 +82,12 @@ from hsn.experiments.rules import (
     Cadence,
     RuleSet,
     check_rules,
+    merge_windows,
     parse_rules,
     resolved_early_stop,
+    rule_windows,
 )
+from hsn.experiments.steptime import STEP_TIME_LIMIT_S
 
 __all__ = [
     "EXECUTION_ONLY",
@@ -93,7 +107,11 @@ __all__ = [
 
 FAMILIES = ("hsn", "gru", "transformer")
 Family = Literal["hsn", "gru", "transformer"]
-EXECUTION_ONLY = frozenset({"eval_batch", "probe_batch", "checkpoint", "sleep_s"})
+# P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
+# computes
+EXECUTION_ONLY = frozenset(
+    {"eval_batch", "probe_batch", "checkpoint", "sleep_s", "max_step_s", "step_time_approval"}
+)
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
@@ -134,12 +152,40 @@ class _TrainParams(_Strict):
     eval_batch: int | None = Field(default=None, ge=1)  # None: train.batch
     checkpoint: Literal["final", "none"] = "final"
     diag_window_docs: int = Field(default=4, ge=1)  # documents of the diagnostics window
+    # P1.14, the step-time guard (hsn.experiments.steptime): the limit on the median step time,
+    # and the approval note ("<who, when>") an arm above the 0.5 s rule (or an eager CUDA HSN arm)
+    # needs at enqueue; both execution-only
+    max_step_s: float = Field(default=STEP_TIME_LIMIT_S, gt=0.0)
+    step_time_approval: str = ""
 
 
-class ReadsStateParams(_TrainParams):
+Window = tuple[int, int]
+
+
+class _DiagCadence(_TrainParams):
+    """P1.14's mixed diagnostic cadence: with ``diag_dense_every`` > 0, diagnostics every
+    ``diag_dense_every`` steps inside ``diag_windows`` (the windows the arm's rules read, derived at
+    expansion and merged with any the spec gives) and every ``diag_every`` steps elsewhere."""
+
+    diag_dense_every: int = Field(default=0, ge=0)
+    diag_windows: tuple[Window, ...] = ()
+
+    @field_validator("diag_windows")
+    @classmethod
+    def _windows(cls, value: tuple[Window, ...]) -> tuple[Window, ...]:
+        for lo, hi in value:
+            if lo < 1 or hi < lo:
+                raise ValueError(f"a diagnostics window [lo, hi] needs 1 <= lo <= hi, got {lo, hi}")
+        return value
+
+
+class ReadsStateParams(_DiagCadence):
     """The 5(b) training recipe (in the spec's overrides) plus the 5(c) edit probe."""
 
     name: Literal["reads_state"]
+    # P1.14: version 2 adds probe v2, the vocabulary-matched edit (hsn.experiments.probe); the
+    # version is the arm id's protocol version, so version 1 arms keep their ids
+    version: Literal[1, 2] = 1
     diag_every: int = Field(default=500, ge=0)  # 0: no diagnostics during training
     diag_docs: int = Field(default=32, ge=1)  # documents of trained_state
     n_train: int = Field(default=0, ge=0)  # 0: the whole split
@@ -147,7 +193,7 @@ class ReadsStateParams(_TrainParams):
     probe_batch: int = Field(default=64, ge=2)
 
 
-class TrainEvalParams(_TrainParams):
+class TrainEvalParams(_DiagCadence):
     name: Literal["train_eval"]
     diag_every: int = Field(default=0, ge=0)
     diag_docs: int = Field(default=32, ge=1)
@@ -155,7 +201,7 @@ class TrainEvalParams(_TrainParams):
     n_dev: int = Field(default=0, ge=0)
 
 
-class OverfitParams(_TrainParams):
+class OverfitParams(_DiagCadence):
     """The G1 overfit recipe: the first ``n_docs`` training documents as train and dev."""
 
     name: Literal["overfit"]
@@ -188,8 +234,16 @@ PROTOCOL_SOURCES: dict[str, tuple[str, ...]] = {
     "reads_state": ("trained", "probe", "final"),
     "train_eval": ("trained", "final"),
     "overfit": ("overfit", "final"),
-    "dry_run": ("trained", "probe", "overfit", "final"),
+    "dry_run": ("trained", "probe", "probe_v2", "overfit", "final"),
 }
+
+
+def protocol_sources(params: Any) -> tuple[str, ...]:
+    """The scalar rule sources a protocol writes (P1.14: reads_state version 2 adds probe_v2)."""
+    sources = PROTOCOL_SOURCES[params.name]
+    if params.name == "reads_state" and getattr(params, "version", 1) == 2:
+        sources = (*sources, "probe_v2")
+    return sources
 
 
 def protocol_params(
@@ -361,6 +415,11 @@ def config_view(cfg: RunConfig) -> dict[str, Any]:
     return view
 
 
+#: P1.14: protocol keys that enter the arm id only when they differ from these values, so that every
+#: arm from before them keeps its id
+IDENTITY_DEFAULTS: dict[str, Any] = {"diag_dense_every": 0, "diag_windows": []}
+
+
 def arm_identity(
     cfg: RunConfig,
     *,
@@ -374,18 +433,32 @@ def arm_identity(
     """``(arm_id, group_id)`` (module docstring). ``protocol`` is the protocol's full parameter
     dump; the execution-only parameters are dropped here."""
     name = str(protocol["name"])
-    science = {k: v for k, v in protocol.items() if k not in EXECUTION_ONLY}
+    science = {
+        k: v
+        for k, v in protocol.items()
+        if k not in EXECUTION_ONLY
+        and k != "version"
+        and not (k in IDENTITY_DEFAULTS and _plain(v) == IDENTITY_DEFAULTS[k])
+    }
+    version = int(protocol.get("version", PROTOCOL_VERSION[name]))  # P1.14: reads_state v2
     payload: dict[str, Any] = {
         "config": config_view(cfg),
         "data": data,
         "family": family,
         "variant": {"name": variant, **dict(variant_params)},
-        "protocol": {**science, "version": PROTOCOL_VERSION[name]},
+        "protocol": {**science, "version": version},
         "early_stop": list(early_stop),
     }
     arm_id = digest(payload)
     payload["config"] = {k: v for k, v in payload["config"].items() if k != "seed"}
     return arm_id, digest(payload)
+
+
+def _plain(value: Any) -> Any:
+    """Tuples as lists (a dumped protocol and a stored one compare alike)."""
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
 
 
 def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str:
@@ -540,8 +613,35 @@ def _expand_one(
         raise SpecError(f"arm {entry.name}: protocol steps {steps} > train.steps {cfg.train.steps}")
     constants = {**spec.constants, **entry.constants}
     diag_every = int(getattr(protocol, "diag_every", 0))
+    dense = int(getattr(protocol, "diag_dense_every", 0))
+    windows: list[list[int]] = []
+    explicit = list(getattr(protocol, "diag_windows", ()))
+    if explicit and not dense:
+        raise SpecError(f"arm {label}: diag_windows needs diag_dense_every (P1.14's mixed cadence)")
+    if dense:
+        try:
+            derived = rule_windows(rules, family, protocol.name, steps)
+        except ValueError as exc:
+            raise SpecError(f"arm {label}: {exc}") from exc
+        windows = merge_windows([*explicit, *derived])
+        if not windows:
+            # no rule of this arm reads a diag: window (a GRU arm beside hsn-only rules, say): the
+            # single cadence, recorded as such, so that its id is the plain arm's
+            dense = 0
+        protocol = protocol.model_copy(
+            update={
+                "diag_dense_every": dense,
+                "diag_windows": tuple((lo, hi) for lo, hi in windows),
+            }
+        )
     cadence = Cadence.of(
-        steps, cfg.train.eval_every, diag_every, PROTOCOL_SOURCES[protocol.name], protocol.name
+        steps,
+        cfg.train.eval_every,
+        diag_every,
+        protocol_sources(protocol),
+        protocol.name,
+        dense_every=dense,
+        windows=windows,
     )
     try:
         check_rules(rules, cadence, constants, family)

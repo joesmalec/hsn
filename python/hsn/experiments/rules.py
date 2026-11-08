@@ -13,12 +13,18 @@ their expanded form. They are experiment rules registered before the run, not ga
   ``<task>/<variant>/accuracy|loss`` of the dev evaluations), ``diag:<key>`` (the diagnostics
   records, :mod:`hsn.experiments.diagnostics`), ``train:loss|accuracy|grad_norm`` (every step).
   Scalars: ``trained:<key>`` (the trained model's state statistics), ``probe:<key>`` (the edit
-  probe, :func:`hsn.experiments.probe.summarize`), ``overfit:<key>``, ``final:<key>`` (the last
+  probe, :func:`hsn.experiments.probe.summarize`), ``probe_v2:<key>`` (P1.14: the
+  vocabulary-matched edit of reads_state version 2, :func:`hsn.experiments.probe.summarize_v2`),
+  ``overfit:<key>``, ``final:<key>`` (the last
   evaluation flattened, ``train_loss``, ``steps``) and ``verdict:<rule>`` (another rule's label).
 * ``steps`` (series only) selects samples: ``{at: n}`` or ``{from: a, to: b, every: k}`` (every
   bound optional; ``every`` keeps the multiples of ``k``). Without ``steps`` every sample counts.
 * ``agg`` (series only, required unless ``steps.at``): ``all``/``any`` apply the comparison to every
   sample; ``median``, ``mean``, ``min``, ``max``, ``first``, ``last`` compare one aggregate.
+* ``min_samples`` (P1.14; series atoms whose ``steps`` has ``from`` and/or ``to``, optional): the
+  window must hold at least that many samples. The static check refuses a cadence that puts fewer
+  steps in it; at evaluation fewer recorded samples (a step P1.12's guard skipped, a short run) make
+  the atom missing (``n/a: <metric> 3 samples < min_samples 5``). Unset: no minimum (as before).
 * ``op``: ``>=``, ``>``, ``<=``, ``<``, ``==``, ``!=``, or ``between`` with ``value: [lo, hi]``
   (inclusive).
 * ``value``: a number, a string, a constant name, or ``"<constant> + <number>"`` /
@@ -34,10 +40,12 @@ any part is False, else missing if any part is missing; ``any`` likewise with Tr
 group: {min_agree: n}}``: the first case whose condition holds gives the label, the default
 otherwise. An arm outside ``applies_to`` reads ``n/a (family <f>)`` or ``n/a (protocol <p>)`` (never
 a pass or a fail); a missing atom in a case reached reads ``n/a: <metric> missing ...``; an arm that
-stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict. ``group.min_agree`` is
-read by ``report`` at seed-group level ("counts as a finding" when that many seeds share a label).
-Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``memory_open``,
-``cells_apart``.
+stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict, and an arm that failed
+(P1.14: a partial record with a ``failure`` block) ``failed: <reason> @ <last step>``.
+``group.min_agree`` is read by ``report`` at seed-group level ("counts as a finding" when that many
+seeds share a label).
+Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``reads_state_v2``
+(P1.14), ``memory_open``, ``cells_apart``.
 
 **Early stop.** ``{name, at_steps: [n, ...], outcome, when, applies_to}``: evaluated by the trainer
 callback right after step ``n``'s evaluation and diagnostics; when ``when`` holds the run stops with
@@ -47,7 +55,15 @@ stop the run; the evaluation is logged either way.
 **Static checks** (:func:`check_rules`, at enqueue, per arm) raise on an unknown source, a source
 the protocol does not produce, an early stop that reads the future or a scalar source, an
 ``at_steps`` entry that is not an evaluation step or not before the last step, a selection the
-cadence does not produce, a missing constant and an ordered comparison with a non-number.
+cadence does not produce, a window with fewer steps than its ``min_samples``, a missing constant and
+an ordered comparison with a non-number.
+
+**Mixed diagnostic cadence (P1.14).** With a protocol's ``diag_dense_every`` set,
+:func:`rule_windows` gives the windows the arm's rules read (every ``diag:`` atom of the verdicts
+and early stops that apply to it: ``steps.at`` a one-step window, a span its ``[from, to]``, clipped
+to the run); :func:`diag_schedule` samples every ``diag_dense_every`` steps inside them and every
+``diag_every`` steps elsewhere. An atom with no ``steps`` would read a mix of dense and sparse
+samples, and is refused in that mode.
 """
 
 from __future__ import annotations
@@ -61,6 +77,7 @@ from typing import Any
 
 __all__ = [
     "AGGS",
+    "MIN_SAMPLES_DOC",
     "OPS",
     "PRESETS",
     "SERIES_SOURCES",
@@ -73,13 +90,15 @@ __all__ = [
     "VerdictRule",
     "check_early_stop",
     "check_rules",
+    "diag_schedule",
     "evaluate_verdicts",
     "parse_rules",
     "resolved_early_stop",
+    "rule_windows",
 ]
 
 SERIES_SOURCES = ("eval", "diag", "train")
-SCALAR_SOURCES = ("trained", "probe", "overfit", "final", "verdict")
+SCALAR_SOURCES = ("trained", "probe", "probe_v2", "overfit", "final", "verdict")
 SOURCES = SERIES_SOURCES + SCALAR_SOURCES
 AGGS = ("all", "any", "median", "mean", "min", "max", "first", "last")
 OPS = (">=", ">", "<=", "<", "==", "!=", "between")
@@ -88,6 +107,8 @@ _CONST_EXPR = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:([+-])\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?))?\s*$"
 )
 EVAL_METRICS = ("accuracy", "loss")
+#: P1.14: the minimum the docs recommend for a windowed rule (``min_samples`` is set per rule)
+MIN_SAMPLES_DOC = 5
 TRAIN_METRICS = ("loss", "accuracy", "grad_norm")
 
 
@@ -153,6 +174,7 @@ class Atom:
     value: Any
     steps: Steps | None = None
     agg: str | None = None
+    min_samples: int | None = None  # P1.14
 
     @property
     def metric(self) -> str:
@@ -166,6 +188,9 @@ class Atom:
             out["agg"] = self.agg
         out["op"] = self.op
         out["value"] = list(self.value) if isinstance(self.value, tuple) else self.value
+        # only when set (P1.14): stored rules and arm ids stay as they were
+        if self.min_samples is not None:
+            out["min_samples"] = self.min_samples
         return out
 
 
@@ -327,7 +352,7 @@ def _parse_value(raw: Any, op: str) -> Any:
 
 
 def _parse_atom(raw: Mapping[str, Any]) -> Atom:
-    unknown = set(raw) - {"metric", "steps", "agg", "op", "value"}
+    unknown = set(raw) - {"metric", "steps", "agg", "op", "value", "min_samples"}
     if unknown:
         raise RuleError(f"unknown condition keys {sorted(unknown)}")
     for key in ("metric", "op", "value"):
@@ -357,7 +382,16 @@ def _parse_atom(raw: Mapping[str, Any]) -> Atom:
             raise RuleError(f"unknown agg {agg!r}; known: {AGGS}")
     elif steps is not None or agg is not None:
         raise RuleError(f"{metric}: scalar sources take no steps / agg")
-    return Atom(source, key, op, _parse_value(raw["value"], op), steps, agg)
+    min_samples = None
+    if "min_samples" in raw:
+        min_samples = _int(raw["min_samples"], "min_samples")
+        if min_samples < 1:
+            raise RuleError(f"{metric}: min_samples must be >= 1, got {min_samples}")
+        if steps is None or steps.at is not None or (steps.start is None and steps.stop is None):
+            raise RuleError(
+                f"{metric}: min_samples needs a window (steps with from and/or to, not at)"
+            )
+    return Atom(source, key, op, _parse_value(raw["value"], op), steps, agg, min_samples)
 
 
 def parse_cond(raw: Any) -> Cond:
@@ -437,13 +471,20 @@ def _group(name: str, raw: Mapping[str, Any]) -> int | None:
 
 
 def _atom(
-    metric: str, op: str, value: Any, steps: dict[str, int] | None = None, agg: str | None = None
+    metric: str,
+    op: str,
+    value: Any,
+    steps: dict[str, int] | None = None,
+    agg: str | None = None,
+    min_samples: int | None = None,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {"metric": metric, "op": op, "value": value}
     if steps is not None:
         out["steps"] = steps
     if agg is not None:
         out["agg"] = agg
+    if min_samples is not None:
+        out["min_samples"] = min_samples
     return out
 
 
@@ -474,24 +515,61 @@ def _preset_reads_state(p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _preset_reads_state_v2(p: dict[str, Any]) -> dict[str, Any]:
+    """P1.14: the v2 verdict (decision D4, A) over the matched documents answered correctly before
+    the edit: v1's thresholds, after "no matched probes" (0) and "too few matched probes" (below
+    ``min_correct``, default 20). Needs reads_state version 2 (or a dry run)."""
+    follow_min, unchanged_max, follow_below = (
+        p.pop("follow_min", 0.5),
+        p.pop("unchanged_max", 0.1),
+        p.pop("follow_below", 0.2),
+    )
+    min_correct = p.pop("min_correct", 20)
+    return {
+        "cases": [
+            {"label": "no matched probes", "when": _atom("probe_v2:correct_n", "==", 0)},
+            {
+                "label": "too few matched probes",
+                "when": _atom("probe_v2:correct_n", "<", min_correct),
+            },
+            {
+                "label": "reads state",
+                "when": {
+                    "all": [
+                        _atom("probe_v2:correct_follow_frac", ">=", follow_min),
+                        _atom("probe_v2:correct_unchanged_frac", "<=", unchanged_max),
+                    ]
+                },
+            },
+            {
+                "label": "does not read state",
+                "when": _atom("probe_v2:correct_follow_frac", "<", follow_below),
+            },
+        ],
+        "default": "partial",
+    }
+
+
 def _preset_memory_open(p: dict[str, Any]) -> dict[str, Any]:
     """Gate p50 and the cell's gradient share at or above their thresholds at the multiples of
     ``every`` from ``from_step``. Without ``window``: the one sample at each such step (``agg``
     all, as registered for queue9 at a cadence of 500), or one aggregate over all of them. With
     ``window: w`` (and ``to_step``): at each such step s, the ``agg`` (default median) over the
-    diagnostics in [s - w, s + w] (the user's windowed rule of 7 Nov, at a cadence of 25)."""
+    diagnostics in [s - w, s + w] (the user's windowed rule of 7 Nov, at a cadence of 25).
+    ``min_samples`` (P1.14) goes to every atom (each window must hold that many samples)."""
     start, every = p.pop("from_step", 500), p.pop("every", 500)
     to_step = p.pop("to_step", None)
     window = p.pop("window", None)
     gate, share = p.pop("gate_p50_min", 0.01), p.pop("cell_share_min", 0.01)
+    least = p.pop("min_samples", None)
     if window is None:
         steps: dict[str, int] = {"from": start, "every": every}
         if to_step is not None:
             steps["to"] = to_step
         agg = p.pop("agg", "all")
         atoms = [
-            _atom("diag:gate/p50", ">=", gate, steps, agg),
-            _atom("diag:grad_share/cell", ">=", share, dict(steps), agg),
+            _atom("diag:gate/p50", ">=", gate, steps, agg, least),
+            _atom("diag:grad_share/cell", ">=", share, dict(steps), agg, least),
         ]
     else:
         if to_step is None:
@@ -500,8 +578,8 @@ def _preset_memory_open(p: dict[str, Any]) -> dict[str, Any]:
         atoms = []
         for s in range(start, int(to_step) + 1, every):
             span = {"from": s - int(window), "to": s + int(window)}
-            atoms.append(_atom("diag:gate/p50", ">=", gate, dict(span), agg))
-            atoms.append(_atom("diag:grad_share/cell", ">=", share, dict(span), agg))
+            atoms.append(_atom("diag:gate/p50", ">=", gate, dict(span), agg, least))
+            atoms.append(_atom("diag:grad_share/cell", ">=", share, dict(span), agg, least))
     return {
         "cases": [{"label": "open", "when": {"all": atoms}}],
         "default": "shut",
@@ -530,6 +608,7 @@ def _preset_cells_apart(p: dict[str, Any]) -> dict[str, Any]:
 
 PRESETS = {
     "reads_state": _preset_reads_state,  # the audit's verdict (probe counts, correct answers)
+    "reads_state_v2": _preset_reads_state_v2,  # P1.14: the same over probe v2's matched edits
     "memory_open": _preset_memory_open,  # queue9 rule: gate p50 and the cell's grad share, x500
     "cells_apart": _preset_cells_apart,  # queue9 rule: rank_pr and diversity_live, trained model
 }
@@ -710,6 +789,7 @@ class RecordView:
         block = {
             "trained": self.record.get("trained_state"),
             "probe": self.record.get("probe"),
+            "probe_v2": self.record.get("probe_v2"),
             "overfit": self.record.get("overfit"),
             "final": self.record.get("final"),
         }[source]
@@ -781,6 +861,9 @@ def _eval_atom(
             return None, detail
         xs = [float(x) for x in samples if x is not None]
         detail["n"] = len(xs)
+        if atom.min_samples is not None and len(xs) < atom.min_samples:
+            detail["missing"] = f"{len(xs)} samples < min_samples {atom.min_samples}"
+            return None, detail
         agg = atom.agg or "last"
         detail["agg"] = agg
         if agg in ("all", "any"):
@@ -836,6 +919,7 @@ def evaluate_verdicts(
     protocol = protocol if protocol is not None else record.get("protocol")
     view = RecordView(record)
     stopped = record.get("stopped")
+    failure = record.get("failure")
     labels: dict[str, str] = {}
     out: dict[str, dict[str, Any]] = {}
     for name in rules.order:
@@ -843,6 +927,10 @@ def evaluate_verdicts(
         outside = rule.scope.excludes(family, protocol)
         if outside is not None:
             labels[name] = f"n/a ({outside})"
+            out[name] = {"label": labels[name], "detail": []}
+            continue
+        if isinstance(failure, Mapping):  # P1.14: a failed arm's partial record never passes
+            labels[name] = f"failed: {failure.get('reason')} @ {failure.get('last_step')}"
             out[name] = {"label": labels[name], "detail": []}
             continue
         if stopped:
@@ -916,10 +1004,70 @@ class Cadence:
         diag_every: int,
         scalar_sources: Iterable[str],
         protocol: str | None = None,
+        *,
+        dense_every: int = 0,
+        windows: Iterable[Sequence[int]] = (),
     ) -> Cadence:
         evals = sorted({s for s in range(eval_every, steps + 1, eval_every)} | {steps})
-        diags = sorted(range(diag_every, steps + 1, diag_every)) if diag_every > 0 else []
-        return cls(steps, tuple(evals), tuple(diags), tuple(scalar_sources), protocol)
+        diags = diag_schedule(steps, diag_every, dense_every, windows)
+        return cls(steps, tuple(evals), diags, tuple(scalar_sources), protocol)
+
+
+def diag_schedule(
+    steps: int, diag_every: int, dense_every: int = 0, windows: Iterable[Sequence[int]] = ()
+) -> tuple[int, ...]:
+    """The diagnostics steps of a run of ``steps`` steps: every multiple of ``diag_every`` (0: none)
+    and, with ``dense_every`` (P1.14's mixed cadence), every multiple of it inside the windows
+    ``[lo, hi]``."""
+    out = set(range(diag_every, steps + 1, diag_every)) if diag_every > 0 else set()
+    if dense_every > 0:
+        for lo, hi in windows:
+            first = -(-max(int(lo), 1) // dense_every) * dense_every
+            out.update(range(first, min(int(hi), steps) + 1, dense_every))
+    return tuple(sorted(out))
+
+
+def merge_windows(windows: Iterable[Sequence[int]]) -> list[list[int]]:
+    """Windows ``[lo, hi]`` sorted, with overlapping ones merged."""
+    out: list[list[int]] = []
+    for lo, hi in sorted((int(a), int(b)) for a, b in windows):
+        if out and lo <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return out
+
+
+def rule_windows(rules: RuleSet, family: str, protocol: str | None, steps: int) -> list[list[int]]:
+    """P1.14: the windows the ``diag:`` atoms of the verdicts and early stops that apply to this arm
+    read (``steps.at`` a one-step window, a span its ``[from, to]``, clipped to ``[1, steps]``),
+    merged. An atom with no ``steps`` raises: it would read a mix of dense and sparse samples."""
+    conds: list[tuple[str, Cond]] = []
+    for name, rule in rules.verdicts.items():
+        if rule.scope.excludes(family, protocol) is None:
+            conds += [(f"verdict {name!r}", case.when) for case in rule.cases]
+    for stop in rules.early_stop:
+        if stop.scope.excludes(family, protocol) is None:
+            conds.append((f"early stop {stop.name!r}", stop.when))
+    windows = []
+    for where, cond in conds:
+        for atom in _atoms(cond):
+            if atom.source != "diag":
+                continue
+            sel = atom.steps
+            if sel is None:
+                raise RuleError(
+                    f"{where}: {atom.metric} reads every diagnostics sample; with diag_dense_every "
+                    "it would read a mix of dense and sparse ones: give it steps"
+                )
+            if sel.at is not None:
+                lo = hi = sel.at
+            else:
+                lo, hi = sel.start or 1, sel.stop if sel.stop is not None else steps
+            lo, hi = max(1, lo), min(steps, hi)
+            if lo <= hi:
+                windows.append((lo, hi))
+    return merge_windows(windows)
 
 
 def _check_atom(
@@ -956,6 +1104,11 @@ def _check_atom(
                 f"{where}: {atom.metric} reads steps {absent} this arm does not record "
                 f"({atom.source} steps {list(available)[:12]}...)"
             )
+        if atom.min_samples is not None and len(wanted) < atom.min_samples:
+            raise RuleError(
+                f"{where}: {atom.metric} {steps.to_json()} holds {len(wanted)} of this arm's "
+                f"{atom.source} steps, fewer than min_samples {atom.min_samples}"
+            )
         if upto is not None and max(wanted) > upto:
             raise RuleError(
                 f"{where}: {atom.metric} reads step {max(wanted)}, after the rule's step {upto}"
@@ -964,9 +1117,10 @@ def _check_atom(
         if upto is not None:
             raise RuleError(f"{where}: an early stop reads step series only, not {atom.metric}")
         if atom.source != "verdict" and atom.source not in cadence.scalar_sources:
+            hint = " (probe_v2 needs reads_state version 2)" if atom.source == "probe_v2" else ""
             raise RuleError(
                 f"{where}: protocol {cadence.protocol} writes no {atom.source}: values "
-                f"({atom.metric}); restrict the rule with applies_to: {{protocol: [...]}}"
+                f"({atom.metric}){hint}; restrict the rule with applies_to: {{protocol: [...]}}"
             )
 
 

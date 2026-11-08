@@ -15,6 +15,7 @@
              [--imported | --no-imported] [--per-seed] [--format md|csv] [--out FILE]
     import   --audit-dir DIR [--dry-run]
     probe-check --exp N [--batch-rows 64]
+    probe-rerun --exp N [--cpu] [--batch-rows N] [--out FILE]   v1 vs the stored probes, then v2
     run-arm  --db DB --exp N --root ROOT       (the worker's child; not for direct use)
 
 Every command takes ``--db`` (default ``$HSN_EXPERIMENTS_DB`` or
@@ -111,6 +112,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-rows", type=int, default=64)
     p.add_argument("--out", default=None)
 
+    p = sub.add_parser("probe-rerun", help="v1 again vs the stored probes, then probe v2 (P1.14)")
+    p.add_argument("--exp", type=int, required=True)
+    p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
+    p.add_argument("--batch-rows", type=int, default=None, help="default: the run's probe_batch")
+    p.add_argument("--out", default=None)
+
     p = sub.add_parser("run-arm", help=argparse.SUPPRESS)
     p.add_argument("--exp", type=int, required=True)
     return ap
@@ -190,8 +197,16 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
         print("added:")
         print(
             _table(
-                [(a["exp_id"], a["label"], a["arm_id"]) for a in report.added],
-                ["exp", "label", "arm id"],
+                [
+                    (
+                        a["exp_id"],
+                        a["label"],
+                        a["arm_id"],
+                        f"{a['step_s']:.3g}" if a.get("step_s") is not None else "unknown",
+                    )
+                    for a in report.added
+                ],
+                ["exp", "label", "arm id", "expected s/step"],
             )
         )
     if report.skipped:
@@ -257,8 +272,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         ).fetchall()
         recent = conn.execute(
             "SELECT e.exp_id, e.label, e.status, e.ended_at, e.card_status, r.verdicts_json, "
-            "r.final_dev_accuracy, r.total_s, e.error FROM experiments e LEFT JOIN results r "
-            "ON r.exp_id = e.exp_id "
+            "r.final_dev_accuracy, r.total_s, e.error, "
+            "json_extract(r.record_json, '$.failure.reason') AS failure_reason, "
+            "json_extract(r.record_json, '$.failure.last_step') AS failure_step "
+            "FROM experiments e LEFT JOIN results r ON r.exp_id = e.exp_id "
             "WHERE e.status IN ('done', 'failed', 'stopped_early', 'cancelled') "
             f"AND e.imported = 0{where} ORDER BY e.ended_at DESC LIMIT ?",
             [*params, args.recent],
@@ -304,6 +321,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"{k}: {v['label'] if isinstance(v, dict) else v}" for k, v in verdicts.items()
         )
         err = (r["error"] or "").strip().splitlines()[-1:] if r["status"] == "failed" else []
+        if r["failure_reason"] is not None:  # P1.14: the partial record's failure, once
+            labels = f"{r['status']} @ {r['failure_step']}: {r['failure_reason']}"
         acc = f"{r['final_dev_accuracy']:.4f}" if r["final_dev_accuracy"] is not None else ""
         rows.append(
             (
@@ -404,6 +423,18 @@ def cmd_probe_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe_rerun(args: argparse.Namespace) -> int:
+    from hsn.experiments.probe_check import probe_rerun
+
+    db = _db(args)
+    out = probe_rerun(db, args.exp, cpu=args.cpu, batch_rows=args.batch_rows)
+    text = json.dumps(out, indent=1, default=str)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+    print(json.dumps({k: v for k, v in out.items() if k != "differ"}, indent=1, default=str))
+    return 0
+
+
 def cmd_run_arm(args: argparse.Namespace) -> int:
     from hsn.experiments.run_arm import main as run_arm
 
@@ -422,6 +453,7 @@ COMMANDS = {
     "report": cmd_report,
     "import": cmd_import,
     "probe-check": cmd_probe_check,
+    "probe-rerun": cmd_probe_rerun,
     "run-arm": cmd_run_arm,
 }
 
@@ -435,9 +467,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     from hsn.experiments.rules import RuleError
     from hsn.experiments.spec import SpecError
+    from hsn.experiments.steptime import StepTimeRefused
 
     try:
         return COMMANDS[args.command](args)
-    except (SpecError, RuleError, dbm.DatabaseError) as exc:
+    except (SpecError, RuleError, StepTimeRefused, dbm.DatabaseError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

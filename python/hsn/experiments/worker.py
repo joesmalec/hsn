@@ -16,7 +16,12 @@ Every poll (default 5 s), in this order:
    or any other process of at least 200 MiB, is foreign. Per running experiment the worker keeps
    the peak MiB of its group, the foreign processes and the other arms of ours seen during it,
    flushed to the row every 60 s and when the child is reaped: ``card_status`` is ``idle``,
-   ``shared (own: ...)`` or ``shared (foreign: ...)``.
+   ``shared (own: ...)`` or ``shared (foreign: ...)``. **P1.14:** the process group of an arm this
+   worker launched or adopted stays ours after its row leaves ``running`` (the child writes its
+   final status, then exits, its CUDA context and inductor's compile workers last) until no process
+   is left in it: such a *finishing* group is never foreign, counts as ``own`` for the arms it
+   overlaps, keeps the card from being idle (a timing arm never starts beside it) and its memory
+   counts as used, not as one of our running arms'.
 4. **Decide** (:func:`hsn.experiments.scheduler.decide`) and **claim** inside one
    ``BEGIN IMMEDIATE`` transaction, so that several workers on one database never launch the same
    arm or overrun the memory budget, then **spawn** ``python -m hsn.experiments run-arm`` with
@@ -156,6 +161,9 @@ class Worker:
         self.id = f"{self.host}:{os.getpid()}"
         self.children: dict[int, subprocess.Popen[bytes]] = {}
         self.watch: dict[int, _Watch] = {}
+        # P1.14: process group -> experiment of every arm launched or adopted here, until no process
+        # is left in the group (finishing groups stay ours after their row leaves running)
+        self.own_pgids: dict[int, int] = {}
         self.adopted: set[int] = set()
         self.idle_since: float | None = None
         self.last_cpu = 0.0
@@ -278,8 +286,17 @@ class Worker:
         now = time.time()
         running = self.db.running()
         reading = self.machine.read_gpu()
-        groups = self.machine.process_groups() if running or reading.processes else {}
-        own_groups = {int(r["pgid"]) for r in running if r["pgid"] is not None}
+        for r in running:  # the groups of the arms watched here (our children, adopted orphans)
+            if int(r["exp_id"]) in self.watch and r["pgid"] is not None:
+                self.own_pgids[int(r["pgid"])] = int(r["exp_id"])
+        look = bool(running or reading.processes or self.own_pgids)
+        groups = self.machine.process_groups() if look else {}
+        running_groups = {int(r["pgid"]) for r in running if r["pgid"] is not None}
+        alive = set(groups.values())
+        for pgid in [g for g in self.own_pgids if g not in running_groups and g not in alive]:
+            del self.own_pgids[pgid]  # its row is finished and no process is left in its group
+        finishing = {g: e for g, e in self.own_pgids.items() if g not in running_groups}
+        own_groups = running_groups | set(finishing)
         own, foreign, _ignored = self.machine.classify(reading.processes, own_groups, groups)
         by_group: dict[int, float] = {}
         for p in own:
@@ -307,7 +324,7 @@ class Worker:
             self.last_cpu = now
         elif not (timing_live or timing_waiting):
             self.cpu_hogs = []
-        idle = reading.ok and not foreign and self.cpu_hogs == []
+        idle = reading.ok and not foreign and self.cpu_hogs == [] and not finishing
         if idle and not running:
             self.idle_since = self.idle_since if self.idle_since is not None else now
         elif not idle:
@@ -328,9 +345,12 @@ class Worker:
                 for pid, pct, cmd in self.cpu_hogs or []:
                     _seen(w.cpu_foreign, pid, now, name=cmd, cpu=pct)
             w.own_with.update(e for e in running_ids if e != exp_id)
+            w.own_with.update(e for e in finishing.values() if e != exp_id)
             if now - w.flushed >= FLUSH_EVERY_S:
                 self._flush(exp_id)
-        own_used = sum(by_group.values())
+        # a finishing group's memory is in use but belongs to none of our running arms: it counts
+        # with the foreign use in the scheduler's memory arithmetic, never as a foreign process
+        own_used = sum(v for g, v in by_group.items() if g not in finishing)
         return Card(
             present=reading.present,
             ok=reading.ok,
@@ -492,6 +512,7 @@ class Worker:
         )
         self.children[exp_id] = proc
         self.watch[exp_id] = _Watch()
+        self.own_pgids[proc.pid] = exp_id
         self.log(f"launched exp {exp_id} ({exp['label']}) pid {proc.pid} in {run_dir}")
         return exp_id
 
