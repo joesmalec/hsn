@@ -45,6 +45,20 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
     early-stop log and the walls, read from the live ``History`` the callback holds;
   - otherwise what the earlier stages wrote.
   ``run-arm`` stores it.
+
+**P1.15.**
+- Every reads_state evaluation is labelled by query slot (:class:`hsn.experiments.split.QuerySlots`,
+  the trainer's ``eval_position_groups``): each evaluation entry carries ``split`` (``first``,
+  ``later``, ``later/1`` to ``later/3``: accuracy, loss, ``n``), checked against the frozen
+  delayed/in_range metric, and ``final`` carries it flattened (``split/<g>/<key>``).
+- The gradient-spike guard (``train.spike_factor``): ``final.skipped_spike_steps`` (``None`` with
+  the guard off), ``skipped_steps`` (every step a guard skipped, with its reason), a ``skipped``
+  mark on those train entries, and the failure kind ``spike`` when spike skips stopped the run.
+- reads_state version 3 runs probe v3 after v1 and v2 (``probe_v3``, ``probes_v3``,
+  ``probes_v3_originals``; :mod:`hsn.experiments.probe`).
+- ``divergence``: the divergence dump's summary (``train.divergence_dump``, on by default: kind,
+  step, norm, path; :mod:`hsn.train.divergence`), in full and partial records; ``None`` without a
+  skipped step.
 """
 
 from __future__ import annotations
@@ -128,6 +142,8 @@ def run_protocol(arm: ArmRun) -> dict[str, Any]:
 
 #: the P1.12 stop rule's messages end with this (hsn.train.loop.Trainer._guard_nonfinite)
 _NONFINITE_STOP = "P1.12 stop rule"
+#: P1.15: a stop rule message that counted spike skips names them
+_SPIKE = "gradient spike"
 
 
 def failure_info(
@@ -136,13 +152,15 @@ def failure_info(
     stage: str,
     last_step: int,
     skipped_nonfinite: int | None = None,
+    skipped_spike: int | None = None,
 ) -> dict[str, Any]:
     """The ``failure`` block of a partial record: ``kind`` (``nonfinite``: P1.12's stop rule;
-    ``step_time``: the 0.5 s rule; ``oom``; ``cancelled``: SIGTERM; ``interrupted``; ``error``),
-    a short ``reason`` (the verdicts read ``failed: <reason> @ <last_step>``), the error's type and
-    message, the traceback's tail, the stage (``setup``, ``train``, ``trained_state``, ``probe``)
-    and ``last_step``, the last completed optimiser step. Classifies by type name, so that the
-    queue side stays torch-free."""
+    ``spike``: the same rule with P1.15's spike skips among the skipped steps; ``step_time``: the
+    0.5 s rule; ``oom``; ``cancelled``: SIGTERM; ``interrupted``; ``error``), a short ``reason``
+    (the verdicts read ``failed: <reason> @ <last_step>``), the error's type and message, the
+    traceback's tail, the stage (``setup``, ``train``, ``trained_state``, ``probe``) and
+    ``last_step``, the last completed optimiser step. Classifies by type name, so that the queue
+    side stays torch-free."""
     import traceback
 
     name = type(exc).__name__
@@ -156,6 +174,8 @@ def failure_info(
         kind, reason = "step_time", first
     elif name == "OutOfMemoryError":
         kind, reason = "oom", "out of memory"
+    elif isinstance(exc, RuntimeError) and _NONFINITE_STOP in message and _SPIKE in message:
+        kind, reason = "spike", "gradient spikes or non-finite gradients (P1.12 stop)"  # P1.15
     elif isinstance(exc, RuntimeError) and _NONFINITE_STOP in message:
         kind, reason = "nonfinite", "non-finite gradients (P1.12 stop)"
     else:
@@ -172,6 +192,8 @@ def failure_info(
     }
     if skipped_nonfinite is not None:
         out["skipped_nonfinite"] = int(skipped_nonfinite)
+    if skipped_spike is not None:  # P1.15: only with the spike guard on
+        out["skipped_spike"] = int(skipped_spike)
     return out
 
 
@@ -215,6 +237,13 @@ def _eval_entry(e: Mapping[str, Any], *, audit_keys: bool) -> dict[str, Any]:
     if audit_keys:
         out["dev_answer_accuracy"] = {g: v["accuracy"] for g, v in groups.items()}
         out["dev_answer_loss"] = {g: v["loss"] for g, v in groups.items()}
+    if e.get("per_position_group") is not None:  # P1.15: the first/later split
+        from hsn.experiments.split import SPLIT_GROUP, split_block
+
+        group = (e.get("per_group") or {}).get("/".join(SPLIT_GROUP)) or {}
+        out["split"] = split_block(
+            e["per_position_group"], group, total_positions=e.get("n_positions")
+        )
     return out
 
 
@@ -238,6 +267,17 @@ def _train_entry(s: Any) -> dict[str, Any]:
     return out
 
 
+def _mark_skipped(train: list[dict[str, Any]], trainer: Any) -> list[dict[str, Any]]:
+    """P1.15: a train entry whose step a guard skipped carries ``skipped`` (``nonfinite`` or
+    ``spike``); a spike step keeps its finite ``grad_norm``, so a rule can tell it apart."""
+    reasons = {int(e["step"]): str(e["reason"]) for e in getattr(trainer, "skipped_steps", [])}
+    for entry in train:
+        reason = reasons.get(int(entry["step"]))
+        if reason is not None:
+            entry["skipped"] = reason
+    return train
+
+
 def _finite(x: float) -> float | None:
     return float(x) if math.isfinite(float(x)) else None
 
@@ -255,6 +295,9 @@ def _final(evals: list[dict[str, Any]], train: list[dict[str, Any]]) -> dict[str
         )
         for g, v in last["per_group"].items():
             out[f"{g}/accuracy"], out[f"{g}/loss"] = v["accuracy"], v["loss"]
+        for g, v in (last.get("split") or {}).items():  # P1.15
+            for key in ("accuracy", "loss", "n"):
+                out[f"split/{g}/{key}"] = v[key]
     return out
 
 
@@ -346,7 +389,14 @@ def _train(
     from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything
     from hsn.experiments.diagnostics import Diagnostics, trained_state
-    from hsn.experiments.probe import edit_probe, edit_probe_v2, summarize, summarize_v2
+    from hsn.experiments.probe import (
+        edit_probe,
+        edit_probe_v2,
+        edit_probe_v3,
+        summarize,
+        summarize_v2,
+        summarize_v3,
+    )
     from hsn.experiments.variants import install_variant
     from hsn.runner import build_model, load_datasets, make_trainer
 
@@ -379,6 +429,17 @@ def _train(
     timer = _EvalTimer()
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
     trainer.eval_batch = params.eval_batch
+    # P1.15: what a divergence dump needs to rebuild this arm's model (hsn.train.divergence)
+    trainer.dump_notes = {
+        "variant": arm.variant,
+        "variant_params": dict(arm.variant_params),
+        "run_id": cfg.run_id,
+        "protocol": params.name,
+    }
+    if isinstance(params, ReadsStateParams):  # P1.15: the first/later split of every evaluation
+        from hsn.experiments.split import QuerySlots
+
+        trainer.eval_position_groups = QuerySlots(dev_ds)
     diag_every = params.diag_every
     # P1.14: the mixed cadence samples an explicit schedule; the single cadence keeps diag_every
     dense = params.diag_dense_every > 0
@@ -414,11 +475,13 @@ def _train(
         arm.walls["fit_s"] = time.perf_counter() - t1
         diag.detach()
         _partial_training(arm, params, trainer, callback, diag, timer, audit_keys)
+        spike_on = getattr(trainer, "spike_factor", None) is not None
         arm.record["failure"] = failure_info(
             exc,
             stage="train",
             last_step=int(trainer.step),
             skipped_nonfinite=int(getattr(trainer, "skipped_nonfinite", 0)),
+            skipped_spike=int(getattr(trainer, "skipped_spike", 0)) if spike_on else None,
         )
         raise
     arm.walls["fit_s"] = time.perf_counter() - t1
@@ -433,7 +496,7 @@ def _train(
     arm.walls["diag_s"] = diag.seconds
 
     evals = [_eval_entry(e, audit_keys=audit_keys) for e in history.evals]
-    train = [_train_entry(s) for s in history.steps]
+    train = _mark_skipped([_train_entry(s) for s in history.steps], trainer)
     if evals:  # the trainer does not call back at its last step: report it, and the phase after
         arm.on_progress(
             {
@@ -463,7 +526,11 @@ def _train(
             # P1.12's non-finite-gradient guard (agreed 7 Nov): None on a checkout without it, so a
             # rule on final:skipped_nonfinite_steps reads missing, never a false 0
             "skipped_nonfinite_steps": measured.get("skipped_nonfinite_steps"),
+            # P1.15: the spike guard's skips; None with the guard off (the guard did not look)
+            "skipped_spike_steps": measured.get("skipped_spike_steps"),
         },
+        "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+        "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
         "stopped": callback.stop,
         "early_stop_log": callback.log,
         "eval_count": timer.count,
@@ -489,7 +556,7 @@ def _train(
             probes = edit_probe(model, ctx, dev_ds, batch_rows=params.probe_batch)
             summary = summarize(probes)
             arm.walls["probe_s"] = time.perf_counter() - t3
-            if params.version == 2:
+            if params.version >= 2:
                 arm.stage = "probe_v2"
                 t4 = time.perf_counter()
                 probes_v2 = edit_probe_v2(
@@ -497,6 +564,16 @@ def _train(
                 )
                 v2 = {"probe_v2": summarize_v2(probes_v2, v1=probes), "probes_v2": probes_v2}
                 arm.walls["probe_v2_s"] = time.perf_counter() - t4
+            if params.version >= 3:  # P1.15: probe v3, the later queries' key-addressed edits
+                arm.stage = "probe_v3"
+                t5 = time.perf_counter()
+                probes_v3, originals_v3 = edit_probe_v3(
+                    model, ctx, dev_ds, batch_rows=params.probe_batch
+                )
+                v2["probe_v3"] = summarize_v3(probes_v3, originals_v3)
+                v2["probes_v3"] = probes_v3
+                v2["probes_v3_originals"] = originals_v3
+                arm.walls["probe_v3_s"] = time.perf_counter() - t5
         if callback.stop is not None:
             record["at_stop"] = {
                 "step": callback.stop["step"],
@@ -532,8 +609,16 @@ def _partial_training(
     trainer's ``measured`` block is written only at the end of a fit, so it is not there."""
     history = callback.history
     evals = [_eval_entry(e, audit_keys=audit_keys) for e in (history.evals if history else [])]
-    train = [_train_entry(s) for s in (history.steps if history else [])]
+    train = _mark_skipped([_train_entry(s) for s in (history.steps if history else [])], trainer)
     skipped = float(getattr(trainer, "skipped_nonfinite", 0))
+    spikes = (  # P1.15: None with the guard off
+        float(getattr(trainer, "skipped_spike", 0))
+        if getattr(trainer, "spike_factor", None) is not None
+        else None
+    )
+    measured: dict[str, Any] = {"skipped_nonfinite_steps": skipped}
+    if spikes is not None:
+        measured["skipped_spike_steps"] = spikes
     window = getattr(trainer, "compiled_window", None)
     compiled = {"window_compile_seconds": window.compile_seconds} if window is not None else {}
     arm.walls["eval_s"] = timer.seconds
@@ -546,12 +631,18 @@ def _partial_training(
             "family": arm.family,
             "autocast": history.autocast if history else None,
             "param_report": history.param_report if history else None,
-            "measured": {"skipped_nonfinite_steps": skipped},
+            "measured": measured,
             "compile": _compile_info(trainer, compiled),
             "evals": evals,
             "diagnostics": list(diag.records),
             "train": train,
-            "final": {**_final(evals, train), "skipped_nonfinite_steps": skipped},
+            "final": {
+                **_final(evals, train),
+                "skipped_nonfinite_steps": skipped,
+                "skipped_spike_steps": spikes,
+            },
+            "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+            "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
             "stopped": None,
             "early_stop_log": list(callback.log),
             "eval_count": timer.count,

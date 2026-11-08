@@ -135,6 +135,12 @@ window loop::
   first evaluation; ``measured["window_compile_seconds"]`` is every variant's compile and
   recording time, evaluation included); the probes and ``capture=True`` stay eager.
 
+* **Gradient spikes (P1.15).** With ``train.spike_factor`` set, a step whose finite global gradient
+  norm exceeds that factor times the running median of the applied norms is skipped exactly like a
+  non-finite one (:meth:`~hsn.train.loop.Trainer._guard_spike`): the same host float, read after
+  the compiled backward, so no device synchronisation and nothing changes in the captured graphs;
+  ``stats["skipped_spike"]`` counts them (only with the guard on).
+
 * **Non-finite gradients (P1.12).** Without a loss scaler, a step whose global gradient norm is not
   finite is skipped by the generic trainer's guard (:mod:`hsn.train.loop`, "Non-finite gradients"):
   gradients zeroed, no optimiser step (LazyAdamW's per-unit steps included), the scheduler and
@@ -670,6 +676,7 @@ class TBPTTTrainer(Trainer):
         compile_steps = 0
         while self.step < steps:
             started = time.perf_counter()
+            snapshot = self._step_snapshot = self._take_snapshot(loader, state)  # P1.15
             next_step = self.step + 1
             stats_step = next_step % train.stats_every == 0 or next_step == steps
             # P2.8: every window runs the compiled window when there is one (a statistics step's
@@ -694,6 +701,8 @@ class TBPTTTrainer(Trainer):
             probe_counts = {"probe_windows": 0.0, "probe_pairs": 0.0, "probe_positions": 0.0}
             for window_index in range(n_windows):
                 window = next(loader)
+                if snapshot is not None:  # P1.15: the dump keeps the step's CPU windows
+                    snapshot.windows.append(window)
                 cut = self._window_cut(window)  # P1.10d: from the CPU window, no device sync
                 positions_sum += cut
                 batch = self._to_device(window)
@@ -762,13 +771,19 @@ class TBPTTTrainer(Trainer):
                     scaled.backward()  # type: ignore[no-untyped-call]
                 if self.counterfactual:  # P2.3: once per window, after its selections ran
                     self._update_ema(info, fwd, probe)
+            if snapshot is not None:  # P1.15: the dump records the step's loss
+                snapshot.loss = loss_sum / n_loss if n_loss else math.nan
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
                 group_norms = self._group_grad_norms(groups) if stats_step else {}
+                if self.grad_hook is not None:  # P1.15: the replay's raw gradients
+                    self.grad_hook(self)
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
+                if not skipped and self.spike_factor is not None:  # P1.15
+                    skipped = self._guard_spike(grad_norm, next_step)
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
@@ -803,6 +818,8 @@ class TBPTTTrainer(Trainer):
                 "route_cost": cost_sum / n_windows,
                 "window_positions": positions_sum / n_windows,
                 "skipped_nonfinite": float(self.skipped_nonfinite),  # P1.12: the count so far
+                # P1.15: the spike guard's count so far (only with train.spike_factor set)
+                **({"skipped_spike": float(self.skipped_spike)} if self.spike_factor else {}),
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
                 **(probe_counts if self.counterfactual else {}),
@@ -880,6 +897,7 @@ class TBPTTTrainer(Trainer):
                 self._compiled.compile_seconds if self._compiled is not None else 0.0
             ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
+            **self._spike_measured(),  # P1.15
         }
         return history
 
@@ -891,16 +909,6 @@ class TBPTTTrainer(Trainer):
         if not isinstance(state, CellGraphState):
             raise TypeError(f"save needs the carried CellGraphState, got {type(state).__name__}")
         path = checkpoint_path(run_dir, self.step)
-        extra: dict[str, Any] = {
-            "config_hash": self.config_hash,
-            "model_name": self.cfg.model_name,
-            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
-            "carried_state": pack_cell_state(state),
-            "q_resync": q_resync_counter(self.windows, self.windows_since_resync, self.resyncs),
-            "reinforce_baseline": self.reinforce_baseline,  # P2.2 (None unless reinforce ran)
-            "cut_pending": self._cut_pending,  # P1.10d: the next window must reset every row
-            **self._guard_extra(),  # P1.12: the non-finite-gradient guard's counts
-        }
         save_checkpoint(
             path,
             self.model,
@@ -909,10 +917,53 @@ class TBPTTTrainer(Trainer):
             self.step,
             capture_rng_state(),
             loader.state_dict(),
-            extra=extra,
+            extra=self._checkpoint_extra(state),
         )
         logger.info("checkpoint %s", path)
         return path
+
+    def _checkpoint_extra(
+        self, state: Any, counters: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """The checkpoint's ``extra`` (P0.5's plus the carried cell state and the resync
+        counters); ``counters`` (P1.15: a :meth:`_counters` dict, the divergence dump's step
+        start) replaces the current ones."""
+        if not isinstance(state, CellGraphState):
+            raise TypeError(f"save needs the carried CellGraphState, got {type(state).__name__}")
+        c = self._counters() if counters is None else counters
+        return {
+            "config_hash": self.config_hash,
+            "model_name": self.cfg.model_name,
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "carried_state": pack_cell_state(state),
+            "q_resync": q_resync_counter(c["windows"], c["windows_since_resync"], c["resyncs"]),
+            "reinforce_baseline": c["reinforce_baseline"],  # P2.2 (None unless reinforce ran)
+            "cut_pending": c["cut_pending"],  # P1.10d: the next window must reset every row
+            **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
+        }
+
+    def _counters(self) -> dict[str, Any]:
+        """P1.15: the counters a checkpoint carries (the generic trainer's plus the windows,
+        resyncs, the trailing cut and the REINFORCE baseline)."""
+        return {
+            **super()._counters(),
+            "windows": self.windows,
+            "windows_since_resync": self.windows_since_resync,
+            "resyncs": self.resyncs,
+            "cut_pending": self._cut_pending,
+            "reinforce_baseline": self.reinforce_baseline,
+        }
+
+    def _snapshot_state(self, state: Any) -> Any:
+        """P1.15: a device copy of the carried cell state."""
+        if not isinstance(state, CellGraphState):
+            raise TypeError(f"the carried state is not a CellGraphState: {type(state).__name__}")
+        return CellGraphState._make(
+            h=state.h.detach().clone(),
+            q=state.q.detach().clone(),
+            age=state.age.detach().clone(),
+            pos=state.pos.detach().clone(),
+        )
 
     def resume(self, path: str | Path) -> int:
         """Load a checkpoint written by :meth:`save` for this configuration; returns its step.

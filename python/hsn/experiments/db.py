@@ -36,6 +36,11 @@ than the code raises):
   runs; rows from before v2 fall back to the arm's;
 * the view ``queue``: queued experiments in FIFO order.
 
+**Read-only (P1.15).** ``Database(path, read_only=True)`` opens an existing file through SQLite's
+``mode=ro`` URI: no directory is created, nothing is migrated (a schema other than this code's
+raises), and :meth:`Database.write` raises. The read-only commands (``split-backfill``, ``replay
+--exp``) open the database this way, so that they can run beside a live worker.
+
 **Guarded writes.** A child process changes its experiment only while that row is ``running`` with
 its PID (:func:`child_start`, :func:`child_progress`, :func:`child_finish`); when recovery has
 marked the row failed in between, the write changes nothing and returns False, and the child stops.
@@ -236,17 +241,37 @@ class Database:
     """One experiment database (module docstring). Safe to share between threads (one connection
     per thread) and processes (SQLite's locking, WAL)."""
 
-    def __init__(self, path: str | Path, *, allow_tmp: bool = False) -> None:
+    def __init__(
+        self, path: str | Path, *, allow_tmp: bool = False, read_only: bool = False
+    ) -> None:
         self.path = Path(path).expanduser()
         check_not_tmp(self.path, allow_tmp=allow_tmp)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only  # P1.15 (module docstring)
         self._local = threading.local()
+        if read_only:
+            if not self.path.is_file():
+                raise DatabaseError(f"{self.path}: no database to open read-only")
+            version = self.version()
+            if version != SCHEMA_VERSION:
+                raise DatabaseError(
+                    f"{self.path} has schema version {version}, this code reads {SCHEMA_VERSION} "
+                    "(read-only: it is not migrated)"
+                )
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.migrate()
 
     @property
     def conn(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is None:
+            if self.read_only:  # P1.15: SQLite refuses every write on this connection
+                uri = f"{self.path.resolve().as_uri()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, timeout=30.0, isolation_level=None)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 30000")
+                self._local.conn = conn
+                return conn
             conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 30000")
@@ -264,6 +289,8 @@ class Database:
 
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            raise DatabaseError(f"{self.path} is open read-only")
         conn = self.conn
         conn.execute("BEGIN IMMEDIATE")
         try:

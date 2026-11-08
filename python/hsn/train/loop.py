@@ -45,7 +45,10 @@ checkpoint (unless that step already wrote one) and stops there (the sweep harne
 rules, :mod:`hsn.experiments`). The step it stops at is not a statistics step of the TBPTT trainer
 (those key on the last step of ``fit``). :attr:`Trainer.eval_batch` (``None`` = ``train.batch``)
 sets the number of parallel streams of :meth:`Trainer.evaluate` only; training is unaffected and
-the per-document metrics change by rounding at most.
+the per-document metrics change by rounding at most. **P1.15:** :attr:`Trainer.eval_position_groups`
+(``None`` by default) labels the evaluation's loss positions
+(:func:`hsn.eval.evaluate.evaluate_windows`, ``position_groups``); the result gains
+``per_position_group``, everything else is computed as before.
 
 **Search budget.** :class:`SearchBudget` counts hyperparameter-search trials against
 ``train.search_trials`` so that every method in the baseline ladder gets the same number of
@@ -76,6 +79,35 @@ were skipped. The guard reads the norm the step already copied to the host for i
 adds no device synchronisation (P2.8's compiled window included: the norm, the clipping and the
 optimiser run eagerly, after the compiled backward).
 
+**Gradient spikes (P1.15).** A divergence can be a single finite jump: exp 171 (8 Nov 2026) ran with
+gradient norms of 0.3 to 0.56, then one batch gave 2.2e10, which clipping applied, and the model
+broke. With ``train.spike_factor`` set (``None``, the default, keeps today's training), a step whose
+finite pre-clip norm exceeds the factor times the median of the last ``train.spike_window`` (default
+100) applied norms is skipped like a non-finite one (:meth:`Trainer._guard_spike`, after
+:meth:`Trainer._guard_nonfinite`): gradients zeroed, no optimiser step, the scheduler advances, the
+skip counted (``skipped_spike``) and logged. The guard decides once ``min(SPIKE_MIN_HISTORY,
+window)`` norms are known; skipped and non-finite norms never enter the history. Spike skips count
+in the P1.12 stop rule with the non-finite ones (one run of consecutive skips, one fraction;
+:meth:`Trainer._stop_rule`), whose message then names both. The count and the history go into the
+checkpoint (only with the guard on) and ``History.measured["skipped_spike_steps"]``; every skipped
+step, with its reason, is in :attr:`Trainer.skipped_steps`. The guard reads the same host float as
+P1.12's, so it adds no device synchronisation and leaves P2.8's captured graphs alone; under an fp16
+``GradScaler`` it is refused. :func:`spike_decision` is the pure rule (evidence scripts use it). The
+factor: 100 sits at the edge of ordinary variation. On the stored runs it would skip 55 steps in 17
+of the 108 runs that did not fail, learners among them (steps of 180 to 572 times the median in exps
+65, 154, 155 and 161); exp 171's jump (7e10 times) and the peak of exp 170's burst (5e14 times) are
+caught at any factor up to about 1e10, so 1e3 to 1e4 is the safer choice for experiments (only 3
+runs skip anything at 1e4). The default stays ``None`` (off).
+
+**Divergence dumps (P1.15).** With ``train.divergence_dump`` (on by default) each step starts with
+a snapshot of what it starts from (:meth:`Trainer._take_snapshot`: the loader position, the
+generators, copies of the carried state and the buffers, the counters; host-side work and device
+copies, no synchronisation), and the first step a guard skips writes it, with the parameters,
+optimiser and scheduler as they still are, as a checkpoint-format dump in ``run_dir``
+(:mod:`hsn.train.divergence`, :meth:`Trainer._on_skip`) for a deterministic replay. Nothing in the
+training changes: the snapshot only reads. :attr:`Trainer.grad_hook` (``None``; the replay's) is
+called after a step's backward, before the clipping.
+
 **Optimiser (P2.6).** ``train.optimizer=adamw`` builds ``torch.optim.AdamW`` with weight decay on
 the tensors of ``ndim >= 2`` and none on the rest; ``train.optimizer=lazy_adamw`` builds the same
 groups as a :class:`~hsn.train.lazy_adam.LazyAdamW` with the unit bank's stacked tensors in unit
@@ -96,13 +128,15 @@ ones above. A model without an HSN cell refuses the keys (the configuration alre
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import hashlib
 import json
 import logging
 import math
+import statistics
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -124,7 +158,7 @@ from hsn.device import (
     set_deterministic,
     synchronize,
 )
-from hsn.eval.evaluate import DEFAULT_METRICS, Metric, evaluate_windows
+from hsn.eval.evaluate import DEFAULT_METRICS, Metric, PositionGroups, evaluate_windows
 from hsn.train.amp import autocast_ctx, autocast_name, make_grad_scaler
 from hsn.train.checkpoint import (
     capture_rng_state,
@@ -133,6 +167,7 @@ from hsn.train.checkpoint import (
     restore_rng_state,
     save_checkpoint,
 )
+from hsn.train.divergence import StepSnapshot, persistent_buffers, write_dump
 from hsn.train.lazy_adam import build_lazy_adamw, cell_parameters
 
 __all__ = [
@@ -140,6 +175,8 @@ __all__ = [
     "NONFINITE_MAX_FRACTION",
     "NONFINITE_MIN_SKIPS",
     "SCHEDULES",
+    "SPIKE_MIN_HISTORY",
+    "SPIKE_WINDOW",
     "BudgetExhaustedError",
     "FitCallback",
     "History",
@@ -150,6 +187,7 @@ __all__ = [
     "Trainer",
     "Trial",
     "detach_state",
+    "spike_decision",
 ]
 
 logger = logging.getLogger("hsn.train")
@@ -170,6 +208,31 @@ NONFINITE_MAX_CONSECUTIVE = 10
 #: its steps so far (30 of a 3,000-step run, 120 of 12,000).
 NONFINITE_MAX_FRACTION = 0.01
 NONFINITE_MIN_SKIPS = 10
+
+# P1.15: the gradient-spike guard (module docstring). train.spike_factor turns it on and
+# train.spike_window sets its window (default SPIKE_WINDOW; the stored runs' spike ratios barely
+# change between windows of 25 and 200 steps); the minimum history is a module constant, as P1.12's.
+#: The default window: the running median reads the last 100 applied (finite, not skipped) norms.
+SPIKE_WINDOW = 100
+#: The guard decides once it has seen min(SPIKE_MIN_HISTORY, window) applied norms (the warm-up's
+#: first steps fall fast: exp 171 went from 4.2 to 0.4 in ten steps).
+SPIKE_MIN_HISTORY = 20
+
+
+def spike_decision(
+    grad_norm: float, history: Collection[float], factor: float, window: int = SPIKE_WINDOW
+) -> tuple[bool, float | None]:
+    """P1.15: ``(skip, median)`` for a finite ``grad_norm`` against ``history``, the applied norms
+    so far (the last ``window`` of them are read): skip when there are at least
+    ``min(SPIKE_MIN_HISTORY, window)`` and ``grad_norm > factor * median``. ``median`` is None below
+    the minimum history. A pure function: the trainer and the evidence scripts share it."""
+    if window < 1:
+        raise ValueError(f"window must be >= 1, got {window}")
+    recent = list(history)[-window:]
+    if len(recent) < min(SPIKE_MIN_HISTORY, window):
+        return False, None
+    median = statistics.median(recent)
+    return bool(grad_norm > factor * median), float(median)
 
 
 def _skipped_counter(extra: Mapping[str, Any], key: str, path: str) -> int:
@@ -505,10 +568,34 @@ class Trainer:
         # consecutive ones (the stop rule's)
         self.skipped_nonfinite = 0
         self._skip_streak = 0
+        # P1.15: the gradient-spike guard (train.spike_factor; None: off), its skips and the history
+        # of applied finite norms its median reads; every skipped step with its reason
+        self.spike_factor: float | None = train.spike_factor
+        self.spike_window = train.spike_window
+        if self.spike_factor is not None and self.scaler is not None:
+            raise NotImplementedError(
+                f"train.spike_factor={self.spike_factor} under an fp16 GradScaler: the scaler "
+                "skips steps itself and the spike guard is not defined there"
+            )
+        self.skipped_spike = 0
+        self._spike_history: collections.deque[float] = collections.deque(maxlen=self.spike_window)
+        self.skipped_steps: list[dict[str, Any]] = []
+        # P1.15: the divergence dump (train.divergence_dump; hsn.train.divergence): the current
+        # step's snapshot, the written dump's summary, notes the harness adds to it, and a hook
+        # called with the trainer after a step's backward and before the clipping (the replay's;
+        # None by default)
+        self.divergence_dump: bool = train.divergence_dump
+        self._step_snapshot: StepSnapshot | None = None
+        self.divergence: dict[str, Any] | None = None
+        self.dump_notes: dict[str, Any] = {}
+        self.grad_hook: Callable[[Trainer], None] | None = None
         self._loader_state: dict[str, Any] | None = None
         self._carried_state: Any = None
         # P1.11: parallel streams of evaluate() (None = train.batch); a harness setting, not config
         self.eval_batch: int | None = None
+        # P1.15: labels of evaluate()'s loss positions (the reads-state harness's query slots,
+        # hsn.experiments.split); a harness setting, not config. None: today's evaluation
+        self.eval_position_groups: PositionGroups | None = None
 
     # construction ----------------------------------------------------------------------------
 
@@ -598,54 +685,135 @@ class Trainer:
         gradients are zeroed, the skip is counted and logged, and the caller leaves the optimiser
         alone (it still advances the scheduler). Raises (the stop rule) when the run keeps
         skipping. Under fp16 the ``GradScaler`` skips such steps itself: the guard returns False
-        and touches nothing."""
+        and touches nothing. P1.15: with the spike guard on, a finite norm leaves the run of
+        consecutive skips to :meth:`_guard_spike`, which may still skip the step."""
         if self.scaler is not None:
             return False
         if math.isfinite(grad_norm):
-            self._skip_streak = 0
+            if self.spike_factor is None:
+                self._skip_streak = 0
             return False
+        self._on_skip(step, "nonfinite", grad_norm)  # P1.15: the dump, before the zeroing
         self.optimizer.zero_grad(set_to_none=True)
         self.skipped_nonfinite += 1
         self._skip_streak += 1
-        skipped = self.skipped_nonfinite
+        self.skipped_steps.append(
+            {"step": step, "reason": "nonfinite", "grad_norm": repr(grad_norm)}
+        )
         logger.warning(
             "step %d: gradient norm %s is not finite; optimizer step skipped (%d skipped so far)",
             step,
             grad_norm,
-            skipped,
+            self.skipped_nonfinite,
+        )
+        self._stop_rule(step)
+        return True
+
+    def _guard_spike(self, grad_norm: float, step: int) -> bool:
+        """P1.15's gradient-spike guard (module docstring) for ``step`` with the finite global
+        gradient norm ``grad_norm`` (before clipping), when ``train.spike_factor`` is set. True
+        means the step is skipped exactly as a non-finite one (:meth:`_guard_nonfinite`);
+        otherwise the norm joins the history of applied norms. The skip counts in the P1.12 stop
+        rule (:meth:`_stop_rule`)."""
+        factor = self.spike_factor
+        if factor is None:
+            return False
+        skip, median = spike_decision(grad_norm, self._spike_history, factor, self.spike_window)
+        if not skip:
+            self._skip_streak = 0
+            self._spike_history.append(float(grad_norm))
+            return False
+        self._on_skip(step, "spike", grad_norm)  # the dump, before the zeroing
+        self.optimizer.zero_grad(set_to_none=True)
+        self.skipped_spike += 1
+        self._skip_streak += 1
+        self.skipped_steps.append(
+            {"step": step, "reason": "spike", "grad_norm": float(grad_norm), "median": median}
+        )
+        logger.warning(
+            "step %d: gradient norm %.4g is %.3g times the median %.4g of the last %d applied "
+            "steps (train.spike_factor %g); optimizer step skipped (%d spikes skipped so far)",
+            step,
+            grad_norm,
+            grad_norm / median if median else math.inf,
+            median,
+            len(self._spike_history),
+            factor,
+            self.skipped_spike,
+        )
+        self._stop_rule(step)
+        return True
+
+    def _stop_rule(self, step: int) -> None:
+        """P1.12's stop rule over every skipped step (P1.15: non-finite and spike skips together,
+        decision D4): raises after :data:`NONFINITE_MAX_CONSECUTIVE` consecutive skips, or at
+        :data:`NONFINITE_MIN_SKIPS` and more than :data:`NONFINITE_MAX_FRACTION` of the steps.
+        Without spike skips the messages are P1.12's."""
+        skipped = self.skipped_nonfinite + self.skipped_spike
+        spikes = self.skipped_spike
+        what = (
+            "a non-finite gradient norm"
+            if spikes == 0
+            else f"a non-finite gradient norm or a gradient spike ({self.skipped_nonfinite} "
+            f"non-finite, {spikes} gradient spikes)"
         )
         if self._skip_streak >= NONFINITE_MAX_CONSECUTIVE:
             raise RuntimeError(
-                f"step {step}: {self._skip_streak} consecutive optimizer steps skipped for a "
-                f"non-finite gradient norm (limit {NONFINITE_MAX_CONSECUTIVE}); {skipped} of "
+                f"step {step}: {self._skip_streak} consecutive optimizer steps skipped for "
+                f"{what} (limit {NONFINITE_MAX_CONSECUTIVE}); {skipped} of "
                 f"{step} steps skipped so far. The run is not training: stopping (P1.12 stop rule)"
             )
         if skipped >= NONFINITE_MIN_SKIPS and skipped > NONFINITE_MAX_FRACTION * step:
             raise RuntimeError(
-                f"step {step}: {skipped} of {step} steps skipped for a non-finite gradient norm "
+                f"step {step}: {skipped} of {step} steps skipped for {what} "
                 f"(more than {NONFINITE_MAX_FRACTION:.0%} of the steps, and at least "
                 f"{NONFINITE_MIN_SKIPS}). The run is not training reliably: stopping (P1.12 stop "
                 "rule)"
             )
-        return True
 
-    def _guard_extra(self) -> dict[str, int]:
-        """The guard's counts for a checkpoint's ``extra`` (P1.12)."""
-        return {
-            "skipped_nonfinite": self.skipped_nonfinite,
-            "skipped_nonfinite_streak": self._skip_streak,
+    def _guard_extra(self, counters: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """The guard's counts for a checkpoint's ``extra`` (P1.12; P1.15: with the spike guard on,
+        its count and the history of applied norms, so that a resumed run continues it; from
+        ``counters`` when given, the step snapshot's)."""
+        c = self._counters() if counters is None else counters
+        out: dict[str, Any] = {
+            "skipped_nonfinite": int(c["skipped_nonfinite"]),
+            "skipped_nonfinite_streak": int(c["skip_streak"]),
         }
+        if self.spike_factor is not None:
+            out["skipped_spike"] = int(c["skipped_spike"])
+            out["spike_history"] = [float(x) for x in c["spike_history"]]
+        return out
 
     def _restore_guard(self, extra: Mapping[str, Any], path: str) -> None:
         """The guard's counts from a checkpoint's ``extra``: 0 when written before the guard;
-        a malformed count, or more consecutive skips than skips, raises."""
+        a malformed count, or more consecutive skips than skips, raises. P1.15: the spike guard's
+        count and history (absent: 0 and empty; a malformed history raises)."""
         skipped = _skipped_counter(extra, "skipped_nonfinite", path)
         streak = _skipped_counter(extra, "skipped_nonfinite_streak", path)
-        if streak > skipped:
+        spikes = 0
+        history: list[float] = []
+        if self.spike_factor is not None:
+            spikes = _skipped_counter(extra, "skipped_spike", path)
+            raw = extra.get("spike_history", [])
+            if (
+                not isinstance(raw, list)
+                or len(raw) > self.spike_window
+                or not all(isinstance(x, float) and math.isfinite(x) and x >= 0.0 for x in raw)
+            ):
+                raise ValueError(
+                    f"{path}: spike_history must be a list of at most {self.spike_window} finite "
+                    "non-negative floats"
+                )
+            history = list(raw)
+        if streak > skipped + spikes:
             raise ValueError(
                 f"{path}: skipped_nonfinite_streak={streak} exceeds skipped_nonfinite={skipped}"
+                + (f" + skipped_spike={spikes}" if spikes else "")
             )
         self.skipped_nonfinite = skipped
+        self.skipped_spike = spikes
+        self._spike_history = collections.deque(history, maxlen=self.spike_window)
         self._skip_streak = streak
 
     def _loader(
@@ -774,6 +942,7 @@ class Trainer:
         total_tokens = 0
         while self.step < steps:
             started = time.perf_counter()
+            snapshot = self._step_snapshot = self._take_snapshot(loader, state)  # P1.15
             self.optimizer.zero_grad(set_to_none=True)
             # host-side float64 accumulator: MPS has no float64 (P0.8 fix for profile:m_series)
             loss_sum = torch.zeros((), dtype=torch.float64)
@@ -782,6 +951,8 @@ class Trainer:
             tokens_in_step = 0
             for _ in range(train.grad_accum):
                 window = next(loader)
+                if snapshot is not None:
+                    snapshot.windows.append(window)
                 batch = self._to_device(window)
                 state = detach_state(state)
                 logits, state, _info = self._forward(batch, state)
@@ -802,12 +973,18 @@ class Trainer:
                     if self.scaler is not None:
                         scaled = self.scaler.scale(scaled)
                     scaled.backward()  # type: ignore[no-untyped-call]
+            if snapshot is not None:  # P1.15: the dump records the step's loss
+                snapshot.loss = float(loss_sum) / n_loss if n_loss else math.nan
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
+                if self.grad_hook is not None:  # P1.15: the replay's raw gradients
+                    self.grad_hook(self)
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
+                if not skipped and self.spike_factor is not None:  # P1.15
+                    skipped = self._guard_spike(grad_norm, self.step + 1)
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -876,8 +1053,16 @@ class Trainer:
             "steps": float(self.step),
             "compiled_windows": 0.0,  # P2.8: the generic trainer never compiles
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
+            **self._spike_measured(),  # P1.15
         }
         return history
+
+    def _spike_measured(self) -> dict[str, float]:
+        """P1.15: ``skipped_spike_steps`` for ``History.measured``, only with the guard on (a rule
+        on it reads missing, never a false 0, when the guard did not run)."""
+        if self.spike_factor is None:
+            return {}
+        return {"skipped_spike_steps": float(self.skipped_spike)}
 
     # evaluation ------------------------------------------------------------------------------
 
@@ -914,6 +1099,7 @@ class Trainer:
                 autocast=autocast_ctx(self.ctx),
                 group_of_doc=torch.tensor(ids, dtype=torch.int64),
                 group_names=names,
+                position_groups=self.eval_position_groups,  # P1.15 (None: no extra groups)
             )
         result["n_docs"] = len(ds)
         return result
@@ -928,13 +1114,6 @@ class Trainer:
     def save(self, run_dir: str | Path, loader: StreamLoader, state: Any) -> Path:
         """Write ``step_<step>.pt`` into ``run_dir`` with everything a bit-exact resume needs."""
         path = checkpoint_path(run_dir, self.step)
-        extra: dict[str, Any] = {
-            "config_hash": self.config_hash,
-            "model_name": self.cfg.model_name,
-            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
-            "carried_state": _map_state(detach_state(state), lambda t: t.cpu()),
-            **self._guard_extra(),  # P1.12
-        }
         save_checkpoint(
             path,
             self.model,
@@ -943,10 +1122,59 @@ class Trainer:
             self.step,
             capture_rng_state(),
             loader.state_dict(),
-            extra=extra,
+            extra=self._checkpoint_extra(state),
         )
         logger.info("checkpoint %s", path)
         return path
+
+    def _checkpoint_extra(
+        self, state: Any, counters: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """A checkpoint's ``extra``: the configuration's identity, the scaler, the carried state
+        and the guards' counts (P1.15: ``counters``, a :meth:`_counters` dict, replaces the
+        current ones; the divergence dump writes the step's start)."""
+        return {
+            "config_hash": self.config_hash,
+            "model_name": self.cfg.model_name,
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "carried_state": _map_state(detach_state(state), lambda t: t.cpu()),
+            **self._guard_extra(counters),  # P1.12
+        }
+
+    def _counters(self) -> dict[str, Any]:
+        """P1.15: the trainer's counters a checkpoint carries (copies), for the step snapshot."""
+        return {
+            "skipped_nonfinite": self.skipped_nonfinite,
+            "skip_streak": self._skip_streak,
+            "skipped_spike": self.skipped_spike,
+            "spike_history": [float(x) for x in self._spike_history],
+        }
+
+    def _snapshot_state(self, state: Any) -> Any:
+        """P1.15: a device copy of the carried state (the step snapshot's)."""
+        return _map_state(detach_state(state), lambda t: t.clone())
+
+    def _take_snapshot(self, loader: StreamLoader, state: Any) -> StepSnapshot | None:
+        """P1.15: the step snapshot (:mod:`hsn.train.divergence`) while a dump may still be
+        written, else None (the dump off, already written, or an fp16 scaler: no guard)."""
+        if not self.divergence_dump or self.divergence is not None or self.scaler is not None:
+            return None
+        return StepSnapshot(
+            step=self.step,
+            loader_state=loader.state_dict(),
+            rng_state=capture_rng_state(),
+            state=self._snapshot_state(state),
+            buffers=persistent_buffers(self.model),
+            counters=self._counters(),
+        )
+
+    def _on_skip(self, step: int, kind: str, grad_norm: float) -> None:
+        """P1.15: called by a guard that skips ``step``, before it zeroes the gradients: the
+        divergence dump of the first such step (:func:`hsn.train.divergence.write_dump`)."""
+        snapshot = self._step_snapshot
+        if snapshot is None or self.divergence is not None:
+            return
+        write_dump(self, snapshot, step=step, kind=kind, grad_norm=grad_norm)
 
     def resume(self, path: str | Path) -> int:
         """Load a checkpoint written by :meth:`save` for this configuration; returns its step."""

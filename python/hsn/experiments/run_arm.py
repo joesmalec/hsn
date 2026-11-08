@@ -88,8 +88,9 @@ def _snapshot() -> dict[str, Any]:
 
 
 def _compact(record: dict[str, Any]) -> dict[str, Any]:
-    """The record the database keeps: everything but the per-probe lists (v1's and v2's)."""
-    lists = ("probes", "probes_v2")
+    """The record the database keeps: everything but the per-probe lists (v1's and v2's; P1.15:
+    v3's and its per-document originals). ``result.json`` keeps them all."""
+    lists = ("probes", "probes_v2", "probes_v3", "probes_v3_originals")
     out = {k: v for k, v in record.items() if k not in lists}
     if isinstance(out.get("at_stop"), dict):
         out["at_stop"] = {k: v for k, v in out["at_stop"].items() if k not in lists}

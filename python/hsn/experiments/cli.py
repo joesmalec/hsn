@@ -16,6 +16,9 @@
     import   --audit-dir DIR [--dry-run]
     probe-check --exp N [--batch-rows 64]
     probe-rerun --exp N [--cpu] [--batch-rows N] [--out FILE]   v1 vs the stored probes, then v2
+    split-backfill [--exp N ...] [--recompute] [--cpu] --out FILE   (P1.15; read-only database)
+    replay   --dump FILE | --exp N [--eager | --compiled] [--no-deterministic] [--repeats 2]
+             [--cpu] [--out FILE]      (P1.15: the divergence dump's step again)
     run-arm  --db DB --exp N --root ROOT       (the worker's child; not for direct use)
 
 Every command takes ``--db`` (default ``$HSN_EXPERIMENTS_DB`` or
@@ -102,6 +105,19 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--per-seed", action="store_true")
     p.add_argument("--format", choices=("md", "csv"), default="md")
     p.add_argument("--out", default=None)
+    p.add_argument(
+        "--split-backfill",
+        default=None,
+        help="a split-backfill JSON: the first/later split of runs stored before P1.15",
+    )
+
+    p = sub.add_parser(
+        "split-backfill", help="the first/later split of stored reads_state runs (read-only)"
+    )
+    p.add_argument("--exp", type=int, nargs="*", default=None)
+    p.add_argument("--recompute", action="store_true", help="evaluate kept checkpoints again")
+    p.add_argument("--cpu", action="store_true", help="recompute on profile:cpu in fp32")
+    p.add_argument("--out", required=True, help="JSON output (a markdown table goes next to it)")
 
     p = sub.add_parser("import", help="backfill the P1.10 audit's result JSONs")
     p.add_argument("--audit-dir", required=True)
@@ -116,6 +132,18 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--exp", type=int, required=True)
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
     p.add_argument("--batch-rows", type=int, default=None, help="default: the run's probe_batch")
+    p.add_argument("--out", default=None)
+
+    p = sub.add_parser("replay", help="replay a divergence dump's step (P1.15)")
+    where = p.add_mutually_exclusive_group(required=True)
+    where.add_argument("--dump", default=None, help="a divergence_<step>.pt file")
+    where.add_argument("--exp", type=int, default=None, help="the experiment's first dump")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--eager", dest="eager", action="store_true", default=None)
+    mode.add_argument("--compiled", dest="eager", action="store_false")
+    p.add_argument("--no-deterministic", dest="deterministic", action="store_false")
+    p.add_argument("--repeats", type=int, default=2)
+    p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32 (approximate)")
     p.add_argument("--out", default=None)
 
     p = sub.add_parser("run-arm", help=argparse.SUPPRESS)
@@ -274,7 +302,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             "SELECT e.exp_id, e.label, e.status, e.ended_at, e.card_status, r.verdicts_json, "
             "r.final_dev_accuracy, r.total_s, e.error, "
             "json_extract(r.record_json, '$.failure.reason') AS failure_reason, "
-            "json_extract(r.record_json, '$.failure.last_step') AS failure_step "
+            "json_extract(r.record_json, '$.failure.last_step') AS failure_step, "
+            # P1.15: the final evaluation's first/later split (absent before P1.15)
+            "json_extract(r.record_json, '$.final.\"split/first/accuracy\"') AS first_acc, "
+            "json_extract(r.record_json, '$.final.\"split/later/accuracy\"') AS later_acc "
             "FROM experiments e LEFT JOIN results r ON r.exp_id = e.exp_id "
             "WHERE e.status IN ('done', 'failed', 'stopped_early', 'cancelled') "
             f"AND e.imported = 0{where} ORDER BY e.ended_at DESC LIMIT ?",
@@ -314,7 +345,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     print(_table(rows, ["exp", "label", "pid", "worker", "started", "step", "dev acc"]))
     print(f"\nrecent ({len(recent)}):")
-    rows = []
+    recent_rows: list[tuple[Any, ...]] = []
     for r in recent:
         verdicts = loads(r["verdicts_json"]) or {}
         labels = "; ".join(
@@ -324,7 +355,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         if r["failure_reason"] is not None:  # P1.14: the partial record's failure, once
             labels = f"{r['status']} @ {r['failure_step']}: {r['failure_reason']}"
         acc = f"{r['final_dev_accuracy']:.4f}" if r["final_dev_accuracy"] is not None else ""
-        rows.append(
+        split = (
+            f"{r['first_acc']:.3f}/{r['later_acc']:.3f}"
+            if r["first_acc"] is not None and r["later_acc"] is not None
+            else ""
+        )
+        recent_rows.append(
             (
                 r["exp_id"],
                 r["label"],
@@ -332,10 +368,25 @@ def cmd_status(args: argparse.Namespace) -> int:
                 (r["ended_at"] or "")[:19],
                 r["card_status"] or "",
                 acc,
+                split,
                 labels or (err[0] if err else ""),
             )
         )
-    print(_table(rows, ["exp", "label", "status", "ended", "card", "dev acc", "verdicts / error"]))
+    print(
+        _table(
+            recent_rows,
+            [
+                "exp",
+                "label",
+                "status",
+                "ended",
+                "card",
+                "dev acc",
+                "first/later",
+                "verdicts / error",
+            ],
+        )
+    )
     return 0
 
 
@@ -382,6 +433,10 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     db = _db(args)
     statuses = [s.strip() for s in args.status.split(",")] if args.status else None
+    backfill = None
+    if args.split_backfill:  # P1.15
+        data = json.loads(Path(args.split_backfill).read_text(encoding="utf-8"))
+        backfill = {int(r["exp_id"]): r for r in data["runs"] if "tier" in r}
     report = build_report(
         db,
         sweep=args.sweep,
@@ -391,6 +446,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         protocol=args.protocol,
         imported=args.imported,
         per_seed=args.per_seed,
+        split_backfill=backfill,
     )
     text = format_csv(report) if args.format == "csv" else format_markdown(report)
     if args.out:
@@ -431,7 +487,54 @@ def cmd_probe_rerun(args: argparse.Namespace) -> int:
     text = json.dumps(out, indent=1, default=str)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
-    print(json.dumps({k: v for k, v in out.items() if k != "differ"}, indent=1, default=str))
+    shown = {k: v for k, v in out.items() if k not in ("differ", "v2_differ")}
+    print(json.dumps(shown, indent=1, default=str))
+    return 0
+
+
+def cmd_split_backfill(args: argparse.Namespace) -> int:
+    """P1.15: the split of stored runs, from a read-only database (hsn.experiments.split)."""
+    from hsn.experiments.split import backfill_split, backfill_table
+
+    db = Database(Path(args.db) if args.db else default_db_path(), read_only=True)
+    out = backfill_split(
+        db, args.exp, recompute=args.recompute, cpu=args.cpu, log=lambda line: print(line)
+    )
+    path = Path(args.out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=1, default=str) + "\n", encoding="utf-8")
+    table = path.with_suffix(".md")
+    table.write_text(backfill_table(out), encoding="utf-8")
+    done = [r for r in out["runs"] if "tier" in r]
+    print(f"wrote {path} and {table}: {len(done)} runs with a split, {len(out['runs'])} read")
+    return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """P1.15: replay a divergence dump's step (hsn.train.divergence.replay)."""
+    from hsn.train.divergence import dump_paths, replay
+
+    if args.dump:
+        path = Path(args.dump)
+    else:
+        db = Database(Path(args.db) if args.db else default_db_path(), read_only=True)
+        exp = db.experiment(args.exp)
+        result = db.row("SELECT json_path FROM results WHERE exp_id = ?", (args.exp,))
+        run_dir = exp["run_dir"] or (
+            str(Path(result["json_path"]).parent) if result and result["json_path"] else None
+        )
+        found = dump_paths(run_dir) if run_dir else []
+        if not found:
+            print(f"error: experiment {args.exp} has no divergence dump", file=sys.stderr)
+            return 2
+        path = found[0]
+    out = replay(
+        path, eager=args.eager, deterministic=args.deterministic, repeats=args.repeats, cpu=args.cpu
+    )
+    text = json.dumps(out, indent=1, default=str)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+    print(text)
     return 0
 
 
@@ -454,6 +557,8 @@ COMMANDS = {
     "import": cmd_import,
     "probe-check": cmd_probe_check,
     "probe-rerun": cmd_probe_rerun,
+    "split-backfill": cmd_split_backfill,
+    "replay": cmd_replay,
     "run-arm": cmd_run_arm,
 }
 

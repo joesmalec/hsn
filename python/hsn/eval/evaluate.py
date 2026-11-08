@@ -13,6 +13,11 @@ produce), carrying the recurrent state between consecutive windows exactly as tr
 returns the averages overall and per *group* (``"<task>/<variant>"`` by default, taken from the
 ``doc`` index of every position through ``group_of_doc``). Every accuracy is a fraction in
 ``[0, 1]`` (the unit :mod:`hsn.eval.metrics` expects); counts are integers.
+
+**Position groups (P1.15).** ``position_groups`` (optional, :class:`PositionGroups`) labels every
+loss position of a pass, for example by query slot (:class:`hsn.experiments.split.QuerySlots`); a
+second accumulator averages the same per-position values by those labels, reported under
+``"per_position_group"``. The overall and per-group results are computed exactly as without it.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +35,7 @@ __all__ = [
     "DEFAULT_METRICS",
     "Metric",
     "MetricAccumulator",
+    "PositionGroups",
     "bits_per_byte",
     "evaluate_windows",
     "nll",
@@ -38,6 +44,17 @@ __all__ = [
 
 Metric = Callable[[Tensor, Tensor], Tensor]
 Batch = dict[str, Tensor]
+
+
+class PositionGroups(Protocol):
+    """P1.15: labels of loss positions. ``names`` are the groups; :meth:`start` gives the labeller
+    of one pass, which maps a CPU window (the loader's fields) to ``[B, T]`` int64 indices into
+    ``names`` (every loss position labelled; values elsewhere are ignored)."""
+
+    @property
+    def names(self) -> Sequence[str]: ...
+
+    def start(self) -> Callable[[Mapping[str, Tensor]], Tensor]: ...
 
 
 def nll(logits: Tensor, targets: Tensor) -> Tensor:
@@ -168,6 +185,7 @@ def evaluate_windows(
     autocast: AbstractContextManager[object] | None = None,
     group_of_doc: Tensor | None = None,
     group_names: Sequence[str] = (),
+    position_groups: PositionGroups | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over consecutive ``windows`` without gradients and average the metrics.
 
@@ -176,9 +194,15 @@ def evaluate_windows(
     is initialised once and carried from window to window; the model applies ``reset`` itself.
     ``group_of_doc[d]`` (int64, on any device) is the index into ``group_names`` of document
     ``d``; when given, per-group results are reported under ``"per_group"``. The result also
-    carries ``n_windows`` and ``n_tokens`` (non-padding positions seen).
+    carries ``n_windows`` and ``n_tokens`` (non-padding positions seen). ``position_groups``
+    (P1.15, module docstring) adds ``per_position_group``.
     """
     accumulator = MetricAccumulator(metrics, group_names)
+    by_position: MetricAccumulator | None = None
+    labeller: Callable[[Mapping[str, Tensor]], Tensor] | None = None
+    if position_groups is not None:
+        by_position = MetricAccumulator(metrics, list(position_groups.names))
+        labeller = position_groups.start()
     if group_names and group_of_doc is None:
         raise ValueError("group_of_doc is required when group_names are given")
     groups = group_of_doc.to(device) if group_of_doc is not None else None
@@ -210,12 +234,17 @@ def evaluate_windows(
                     doc = window["doc"].to(device)
                     group_ids = groups[doc.clamp_min(0)]
                 accumulator.update(logits.float(), targets, loss_mask, group_ids)
+                if by_position is not None and labeller is not None:  # P1.15
+                    labels = labeller(window).to(device)
+                    by_position.update(logits.float(), targets, loss_mask, labels)
                 n_windows += 1
                 n_tokens += int((window["doc"] >= 0).sum())
     finally:
         if was_training:
             model.train()
     out = accumulator.result()
+    if by_position is not None:
+        out["per_position_group"] = by_position.result()["per_group"]
     out["n_windows"] = n_windows
     out["n_tokens"] = n_tokens
     return out

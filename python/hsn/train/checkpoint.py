@@ -164,17 +164,22 @@ def save_checkpoint(
     loader_state: Mapping[str, Any] | None,
     *,
     extra: Mapping[str, Any] | None = None,
+    model_state: Mapping[str, Any] | None = None,
 ) -> None:
-    """Write one checkpoint file atomically (see the module docstring for its contents)."""
+    """Write one checkpoint file atomically (see the module docstring for its contents).
+    ``model_state`` (P1.15's divergence dump) replaces ``model.state_dict()``; it must have the
+    same keys."""
     if step < 0:
         raise ValueError(f"step must be >= 0, got {step}")
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if model_state is not None and set(model_state) != set(model.state_dict()):
+        raise ValueError("model_state must have the model's state-dict keys")
     payload: dict[str, Any] = {
         "format": CHECKPOINT_FORMAT,
         "hsn_version": hsn.__version__,
         "step": int(step),
-        "model": model.state_dict(),
+        "model": model.state_dict() if model_state is None else dict(model_state),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "rng_state": dict(rng_state),

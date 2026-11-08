@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,18 @@ pytestmark = pytest.mark.usefixtures("isolated")
 
 
 def _open(path: str) -> int:
-    return dbm.Database(path, allow_tmp=True).version()
+    """One process's first open. P1.15: SQLite may answer a concurrent switch to WAL with
+    "database is locked" at once (the journal-mode change does not wait in the busy handler), seen
+    once under load locally and once on the hosted runner; a second process retries, as a worker
+    would. The test still checks that the concurrent opens migrate exactly once."""
+    for attempt in range(20):
+        try:
+            return dbm.Database(path, allow_tmp=True).version()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == 19:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def test_p1_11_db_schema_and_migrations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

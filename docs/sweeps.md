@@ -1,6 +1,6 @@
 # Experiment sweeps (P1.11)
 
-Status: P1.11, 7 Nov 2026; follow-ups P1.14, 7 Nov 2026. The harness turns one YAML file into many experiments,
+Status: P1.11, 7 Nov 2026; follow-ups P1.14, 7 Nov 2026, and P1.15, 8 Nov 2026. The harness turns one YAML file into many experiments,
 with no code change per experiment. Every experiment, past, present and future, is recorded in one SQLite
 database, which is also the queue. Code: `python/hsn/experiments/`. Command line:
 `python -m hsn.experiments <command>` or `hsn sweep <command>`.
@@ -11,6 +11,16 @@ P1.14 added:
 - [the mixed diagnostic cadence](#mixed-diagnostic-cadence) and [`min_samples`](#rules);
 - [probe v2](#probe-v2-the-vocabulary-matched-edit), the vocabulary-matched edit;
 - the write rate next to the gate quantiles.
+
+P1.15 added:
+- [the first/later split](#the-firstlater-split) of every reads_state evaluation, and a read-only
+  [backfill](#reports-and-import) for stored runs;
+- [probe v3](#probe-v3-key-addressed-edits): the value edit and the key swap of the later, key-addressed queries
+  (reads_state `version: 3`);
+- [the gradient-spike guard](#gradient-spikes-and-divergence-dumps) (`train.spike_factor`, `train.spike_window`)
+  and the divergence dump with its deterministic replay (`train.divergence_dump`, on by default);
+- [the presets](#rules) `memory_writes`, `reads_state_v3` and `binds_keys`, and `min_vocab` on
+  `reads_state_v2`.
 
 Existing specs expand to the same arms with the same ids.
 
@@ -54,6 +64,8 @@ families:                                   # optional per-family recipe, applie
 protocol: {name: reads_state, diag_every: 500, diag_docs: 32, eval_batch: 128, probe_batch: 64}
 # P1.14, all optional:  version: 2 (probe v2)   diag_dense_every: 25 (mixed cadence)
 #                       max_step_s: 2.0 + step_time_approval: "user, 7 Nov 18:19: E5 pair" (above 0.5 s)
+# P1.15, optional:      version: 3 (probe v3, after v1 and v2); and, as config overrides,
+#                       train.spike_factor=100 (the spike guard), train.divergence_dump=false (no dump)
 timing: false                               # true: the arm runs alone, on an idle card and CPU
 constants: {chance: 0.0208333}              # usable in rule values
 seeds: [0, 1, 2]
@@ -181,6 +193,74 @@ stored probes, then runs v2. On exps 46, 48 and 53 (CUDA, bf16) v1 reproduced ev
 
 For exp 53, 2 original answers were exact bf16 ties: one side's top-2 margin was 0.0.
 
+### The first/later split
+
+In a delayed/in_range document the first query always asks the first fact, so position alone answers it; the
+later queries (slots 1 to 3) ask facts by key, and the dev keys (bytes 112 to 127) never occur in training. Every
+strong model scores about 1.0 on first queries and about 0.60 on later ones, just under the audit's key-blind
+bound (0.800 overall, 0.623 on later queries). One dev accuracy hides that, so every reads_state evaluation now
+reports the split (`hsn.experiments.split`):
+- each evaluation entry carries `split`: `first`, `later` (slots 1 to 3 together), `later/1`, `later/2`,
+  `later/3`, each with `accuracy`, `loss` and `n`;
+- `final` carries it flattened: `split/first/accuracy`, `split/later/accuracy`, `split/later/1/n`, ...
+
+It is computed from the evaluation's own per-position values: the dev documents are parsed (each loss position
+must follow `QRY` and be a key, and slot 0 must ask the first fact; anything else raises), and a second
+accumulator averages the same values by slot. The frozen metric is computed exactly as before. The split is
+checked against it: the slots' positions, correct answers and losses must sum to the delayed/in_range group's,
+or the run raises. Rules read it as `eval:split/<g>/<metric>` (a step series) or `final:split/<g>/<metric>`.
+The dev set has 2,126 answers: 1,000 first queries and 1,126 later ones (661 / 404 / 61 by slot).
+
+### Probe v3: key-addressed edits
+
+`protocol: {name: reads_state, version: 3}` runs v1 and v2 unchanged, then v3 on every *later* query `QRY k v`
+of every dev delayed/in_range document. Each query gets two edits, each on its own copy of the document:
+- **the value edit:** fact k's value becomes a value of the model's answer vocabulary absent from the document.
+  The vocabulary is the value symbols the model answers at any query of the original documents, in v3's own
+  pass. The draw is `blake2b("hsn-probe-v3:value:0:<doc id>:<slot>")`. The probe *follows* when the answer at
+  that query changes to the new value. It tells whether the later answer is read from the state;
+- **the key swap:** the keys of fact k and of a partner fact j trade places (j is not k, not asked before this
+  slot, and has another value; drawn the same way). The probe *follows* when the answer changes to j's value.
+  A reader that binds keys follows. A key-blind reader (positions and exclusion only) does not change, because
+  no position or value moved. It tells whether the read is addressed by key.
+
+The value edit alone cannot tell the two readers apart: a key-blind reader that guesses fact k by position also
+reads k's value from its state, so it follows whenever its guess is right (36.6 % of later queries have a single
+eligible fact). Every probe also records its key-blind ambiguity: the number of facts a key-blind reader may
+assign to the slot (index w ≥ 1 with 2w ≥ 3·slot, not yet asked; the generator's rule and `ceiling_check.py`'s).
+
+`probe_v3` reports, for both edits, follow / other / unchanged over the later queries answered correctly before
+the edit, overall, by slot (`by_slot`) and by ambiguity (`by_ambiguity`: `single`, `multiple`), plus the
+vocabulary, the probe pass's own first/later accuracy (`pass_accuracy`) and the verdicts:
+- value edit (preset `reads_state_v3`): `no correct later queries` (none), `vocabulary too small` (below 20,
+  `min_vocab`), `too few correct later queries` (below 20 edited, `min_correct`), then v1's thresholds,
+  labelled for the later queries: `reads state (later queries)`, `does not read state (later queries)`,
+  `partial (later queries)`. A later answer read from the state; it says nothing of key binding, which is the
+  swap's verdict;
+- key swap (preset `binds_keys`): `no swap probes`, `too few swap probes` (below 20), `binds keys` (follow ≥ 0.5
+  and unchanged ≤ 0.1), `does not bind keys` (follow < 0.2), `partial`.
+
+Batching is v1's (rows truncated after their last scored position, a fresh state per row, chunks by length);
+`edit_probe_v3(..., reference=True)` is the per-row loop, equal to it exactly in fp64. The per-probe rows are in
+`result.json` (`probes_v3`, `probes_v3_originals`), not in the database. Oracle models in the tests pin the
+meaning: a reader that binds keys reads `binds keys`, a key-blind positional reader `does not bind keys`.
+
+`probe-rerun --exp N` (P1.15) also compares v2 with the stored v2 probes and runs v3. On the stored checkpoints
+(CUDA, bf16, `probe_batch` 64; 8 Nov 2026) v1 reproduced every stored answer of all four runs and v2 every
+stored answer of exp 136. v3, over the later queries answered correctly before each edit (vocabulary 48 in all
+four):
+
+| exp | model | later-query accuracy (probe pass) | value edit: follow / other / unchanged | key swap: follow / other / unchanged | value verdict | swap verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| 136 | HSN d=64 + A4, WSD 9k | 0.604 | 535 / 140 / 5 of 680 | 2 / 4 / 671 of 677 | reads state (later queries) | does not bind keys |
+| 154 | gru_2m, WSD 9k at 5e-4 | 0.604 | 532 / 139 / 9 of 680 | 0 / 1 / 676 of 677 | reads state (later queries) | does not bind keys |
+| 161 | gru_2m, WSD 15k at 5e-4 | 0.607 | 544 / 130 / 10 of 684 | 0 / 0 / 681 of 681 | reads state (later queries) | does not bind keys |
+| 119 | transformer_2m, 3k of 9k at 1.25e-4 | 0.239 | 92 / 153 / 24 of 269 | 0 / 1 / 265 of 266 | partial (later queries) | does not bind keys |
+
+Every model reads its later answers from its state (on queries with a single key-blind candidate the value edit
+is followed 96 to 97 % of the time by HSN and gru_2m) and none binds keys: swapping two facts' keys changes
+almost no answer. This is the audit's key-blind finding shown by an intervention.
+
 **`train_eval`**: train and evaluate, with optional diagnostics and `trained_state`. No probe.
 
 **`overfit`**: the G1 overfit recipe. The first `n_docs` (64) training documents are both train and dev, and the
@@ -274,9 +354,89 @@ status, it writes:
 - a `failure` block: `kind` (`nonfinite`, `step_time`, `oom`, `cancelled`, `interrupted` or `error`), `reason`,
   the error and the traceback's tail, the stage and the last completed step.
 
+P1.15: a run whose skips included gradient spikes stops with the kind `spike` (the same P1.12 rule). The partial
+record keeps `skipped_steps` and `divergence`.
+
 The status stays `failed` or `cancelled`, so the arm can be queued again. Every verdict that applies reads
 `failed: <reason> @ <step>`, which is never a pass and never a finding. A registered early stop keeps its
 `stopped early: ...` label and its full record, as before.
+
+### Gradient spikes and divergence dumps
+
+A divergence can be one finite jump. Exp 171 ran with gradient norms of 0.3 to 0.56, then one batch gave
+2.2e10 at step 1,269; P1.12's guard skips only non-finite norms, so clipping applied it, and the model broke.
+Finite spikes are common in the stored runs. On the 108 stored runs that did not fail, the guard (window 100)
+would skip 55 steps in 17 runs at factor 100, 21 steps in 5 runs at 1,000, and 16 steps in 3 runs at 10^4. Many
+of those runs learned anyway: gru_2m exp 161 (0.793) spiked 1.5e5 times its median at step 3,791. Others stayed
+at chance after early spikes: the gru_2m seeds of exps 122, 123, 144 and 145, and HSN exp 170, whose burst
+reached 5e14 at steps 1,345 to 1,363. In exp 171 every step before 1,269 is at most 4.5 times its median, so
+every factor from 5 to 6e10 skips step 1,269 and nothing before it. After a first skip the stored norms are not
+a counterfactual: a guarded run's later batches meet another model.
+
+**Choosing the factor.** 100 sits at the edge of ordinary variation: it would skip 55 steps in 17 of the 108
+runs, learners among them (exps 65, 154, 155 and 161 have steps of 180 to 572 times their median and learned).
+Exp 171's jump (7e10) and the peak of exp 170's burst (5e14) are caught at any factor up to about 1e10. For
+experiments, 1e3 to 1e4 is the safer choice: only 3 runs skip anything at 1e4. The default stays `None` (off).
+
+**The spike guard** (config, off by default):
+- `train.spike_factor` (None: off; 1e3 to 1e4 for experiments, 100 at the edge): skip a step whose finite
+  pre-clip global norm exceeds the factor times the median of the last `train.spike_window` (default 100)
+  applied norms. The guard decides once min(20, window) norms are known; skipped and non-finite norms never
+  enter the history.
+- A skip is P1.12's skip: gradients zeroed, no optimiser step, the scheduler advances. It is counted
+  (`final.skipped_spike_steps`, None with the guard off), logged, listed in `skipped_steps` with its reason, and
+  marked on its train entry (`skipped: spike`, the finite norm kept).
+- Spike and non-finite skips count together in P1.12's stop rule (10 consecutive, or more than 1 % with at least
+  10); the failure kind is then `spike`.
+- On P2.8's compiled path the guard reads the norm the step already copies to the host, after the compiled
+  backward: no device synchronisation and nothing changes in the captured graphs. It is refused under an fp16
+  `GradScaler`.
+- Cost, measured on the RTX 3060 (E1's compiled dense recipe, B32, median of steps 11 to 60, 3 processes each):
+  defaults 0.2399 / 0.2391 / 0.2386 s per step against 0.2405 / 0.2395 / 0.2393 on the base commit; with the
+  guard at 100, 0.2391 / 0.2388 / 0.2392; with the dump off, 0.2387. All within noise.
+
+**The divergence dump** (`train.divergence_dump`, on by default): at the first step a guard skips (non-finite,
+or a spike with the guard on) the trainer writes `divergence_<step>.pt` into the run directory, with a JSON
+sidecar. It is a checkpoint at the step before: the parameters, optimiser and scheduler (still pre-step at that
+point), and the step snapshot every step keeps (loader position, every generator, copies of the carried state
+and the buffers, the counters). It adds the event, the step's windows with their document ids, the resolved
+configuration, the versions and per-parameter gradient finiteness. It is 22.5 MB for ref_a1 at B32. The record's
+`divergence` names it. A failing write is logged and recorded, and training goes on.
+
+**Replay:**
+
+```bash
+python -m hsn.experiments replay --dump RUN_DIR/divergence_00001269.pt [--eager | --compiled] [--repeats 2] [--out FILE]
+python -m hsn.experiments replay --exp N            # the experiment's first dump (read-only database)
+```
+
+It rebuilds the trainer from the dump's configuration, resumes from the dump, checks the windows it regenerates
+against the stored ones, and runs the step again under deterministic kernels (and inductor's deterministic mode
+when compiled), as P1.13's CUDA golden test does. It reports:
+- the replayed loss and pre-clip norm against the recorded ones and against each other (deterministic replays
+  agree bit for bit);
+- the raw per-parameter gradient norms and the non-finite parameters;
+- eager, with `model.cand_norm=rms`, the RMS of the candidate norm's input (the near-zero hypothesis of exp 171).
+
+`--cpu` replays a CUDA dump in fp32 on the CPU; it is approximate (another device and dtype).
+
+**A real one (8 Nov 2026).** Exp 170/171's arm (HSN d=64 + A4, WSD at 2e-3) was rerun for 1,500 steps with the guard
+at 100 (scratch database, P1.15 evidence).
+- **Seed 0:** step 908 gave a norm of 2.2e16 (4e16 times its median) at a normal loss (3.88). The guard skipped it
+  and wrote the dump (22.5 MB). The next nine batches, with the weights frozen at step 907, gave 1e13 to 3.5e18
+  at normal losses, and P1.12's stop ended the run at step 917 (kind `spike`).
+- **Seed 1:** ran 1,500 steps without a spike.
+
+**The replay of seed 0's dump:**
+- compiled, under the deterministic modes, two replays agree bit for bit and give 2.27e16 (1.3 % from the
+  recorded norm);
+- eager they give 6.2e13: still a spike, and also identical twice;
+- the candidate norm's input RMS is at least 2.41 (median 3.01): the near-zero RMSNorm hypothesis is refuted for
+  this event;
+- the exploding gradient is spread over the cell's gate, `W_out`, the byte embedding, the encoder and the
+  shared transform, at a normal forward: it points at the backward through time, not at one singular operation.
+
+So at that point the weights made many batches' backward explode, not one outlier batch.
 
 ## Rules
 
@@ -292,7 +452,8 @@ are never changed here.
 
 **Metric sources**, written `source:key`:
 - step series:
-  - `eval:accuracy`, `eval:loss`, `eval:delayed/in_range/accuracy`;
+  - `eval:accuracy`, `eval:loss`, `eval:delayed/in_range/accuracy`; P1.15: `eval:split/later/accuracy` (and
+    `first`, `later/1` to `later/3`);
   - `diag:<key>`;
   - `train:loss|accuracy|grad_norm`;
 - scalars:
@@ -300,6 +461,8 @@ are never changed here.
   - `probe:<key>`, e.g. `correct_n`, `correct_follow_frac`, `correct_unchanged_frac`, `first_query_accuracy`;
   - `probe_v2:<key>` (P1.14, reads_state version 2), e.g. `correct_n`, `correct_follow_frac`, `vocab_size`,
     `matched_frac`;
+  - `probe_v3:<key>` (P1.15, reads_state version 3), e.g. `correct_later_n`, `vocab_size`, `value/correct_n`,
+    `value/follow_frac`, `value/unchanged_frac`, `swap/correct_n`, `swap/follow_frac`, `swap/unchanged_frac`;
   - `overfit:<key>`;
   - `final:<key>`;
   - `verdict:<rule>`, another rule's label.
@@ -335,9 +498,17 @@ first case that holds gives the label, the default otherwise. Special results:
 | preset | meaning | applies to |
 | --- | --- | --- |
 | `reads_state` | the audit's verdict on the probes answered correctly before the edit: reads state when ≥ 50 % follow the edit and ≤ 10 % are unchanged; does not read state when < 20 % follow; partial otherwise | every family |
-| `reads_state_v2` | P1.14: the same thresholds over probe v2's matched documents answered correctly before the edit, after `no matched probes` (0) and `too few matched probes` (< `min_correct`, 20). Needs reads_state version 2 | every family |
+| `reads_state_v2` | P1.14: the same thresholds over probe v2's matched documents answered correctly before the edit, after `no matched probes` (0) and `too few matched probes` (< `min_correct`, 20). P1.15: `min_vocab: 20` adds `vocabulary too small` after `no matched probes` (absent: the expansion is P1.14's). Needs reads_state version 2 | every family |
+| `reads_state_v3` | P1.15: probe v3's value edit over the correct later queries: `no correct later queries`, `vocabulary too small` (< `min_vocab`, 20), `too few correct later queries` (< `min_correct`, 20), then v1's thresholds labelled `reads state (later queries)`, `does not read state (later queries)`, `partial (later queries)`. Needs version 3 | every family |
+| `binds_keys` | P1.15: probe v3's key swap: `no swap probes`, `too few swap probes` (< `min_correct`, 20), `binds keys` (follow ≥ 0.5 and unchanged ≤ 0.1), `does not bind keys` (follow < 0.2), `partial`. Needs version 3 | every family |
+| `memory_writes` | P1.15: `writes` when, over the diagnostics in `[from_step, to_step]` (1,000 to 1,500), the median `gate/write_rate` ≥ `write_rate_min` (0.025) and the median `update_ratio/cell` ≥ `update_ratio_min` (0.001), each window with `min_samples` (3); else `no writes`. Parameters also `agg`. Provisional (see the caveat below) | hsn |
 | `memory_open` | gate p50 ≥ 0.01 and `grad_share/cell` ≥ 0.01 at every multiple of 500 from step 500 (as registered for queue9). Parameters: `from_step`, `to_step`, `every`, `agg`, `gate_p50_min`, `cell_share_min`, `window` (with `to_step`: the median over ±window at each multiple), `min_samples` (P1.14) | hsn |
 | `cells_apart` | `rank_pr/answer` ≥ 2.0 and `diversity_live/answer` ≥ 0.2 on the trained model | hsn |
+
+**`memory_writes` caveat.** Its thresholds come from the 16 stored runs that record the write rate (exps 128 to
+174), and the margins are thin: exp 174, a dead run, writes at 0.0275 against the 0.025 threshold, and the
+lowest learner (exp 128) at 0.034. Under Adam `update_ratio/cell` scales with the learning rate, so the 0.001
+threshold is calibrated for lr of about 1e-3 to 2.5e-3 only; set `update_ratio_min` for other rates.
 
 **Early stops.** `{name, at_steps, outcome, when, applies_to}`. Each is evaluated right after the evaluation and
 diagnostics of each listed step. It may read step series only, and never past its step. Every listed step must
@@ -411,13 +582,33 @@ that spec's verdict rules are evaluated again on the stored records of its arms,
 **Columns:**
 - verdict labels with seed counts;
 - final dev accuracy and loss as mean [min, max];
-- probe fractions; with probe v2 also `v2_follow`, `v2_unchanged`, `v2_vocab` and `v2_matched`;
+- P1.15: the first/later split, `first_acc`, `later_acc`, `later_1` to `later_3`, and `split_src` (`record`, or
+  `derived` / `recomputed` from a backfill file);
+- probe fractions; with probe v2 also `v2_follow`, `v2_unchanged`, `v2_vocab` and `v2_matched`; with probe v3
+  also `v3_follow`, `v3_unchanged`, `v3_vocab`, `swap_follow` and `swap_unchanged`;
 - `write_rate` (the trained model's) and `step_s` (the median step time);
 - early stops and failures (`<reason> @ <step>`);
 - train, total and compile seconds;
 - card and commits.
 
-`status` shows a failed or cancelled row as `failed @ <step>: <reason>`.
+`status` shows a failed or cancelled row as `failed @ <step>: <reason>`, and (P1.15) the final first/later split.
+
+**Split backfill (P1.15).** Runs stored before P1.15 have no split. `split-backfill [--exp N ...] [--recompute]
+[--cpu] --out FILE` opens the database read-only and writes FILE (JSON) and a markdown table next to it:
+- every stored reads_state record gets the derived split, the audit's hand reconstruction: first = the probe's
+  first-query accuracy, later = (dev × 2,126 − first × 1,000) / 1,126. It is approximate (the probe and the
+  evaluation round differently) and has no later slots;
+- with `--recompute`, a run whose checkpoint is kept is evaluated again, eager, with the slots: the exact split
+  with its later slots, and the recomputed overall accuracy against the stored one.
+
+`report --split-backfill FILE` fills the split columns of those runs.
+
+On 8 Nov 2026 (read-only snapshot of the database, CUDA) the backfill recomputed all 127 stored reads_state runs
+with a kept checkpoint. 113 reproduce their stored dev accuracy exactly, and the rest are within 4 answers of it
+(eager evaluation against the runs' compiled one). The derived split equals the audit's hand reconstruction
+(AUDIT.md, 02:52 and later). The recomputed later-query accuracy is within 2 answers of it for 12 of the 13
+runs listed there; exp 173 (d=128 at R*) is 7 answers off. Per later slot, HSN exp 136 scores 0.531 / 0.696 /
+0.803, and gru_2m exp 154 0.513 / 0.728 / 0.869.
 
 `import --audit-dir /home/joe/hsn-eff/evidence/EFF` backfills the audit's reads-state JSONs and its overfit
 summaries (`hsn/`, `e2/`) as imported runs of the pseudo-sweep `imported_audit`. Per file:

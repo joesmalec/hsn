@@ -317,6 +317,21 @@ class TrainConfig(_StrictModel):
     cell_lr_mult: float = Field(default=1.0, gt=0.0)
     cell_weight_decay: float | None = Field(default=None, ge=0.0)
     # --- end P1.13 ---
+    # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
+    # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
+    # the last spike_window applied finite norms (once min(20, spike_window) are known); counted
+    # in P1.12's stop rule. 100 sits at the edge of ordinary variation: on the stored runs it
+    # would skip 55 steps in 17 of 108 non-failed runs, learners among them (180x to 572x steps
+    # in exps 65, 154, 155, 161); exp 171's jump (7e10x) and the peak of exp 170's burst (5e14x)
+    # are caught at any factor up to about 1e10. For experiments 1e3 to 1e4 is the safer choice
+    # (only 3 runs skip anything at 1e4). spike_window is read only with spike_factor set (the
+    # user's request, 8 Nov).
+    spike_factor: float | None = Field(default=None, gt=1.0)
+    spike_window: int = Field(default=100, ge=1)
+    # write a dump of the pre-step state at the first step a guard skips (non-finite, or a spike
+    # with spike_factor set), for a deterministic replay (python/hsn/train/divergence.py)
+    divergence_dump: bool = True
+    # --- end P1.15 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
     micro_batch: int = Field(default=4, ge=1)
@@ -433,6 +448,13 @@ class TrainConfig(_StrictModel):
                 f"but train.schedule={self.schedule!r}; drop it or use wsd"
             )
         # --- end P1.13 ---
+        # --- P1.15: the spike window is read by the spike guard only ---
+        if self.spike_factor is None and self.spike_window != 100:
+            raise ValueError(
+                f"train.spike_window={self.spike_window} is read by the gradient-spike guard only, "
+                "but train.spike_factor is not set; drop it or set the factor"
+            )
+        # --- end P1.15 ---
         return self
 
 
