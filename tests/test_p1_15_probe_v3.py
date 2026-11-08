@@ -381,6 +381,11 @@ def test_p1_15_probe_rerun_and_report_v3(
     stored = json.loads(Path(out["checkpoint"]).parent.joinpath("result.json").read_text())
     for key in ("value", "swap", "vocab_size", "pass_accuracy"):
         assert out["v3"][key] == stored["probe_v3"][key], key
+    stored_db = db.row("SELECT record_json FROM results WHERE exp_id = ?", (exp_id,))
+    assert stored_db is not None
+    compact = json.loads(stored_db["record_json"])
+    assert "probes_v3" not in compact and "probes_v3_originals" not in compact
+    assert compact["probe_v3"] == stored["probe_v3"]  # the summary stays in the database
     row = build_report(db, per_seed=True).rows[0]
     assert row["v3_vocab"] == stored["probe_v3"]["vocab_size"]
     assert row["swap_follow"] == stored["probe_v3"]["swap/follow_frac"]
