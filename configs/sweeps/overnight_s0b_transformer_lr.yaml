@@ -54,7 +54,8 @@ arms:
     family: transformer
     overrides: [train.steps=9000, train.ckpt_every=9000]
     protocol: {steps: 3000}
-    grid: {train.lr: [0.001, 0.0005, 0.00025, 0.000125]}
+    # 6.25e-5 added 7 Nov: 1.25e-4 improved (0.580, exp 119), so the pre-approved further step on the best schedule
+    grid: {train.lr: [0.001, 0.0005, 0.00025, 0.000125, 0.0000625]}
   # added 7 Nov (the coordinator's union of both proposals: a 3x3 grid): cosine over 3,000
   - name: s0b_tf2m_cos3k
     family: transformer
