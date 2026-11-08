@@ -1,0 +1,341 @@
+{
+ "level": "L0",
+ "profile": "m_series",
+ "tag": "dense",
+ "git_revision": "0fb3c38f1a93577745c841e13cbc441179c912c8",
+ "torch": "2.15.0",
+ "config": "configs/experiments/g1_ref_a1.yaml",
+ "overrides": [],
+ "config_hash": "58214e04c7f8b71211a1a8bcdec66eb4ce568385f35fea49a1da65deb55b39f1",
+ "routing": "dense",
+ "gate_mode": "soft",
+ "batch": 16,
+ "unroll": 256,
+ "precision": "bf16",
+ "autocast": "torch.float16",
+ "compile_mode": "none",
+ "block": null,
+ "card": {
+  "status": "shared",
+  "rule": "shared when another process used >= 50% CPU in a listing (processes at >= 10% CPU listed, base names only)",
+  "cpu_processes": [
+   [
+    {
+     "pid": "766",
+     "cpu": "99.3",
+     "rss_kib": "7696",
+     "name": "BTLEServer"
+    },
+    {
+     "pid": "10499",
+     "cpu": "94.4",
+     "rss_kib": "173952",
+     "name": "spotlightknowledged"
+    },
+    {
+     "pid": "14396",
+     "cpu": "85.7",
+     "rss_kib": "244000",
+     "name": "python"
+    },
+    {
+     "pid": "1",
+     "cpu": "29.4",
+     "rss_kib": "27872",
+     "name": "launchd"
+    }
+   ],
+   [
+    {
+     "pid": "766",
+     "cpu": "99.1",
+     "rss_kib": "7696",
+     "name": "BTLEServer"
+    },
+    {
+     "pid": "10499",
+     "cpu": "94.1",
+     "rss_kib": "169696",
+     "name": "spotlightknowledged"
+    },
+    {
+     "pid": "14396",
+     "cpu": "53.3",
+     "rss_kib": "1091312",
+     "name": "python"
+    },
+    {
+     "pid": "20690",
+     "cpu": "21.8",
+     "rss_kib": "3017088",
+     "name": "com.apple.Virtualization.VirtualMachine"
+    }
+   ]
+  ]
+ },
+ "compile": {
+  "warm_steps": 3,
+  "warm_wall_s": 1.99,
+  "compile_seconds": 0.0,
+  "compile_steps": 0,
+  "startup_step_s": 0.508,
+  "note": "compile (cold: inductor's graph caches off); MPS has no CUDA Graphs; never inside the steady-state numbers"
+ },
+ "train_step": {
+  "steps": 60,
+  "repeats": 3,
+  "wall_ms_p50": 442.081,
+  "wall_ms_p95": 446.056,
+  "wall_ms_p50_by_repeat": [
+   442.293,
+   442.081,
+   442.278
+  ],
+  "tokens_per_s": 7140.4,
+  "launches_host": 39625,
+  "kernels_device": 39645,
+  "device_ms": 419.321,
+  "gpu_busy_fraction": 0.9485,
+  "bytes": {
+   "peak": 34660608,
+   "reserved": 4635361280
+  },
+  "launch_definitions": {
+   "launches_host": "dispatches of the serialised plain step that ran GPU work: aten ops at the dispatcher (a TorchDispatchMode) and inductor-generated Metal kernel calls",
+   "kernels_device": "GPU command buffers of the serialised plain step (Metal System Trace metal-gpu-intervals; one per dispatch there)",
+   "device_ms": "GPU busy time of a natural (unserialised) plain step: the union of its command buffers' GPU intervals"
+  }
+ },
+ "serving_step": [
+  {
+   "batch": 1,
+   "tokens": 200,
+   "latency_ms_p50": 0.875,
+   "latency_ms_p95": 1.7761,
+   "launches_host_per_token": -1,
+   "compile_s": 0.0
+  },
+  {
+   "batch": 16,
+   "tokens": 200,
+   "latency_ms_p50": 1.4701,
+   "latency_ms_p95": 1.5389,
+   "launches_host_per_token": -1,
+   "compile_s": 0.0
+  }
+ ],
+ "segments": {
+  "shared_path": {
+   "kernels_device": 6079.0,
+   "device_ms": 32.827,
+   "share_of_step": 0.0743,
+   "device_ms_serialised": 66.387
+  },
+  "scorer": {
+   "kernels_device": 2773.0,
+   "device_ms": 14.872,
+   "share_of_step": 0.0336,
+   "device_ms_serialised": 29.026
+  },
+  "messages": {
+   "kernels_device": 17344.0,
+   "device_ms": 133.386,
+   "share_of_step": 0.3017,
+   "device_ms_serialised": 260.797
+  },
+  "selected_cells": {
+   "kernels_device": 4773.0,
+   "device_ms": 202.444,
+   "share_of_step": 0.4579,
+   "device_ms_serialised": 400.451
+  },
+  "decode": {
+   "kernels_device": 16.0,
+   "device_ms": 0.516,
+   "share_of_step": 0.0012,
+   "device_ms_serialised": 0.995
+  },
+  "loss": {
+   "kernels_device": 42.0,
+   "device_ms": 0.181,
+   "share_of_step": 0.0004,
+   "device_ms_serialised": 0.347
+  },
+  "optimizer": {
+   "kernels_device": 302.0,
+   "device_ms": 2.004,
+   "share_of_step": 0.0045,
+   "device_ms_serialised": 3.972
+  },
+  "grad_accumulation": {
+   "kernels_device": 8258.0,
+   "device_ms": 24.598,
+   "share_of_step": 0.0556,
+   "device_ms_serialised": 47.936
+  },
+  "other": {
+   "kernels_device": 58.0,
+   "device_ms": 2.747,
+   "share_of_step": 0.0062,
+   "device_ms_serialised": 5.307
+  }
+ },
+ "attribution": {
+  "method": "MPS: Metal System Trace (xctrace) GPU intervals of a serialised plain step, each assigned to the dispatch range containing it (aten ops at the dispatcher); the range classified as on CUDA (Python stacks, backward through sequence_nr); segment from the HSN frames of the stack",
+  "kernels_total": 39645,
+  "unattributed_kernels": 0,
+  "unattributed_device_ms": 0.0,
+  "unattributed_top": {},
+  "other_top_ms": {
+   "hsn.py:1116 _window_epilogue / aten.amax.default": 4.26,
+   "hsn.py:929 forward / aten.stack.default": 2.082,
+   "hsn.py:930 forward / aten.stack.default": 1.881,
+   "hsn.py:928 forward / aten.stack.default": 1.402,
+   "hsn.py:925 forward / aten.stack.default": 1.385,
+   "hsn.py:927 forward / aten.stack.default": 1.342,
+   "hsn.py:926 forward / aten.stack.default": 1.337,
+   "hsn.py:1114 _window_epilogue / aten._softmax.default": 1.222,
+   "hsn.py:1115 _window_epilogue / aten._log_softmax.default": 1.217,
+   "hsn.py:1116 _window_epilogue / aten.abs.default": 0.391,
+   "hsn.py:1117 _window_epilogue / aten.mean.dim": 0.184,
+   "hsn.py:1118 _window_epilogue / aten.mean.dim": 0.106
+  },
+  "bytes_note": "allocator peak/reserved per step only; not separable per segment inside one window; DRAM traffic not measured; MPS: peak is a sampled high-water mark (hsn.device.memory_stats), reserved is torch.mps.driver_allocated_memory()"
+ },
+ "metal_trace": {
+  "xctrace": "xctrace version 16.0 (17E202)",
+  "template": "Metal System Trace",
+  "repeats": 3,
+  "natural": {
+   "step_wall_ms": [
+    454.026,
+    437.736,
+    437.57
+   ],
+   "command_buffers": [
+    635,
+    902,
+    644
+   ],
+   "gpu_busy_ms": [
+    428.744,
+    419.321,
+    416.333
+   ],
+   "gpu_busy_ms_median": 419.321
+  },
+  "serialised": {
+   "step_wall_ms": [
+    57924.573,
+    83475.71,
+    83046.193
+   ],
+   "command_buffers": [
+    39645,
+    40423,
+    40111
+   ],
+   "gpu_ms": [
+    829.45,
+    850.946,
+    801.664
+   ],
+   "dispatches_with_gpu_work": [
+    39625,
+    40405,
+    40093
+   ],
+   "aten_ops": 175966,
+   "compiled_kernel_calls": 0,
+   "encoders_per_command_buffer": {
+    "1": 120121,
+    "2": 29
+   },
+   "trace_chunks": 9,
+   "dispatches_per_chunk": 20000,
+   "chunk_pause_s": 218.0,
+   "intervals_contained": [
+    39645,
+    40423,
+    40111
+   ],
+   "intervals_partial": [
+    0,
+    0,
+    0
+   ],
+   "intervals_unassigned": [
+    0,
+    0,
+    0
+   ],
+   "assigned_fraction": [
+    1.0,
+    1.0,
+    1.0
+   ]
+  },
+  "serialised_over_natural": [
+   1.978,
+   2.029,
+   1.912
+  ],
+  "traces_kept": null,
+  "ktrace_temp_bytes_deleted": 5086911240,
+  "shares_by_repeat": {
+   "shared_path": [
+    0.0736,
+    0.0743,
+    0.0785
+   ],
+   "scorer": [
+    0.0332,
+    0.0336,
+    0.0337
+   ],
+   "messages": [
+    0.2982,
+    0.3053,
+    0.3017
+   ],
+   "selected_cells": [
+    0.4579,
+    0.4678,
+    0.4562
+   ],
+   "decode": [
+    0.0047,
+    0.0011,
+    0.0012
+   ],
+   "loss": [
+    0.0014,
+    0.0004,
+    0.0004
+   ],
+   "optimizer": [
+    0.0045,
+    0.0044,
+    0.0141
+   ],
+   "grad_accumulation": [
+    0.0548,
+    0.0556,
+    0.0564
+   ],
+   "other": [
+    0.0201,
+    0.0059,
+    0.0062
+   ]
+  },
+  "decision_by_repeat": [
+   "(L0 shares, not the decision) L2 justified: yes \u2014 selected_cells is 45.8% of step time at L0",
+   "(L0 shares, not the decision) L2 justified: yes \u2014 selected_cells is 46.8% of step time at L0",
+   "(L0 shares, not the decision) L2 justified: yes \u2014 selected_cells is 45.6% of step time at L0"
+  ],
+  "share_method": "proportional, median of repeats (the user's choices, 7 Nov 2026): per repeat, serialised segment GPU ms x median natural step GPU busy / that repeat's serialised GPU total; device_ms the median over repeats; share = that / step p50",
+  "decision_raw_cuda_formula": "(L0 shares, not the decision) L2 justified: yes \u2014 selected_cells is 90.6% of step time at L0"
+ },
+ "decision": "(L0 shares, not the decision) L2 justified: yes \u2014 selected_cells is 45.8% of step time at L0"
+}
