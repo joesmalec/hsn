@@ -1,0 +1,59 @@
+# Second sweep, block C step 1: the memory checks at the detecting recipe R, for both widths (the registered
+# gap rule: R is not a block B recipe). R = 3,000 steps of a 9,000-step schedule at lr 2e-3 (B32, warm-up 200,
+# cosine over 9,000), the lowest detecting lr: GRU 128x1 reads state there (exp 85) and 64x1 does not (exp 83).
+#
+# E1's design at R: dense HSN, B32, lr 2e-3, train.steps=9000 (the schedule), stopped at step 600 (protocol
+# steps), evaluation every 100, diagnostics every 25, compiled; d=64 (about 0.244 s per step, measured) and
+# d=128 (about 0.30 to 0.35 s per step, from P2.8's 12-step check), both within the 0.5 s rule.
+#
+# Pass rule (the registered memory check): over the 9 diagnostics at steps 400 to 600, the median gate p50
+# >= 0.01 and the median grad_share/cell >= 0.01; sat99/answer and gate p90 reported. If either width fails:
+# report and wait. If both pass: E2 at R (d=128 and d=64, 3,000 of the 9,000-step schedule, compiled, queue9's
+# verdicts and early stops unchanged).
+
+name: sweep2_c_memcheck
+description: memory checks at R = 3k of a 9k schedule, lr 2e-3, for HSN d=64 and d=128 (block C step 1)
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.002
+    - train.steps=9000
+    - train.eval_every=100
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, steps: 600, diag_every: 25, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    memory_check_600:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "diag:gate/p50", steps: {from: 400, to: 600, every: 25}, agg: median, op: ">=", value: 0.01}
+              - {metric: "diag:grad_share/cell", steps: {from: 400, to: 600, every: 25}, agg: median, op: ">=", value: 0.01}
+      default: fail
+    reads_state: {preset: reads_state}
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: c_memcheck_d64
+    family: hsn
+  - name: c_memcheck_d128
+    family: hsn
+    overrides: [model.d=128]
