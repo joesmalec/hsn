@@ -486,14 +486,11 @@ def test_p2_8_attribute_mps_segments_and_decision(ps: ModuleType) -> None:
     )
 
 
-def test_p2_8_segment_table_cuda_and_proportional(ps: ModuleType) -> None:
-    """CUDA: segment device time over the step p50, as it is. MPS: the serialised mix applied to
-    the natural step's GPU busy time, so the shares sum to the GPU busy fraction; the raw
-    serialised ms are kept."""
+def test_p2_8_segment_table_cuda(ps: ModuleType) -> None:
+    """CUDA: segment device time over the step p50, as it is (no serialised column)."""
     attribution = {
         "device_us": {"messages": 300.0, "selected_cells": 600.0, "other": 100.0},
         "kernels": {"messages": 3.0, "selected_cells": 2.0, "other": 1.0},
-        "gpu_us": 1000.0,
     }
     segments, shares = ps.segment_table(attribution, 2000.0)
     assert shares["selected_cells"] == pytest.approx(0.3) and shares["messages"] == 0.15
@@ -502,12 +499,35 @@ def test_p2_8_segment_table_cuda_and_proportional(ps: ModuleType) -> None:
         "device_ms": 0.6,
         "share_of_step": 0.3,
     }
-    segments, shares = ps.segment_table(attribution, 2000.0, natural_busy_us=500.0)
-    assert shares["selected_cells"] == pytest.approx(0.15) and shares["messages"] == 0.075
-    assert sum(shares.values()) == pytest.approx(500.0 / 2000.0)
+
+
+def test_p2_8_combine_repeats_proportional_median(ps: ModuleType) -> None:
+    """MPS: each serialised repeat's mix is applied to the median natural GPU busy time, and every
+    segment takes the median over repeats; the shares then sum to about the busy fraction, the
+    raw serialised medians are kept and the decision line reads the medians."""
+
+    def rep(messages: float, cells: float, other: float) -> dict[str, Any]:
+        return {
+            "device_us": {"messages": messages, "selected_cells": cells, "other": other},
+            "gpu_us": messages + cells + other,
+            "kernels": {"messages": 3.0},
+            "dispatches": 7,
+        }
+
+    repeats = [rep(300.0, 600.0, 100.0), rep(800.0, 800.0, 400.0), rep(200.0, 700.0, 100.0)]
+    combined, by_repeat = ps.combine_repeats(repeats, [500.0, 400.0, 900.0])
+    assert by_repeat[0]["messages"] == pytest.approx(150.0)  # 30 % of the median busy, 500
+    assert by_repeat[1]["selected_cells"] == pytest.approx(200.0)
+    assert combined["device_us"]["messages"] == pytest.approx(150.0)  # median of 150, 200, 100
+    assert combined["device_us"]["selected_cells"] == pytest.approx(300.0)  # of 300, 200, 350
+    assert combined["device_us_serialised"]["messages"] == 300.0
+    assert combined["gpu_us"] == 1000.0 and combined["dispatches"] == 7
+    segments, shares = ps.segment_table(combined, 2000.0)
     assert segments["messages"]["device_ms"] == 0.15
     assert segments["messages"]["device_ms_serialised"] == 0.3
     assert ps.decision_line(shares, "L1").startswith("L2 justified: no — selected_cells is 15.0%")
+    with pytest.raises(ValueError, match="serialised repeats"):
+        ps.combine_repeats(repeats, [500.0])
 
 
 def test_p2_8_mps_classifier_rules_on_hsn(ps: ModuleType) -> None:

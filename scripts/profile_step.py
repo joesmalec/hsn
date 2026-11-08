@@ -93,6 +93,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -966,6 +967,34 @@ def attribute_mps(
     }
 
 
+def combine_repeats(
+    repeats: list[dict[str, Any]], natural_busy_us: list[float]
+) -> tuple[dict[str, Any], list[dict[str, float]]]:
+    """The MPS attribution of ``n`` serialised repeats (:func:`attribute_mps`) and ``n`` natural
+    steps' GPU busy µs. A repeat's proportional segment µs are its serialised mix (segment over
+    the repeat's serialised GPU total) applied to the median natural GPU busy time; the result's
+    ``device_us`` is the median over repeats per segment, ``device_us_serialised`` the median of
+    the raw serialised µs, ``gpu_us`` the median serialised total. Counts and the breakdowns
+    (kernels, unattributed, other) are the first repeat's: the dispatches of every repeat are the
+    same ops. Returns the combined attribution and each repeat's proportional µs."""
+    if not repeats or len(repeats) != len(natural_busy_us):
+        raise ValueError(f"{len(repeats)} serialised repeats for {len(natural_busy_us)} natural")
+    busy = statistics.median(natural_busy_us)
+    by_repeat = []
+    for att in repeats:
+        total = att["gpu_us"]
+        factor = busy / total if total > 0 else 0.0
+        by_repeat.append({seg: att["device_us"].get(seg, 0.0) * factor for seg in SEGMENTS})
+    combined = dict(repeats[0])
+    combined["device_us"] = {seg: statistics.median(r[seg] for r in by_repeat) for seg in SEGMENTS}
+    combined["device_us_serialised"] = {
+        seg: statistics.median(att["device_us"].get(seg, 0.0) for att in repeats)
+        for seg in SEGMENTS
+    }
+    combined["gpu_us"] = statistics.median(att["gpu_us"] for att in repeats)
+    return combined, by_repeat
+
+
 def profile_mps(
     args: argparse.Namespace,
     trainer: TBPTTTrainer,
@@ -975,39 +1004,43 @@ def profile_mps(
     dev_ds: Any,
     horizon: int,
 ) -> tuple[int, int, float, dict[str, Any], dict[str, Any]]:
-    """The MPS counterpart of :func:`profile_cuda` (module docstring): a natural traced plain step,
-    then (at L1 after compiling a fresh window whose Metal kernels are serialised) a serialised
-    one in chunked traces. Returns host dispatches, command buffers, natural GPU busy µs, the
-    attribution and the trace record."""
+    """The MPS counterpart of :func:`profile_cuda` (module docstring): ``--trace-repeats`` natural
+    traced plain steps, then (at L1 after compiling a fresh window whose Metal kernels are
+    serialised) as many serialised ones in chunked traces, combined by :func:`combine_repeats`.
+    Returns host dispatches, command buffers, the median natural GPU busy µs, the attribution and
+    the trace record."""
     pid = os.getpid()
+    n = args.trace_repeats
+    if n < 1:
+        raise ValueError(f"--trace-repeats must be >= 1, got {n}")
     keep = bool(args.keep_trace)
     base = Path(args.trace_dir) if args.trace_dir else Path(tempfile.gettempdir())
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="hsn_metal_trace_", dir=base))
     stem = f"{args.profile}_{args.level}" + (f"_{args.tag}" if args.tag else "")
 
-    # a natural plain step under the trace (the next step; the recording stops at its end, before
-    # the closing stats step)
+    # n natural plain steps under one recording (it stops at the last one's end, before the
+    # closing stats step)
     natural_rec = metal_trace.Recording(work / f"{stem}_natural.trace", pid)
 
     def stop_natural(k: int) -> None:
-        if k == 2:
+        if k == n + 1:
             natural_rec.stop()
 
     with natural_rec:
         with step_marks(trainer, on_mark=stop_natural) as marks:
-            trainer.fit(train_ds, dev_ds, horizon + 2)
+            trainer.fit(train_ds, dev_ds, trainer.step + n + 1)
         synchronize(ctx.device)
-    if len(marks) < 2:
-        raise RuntimeError(f"the natural traced fit ran {len(marks)} steps; two expected")
+    if len(marks) < n + 1:
+        raise RuntimeError(f"the natural traced fit ran {len(marks)} steps; {n + 1} expected")
     natural_dir = work / f"{stem}_natural_export"
     natural_dir.mkdir(exist_ok=True)
     natural = metal_trace.gpu_intervals(natural_rec.out, pid, natural_dir)
-    n_lo, n_hi = marks[0], marks[1]
-    natural_step = [g for g in natural if n_lo <= g.start_ns < n_hi]
-    natural_busy_ns = metal_trace.busy_ns(natural, n_lo, n_hi)
-    if not natural_step:
-        raise RuntimeError("the natural traced step holds no GPU interval of this process")
+    windows = list(zip(marks[:n], marks[1 : n + 1], strict=True))
+    natural_busy_ns = [metal_trace.busy_ns(natural, lo, hi) for lo, hi in windows]
+    natural_cbs = [sum(1 for g in natural if lo <= g.start_ns < hi) for lo, hi in windows]
+    if not all(natural_cbs):
+        raise RuntimeError(f"a natural traced step holds no GPU interval ({natural_cbs})")
     if not keep:
         shutil.rmtree(natural_rec.out, ignore_errors=True)
         shutil.rmtree(natural_dir, ignore_errors=True)
@@ -1032,11 +1065,11 @@ def profile_mps(
         plain = compile_mod.CompiledWindow(model, ctx, window.mode, window.backend)
         trainer._compiled = plain
         del window
-        trainer.fit(train_ds, dev_ds, horizon + 4)  # compile the plain blocks
+        trainer.fit(train_ds, dev_ds, trainer.step + 2)  # compile the plain blocks
         provenance = mps_kernel_provenance(set(get_kernel_information_jsons()) - before)
 
-    # a serialised plain step in chunked traces, each dispatch classified as it runs (the closing
-    # stats step runs plain and untraced)
+    # n serialised plain steps in chunked traces, each dispatch classified as it runs (the
+    # closing stats step runs plain and untraced)
     classifier = MPSClassifier(provenance)
     mode = metal_trace.Serialised(metal_trace.mps_sync, classify=classifier)
     chunks = metal_trace.ChunkedTrace(
@@ -1050,7 +1083,7 @@ def profile_mps(
         )
 
     def switch(k: int) -> None:
-        if k == 2:  # the plain step is done: the stats step runs unserialised and untraced
+        if k == n + 1:  # the plain steps are done: the stats step runs unserialised, untraced
             mode.enabled = False
             if gate is not None:
                 gate.on = False
@@ -1061,51 +1094,58 @@ def profile_mps(
             gate.on = True
         with step_marks(trainer, on_mark=switch) as serial_marks:
             with mode:
-                trainer.fit(train_ds, dev_ds, horizon + (6 if args.level == "L1" else 4))
+                trainer.fit(train_ds, dev_ds, trainer.step + n + 1)
         if gate is not None:
             gate.on = False
-    if len(serial_marks) < 2:
-        raise RuntimeError(f"the serialised fit ran {len(serial_marks)} steps; two expected")
+    if len(serial_marks) < n + 1:
+        raise RuntimeError(f"the serialised fit ran {len(serial_marks)} steps; {n + 1} expected")
     if gate is not None and gate.calls == 0:
         raise RuntimeError(
             "the serialised L1 step ran no inductor Metal kernel through the wrapper (the window "
             "ran eager, or its libraries were compiled before serialise_mps_kernels)"
         )
-    s_lo, s_hi = serial_marks[0], serial_marks[1]
-    attribution = attribute_mps(mode.records, chunks.intervals, s_lo, s_hi)
+    serial_windows = list(zip(serial_marks[:n], serial_marks[1 : n + 1], strict=True))
+    repeats = [attribute_mps(mode.records, chunks.intervals, lo, hi) for lo, hi in serial_windows]
+    attribution, by_repeat = combine_repeats(repeats, [b / 1e3 for b in natural_busy_ns])
     encoders = metal_trace.encoders_per_command_buffer(
-        [g for g in chunks.intervals if s_lo <= g.start_ns < s_hi]
+        [g for g in chunks.intervals if serial_windows[0][0] <= g.start_ns < serial_windows[-1][1]]
     )
-    serial_ms = attribution["gpu_us"] / 1e3
-    natural_busy_ms = natural_busy_ns / 1e6
+    natural_busy_ms = [b / 1e6 for b in natural_busy_ns]
+    serial_ms = [att["gpu_us"] / 1e3 for att in repeats]
+
+    def ms(values: list[float]) -> list[float]:
+        return [round(v, 3) for v in values]
+
     trace_info: dict[str, Any] = {
         "xctrace": metal_trace.version(),
         "template": metal_trace.TEMPLATE,
+        "repeats": n,
         "natural": {
-            "step_wall_ms": round((n_hi - n_lo) / 1e6, 3),
-            "command_buffers": len(natural_step),
-            "gpu_busy_ms": round(natural_busy_ms, 3),
-            "gpu_interval_ms_sum": round(sum(g.duration_ns for g in natural_step) / 1e6, 3),
+            "step_wall_ms": ms([(hi - lo) / 1e6 for lo, hi in windows]),
+            "command_buffers": natural_cbs,
+            "gpu_busy_ms": ms(natural_busy_ms),
+            "gpu_busy_ms_median": round(statistics.median(natural_busy_ms), 3),
         },
         "serialised": {
-            "step_wall_ms": round((s_hi - s_lo) / 1e6, 3),
-            "command_buffers": attribution["kernels_total"],
-            "gpu_ms": round(serial_ms, 3),
-            "dispatches_with_gpu_work": attribution["dispatches"],
+            "step_wall_ms": ms([(hi - lo) / 1e6 for lo, hi in serial_windows]),
+            "command_buffers": [att["kernels_total"] for att in repeats],
+            "gpu_ms": ms(serial_ms),
+            "dispatches_with_gpu_work": [att["dispatches"] for att in repeats],
             "aten_ops": mode.calls,
             "compiled_kernel_calls": gate.calls if gate is not None else 0,
             "encoders_per_command_buffer": {str(k): v for k, v in encoders.items()},
             "trace_chunks": chunks.chunks,
             "dispatches_per_chunk": args.trace_chunk,
             "chunk_pause_s": round(chunks.pause_s, 1),
-            "intervals_contained": attribution["contained"],
-            "intervals_partial": attribution["partial"],
-            "intervals_unassigned": attribution["unassigned"],
-            "assigned_fraction": round(attribution["assigned_fraction"], 4),
+            "intervals_contained": [att["contained"] for att in repeats],
+            "intervals_partial": [att["partial"] for att in repeats],
+            "intervals_unassigned": [att["unassigned"] for att in repeats],
+            "assigned_fraction": [round(att["assigned_fraction"], 4) for att in repeats],
         },
-        "serialised_over_natural": round(serial_ms / natural_busy_ms, 3)
-        if natural_busy_ms > 0
-        else None,
+        "serialised_over_natural": [
+            round(s / statistics.median(natural_busy_ms), 3) for s in serial_ms
+        ],
+        "device_us_by_repeat": by_repeat,  # main() turns these into shares and decision lines
         "traces_kept": str(work) if keep else None,
         "ktrace_temp_bytes_deleted": natural_rec.ktrace_bytes + chunks.ktrace_bytes,
     }
@@ -1114,7 +1154,7 @@ def profile_mps(
     return (
         int(attribution["dispatches"]),
         int(attribution["kernels_total"]),
-        natural_busy_ns / 1e3,
+        statistics.median(natural_busy_ns) / 1e3,
         attribution,
         trace_info,
     )
@@ -1181,30 +1221,25 @@ def serving(
 
 
 def segment_table(
-    attribution: dict[str, Any], step_us: float, natural_busy_us: float | None = None
+    attribution: dict[str, Any], step_us: float
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
-    """Per segment: device kernels, device ms and the share of the step p50 ``step_us``. With
-    ``natural_busy_us`` (MPS, module docstring) the device ms are proportional (the segment's
-    share of the serialised GPU time, ``attribution["gpu_us"]``, applied to the natural step's GPU
-    busy time) and the raw serialised ms are kept as ``device_ms_serialised``; without it (CUDA)
-    the attributed device time as it is."""
-    proportional = 1.0
-    if natural_busy_us is not None:
-        total = attribution["gpu_us"]
-        proportional = natural_busy_us / total if total > 0 else 0.0
+    """Per segment: device kernels, device ms and the share of the step p50 ``step_us``. On MPS
+    the attribution's device µs are the proportional medians of :func:`combine_repeats` and its
+    raw serialised medians are kept as ``device_ms_serialised``; on CUDA the attributed device
+    time as it is."""
+    serialised = attribution.get("device_us_serialised")
     segments: dict[str, dict[str, float]] = {}
     shares: dict[str, float] = {}
     for name in SEGMENTS:
-        raw = attribution["device_us"].get(name, 0.0)
-        us = raw * proportional
+        us = attribution["device_us"].get(name, 0.0)
         shares[name] = us / step_us if step_us > 0 else 0.0
         segments[name] = {
             "kernels_device": round(attribution["kernels"].get(name, 0.0), 1),
             "device_ms": round(us / 1e3, 3),
             "share_of_step": round(shares[name], 4),
         }
-        if natural_busy_us is not None:
-            segments[name]["device_ms_serialised"] = round(raw / 1e3, 3)
+        if serialised is not None:
+            segments[name]["device_ms_serialised"] = round(serialised.get(name, 0.0) / 1e3, 3)
     return segments, shares
 
 
@@ -1240,6 +1275,13 @@ def main() -> None:
         "--keep-trace",
         action="store_true",
         help="MPS: keep the traces (in --trace-dir) for Instruments instead of deleting them",
+    )
+    ap.add_argument(
+        "--trace-repeats",
+        type=int,
+        default=3,
+        metavar="N",
+        help="MPS: natural and serialised traced steps; the shares are the median over them",
     )
     ap.add_argument(
         "--trace-chunk",
@@ -1309,15 +1351,25 @@ def main() -> None:
     mps = ctx.device.type == "mps"
 
     step_us = 1e6 * p50
-    segments, shares = segment_table(attribution, step_us, dev_us if trace_info else None)
+    segments, shares = segment_table(attribution, step_us)
     if trace_info is not None:
+        by_repeat = trace_info.pop("device_us_by_repeat")
+        trace_info["shares_by_repeat"] = {
+            seg: [round(r[seg] / step_us, 4) if step_us > 0 else 0.0 for r in by_repeat]
+            for seg in SEGMENTS
+        }
+        trace_info["decision_by_repeat"] = [
+            decision_line({seg: r[seg] / step_us for seg in SEGMENTS}, args.level)
+            for r in by_repeat
+        ]
         raw_shares = {
-            k: attribution["device_us"].get(k, 0.0) / step_us if step_us > 0 else 0.0
+            k: attribution["device_us_serialised"].get(k, 0.0) / step_us if step_us > 0 else 0.0
             for k in SEGMENTS
         }
         trace_info["share_method"] = (
-            "proportional (the user's choice, 7 Nov 2026): device_ms = serialised segment GPU "
-            "ms x natural step GPU busy / serialised step GPU total; share = that / step p50"
+            "proportional, median of repeats (the user's choices, 7 Nov 2026): per repeat, "
+            "serialised segment GPU ms x median natural step GPU busy / that repeat's "
+            "serialised GPU total; device_ms the median over repeats; share = that / step p50"
         )
         trace_info["decision_raw_cuda_formula"] = decision_line(raw_shares, args.level)
     if mps:
