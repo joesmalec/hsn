@@ -50,9 +50,11 @@
 #     more, not threshold noise;
 #   - learning onsets come late (exp 48: 0.022 at 2,000, 0.063 at 2,500; GRU 128x1 at lr 3e-3 between 1,500
 #     and 2,000), so dev accuracy is never a stop signal.
-# A non-finite objective needs no rule: the trainer raises on it (bf16 and fp32 have no loss scaler), and the
-# arm fails loudly. A stopped arm's verdicts read "stopped early: ...", never a pass; its probe and
-# trained_state are kept under at_stop.
+# Non-finite gradients need no early stop here: P1.12's guard skips a step whose gradient norm is not finite
+# (no optimiser step, the schedule advances) and itself stops the run (RuntimeError; the arm fails loudly) at
+# 10 consecutive skips or when at least 10 skips exceed 1 % of the steps, so a harness stop on its counter
+# would duplicate it. The verdict nonfinite_skips reports any skipped step. A stopped arm's verdicts read
+# "stopped early: ...", never a pass; its probe and trained_state are kept under at_stop.
 
 name: queue9
 description: P1.10 audit follow-up E2 to E6 at R* (B32, lr 1e-3) on delayed/in_range, with GRU positive controls
@@ -105,6 +107,14 @@ rules:
               - {metric: "trained:cell_spread/answer", op: "==", value: 0}
               - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
       default: not identical
+    # P1.12: optimiser steps the non-finite-gradient guard skipped (the trainer stops a run that keeps skipping)
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
   early_stop:
     - name: memory_shut_1500
       at_steps: [1500]

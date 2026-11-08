@@ -13,7 +13,8 @@
 # <= 0.03, dev loss >= 3.85. Reading: onset < 200 (lr still rising) means a gentler warm-up alone is unlikely to
 # save lr 3e-3; onset >= 200 with a gradual decline means one gentler-warm-up try is worth proposing; still open
 # at 600 means the shut comes later (report). The onset is read from the stored diagnostics series; the rules
-# below label the end state.
+# below label the end state. Non-finite gradients: P1.12's guard skips such steps and stops a run that keeps
+# skipping; the verdict nonfinite_skips reports any skip.
 
 name: queue9_onset
 description: P1.10 audit follow-up E1, the onset of the memory shut at lr 3e-3 (600 steps of the 3,000-step schedule)
@@ -59,6 +60,13 @@ rules:
               - {metric: "eval:delayed/in_range/accuracy", steps: {at: 600}, op: "<=", value: 0.03}
               - {metric: "eval:delayed/in_range/loss", steps: {at: 600}, op: ">=", value: 3.85}
       default: above chance
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
 arms:
   - name: e1_onset_lr3e-3
     family: hsn
