@@ -1,4 +1,4 @@
-# Approved by the user (via the coordinator, 8 Nov 2026 about 11:30): the T0 follow-ups and one low-factor spike-guard arm,
+# Approved by the user (via the coordinator, 8 Nov 2026 about 11:15): the T0 follow-ups and one low-factor spike-guard arm,
 # enqueued after S2 (exps 189 / 190). Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any
 # run. T0 (exps 185 / 187 / 188: top-K k 4 STE + cand_norm at 2.5e-3 / 2e-3 / 3e-3, WSD 3k) exploded through router -> byte_emb
 # within 450 to 860 steps (pre-clip norm medians 5e5 to 7e6); these arms separate A4 from the lr and test an early guard:
