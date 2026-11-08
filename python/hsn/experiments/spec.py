@@ -50,6 +50,17 @@ baseline would train eager under a compiled label), a family that does not match
 set (untested under P2.8's compiled window), ``routing=random`` with the reads-state protocol (its
 evaluation draws batch-shaped random numbers, so the batched probe would not match), protocol steps
 beyond the schedule, duplicate labels, and every check of :func:`hsn.experiments.rules.check_rules`.
+
+**P1.14 protocol keys** (approved with the P1.14 plan):
+- ``max_step_s`` and ``step_time_approval``: the step-time guard. Execution-only, so not in the id.
+- ``diag_dense_every`` and ``diag_windows``: the mixed cadence. The windows are derived from the
+  arm's rules at expansion; both keys are in the id only when not at their defaults, see
+  :data:`IDENTITY_DEFAULTS`.
+- reads_state ``version``: 2 adds probe v2. It fills the id's existing protocol-version slot, so
+  version 1 is today's payload.
+
+The step-time refusals happen at enqueue (:func:`hsn.experiments.db.enqueue_arms`), not here, so
+expansion of every existing spec is unchanged.
 """
 
 from __future__ import annotations

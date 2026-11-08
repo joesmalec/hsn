@@ -27,7 +27,9 @@ than the code raises):
   files, card status, peak GPU memory, exit code, error, run directory, progress; imported rows are
   marked;
 * ``results``: one row per finished experiment: the compact record (no per-probe list), the
-  verdicts, the early-stop record, the path of the full JSON and a few scalars;
+  verdicts, the early-stop record, the path of the full JSON and a few scalars. P1.14: also one row
+  per attempt that failed or was cancelled in its child, holding the partial record with its
+  ``failure`` block (``final_dev_accuracy`` NULL: not a final result);
 * ``meta``: ``paused`` and the like;
 * v2 adds ``experiments.protocol_json`` and ``experiments.config_json``: each attempt's own protocol
   (execution parameters included) and resolved configuration (its own ``run_id``), which the child

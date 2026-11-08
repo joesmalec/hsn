@@ -29,6 +29,22 @@ The record (:func:`run_protocol`'s result; :class:`hsn.experiments.rules.RecordV
 accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``probe`` (counts;
 ``probes`` holds every probe), ``overfit``, ``stopped`` / ``early_stop_log`` / ``at_stop``,
 ``walls``, ``measured``, ``compile`` and ``variant``.
+
+**P1.14.**
+- Every training record has ``step_time`` (the 0.5 s guard, :mod:`hsn.experiments.steptime`,
+  fed by the step callback; an arm above its ``max_step_s`` raises ``StepTimeExceeded``) and
+  ``protocol_version``.
+- A train entry with a non-finite loss, accuracy or gradient norm keeps ``null`` there and its
+  kind in ``nonfinite``.
+- With ``diag_dense_every`` the diagnostics sample the arm's mixed schedule
+  (:func:`hsn.experiments.rules.diag_schedule`).
+- reads_state version 2 runs probe v2 after v1 (``probe_v2``, ``probes_v2``).
+- On any exception the record built so far stays in ``ArmRun.record`` with a ``failure`` block
+  (:func:`failure_info`), and the exception propagates unchanged:
+  - after a raising fit: the evaluations, diagnostics, every completed step's train record, the
+    early-stop log and the walls, read from the live ``History`` the callback holds;
+  - otherwise what the earlier stages wrote.
+  ``run-arm`` stores it.
 """
 
 from __future__ import annotations
@@ -157,11 +173,6 @@ def failure_info(
     if skipped_nonfinite is not None:
         out["skipped_nonfinite"] = int(skipped_nonfinite)
     return out
-
-
-def failure_label(failure: Mapping[str, Any]) -> str:
-    """The verdict label of a failed arm (P1.14): never a case label, never a finding."""
-    return f"failed: {failure.get('reason')} @ {failure.get('last_step')}"
 
 
 # --------------------------------------------------------------------------------------------------

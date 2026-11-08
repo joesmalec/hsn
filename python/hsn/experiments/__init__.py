@@ -15,6 +15,14 @@ The reads-state protocol, its edit probe (:mod:`hsn.experiments.probe`), the tra
 the P1.10 efficiency audit's (branch ``hsn-efficiency``, ``f8884ec``), moved here as library code.
 Variants are harness-level and selected by name; they add no model configuration keys.
 
-The queue side (spec, rules, db, scheduler, machine, worker, report, importer, cli) imports without
-torch; only the protocols that train load it.
+The queue side (spec, rules, db, scheduler, machine, worker, report, importer, cli, steptime)
+imports without torch; only the protocols that train load it.
+
+P1.14 added:
+- failed and cancelled arms keep their partial record (:mod:`hsn.experiments.run_arm`);
+- the 0.5 s step-time guard (:mod:`hsn.experiments.steptime`);
+- the mixed diagnostic cadence and ``min_samples`` (:mod:`hsn.experiments.rules`);
+- probe v2, the vocabulary-matched edit (:mod:`hsn.experiments.probe`);
+- the gate write rate (:mod:`hsn.experiments.diagnostics`);
+- finishing process groups counted as ours (:mod:`hsn.experiments.worker`).
 """
