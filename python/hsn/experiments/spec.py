@@ -71,8 +71,10 @@ from hsn.experiments.rules import (
     Cadence,
     RuleSet,
     check_rules,
+    merge_windows,
     parse_rules,
     resolved_early_stop,
+    rule_windows,
 )
 from hsn.experiments.steptime import STEP_TIME_LIMIT_S
 
@@ -146,7 +148,27 @@ class _TrainParams(_Strict):
     step_time_approval: str = ""
 
 
-class ReadsStateParams(_TrainParams):
+Window = tuple[int, int]
+
+
+class _DiagCadence(_TrainParams):
+    """P1.14's mixed diagnostic cadence: with ``diag_dense_every`` > 0, diagnostics every
+    ``diag_dense_every`` steps inside ``diag_windows`` (the windows the arm's rules read, derived at
+    expansion and merged with any the spec gives) and every ``diag_every`` steps elsewhere."""
+
+    diag_dense_every: int = Field(default=0, ge=0)
+    diag_windows: tuple[Window, ...] = ()
+
+    @field_validator("diag_windows")
+    @classmethod
+    def _windows(cls, value: tuple[Window, ...]) -> tuple[Window, ...]:
+        for lo, hi in value:
+            if lo < 1 or hi < lo:
+                raise ValueError(f"a diagnostics window [lo, hi] needs 1 <= lo <= hi, got {lo, hi}")
+        return value
+
+
+class ReadsStateParams(_DiagCadence):
     """The 5(b) training recipe (in the spec's overrides) plus the 5(c) edit probe."""
 
     name: Literal["reads_state"]
@@ -157,7 +179,7 @@ class ReadsStateParams(_TrainParams):
     probe_batch: int = Field(default=64, ge=2)
 
 
-class TrainEvalParams(_TrainParams):
+class TrainEvalParams(_DiagCadence):
     name: Literal["train_eval"]
     diag_every: int = Field(default=0, ge=0)
     diag_docs: int = Field(default=32, ge=1)
@@ -165,7 +187,7 @@ class TrainEvalParams(_TrainParams):
     n_dev: int = Field(default=0, ge=0)
 
 
-class OverfitParams(_TrainParams):
+class OverfitParams(_DiagCadence):
     """The G1 overfit recipe: the first ``n_docs`` training documents as train and dev."""
 
     name: Literal["overfit"]
@@ -371,6 +393,11 @@ def config_view(cfg: RunConfig) -> dict[str, Any]:
     return view
 
 
+#: P1.14: protocol keys that enter the arm id only when they differ from these values, so that every
+#: arm from before them keeps its id
+IDENTITY_DEFAULTS: dict[str, Any] = {"diag_dense_every": 0, "diag_windows": []}
+
+
 def arm_identity(
     cfg: RunConfig,
     *,
@@ -384,7 +411,12 @@ def arm_identity(
     """``(arm_id, group_id)`` (module docstring). ``protocol`` is the protocol's full parameter
     dump; the execution-only parameters are dropped here."""
     name = str(protocol["name"])
-    science = {k: v for k, v in protocol.items() if k not in EXECUTION_ONLY}
+    science = {
+        k: v
+        for k, v in protocol.items()
+        if k not in EXECUTION_ONLY
+        and not (k in IDENTITY_DEFAULTS and _plain(v) == IDENTITY_DEFAULTS[k])
+    }
     payload: dict[str, Any] = {
         "config": config_view(cfg),
         "data": data,
@@ -396,6 +428,13 @@ def arm_identity(
     arm_id = digest(payload)
     payload["config"] = {k: v for k, v in payload["config"].items() if k != "seed"}
     return arm_id, digest(payload)
+
+
+def _plain(value: Any) -> Any:
+    """Tuples as lists (a dumped protocol and a stored one compare alike)."""
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
 
 
 def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str:
@@ -550,8 +589,30 @@ def _expand_one(
         raise SpecError(f"arm {entry.name}: protocol steps {steps} > train.steps {cfg.train.steps}")
     constants = {**spec.constants, **entry.constants}
     diag_every = int(getattr(protocol, "diag_every", 0))
+    dense = int(getattr(protocol, "diag_dense_every", 0))
+    windows: list[list[int]] = []
+    explicit = list(getattr(protocol, "diag_windows", ()))
+    if explicit and not dense:
+        raise SpecError(f"arm {label}: diag_windows needs diag_dense_every (P1.14's mixed cadence)")
+    if dense:
+        try:
+            derived = rule_windows(rules, family, protocol.name, steps)
+        except ValueError as exc:
+            raise SpecError(f"arm {label}: {exc}") from exc
+        windows = merge_windows([*explicit, *derived])
+        if not windows:
+            raise SpecError(f"arm {label}: diag_dense_every set, but no rule reads a diag: window")
+        protocol = protocol.model_copy(
+            update={"diag_windows": tuple((lo, hi) for lo, hi in windows)}
+        )
     cadence = Cadence.of(
-        steps, cfg.train.eval_every, diag_every, PROTOCOL_SOURCES[protocol.name], protocol.name
+        steps,
+        cfg.train.eval_every,
+        diag_every,
+        PROTOCOL_SOURCES[protocol.name],
+        protocol.name,
+        dense_every=dense,
+        windows=windows,
     )
     try:
         check_rules(rules, cadence, constants, family)

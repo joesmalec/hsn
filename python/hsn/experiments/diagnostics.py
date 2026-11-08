@@ -1,6 +1,7 @@
 """Training diagnostics of the P1.10 efficiency audit (``scripts/eff_overfit.py``, ``f8884ec``).
 
-Every ``every`` optimiser steps, per top-level module of the model:
+Every ``every`` optimiser steps (P1.14: or at the steps of an explicit ``schedule``, the mixed
+cadence of :func:`hsn.experiments.rules.diag_schedule`), per top-level module of the model:
 
 * ``update_ratio/<module>`` = ``||theta_after - theta_before|| / ||theta_after||`` for that step;
 * ``grad_share/<module>`` = ``||g_module|| / ||g_total||`` of the clipped (and unscaled) gradients,
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Collection
 from typing import Any
 
 import torch
@@ -97,6 +99,8 @@ class Diagnostics:
         docs: ByteDataset,
         every: int,
         n_docs: int = 4,
+        *,
+        schedule: Collection[int] | None = None,
     ) -> None:
         if every < 1:
             raise ValueError(f"Diagnostics every must be >= 1, got {every}")
@@ -104,6 +108,8 @@ class Diagnostics:
         self.cfg = cfg
         self.ctx = ctx
         self.every = every
+        # P1.14: an explicit set of steps (the mixed cadence) instead of the multiples of every
+        self.schedule = frozenset(schedule) if schedule is not None else None
         self.groups = module_groups(model)
         self.records: list[dict[str, Any]] = []
         self.optimizer_calls = 0
@@ -145,7 +151,8 @@ class Diagnostics:
                 f"guard) != optimiser call {self.optimizer_calls} without a loss scaler"
             )
         self._pending = None
-        if step % self.every == 0:
+        sampled = step in self.schedule if self.schedule is not None else step % self.every == 0
+        if sampled:
             with torch.no_grad():
                 before = {n: [p.detach().clone() for p in ps] for n, ps in self.groups.items()}
                 grads = {

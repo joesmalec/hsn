@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from hsn.config import RunConfig
-from hsn.experiments.rules import RuleSet, check_early_stop
+from hsn.experiments.rules import RuleSet, check_early_stop, diag_schedule
 from hsn.experiments.spec import (
     DryRunParams,
     OverfitParams,
@@ -369,17 +369,29 @@ def _train(
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
     trainer.eval_batch = params.eval_batch
     diag_every = params.diag_every
-    diag = Diagnostics(model, cfg, ctx, dev_ds, max(diag_every, 1), n_docs=params.diag_window_docs)
-    if diag_every:
+    # P1.14: the mixed cadence samples an explicit schedule; the single cadence keeps diag_every
+    dense = params.diag_dense_every > 0
+    schedule = diag_schedule(arm.steps, diag_every, params.diag_dense_every, params.diag_windows)
+    diag = Diagnostics(
+        model,
+        cfg,
+        ctx,
+        dev_ds,
+        max(diag_every, 1),
+        n_docs=params.diag_window_docs,
+        schedule=schedule if dense else None,
+    )
+    sampling = bool(schedule)
+    if sampling:
         diag.attach(trainer)
     audit_keys = isinstance(params, ReadsStateParams)
     guard = StepTimeGuard(
         limit_s=params.max_step_s,
         approval=params.step_time_approval,
-        diag_steps=frozenset(range(diag_every, arm.steps + 1, diag_every)) if diag_every else (),
+        diag_steps=frozenset(schedule),
         stats_every=cfg.train.stats_every,
     )
-    callback = _StepCallback(arm, diag if diag_every else None, audit_keys=audit_keys, guard=guard)
+    callback = _StepCallback(arm, diag if sampling else None, audit_keys=audit_keys, guard=guard)
     arm.walls["setup_s"] = time.perf_counter() - t0
 
     arm.stage = "train"
