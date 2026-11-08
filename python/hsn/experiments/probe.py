@@ -23,7 +23,8 @@ row its own fresh state with a reset in column 0 only, and reads the argmax at e
 ``p``. :func:`edit_probe_reference` is the audit's loop (one full document per forward, B = 1),
 kept for the tests and ``probe-check``. Batching changes GEMM row counts, so results agree with the
 reference exactly in fp64 and to about one ulp in fp32 / bf16; a near-tie (top-2 margin of the
-order of the rounding) can flip, which ``probe-check`` reports with its margin.
+order of the rounding) can flip, which ``probe-check`` reports with its margin. Both probes raise
+when no document is probed (P1.14).
 """
 
 from __future__ import annotations
@@ -159,6 +160,18 @@ def probe_items(dev: ByteDataset) -> list[ProbeItem]:
     return items
 
 
+def _probed(dev: ByteDataset) -> list[ProbeItem]:
+    """:func:`probe_items`, raising when there is none (P1.14: a probe of nothing is an error, not a
+    verdict)."""
+    items = probe_items(dev)
+    if not items:
+        raise ValueError(
+            f"edit probe: no document probed among {len(dev)} dev documents (none is a "
+            f"{PROBE_GROUP[0]}/{PROBE_GROUP[1]} document with a first-fact query)"
+        )
+    return items
+
+
 def _record(item: ProbeItem, a0: int, a1: int) -> dict[str, Any]:
     return {
         "doc": item.doc,
@@ -223,7 +236,7 @@ def edit_probe(
     ``margins`` adds the top-2 logit margins before and after the edit."""
     if batch_rows < 2 or batch_rows % 2:
         raise ValueError(f"batch_rows must be an even number >= 2, got {batch_rows}")
-    items = probe_items(dev)
+    items = _probed(dev)
     _check_model(model, items)
     order = sorted(range(len(items)), key=lambda j: (items[j].answer_pos, j))
     per_chunk = batch_rows // 2
@@ -275,7 +288,7 @@ def edit_probe_reference(
 ) -> list[dict[str, Any]]:
     """The audit's probe: for each probed document one forward of the whole document at B = 1,
     original then edited (``scripts/eff_reads_state.py`` at ``f8884ec``)."""
-    items = probe_items(dev)
+    items = _probed(dev)
     _check_model(model, items)
     was_training = model.training
     model.eval()
