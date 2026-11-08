@@ -56,6 +56,8 @@ arms:
     protocol: {steps: 3000}
     # 6.25e-5 added 7 Nov: 1.25e-4 improved (0.580, exp 119), so the pre-approved further step on the best schedule
     grid: {train.lr: [0.001, 0.0005, 0.00025, 0.000125, 0.0000625]}
+    # seeds 1 and 2 added 8 Nov (c3, coordinator): only the 1.25e-4 point is enqueued
+    seeds: [0, 1, 2]
   # added 7 Nov (the coordinator's union of both proposals: a 3x3 grid): cosine over 3,000
   - name: s0b_tf2m_cos3k
     family: transformer
