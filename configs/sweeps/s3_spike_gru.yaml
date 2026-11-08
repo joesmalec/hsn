@@ -1,0 +1,85 @@
+# Approved by the user (via the coordinator, 8 Nov 2026 about 10:25: "Approve all"; guard factor "100 for the test, 10,000 default"). Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run; drafted on main 80b893d (P1.15).
+# (S1) Does the gradient-spike guard rescue gru_2m seeds that spiked early and stayed at chance? gru_2m on WSD 0.2 at
+# 2.5e-3 (the queue9 baseline recipe, eager), seeds 1 and 2: originals exps 122 / 123 (3k) and 144 / 145 (9k), all at
+# chance, with early finite spikes (seed 1: 192x / 815x at steps 344 / 346; seed 2: 233x at 761, then 2,229x and a
+# 1.2e6 to 2.1e6x burst at 771 to 777). Guarded reruns (train.spike_factor) and matched unguarded reruns of the same
+# configuration (GPU training is not bitwise reproducible across processes: exps 122 / 144 already differ at step 346),
+# so the comparison is distributional. Comparison controls only (non-timing, eager, may share the card).
+
+name: s3_spike_gru
+description: "gru_2m WSD 2.5e-3 seeds 1-2: spike-guard reruns (factor 100; seed 2 also 1e4) with matched unguarded reruns"
+base:
+  config: configs/baselines/gru_2m.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=none
+    - train.batch=32
+    - train.micro_batch=32
+    - train.steps=3000
+    - train.eval_every=500
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - train.warmup_steps=200
+    - train.weight_decay=0.01
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.grad_clip=1.0
+    - train.lr=0.0025
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, version: 3, diag_every: 500, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: false
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [1, 2]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20}
+    reads_state_v3: {preset: reads_state_v3} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys} # the key swap: does the read follow the key
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    guard_fired:
+      cases:
+        - label: spikes skipped
+          when: {metric: "final:skipped_spike_steps", op: ">", value: 0}
+      default: no spike skipped
+    reads_any:
+      cases:
+        - label: reads state
+          when:
+            any:
+              - {metric: "verdict:reads_state", op: "==", value: "reads state"}
+              - {metric: "verdict:reads_state_v2", op: "==", value: "reads state"}
+      default: does not read state
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s3g_gru2m_9k_guard100
+    family: gru
+    overrides: [train.steps=9000, train.ckpt_every=9000, train.spike_factor=100]
+    protocol: {steps: 9000}
+  - name: s3g_gru2m_9k_noguard
+    family: gru
+    overrides: [train.steps=9000, train.ckpt_every=9000]
+    protocol: {steps: 9000}
+  - name: s3g_gru2m_9k_guard1e4 # the factor decision: skips only seed 2's 1e6x burst (seed 1's spikes stay below 1e3)
+    family: gru
+    overrides: [train.steps=9000, train.ckpt_every=9000, train.spike_factor=10000]
+    protocol: {steps: 9000}
+    seeds: [2]
+  - name: s3g_gru2m_3k_guard100
+    family: gru
+    overrides: [train.spike_factor=100]
+  - name: s3g_gru2m_3k_noguard
+    family: gru

@@ -1,0 +1,74 @@
+# Approved by the user (via the coordinator, 8 Nov 2026 about 10:25: "Approve all"; guard factor "100 for the test, 10,000 default"). Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run; drafted on main 80b893d (P1.15).
+# (T1) The top-K + cand_norm arm of T0 trained 9,000 steps (constant to 7,200), seeds 0, 1, 2, at lr 2.5e-3 (or T0's
+# healthy lr, 2e-3 before 3e-3). Compared with the dense arm (exps 136 / 138 / 139) on quality, the first / later split,
+# onset steps, probe v3 (value edit, key swap) and step time. No spike guard (as the dense arm); the dump is on.
+
+name: s3_topk_cand_9k
+description: "Top-K (k 4, STE) + cand_norm, d=64, WSD 0.2 over 9k at 2.5e-3, seeds 0-2 (probe v3)"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.0025
+    - train.steps=9000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.cand_norm=rms
+    - model.routing=topk
+    - model.k_select=4
+    - train.gate_mode=ste
+protocol: {name: reads_state, version: 3, steps: 9000, diag_every: 250, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state, group: {min_agree: 2}}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20, group: {min_agree: 2}}
+    reads_state_v3: {preset: reads_state_v3} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys} # the key swap: does the read follow the key
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    beats_bar:
+      cases:
+        - label: above 0.7930
+          when:
+            all:
+              - {metric: "eval:delayed/in_range/accuracy", steps: {at: 9000}, op: ">", value: 0.7930}
+      default: not above 0.7930
+    memory_writes: {preset: memory_writes} # write rate >= 0.025 and cell update ratio >= 0.001, 1,000 to 1,500
+    cells_apart: {preset: cells_apart}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s3_topk_cand_9k
+    family: hsn
+    seeds: [0, 1, 2]
