@@ -571,11 +571,40 @@ def test_p2_8_profile_step_refuses_cpu(ps: ModuleType, monkeypatch: pytest.Monke
             "L0",
         ],
     )
-    monkeypatch.setattr(ps, "cpu_processes", lambda limit=8: [])
+    monkeypatch.setattr(ps, "cpu_processes", lambda: [])
     cpu = SimpleNamespace(device=torch.device("cpu"))
     monkeypatch.setattr(ps, "build", lambda args: (None, cpu, None, None, None, None))
     with pytest.raises(RuntimeError, match="profiles a device queue"):
         ps.main()
+
+
+def test_p2_8_parse_ps_basenames_busy_only(ps: ModuleType) -> None:
+    """The card keeps busy processes (>= 10 % CPU) by base name: the profiles are published."""
+    out = (
+        "  766 99.5 7616 /usr/sbin/BTLEServer\n"
+        "  901  3.0 1000 /Applications/Some App.app/Contents/MacOS/Some App\n"
+        " 1200 45.1 819088 /Users/someone/hsn/.venv/bin/python\n"
+    )
+    assert ps.parse_ps(out) == [
+        {"pid": "766", "cpu": "99.5", "rss_kib": "7616", "name": "BTLEServer"},
+        {"pid": "1200", "cpu": "45.1", "rss_kib": "819088", "name": "python"},
+    ]
+
+
+def test_p2_8_mps_classifier_reads_package_frames(
+    ps: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A torch file named like an HSN file (under a directory named hsn, as the repo's .venv is)
+    does not classify; the package's own frames do, and name the label."""
+    venv = "/r/hsn/.venv/lib/python3.12/site-packages/torch/autograd/graph.py"
+    units = ps.PACKAGE_ROOT + "model/units.py"
+    classifier = ps.MPSClassifier({})
+    monkeypatch.setattr(ps, "python_frames", lambda skip=1: [(venv, 1, "run_backward")])
+    assert classifier("aten.mm.default") == (None, "(no hsn frame) / aten.mm.default")
+    frames = [(units, 7, "forward"), (venv, 1, "run_backward")]
+    monkeypatch.setattr(ps, "python_frames", lambda skip=1: frames)
+    shares, label = classifier("aten.mm.default")
+    assert shares == {"selected_cells": 1.0} and label.startswith("units.py:7 forward")
 
 
 def test_p2_8_machine_status_rule(ps: ModuleType) -> None:
@@ -584,7 +613,7 @@ def test_p2_8_machine_status_rule(ps: ModuleType) -> None:
     busy = quiet + [{"pid": "1", "cpu": "75.0", "rss_kib": "1", "name": "WindowServer"}]
     assert ps.machine_status([quiet, quiet]) == "idle"
     assert ps.machine_status([quiet, busy]) == "shared"
-    ps_itself = quiet + [{"pid": "2", "cpu": "90.0", "rss_kib": "1", "name": "/bin/ps"}]
+    ps_itself = quiet + [{"pid": "2", "cpu": "90.0", "rss_kib": "1", "name": "ps"}]
     assert ps.machine_status([ps_itself]) == "idle"
 
 

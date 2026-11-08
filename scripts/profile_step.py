@@ -223,9 +223,23 @@ def card_status(seen: list[list[dict[str, str]]]) -> str:
     return "shared" if any(counts(r) for listing in seen for r in listing) else "idle"
 
 
-def cpu_processes(limit: int = 8) -> list[dict[str, str]]:
-    """The busiest processes ``ps`` lists (pid, % CPU, RSS KiB, command), for the MPS ``card``:
-    an Apple GPU has no compute-process listing, and the CPU feeds a launch-bound step."""
+def parse_ps(out: str, min_cpu: float = 10.0) -> list[dict[str, str]]:
+    """The processes of a ``ps -Ao pid=,pcpu=,rss=,comm=`` listing using at least ``min_cpu`` % CPU,
+    busiest first: pid, % CPU, RSS KiB and the command's base name only (the profiles are
+    published; full paths name the user's home and applications)."""
+    rows = []
+    for line in out.strip().splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and float(parts[1]) >= min_cpu:
+            name = Path(parts[3].strip()).name
+            rows.append({"pid": parts[0], "cpu": parts[1], "rss_kib": parts[2], "name": name})
+    rows.sort(key=lambda r: float(r["cpu"]), reverse=True)
+    return rows
+
+
+def cpu_processes() -> list[dict[str, str]]:
+    """The busy processes now (:func:`parse_ps`), for the MPS ``card``: an Apple GPU has no
+    compute-process listing, and the CPU feeds a launch-bound step."""
     out = subprocess.run(
         ["ps", "-Ao", "pid=,pcpu=,rss=,comm="],
         capture_output=True,
@@ -233,13 +247,7 @@ def cpu_processes(limit: int = 8) -> list[dict[str, str]]:
         timeout=20,
         check=True,
     ).stdout
-    rows = []
-    for line in out.strip().splitlines():
-        parts = line.split(None, 3)
-        if len(parts) == 4:
-            rows.append({"pid": parts[0], "cpu": parts[1], "rss_kib": parts[2], "name": parts[3]})
-    rows.sort(key=lambda r: float(r["cpu"]), reverse=True)
-    return rows[:limit]
+    return parse_ps(out)
 
 
 def machine_status(seen: list[list[dict[str, str]]]) -> str:
@@ -248,7 +256,7 @@ def machine_status(seen: list[list[dict[str, str]]]) -> str:
     own = str(os.getpid())
 
     def busy(row: dict[str, str]) -> bool:
-        if row["pid"] == own or row["name"].endswith("/ps") or row["name"] == "ps":
+        if row["pid"] == own or row["name"] == "ps":
             return False
         return float(row["cpu"]) >= MPS_BUSY_SHARE
 
@@ -685,6 +693,8 @@ OPTIMIZER_FILES = (
 )
 #: inductor's profiling wrappers of extern calls (``trace.provenance_tracking_to_timeline``)
 EXTERN_PREFIX = "extern_kernels_"
+#: the frames the MPS segment rules read: the hsn package's own
+PACKAGE_ROOT = str(REPO / "python" / "hsn").replace("\\", "/") + "/"
 Shares = dict[str, float] | None
 
 
@@ -808,7 +818,8 @@ class MPSClassifier:
       reaches the dispatcher's Python key);
     * an op on another thread with no node: the engine's other gradient sums;
     * the optimizer step (:data:`OPTIMIZER_FILES` frames): ``optimizer``;
-    * otherwise :func:`classify_frames` of the Python stack.
+    * otherwise :func:`classify_frames` of the Python stack's frames in the hsn package
+      (:data:`PACKAGE_ROOT`; the repo's ``.venv`` lies under a directory named ``hsn`` too).
 
     A rule that finds nothing leaves the dispatch unattributed (``other``), as on CUDA."""
 
@@ -826,7 +837,10 @@ class MPSClassifier:
     def __call__(self, func: Any) -> tuple[Shares, str]:
         node = torch._C._current_autograd_node()
         frames = python_frames(3)  # from the frame that issued the op
-        label = f"{innermost_label(frames)} / {func}"
+        # the segment rules read the package's own frames only: the repo's .venv lies under a
+        # directory named hsn too, and torch has files named like HSN's (autograd/graph.py)
+        own = [f for f in frames if f[0].replace("\\", "/").startswith(PACKAGE_ROOT)]
+        label = f"{innermost_label(own)} / {func}"
         for _, _, fn in reversed(frames):
             if fn.startswith(EXTERN_PREFIX):
                 traces = self.provenance.get((node is not None, fn))
@@ -849,7 +863,7 @@ class MPSClassifier:
         paths = [path.replace("\\", "/") for path, _, _ in frames]
         if any(part in path for path in paths for part in OPTIMIZER_FILES):
             return {"optimizer": 1.0}, label
-        found = classify_frames(frames)
+        found = classify_frames(own)
         if found is None:
             return None, label
         self.forward.setdefault(int(torch._C._autograd._get_sequence_nr()) - 1, found)
@@ -1309,7 +1323,8 @@ def main() -> None:
     if mps:
         card: dict[str, Any] = {
             "status": machine_status(cpu_seen),
-            "rule": f"shared when another process used >= {MPS_BUSY_SHARE:.0f}% CPU in a listing",
+            "rule": f"shared when another process used >= {MPS_BUSY_SHARE:.0f}% CPU in a listing "
+            "(processes at >= 10% CPU listed, base names only)",
             "cpu_processes": cpu_seen,
         }
         compile_note = (
