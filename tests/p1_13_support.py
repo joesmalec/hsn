@@ -128,6 +128,9 @@ CASES: dict[str, tuple[Path, list[str], str]] = {
             "train.micro_batch=4",
             *_SCHEDULE,
             "hardware.compile_mode=reduce-overhead",
+            # with inductor's deterministic mode (_compiled_settings): bit-reproducible across
+            # processes and inductor caches (without it a few reduction gradients differ ~1e-10)
+            "train.deterministic=true",
         ],
         "cuda",
     ),
@@ -246,18 +249,25 @@ def state_dict_layout(model: nn.Module) -> list[list[Any]]:
 
 
 @contextlib.contextmanager
-def _max_block(n: int | None) -> Iterator[None]:
+def _compiled_settings(n: int | None) -> Iterator[None]:
+    """A CUDA case: P2.8 blocks of at most ``n`` positions and inductor's deterministic mode,
+    which skips the on-device benchmarking that picks a kernel configuration (a reduction's block
+    size, so its summation order) by timing. Without it two processes agree bit for bit only when
+    they share an inductor cache (the first one's timing choices); with it any two do."""
     if n is None:
         yield
         return
+    import torch._inductor.config as inductor_config
     from hsn.train import compile as compile_mod
 
     old = compile_mod.MAX_BLOCK
     compile_mod.MAX_BLOCK = n
     try:
-        yield
+        with inductor_config.patch(deterministic=True):
+            yield
     finally:
         compile_mod.MAX_BLOCK = old
+        torch._dynamo.reset()
 
 
 def run_case(
@@ -296,7 +306,7 @@ def run_case(
 
     with (
         tempfile.TemporaryDirectory() as tmp,
-        _max_block(CUDA_MAX_BLOCK if kind == "cuda" else None),
+        _compiled_settings(CUDA_MAX_BLOCK if kind == "cuda" else None),
     ):
         trainer = make_trainer(model, cfg, ctx, run_dir=Path(tmp) / "run")
         history = trainer.fit(train_ds, dev_ds, STEPS, callback=callback)
@@ -343,6 +353,7 @@ def capture(device: str, repeats: int, profile: str | None) -> dict[str, Any]:
         "fingerprint": fingerprint(device),
         "steps": STEPS,
         "cuda_max_block": CUDA_MAX_BLOCK if device == "cuda" else None,
+        "inductor_deterministic": device == "cuda",
         "cases": runs[0],
         "reproducible": all(r == runs[0] for r in runs[1:]),
         "repeats": repeats,

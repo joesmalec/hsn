@@ -6,7 +6,8 @@ gradient norm, the learning rate and digests of every gradient and parameter, th
 weights, optimiser state and carried recurrent state, for a dense HSN (AdamW), a top-K HSN with
 straight-through gates (sparse round, lazy AdamW) and the GRU baseline on the CPU, and (cuda
 marker) a dense HSN in P2.8's compiled window under bf16 autocast. On the platform a fixture was
-captured on (torch version, CPU capability, card) every value and digest must match exactly;
+captured on (torch version, CPU capability, card) every value and digest must match exactly (on
+CUDA with deterministic kernels and inductor's deterministic mode; see the CUDA test);
 elsewhere (another CPU, CI) the learning rates must still match exactly (pure Python) and the
 floats to 1e-4, and the digests are not compared (BLAS kernels differ by instruction set).
 
@@ -43,7 +44,9 @@ def _fixture(path: Path) -> dict[str, Any]:
     return data
 
 
-def _compare(name: str, got: dict[str, Any], want: dict[str, Any], *, bitwise: bool) -> None:
+def _compare(
+    name: str, got: dict[str, Any], want: dict[str, Any], *, bitwise: bool, digests: bool = True
+) -> None:
     got = json.loads(json.dumps(got))  # the fixture's JSON types (tuples become lists)
     assert len(got["steps"]) == len(want["steps"]), name
     for g, w in zip(got["steps"], want["steps"], strict=True):
@@ -55,13 +58,16 @@ def _compare(name: str, got: dict[str, Any], want: dict[str, Any], *, bitwise: b
                 assert g[key] == w[key], (name, g["step"], key, gv, wv)
             else:
                 assert math.isclose(gv, wv, rel_tol=RTOL), (name, g["step"], key, gv, wv)
-        if bitwise:
+        if bitwise and digests:
             assert g["grads"] == w["grads"], (name, g["step"], "gradients")
             assert g["params"] == w["params"], (name, g["step"], "parameters")
     assert got["last_lr"] == want["last_lr"], name
     assert got["groups"] == want["groups"], name  # the optimiser's groups and hyperparameters
     if bitwise:
-        for key in ("model", "optimizer", "carried_checkpoint", "carried"):
+        for key in ("carried_checkpoint", "carried"):
+            assert got[key] == want[key], (name, key)
+    if bitwise and digests:
+        for key in ("model", "optimizer"):
             assert got[key] == want[key], (name, key)
 
 
@@ -76,17 +82,24 @@ def test_p1_13_defaults_bitwise_cpu(name: str) -> None:
 
 @pytest.mark.cuda
 def test_p1_13_defaults_bitwise_cuda() -> None:
-    """The compiled dense HSN under bf16 on CUDA reproduces the base commit's run (bitwise when
-    the capture was reproducible run to run on this card; otherwise to the tolerance)."""
+    """The compiled dense HSN under bf16 on CUDA reproduces the base commit's run, every value
+    and digest on the capture card. The case runs with deterministic kernels
+    (``train.deterministic=true``, as the CPU cases) and inductor's deterministic mode, scoped to
+    the run by :mod:`p1_13_support`. Measured 7 Nov 2026 on the RTX 3060: without the latter, the
+    first compile in an inductor cache picks reduction configurations by timing them, so a fresh
+    cache can change the numerics (the gradients from step 1, the loss at step 6); without the
+    former, two reduction gradients (``cell.norm.weight``, ``cell.units.b1``) differ by about
+    1e-10 between processes. With both, two processes with fresh caches agree bit for bit."""
     from cards import cuda_profile
 
     fixture = _fixture(CUDA_FIXTURE)
-    profile = cuda_profile()
-    got = run_case("hsn_dense_compiled_cuda", profile)
-    same_platform = fixture["fingerprint"] == fingerprint("cuda")
-    bitwise = same_platform and bool(fixture["reproducible"])
+    assert fixture["inductor_deterministic"] is True and fixture["reproducible"]
+    got = run_case("hsn_dense_compiled_cuda", cuda_profile())
     _compare(
-        "hsn_dense_compiled_cuda", got, fixture["cases"]["hsn_dense_compiled_cuda"], bitwise=bitwise
+        "hsn_dense_compiled_cuda",
+        got,
+        fixture["cases"]["hsn_dense_compiled_cuda"],
+        bitwise=fixture["fingerprint"] == fingerprint("cuda"),
     )
 
 
