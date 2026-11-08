@@ -64,3 +64,4 @@ rules:
 arms:
   - name: s2_wsd_cand_d64_9k
     family: hsn
+    seeds: [0, 1, 2] # seeds 1 and 2 approved regardless of seed 0 (coordinator, 8 Nov 00:02)
