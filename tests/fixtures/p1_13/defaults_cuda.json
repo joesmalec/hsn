@@ -1,0 +1,123 @@
+{
+ "about": "P1.13 golden runs of the defaults (tests/p1_13_support.py)",
+ "capture_note": "captured from an export of 8eb2f01 (git archive) via PYTHONPATH, train.deterministic=true and torch._inductor.config.deterministic, a fresh inductor cache, 7 Nov 2026 19:45 MST (GPU slot 2); a second process with another fresh cache gave identical records (every value and digest)",
+ "cases": {
+  "hsn_dense_compiled_cuda": {
+   "carried": "237610903bd54efd0cecc15982e3a5281bbc6a4bc5bc7b20b9a6919e8940f227",
+   "carried_checkpoint": "237610903bd54efd0cecc15982e3a5281bbc6a4bc5bc7b20b9a6919e8940f227",
+   "groups": [
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 19,
+     "weight_decay": 0.01
+    },
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 13,
+     "weight_decay": 0.0
+    }
+   ],
+   "last_lr": [
+    "0x0.0p+0",
+    "0x0.0p+0"
+   ],
+   "model": "2b4c51cd6215e49e7aa873c1fddcf310ea456cc946b911a2d4b327541865ab07",
+   "optimizer": "e0f352381991e399e53c1bdb979a646d6735dc482d6d0d52029bf7052c8f4729",
+   "steps": [
+    {
+     "grad_norm": "0x1.b05c460000000p-2",
+     "grads": "bc518939ac018fa1aeaef01b91229aee86184361cbdf0903c30b02556b3aeb82",
+     "loss": "0x1.62e1300000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "52fb1f9578f6354a6efd91879bbe1c006e4d4a1a62bc669dd0472f3db80133d1",
+     "step": 1
+    },
+    {
+     "grad_norm": "0x1.0f55620000000p-1",
+     "grads": "5f12f5c037329948a656438eeeb7a623132d7590774bce8ca9d6d7696da95662",
+     "loss": "0x1.62cc740000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "5ca99b23c5d960b27aa6a92bb19e1ab4501957d252e80e8882568dcef0c58a19",
+     "step": 2
+    },
+    {
+     "grad_norm": "0x1.0f184e0000000p-1",
+     "grads": "de62710c5cb13e983328294951ce454a563cd8a2010c2e3e74f6b084e1c6f112",
+     "loss": "0x1.628a2c0000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "7063c8855c34e38a9d3ce166853710d2506fd162d6468e719909dc8e4b28ca1c",
+     "step": 3
+    },
+    {
+     "grad_norm": "0x1.b7ed7e0000000p-2",
+     "grads": "3eab12da2385dc4cef562204b9e0efa7a3f7111643389de5350d88f4e365b494",
+     "loss": "0x1.62d4ae0000000p+2",
+     "lr": "0x1.4fa17f634f425p-9",
+     "params": "2513517176375c032f551392f2f43a62a1b5a5956b606d336489dd2f271087db",
+     "step": 4
+    },
+    {
+     "grad_norm": "0x1.a15d8e0000000p-2",
+     "grads": "aebd4ca4339e99cdb6810f75533254f472115b1beb2f7db09b961a551982347d",
+     "loss": "0x1.627cd00000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "1e87cddef8d68454aa993b60d426cbd900cc5e5d9dfc03c5ae34ee101b9b17a5",
+     "step": 5
+    },
+    {
+     "grad_norm": "0x1.40aae40000000p-2",
+     "grads": "9680567d027558fa43daafbf6374192ab5659cba630a93a78e28a22f4d992e1d",
+     "loss": "0x1.6273e00000000p+2",
+     "lr": "0x1.ccae631ac56a4p-12",
+     "params": "ef97417b81f2a3ed95455c91ce496a58930e92adade39543e7482463cb6322e4",
+     "step": 6
+    }
+   ]
+  }
+ },
+ "cross_process_reproducible": true,
+ "cuda_max_block": 8,
+ "fingerprint": {
+  "card": "NVIDIA GeForce RTX 3060",
+  "cpu_capability": "AVX2",
+  "cpu_model": "AMD Ryzen 9 3950X 16-Core Processor",
+  "cuda": "13.2",
+  "device": "cuda",
+  "machine": "x86_64",
+  "threads": "4",
+  "torch": "2.15.0+cu132"
+ },
+ "fingerprint_note": "cpu_model and threads added 7 Nov 2026 ~20:10 MST (CI: a runner with the same torch build and ISA gave other gradient bits); both are the capture's facts: this machine, OMP_NUM_THREADS=4",
+ "git_rev_of_capture_tree": "d49f2c050c3e0e6052843dd019f33539af307457",
+ "hsn_file": "/tmp/claude-1000/-home-joe-hsn-p1-13/6eb2c05e-6e5f-4184-8701-3d95a81c6804/scratchpad/base/python/hsn/__init__.py",
+ "inductor_deterministic": true,
+ "repeats": 1,
+ "reproducible": true,
+ "steps": 6
+}

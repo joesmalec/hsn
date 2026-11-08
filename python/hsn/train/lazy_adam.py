@@ -57,7 +57,11 @@ decay on tensors with ``ndim >= 2``, none on the rest) and marks the unit bank's
 tensors (:class:`~hsn.model.units.UnitBank`: ``W1 [M, 4d, H]``, ``b1 [M, H]``, ``W2 [M, H, d]``,
 ``b2 [M, d]``) as unit groups; the shared parameters (E, P, S, D, V, W_out, the gate B, the scorer,
 the edge logits, the embeddings) are never lazy (chunk "Do not"). A model without a unit bank is
-refused: there is nothing lazy to do, and the configuration asked for it.
+refused: there is nothing lazy to do, and the configuration asked for it. **P1.13:** with
+``cell_lr_mult != 1`` or a ``cell_weight_decay`` (``train.*``) the parameters of the HSN cell
+(:func:`cell_parameters`; the unit bank is part of it) get their own groups at ``lr *
+cell_lr_mult`` with ``cell_weight_decay`` on their ``ndim >= 2`` tensors; with the defaults the
+groups are exactly the ones above.
 
 **State and checkpoints.** Per tensor: ``exp_avg`` and ``exp_avg_sq`` like the parameter and
 ``step`` — int64 ``[M]`` on the CPU for a unit group, a 0-dim int64 CPU tensor otherwise — all
@@ -80,6 +84,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from hsn.model.cell import PDGCell
 from hsn.model.router import Selection
 from hsn.model.units import UnitBank
 
@@ -87,6 +92,7 @@ __all__ = [
     "LazyAdamW",
     "active_units_from_indices",
     "build_lazy_adamw",
+    "cell_parameters",
     "find_unit_bank",
 ]
 
@@ -483,43 +489,73 @@ def find_unit_bank(model: nn.Module) -> UnitBank:
     return banks[0]
 
 
+def cell_parameters(model: nn.Module) -> list[nn.Parameter]:
+    """P1.13: the trainable parameters of the one :class:`~hsn.model.cell.PDGCell` in ``model``
+    (``HSN.cell``): ``V``, ``W_out``, the gate, the input and candidate norms, the unit bank, the
+    graph's edge logits and anything a P1.11 variant installs under the cell, in module order. The
+    set is exactly the ``cell`` group of the P1.11 diagnostics (``grad_share/cell``). A model
+    without one PDGCell (the baselines) raises: ``train.cell_lr_mult`` and
+    ``train.cell_weight_decay`` act on the HSN cell only."""
+    cells = [module for module in model.modules() if isinstance(module, PDGCell)]
+    if len(cells) != 1:
+        raise ValueError(
+            f"train.cell_lr_mult / train.cell_weight_decay act on the HSN cell (one PDGCell); "
+            f"{type(model).__name__} has {len(cells)}. Leave them at their defaults (1.0 / null)."
+        )
+    return [p for p in cells[0].parameters() if p.requires_grad]
+
+
 def build_lazy_adamw(
     model: nn.Module,
     *,
     lr: float,
     betas: tuple[float, float],
     weight_decay: float,
+    cell_lr_mult: float = 1.0,
+    cell_weight_decay: float | None = None,
 ) -> LazyAdamW:
     """The :class:`LazyAdamW` of ``model`` with the P0.5 groups (``weight_decay`` on tensors with
     ``ndim >= 2``, none on the rest), the unit bank's tensors in unit groups
     (``unit_dim=0, n_units=M``) and every other parameter in ordinary groups. Group order:
-    shared decay, shared no-decay, unit decay, unit no-decay (empty groups are left out)."""
+    shared decay, shared no-decay, unit decay, unit no-decay (empty groups are left out).
+
+    P1.13: with ``cell_lr_mult != 1`` or ``cell_weight_decay`` given, the cell's parameters
+    (:func:`cell_parameters`) that are not units get groups of their own between the shared and
+    the unit groups, and the cell and unit groups train at ``lr * cell_lr_mult`` with
+    ``cell_weight_decay`` (``None``: ``weight_decay``) on their ``ndim >= 2`` tensors. Group order:
+    shared decay, shared no-decay, cell decay, cell no-decay, unit decay, unit no-decay."""
     bank = find_unit_bank(model)
     unit_ids = {id(p) for p in bank.parameters()}
-    buckets: dict[tuple[bool, bool], list[Tensor]] = {}
+    split = cell_lr_mult != 1.0 or cell_weight_decay is not None
+    cell_ids = {id(p) for p in cell_parameters(model)} if split else set()
+    # bucket key: (kind, decays), kind 0 shared, 1 cell (not units), 2 units
+    buckets: dict[tuple[int, bool], list[Tensor]] = {}
     for p in model.parameters():
         if not p.requires_grad:
             continue
-        key = (id(p) in unit_ids, p.ndim >= 2)
-        buckets.setdefault(key, []).append(p)
+        kind = 2 if id(p) in unit_ids else 1 if id(p) in cell_ids else 0
+        buckets.setdefault((kind, p.ndim >= 2), []).append(p)
     if not buckets:
         raise ValueError("the model has no trainable parameters")
-    if not any(is_unit for is_unit, _ in buckets):
+    if not any(kind == 2 for kind, _ in buckets):
         raise ValueError(
             "train.optimizer=lazy_adamw: the unit bank has no trainable parameters, so there is "
             "nothing lazy to update; use train.optimizer=adamw"
         )
+    cell_decay = weight_decay if cell_weight_decay is None else cell_weight_decay
     groups: list[dict[str, Any]] = []
-    for is_unit in (False, True):
+    for kind in (0, 1, 2):
         for decays in (True, False):
-            params = buckets.get((is_unit, decays))
+            params = buckets.get((kind, decays))
             if not params:
                 continue
             group: dict[str, Any] = {
                 "params": params,
-                "weight_decay": weight_decay if decays else 0.0,
+                "weight_decay": (cell_decay if kind and split else weight_decay) if decays else 0.0,
             }
-            if is_unit:
+            if kind and split:  # P1.13: the cell's own learning rate
+                group["lr"] = lr * cell_lr_mult
+            if kind == 2:
                 group["unit_dim"] = 0
                 group["n_units"] = bank.n_units
             groups.append(group)

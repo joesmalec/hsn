@@ -1,0 +1,890 @@
+{
+ "about": "P1.13 golden runs of the defaults (tests/p1_13_support.py)",
+ "cases": {
+  "gru": {
+   "carried": null,
+   "carried_checkpoint": "f668f2844b6f4c0bc61e6f1fd66ee226e85ba164e7525bb0d4b389cc7a500911",
+   "groups": [
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 5,
+     "weight_decay": 0.01
+    },
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 5,
+     "weight_decay": 0.0
+    }
+   ],
+   "last_lr": [
+    "0x0.0p+0",
+    "0x0.0p+0"
+   ],
+   "model": "3f7aa551e1455b441b26d3f6b38c9d3378f038d6aafb13307ca532319842adeb",
+   "optimizer": "1e410e9c15c584ef2e17ecf311878a59171538556bf673cf829c75c968df2d33",
+   "steps": [
+    {
+     "grad_norm": "0x1.af352c0000000p+0",
+     "grads": "d5c5509c59e5709e17abdc3479b783b53022bb90aa3def67ceeb872c2ce8ce4d",
+     "loss": "0x1.64efe20000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "54e4f458657a21dc52aa2c42368eb3101cb4fadd9cd98304dfe621063857eb66",
+     "step": 1
+    },
+    {
+     "grad_norm": "0x1.1b26080000000p+1",
+     "grads": "a55ca53c8749ab7126a8b0506bddeea45717b96390f0c6e97c7d1f6746574868",
+     "loss": "0x1.657a540000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "eb883f0d34221da917a1cac2b965f11ab50537eb89427b801c9f7e6149588830",
+     "step": 2
+    },
+    {
+     "grad_norm": "0x1.1826de0000000p+1",
+     "grads": "b92d57c8f7919e71df48fb0ececcd44ceb3a188c63682c239822289bbf4a5e54",
+     "loss": "0x1.61a5f80000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "1ffc5968ad8c331bd21eacee844393e9e203068f9888122787009594ccaebe4f",
+     "step": 3
+    },
+    {
+     "grad_norm": "0x1.c7aec00000000p+0",
+     "grads": "cec85e1b252a8e2ab7c6117cb044471dc705c253942686ba2d75189522948287",
+     "loss": "0x1.65964a0000000p+2",
+     "lr": "0x1.4fa17f634f425p-9",
+     "params": "7a2506acd1b98095273bad896b3e7208c199f04c79d3bf02831515b6f695fca9",
+     "step": 4
+    },
+    {
+     "grad_norm": "0x1.af72020000000p+0",
+     "grads": "a88500d2d803cfba60734e01b5b3931e7352b1806e5cfdcbe41685dd69a65b5a",
+     "loss": "0x1.5cca000000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "d499a969a80098dfec4a718514b680016caaf9618d1b7bea1ebd7e5ffc2e2372",
+     "step": 5
+    },
+    {
+     "grad_norm": "0x1.4dddb20000000p+0",
+     "grads": "ac32b96ff9fb208b4e10f319b0b167072d38b256d67977b9a4d0777008167089",
+     "loss": "0x1.610c500000000p+2",
+     "lr": "0x1.ccae631ac56a4p-12",
+     "params": "3f7aa551e1455b441b26d3f6b38c9d3378f038d6aafb13307ca532319842adeb",
+     "step": 6
+    }
+   ]
+  },
+  "hsn_dense": {
+   "carried": "9e8996d6708ec5cf7e2755292a8347337556fa85c2395fc3784d67c8e0074f47",
+   "carried_checkpoint": "9e8996d6708ec5cf7e2755292a8347337556fa85c2395fc3784d67c8e0074f47",
+   "groups": [
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 19,
+     "weight_decay": 0.01
+    },
+    {
+     "amsgrad": false,
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "capturable": false,
+     "decoupled_weight_decay": true,
+     "differentiable": false,
+     "eps": 1e-08,
+     "foreach": null,
+     "fused": null,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "maximize": false,
+     "n_params": 13,
+     "weight_decay": 0.0
+    }
+   ],
+   "last_lr": [
+    "0x0.0p+0",
+    "0x0.0p+0"
+   ],
+   "model": "d4f7716da6496d9b7bb784230d20dcd140a94bc6f61ed95a483c5e3a30b522d2",
+   "optimizer": "d37b272a355ba1c8df59fceedf75ece93f6a33eaa6949612307a5de81fbe467f",
+   "steps": [
+    {
+     "grad_norm": "0x1.a3cf060000000p-2",
+     "grads": "0256fcbaf1a048bf218415b849acd9cf83182b8f4e598d4390d955b80e7cfa66",
+     "loss": "0x1.62e3b00000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "1d5559670eab50db94015e0cdf017ab14ac1b3f55263eed907d2f2ac51052d1f",
+     "step": 1
+    },
+    {
+     "grad_norm": "0x1.14be840000000p-1",
+     "grads": "12a888bd4d313274fe79b65b68089cf466c4e26af1a13055d3aea0f439e97459",
+     "loss": "0x1.62cf560000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "700cf481e9794eeb04a0f944ea3553e216532e27fbcc975bf0ee89a88d9eb9e7",
+     "step": 2
+    },
+    {
+     "grad_norm": "0x1.101f720000000p-1",
+     "grads": "62476bae30232339b395d91a9aff5097d09ff944ae9ef05147b88c500d65c7c3",
+     "loss": "0x1.628eba0000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "8ca9fdd71cbe6b9a9531fe95af3d64b5f89a29767d9a4dea73d7fc4d92e8b3d6",
+     "step": 3
+    },
+    {
+     "grad_norm": "0x1.b5d86e0000000p-2",
+     "grads": "d65c4f6bf8c7362735483ac41e6b5599c75197eec01e8539b355454464e69589",
+     "loss": "0x1.62d2100000000p+2",
+     "lr": "0x1.4fa17f634f425p-9",
+     "params": "b4300f1b460a7d07e3fa31c90fa421be3f153d8a2e35e30ddf2f88cd9320dcef",
+     "step": 4
+    },
+    {
+     "grad_norm": "0x1.a139700000000p-2",
+     "grads": "d116fd097db79cf23b7936b3046a820e94c088218aff6ad3c6270e4e250af11f",
+     "loss": "0x1.629e800000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "87eb9eaf473f21c1e6bf8cc36829167405644736a43fd48d7dc3a568c54bbd66",
+     "step": 5
+    },
+    {
+     "grad_norm": "0x1.4712580000000p-2",
+     "grads": "473dc8e3ff65ecfeeb406f53dd51228e270a3576dae537c763af32307b86a46a",
+     "loss": "0x1.628f4a0000000p+2",
+     "lr": "0x1.ccae631ac56a4p-12",
+     "params": "977cd1267e921bdddf6e62d9aae344668b569de2d97ed077def3c6619a8e2e48",
+     "step": 6
+    }
+   ]
+  },
+  "hsn_topk": {
+   "carried": "f3bbdea219840a97f0d916cae349b794a2265c6b20f7c1c217e8a2959a37c6e1",
+   "carried_checkpoint": "f3bbdea219840a97f0d916cae349b794a2265c6b20f7c1c217e8a2959a37c6e1",
+   "groups": [
+    {
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "eps": 1e-08,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "n_params": 15,
+     "weight_decay": 0.01
+    },
+    {
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "eps": 1e-08,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "n_params": 13,
+     "weight_decay": 0.0
+    },
+    {
+     "betas": [
+      0.9,
+      0.999
+     ],
+     "eps": 1e-08,
+     "initial_lr": 0.003,
+     "lr": 0.0,
+     "n_params": 4,
+     "n_units": 2,
+     "unit_dim": 0,
+     "weight_decay": 0.01
+    }
+   ],
+   "last_lr": [
+    "0x0.0p+0",
+    "0x0.0p+0",
+    "0x0.0p+0"
+   ],
+   "model": "5a9e54c2194beaf32629c37576e69882b932d73d9360044200c3dc0709bd36eb",
+   "optimizer": "3225b3896dc962cd54ea3385c1d920c1808d0382c07c327221314e1bc7a4a8c3",
+   "steps": [
+    {
+     "grad_norm": "0x1.9f5be40000000p-2",
+     "grads": "df233154aaab8b505311f6017d401203990c070d1f00aa86d7a3efd2ac652c68",
+     "loss": "0x1.62e39a0000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "fef36219a92048d2af7c60b83ac97db0d895d05758d833353cb8025a63a25481",
+     "step": 1
+    },
+    {
+     "grad_norm": "0x1.129f860000000p-1",
+     "grads": "5a1e0b5623ff797d6d2c16700c1caf25d9a910079cf85e163b2d29ee9aea8a73",
+     "loss": "0x1.62d0640000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "d3cb868a4424202803100f673be84cb0055896e356150d13febea2c36a353dcb",
+     "step": 2
+    },
+    {
+     "grad_norm": "0x1.0e86d40000000p-1",
+     "grads": "d0d0a70711fdd7e5e4573f2139e4a6da477a927ae256257080add19d53ec52e3",
+     "loss": "0x1.6290660000000p+2",
+     "lr": "0x1.89374bc6a7efap-9",
+     "params": "bf896147ca4446ec84e320fc880711dac188e8aebdcf0f913feaec1b1c8b50f4",
+     "step": 3
+    },
+    {
+     "grad_norm": "0x1.b44f860000000p-2",
+     "grads": "914dd6b9b111b6de2d0b2c567b8f29a2f168f738664a9af226dac6c18cf36418",
+     "loss": "0x1.62d1960000000p+2",
+     "lr": "0x1.4fa17f634f425p-9",
+     "params": "7637ba97dc637266e450dbe3f0ffa9588371da4dea8a723fbc41b04f3628063b",
+     "step": 4
+    },
+    {
+     "grad_norm": "0x1.a00a460000000p-2",
+     "grads": "d4264a23b71bdaa484a71fa904377a02117794064dd10eaf9658ac019fb914df",
+     "loss": "0x1.629dc60000000p+2",
+     "lr": "0x1.89374bc6a7efap-10",
+     "params": "4136abe7e9b72281179e444ed476e9a96e964fe3923166309eda83743a1bb2dd",
+     "step": 5
+    },
+    {
+     "grad_norm": "0x1.45d7300000000p-2",
+     "grads": "98a8ffeec422f7fca158875859e157bd046ad2fe26e5a4d122fad51ad804619b",
+     "loss": "0x1.628b460000000p+2",
+     "lr": "0x1.ccae631ac56a4p-12",
+     "params": "586285766b051740f6ae2779e2cd9a523d2385482321bb1eb9dfe208f2579e94",
+     "step": 6
+    }
+   ]
+  }
+ },
+ "cuda_max_block": null,
+ "fingerprint": {
+  "cpu_capability": "AVX2",
+  "cpu_model": "AMD Ryzen 9 3950X 16-Core Processor",
+  "device": "cpu",
+  "machine": "x86_64",
+  "threads": "4",
+  "torch": "2.15.0+cu132"
+ },
+ "fingerprint_note": "cpu_model and threads added 7 Nov 2026 ~20:10 MST (CI: a runner with the same torch build and ISA gave other gradient bits); both are the capture's facts: this machine, OMP_NUM_THREADS=4",
+ "git_rev_of_capture_tree": "8eb2f01b361c94580e9c28f466779cf74435e17f",
+ "hsn_file": "/home/joe/hsn-p1.13/python/hsn/__init__.py",
+ "repeats": 2,
+ "reproducible": true,
+ "state_dict_layouts": {
+  "ref_a1_dense": [
+   [
+    "byte_emb.weight",
+    [
+     256,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "ctx_emb.weight",
+    [
+     16,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc1.weight",
+    [
+     512,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc2.weight",
+    [
+     64,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc2.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc1.weight",
+    [
+     512,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc2.weight",
+    [
+     64,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc2.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc1.weight",
+    [
+     512,
+     192
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc2.weight",
+    [
+     64,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc2.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.V.weight",
+    [
+     64,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.W_out.weight",
+    [
+     64,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.gate.weight",
+    [
+     64,
+     256
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.gate.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.norm.weight",
+    [
+     256
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.W1",
+    [
+     8,
+     256,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.b1",
+    [
+     8,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.W2",
+    [
+     8,
+     512,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.b2",
+    [
+     8,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units._extra_state",
+    null,
+    "dict"
+   ],
+   [
+    "cell.graph.edge_logit",
+    [
+     128
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.graph.indptr",
+    [
+     33
+    ],
+    "torch.int64"
+   ],
+   [
+    "cell.graph.indices",
+    [
+     128
+    ],
+    "torch.int64"
+   ],
+   [
+    "cell.graph.is_random",
+    [
+     128
+    ],
+    "torch.bool"
+   ],
+   [
+    "router.scorer.ema_utility",
+    [
+     32
+    ],
+    "torch.float32"
+   ],
+   [
+    "router.scorer.ema_selected",
+    [
+     32
+    ],
+    "torch.float32"
+   ],
+   [
+    "router.scorer.net.weight",
+    [
+     8,
+     200
+    ],
+    "torch.float32"
+   ],
+   [
+    "router.scorer.net.bias",
+    [
+     8
+    ],
+    "torch.float32"
+   ],
+   [
+    "halting.linear.weight",
+    [
+     1,
+     128
+    ],
+    "torch.float32"
+   ],
+   [
+    "halting.linear.bias",
+    [
+     1
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc1.weight",
+    [
+     512,
+     128
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc2.weight",
+    [
+     256,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc2.bias",
+    [
+     256
+    ],
+    "torch.float32"
+   ]
+  ],
+  "ref_a1_topk": [
+   [
+    "byte_emb.weight",
+    [
+     256,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "ctx_emb.weight",
+    [
+     16,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc1.weight",
+    [
+     512,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc2.weight",
+    [
+     64,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "encoder.fc2.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc1.weight",
+    [
+     512,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc2.weight",
+    [
+     64,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "predictor.fc2.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc1.weight",
+    [
+     512,
+     192
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc2.weight",
+    [
+     64,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "shared.fc2.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.V.weight",
+    [
+     64,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.W_out.weight",
+    [
+     64,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.gate.weight",
+    [
+     64,
+     256
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.gate.bias",
+    [
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.norm.weight",
+    [
+     256
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.W1",
+    [
+     8,
+     256,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.b1",
+    [
+     8,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.W2",
+    [
+     8,
+     512,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units.b2",
+    [
+     8,
+     64
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.units._extra_state",
+    null,
+    "dict"
+   ],
+   [
+    "cell.graph.edge_logit",
+    [
+     128
+    ],
+    "torch.float32"
+   ],
+   [
+    "cell.graph.indptr",
+    [
+     33
+    ],
+    "torch.int64"
+   ],
+   [
+    "cell.graph.indices",
+    [
+     128
+    ],
+    "torch.int64"
+   ],
+   [
+    "cell.graph.is_random",
+    [
+     128
+    ],
+    "torch.bool"
+   ],
+   [
+    "router.scorer.ema_utility",
+    [
+     32
+    ],
+    "torch.float32"
+   ],
+   [
+    "router.scorer.ema_selected",
+    [
+     32
+    ],
+    "torch.float32"
+   ],
+   [
+    "router.scorer.net.weight",
+    [
+     8,
+     200
+    ],
+    "torch.float32"
+   ],
+   [
+    "router.scorer.net.bias",
+    [
+     8
+    ],
+    "torch.float32"
+   ],
+   [
+    "halting.linear.weight",
+    [
+     1,
+     128
+    ],
+    "torch.float32"
+   ],
+   [
+    "halting.linear.bias",
+    [
+     1
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc1.weight",
+    [
+     512,
+     128
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc1.bias",
+    [
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc2.weight",
+    [
+     256,
+     512
+    ],
+    "torch.float32"
+   ],
+   [
+    "decoder.fc2.bias",
+    [
+     256
+    ],
+    "torch.float32"
+   ]
+  ]
+ },
+ "steps": 6
+}

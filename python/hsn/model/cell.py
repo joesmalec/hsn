@@ -14,6 +14,16 @@ states ``h[·, t, r−1]``::
     b_i = σ( B · v_i )                                     ∈ (0, 1)^d
     h[i, t, r] = (1 − b_i) ⊙ h[i, t, r−1] + b_i ⊙ c_i
 
+P1.13 (amendment A4, ``docs/amendments/A4_cand_norm.md``; opt-in): with ``model.cand_norm = rms``
+the candidate's pre-activation is RMS-normalised over its width ``d`` with a learned gain ``g``
+(:attr:`PDGCell.cand_norm`, the Appendix C.1 row ``cand_norm``), ``c_i = tanh( RMSNorm_g( W_out ·
+Σ_j α_ij F_j(v_i) ) )``: the tanh, the convex gate and with them ``h ∈ [−1, 1]`` are unchanged, and
+the pre-activation's RMS is ``|g|`` instead of whatever the weights grew to. The sparse round
+applies its per-slot ``α`` after the norm, ``c = tanh( α ⊙ RMSNorm_g( W_out · F ) )``: ``α`` is
+exactly 1.0 forward on the valid slots, so the values equal the normalised ``W_out(α ⊙ F)``, but a
+scale-invariant norm after ``α`` would zero P2.2's straight-through gradient, which enters the round
+only through ``α``. ``none`` (default) is the P1.5 candidate, bit for bit.
+
 In dense mode every cell is updated and ``α_i`` is a distribution over all ``M`` units (a softmax
 of the scorer logits, computed by :class:`~hsn.model.hsn.HSN`). The sparse round (P2.5,
 :meth:`PDGCell.step_sparse`) runs the same equations for the ``K`` cells of a P2.1
@@ -149,6 +159,13 @@ class PDGCell(nn.Module):
         self.norm: nn.Module = (
             nn.RMSNorm(4 * d, eps=1e-6) if cfg.cell_norm == "rms" else nn.Identity()
         )
+        # P1.13 (amendment A4): RMSNorm over W_out(.) before the candidate's tanh (a learned gain of
+        # width d, the Appendix C.1 row ``cand_norm``; its ones init draws no random numbers);
+        # Identity when model.cand_norm = none.
+        self.cand_norm_kind = cfg.cand_norm
+        self.cand_norm: nn.Module = (
+            nn.RMSNorm(d, eps=1e-6) if cfg.cand_norm == "rms" else nn.Identity()
+        )
         self.units = UnitBank.from_config(cfg)
         self.graph = CellGraph(
             cfg.n_cells,
@@ -240,7 +257,8 @@ class PDGCell(nn.Module):
             # bf16 autocast W_out and the gate emit bf16; a bf16 ``1 - b`` is rounded, the weights
             # no longer sum to one and |h| compounds past the §2.3 bound over a window (measured
             # 1.33 after 256 positions on rtx3060). Without autocast the casts are no-ops.
-            c = torch.tanh(self.W_out(mixed).to(h_prev.dtype))
+            # P1.13: cand_norm (Identity by default) normalises the state-dtype pre-activation.
+            c = torch.tanh(self.cand_norm(self.W_out(mixed).to(h_prev.dtype)))
             b = torch.sigmoid(self.gate(v).to(h_prev.dtype))
             h_new = torch.lerp(h_prev, c, b)  # (1 − b) ⊙ h + b ⊙ c in one op (P1.10c)
             if self.disabled_cells:
@@ -346,7 +364,11 @@ class PDGCell(nn.Module):
                 # α (fp32, the selection's gradient entry) promotes the unit output like the dense
                 # path's mixing does; W_out recasts under autocast.
                 mixed = sel.alpha.unsqueeze(-1) * unit_out  # α_i F_j(v_i)
-                c = torch.tanh(self.W_out(mixed).to(state.dtype))  # P1.9: see step_dense
+                if self.cand_norm_kind == "none":
+                    c = torch.tanh(self.W_out(mixed).to(state.dtype))  # P1.9: see step_dense
+                else:  # P1.13: α after the norm keeps the selection gradient (module docstring)
+                    pre = self.cand_norm(self.W_out(unit_out).to(state.dtype))
+                    c = torch.tanh(sel.alpha.unsqueeze(-1).to(state.dtype) * pre)
                 new_state = native.gated_delta_update(
                     state, cells, c, b, valid, validate=not static
                 )
@@ -371,7 +393,8 @@ class PDGCell(nn.Module):
     # ----------------------------------------------------------------------------------------------
 
     def param_count(self) -> int:
-        """Measured parameter count of ``V``, ``W_out``, the gate, the units and the edge logits."""
+        """Measured parameter count of ``V``, ``W_out``, the gate, the norms, the units and the
+        edge logits."""
         return sum(p.numel() for p in self.parameters())
 
     def extra_repr(self) -> str:

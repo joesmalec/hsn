@@ -1,0 +1,78 @@
+# P1.13 lever arms for dense HSN: each lever alone, in the 600-step memory check (proposal of the P1.13
+# plan, approved by the user 7 Nov 2026; the audit registers the rules and predictions in AUDIT.md before any
+# run and enqueues the arms after the merge, on a worker restarted on the merged main).
+#
+# Stage 1, E1's recipe (queue9_onset / sweep2_b_hsn_h600: dense d=64, B32, lr 3e-3, the 3,000-step cosine
+# with warm-up 200, compiled, diagnostics every 25, evaluation every 200), stopped at 600:
+#   L1  train.schedule=wsd, train.decay_fraction=0.2   near-null control (cosine is at 0.95 at step 600)
+#   L2  train.cell_lr_mult=0.33                        the cell at 9.9e-4 (exp 48's healthy rate)
+#   L3  model.cand_norm=rms                            amendment A4 (docs/amendments/A4_cand_norm.md)
+# Stage 2, the detecting recipe R of block C (sweep2_c_memcheck: lr 2e-3, 3,000 of a 9,000-step cosine,
+# evaluation every 100), stopped at 600; its no-lever check is block C's exp 87 (fail: gate p50 0.001,
+# share 0.0066, sat99 0.52):
+#   R-cand  model.cand_norm=rms
+#   R-cell  train.cell_lr_mult=0.5                     the cell at 1e-3
+#
+# Pass rule (the registered memory check): over the 9 diagnostics at steps 400 to 600, the median gate p50
+# >= 0.01 and the median grad_share/cell >= 0.01. sat99/answer and update_ratio/cell over the same window are
+# reported, not criteria (under cand_norm the share of a weight before the norm scales as 1/||W||).
+# Expected step time: 0.244 s (L1, L2, R-cell), about 0.25 s with cand_norm (measured in P1.13's timing slot).
+
+name: p1_13_levers_hsn_h600
+description: (horizon 600) dense HSN with each P1.13 lever alone, at E1's recipe and at block C's recipe R
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.003
+    - train.steps=3000
+    - train.eval_every=200
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, steps: 600, diag_every: 25, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    memory_check_600:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "diag:gate/p50", steps: {from: 400, to: 600, every: 25}, agg: median, op: ">=", value: 0.01}
+              - {metric: "diag:grad_share/cell", steps: {from: 400, to: 600, every: 25}, agg: median, op: ">=", value: 0.01}
+      default: fail
+    reads_state: {preset: reads_state}
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  # stage 1: E1's recipe
+  - name: l1_wsd
+    family: hsn
+    overrides: [train.schedule=wsd, train.decay_fraction=0.2]
+  - name: l2_cell_lr
+    family: hsn
+    overrides: [train.cell_lr_mult=0.33]
+  - name: l3_cand_norm
+    family: hsn
+    overrides: [model.cand_norm=rms]
+  # stage 2: block C's recipe R
+  - name: r_cand_norm
+    family: hsn
+    overrides: [train.lr=0.002, train.steps=9000, train.eval_every=100, train.ckpt_every=9000, model.cand_norm=rms]
+  - name: r_cell_lr
+    family: hsn
+    overrides: [train.lr=0.002, train.steps=9000, train.eval_every=100, train.ckpt_every=9000, train.cell_lr_mult=0.5]

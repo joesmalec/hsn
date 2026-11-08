@@ -129,6 +129,7 @@ def _dims(cfg: RunConfig, model: HSN) -> dict[str, Any]:
         "exclude": set(m.scorer_features.exclude),
         "edge_norm": m.edge_norm,
         "cell_norm": m.cell_norm,  # P1.5a: RMSNorm on the cell input, or none
+        "cand_norm": m.cand_norm,  # P1.13: RMSNorm before the candidate's tanh, or none
         "disabled": set(m.disabled_cells),
         "indptr": graph.indptr.tolist(),
         "indices": graph.indices.tolist(),
@@ -268,7 +269,10 @@ def _ref_step(
         v_i = _rmsnorm(v_raw, p["cell.norm.weight"]) if dims["cell_norm"] == "rms" else v_raw
         outs = [_unit(p, j, v_i) for j in range(M)]
         mixed = [sum(alpha[i][j] * outs[j][c] for j in range(M)) for c in range(d)]
-        c_i = [math.tanh(val) for val in _linear(p["cell.W_out.weight"], None, mixed)]
+        pre = _linear(p["cell.W_out.weight"], None, mixed)
+        if dims["cand_norm"] == "rms":  # P1.13 (amendment A4)
+            pre = _rmsnorm(pre, p["cell.cand_norm.weight"])
+        c_i = [math.tanh(val) for val in pre]
         b_i = [_sigmoid(val) for val in _linear(p["cell.gate.weight"], p["cell.gate.bias"], v_i)]
         if i in dims["disabled"]:
             h_i = list(h[i])

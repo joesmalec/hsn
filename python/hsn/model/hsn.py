@@ -32,7 +32,8 @@ for bit. ``forward(..., capture=True)`` returns the per-position cell states and
 The dense reference uses the same linear scorer as the sparse model, with ``α = softmax(logits)``
 over all units and every cell updated (Appendix H.5), so the measured parameter count is exactly
 Appendix C.1: :meth:`HSN.param_report` lists the twelve C.1 rows plus amendment A1's ``cell_norm``
-row (P1.5a) and their ``total`` (1,820,617 for ``configs/ref_a1.yaml``; 1,820,361 before A1). The
+row (P1.5a), amendment A4's ``cand_norm`` row (P1.13; 0 unless ``model.cand_norm = rms``) and their
+``total`` (1,820,617 for ``configs/ref_a1.yaml``; 1,820,361 before A1). The
 learned edge weights of the P1.4 graph (``N·(D_g + random_edges)`` logits, 128 for A.1) are
 trainable parameters that Appendix C does not list; the report gives them
 as ``edges`` and ``total_trainable = total + edges``, which is what a run manifest's
@@ -135,6 +136,7 @@ PARAM_REPORT_ROWS: tuple[str, ...] = (
     "v_msg",
     "gate",
     "cell_norm",  # P1.5a (amendment A1): the RMSNorm gain over the 4d cell input
+    "cand_norm",  # P1.13 (amendment A4): the RMSNorm gain before the candidate's tanh (0: none)
     "scorer",
     "halting",
     "decoder",
@@ -1157,6 +1159,7 @@ class HSN(nn.Module):
             "v_msg": self.cell.V,
             "gate": self.cell.gate,
             "cell_norm": self.cell.norm,
+            "cand_norm": self.cell.cand_norm,
             "scorer": self.scorer,
             "halting": self.halting,
             "decoder": self.decoder,

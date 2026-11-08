@@ -150,6 +150,11 @@ def install_variant(
         raise TypeError(f"variant {variant} needs an HSN model, got {type(model).__name__}")
     if variant == "pdg":
         return {"variant": "pdg"}
+    if model.cfg.cand_norm != "none":  # P1.13 hook (agreed with the coordinator, 7 Nov 2026)
+        raise ValueError(
+            f"variant {variant!r} with model.cand_norm={model.cfg.cand_norm} is refused: the "
+            "variants' rounds and parameter reports predate the candidate norm; use variant pdg"
+        )
     cell = model.cell
     d, N = cell.d, cell.n_cells
     if variant == "linear_head":
