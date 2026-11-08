@@ -3,7 +3,7 @@
 # /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
 #
 # The queue9 baseline recipe (B32, warm-up 200, weight decay 0.01, grad_clip 1.0, eval every 500, eager, sharing the
-# card), delayed/in_range, seed 0; transformer_2m at lr 1e-3, 5e-4 and 2.5e-4 on two schedules: WSD 0.2 over 3,000,
+# card), delayed/in_range, seed 0; transformer_2m at lr 1e-3, 5e-4 and 2.5e-4 on three schedules: cosine over 3,000, WSD 0.2 over 3,000,
 # and 3,000 steps of a 9,000-step cosine. Comparison controls only; about 0.025 to 0.045 s per step.
 #
 # Rule (registered): the best transformer recipe is the one with the highest final dev accuracy among the arms that
@@ -53,4 +53,8 @@ arms:
     family: transformer
     overrides: [train.steps=9000, train.ckpt_every=9000]
     protocol: {steps: 3000}
+    grid: {train.lr: [0.001, 0.0005, 0.00025]}
+  # added 7 Nov (the coordinator's union of both proposals: a 3x3 grid): cosine over 3,000
+  - name: s0b_tf2m_cos3k
+    family: transformer
     grid: {train.lr: [0.001, 0.0005, 0.00025]}
