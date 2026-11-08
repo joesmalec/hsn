@@ -785,3 +785,49 @@ def test_p1_13_compiled_training_steps_cuda(lever: str, tmp_path: Path) -> None:
         assert isinstance(model.cell.cand_norm, nn.RMSNorm)
         gain = model.cell.cand_norm.weight
         assert gain is not None and not bool((gain == 1.0).all())  # the gain trained
+
+
+# --------------------------------------------------------------------------------------------------
+# The lever arms' sweep specs
+# --------------------------------------------------------------------------------------------------
+
+
+def test_p1_13_sweep_specs_expand(tmp_path: Path) -> None:
+    """Both committed P1.13 specs expand (no database) into the planned arms: five HSN memory
+    checks of 600 steps, each with one lever, and six GRU arms on a 3,000-step WSD schedule."""
+    from hsn.experiments.spec import expand, load_spec
+    from p1_11_support import fake_repo
+
+    repo = fake_repo(tmp_path)
+    spec, _ = load_spec(REPO / "configs" / "sweeps" / "p1_13_levers_hsn_h600.yaml")
+    hsn_arms = {a.label: a for a in expand(spec, repo=repo)}
+    assert sorted(hsn_arms) == sorted(
+        f"{n}/s0" for n in ("l1_wsd", "l2_cell_lr", "l3_cand_norm", "r_cand_norm", "r_cell_lr")
+    )
+    for arm in hsn_arms.values():
+        cfg = arm.config
+        assert arm.family == "hsn" and arm.steps == 600 and arm.timing
+        assert cfg.model.d == 64 and cfg.train.batch == 32
+        assert cfg.hardware.compile_mode == "reduce-overhead"
+        levers = [
+            cfg.train.schedule == "wsd",
+            cfg.train.cell_lr_mult != 1.0,
+            cfg.model.cand_norm != "none",
+        ]
+        assert sum(levers) == 1, arm.label  # one lever at a time
+    e1 = {k: hsn_arms[f"{k}/s0"].config.train for k in ("l1_wsd", "l2_cell_lr", "l3_cand_norm")}
+    assert all(t.lr == 0.003 and t.steps == 3000 and t.warmup_steps == 200 for t in e1.values())
+    assert e1["l1_wsd"].decay_fraction == 0.2 and e1["l2_cell_lr"].cell_lr_mult == 0.33
+    r = {k: hsn_arms[f"{k}/s0"].config for k in ("r_cand_norm", "r_cell_lr")}
+    assert all(c.train.lr == 0.002 and c.train.steps == 9000 for c in r.values())
+    assert r["r_cand_norm"].model.cand_norm == "rms" and r["r_cell_lr"].train.cell_lr_mult == 0.5
+
+    spec, _ = load_spec(REPO / "configs" / "sweeps" / "p1_13_levers_gru_wsd.yaml")
+    gru_arms = expand(spec, repo=repo)
+    assert len(gru_arms) == 6
+    for arm in gru_arms:
+        train = arm.config.train
+        assert arm.family == "gru" and not arm.timing and arm.steps == 3000
+        assert (train.schedule, train.decay_fraction, train.steps) == ("wsd", 0.2, 3000)
+        assert arm.config.baseline.gru.d_model in (64, 128)
+        assert train.lr in (0.002, 0.0025, 0.003)
