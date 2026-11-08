@@ -7,10 +7,11 @@ go under ``$HSN_EXPERIMENTS_ROOT`` (default ``<db dir>/runs``). A path under the
 (``/tmp`` is wiped on reboot here) raises unless ``allow_tmp`` (tests) or
 ``HSN_EXPERIMENTS_ALLOW_TMP=1``.
 
-**Concurrency.** WAL journal, ``busy_timeout`` 30 s, one connection per thread. Every write runs in
-``with db.write():`` (``BEGIN IMMEDIATE``), which serialises writers (two or three workers, their
-children, ``enqueue``) without lost updates; multi-statement reads use ``with db.read():`` for one
-snapshot (a reporter never sees half a transaction).
+**Concurrency.** WAL journal, ``busy_timeout`` 30 s, one connection per thread (P1.16: a first open
+retries the switch to WAL on "database is locked", which the busy handler does not cover). Every
+write runs in ``with db.write():`` (``BEGIN IMMEDIATE``), which serialises writers (two or three
+workers, their children, ``enqueue``) without lost updates; multi-statement reads use ``with
+db.read():`` for one snapshot (a reporter never sees half a transaction).
 
 **Schema** (version in ``PRAGMA user_version``; :data:`MIGRATIONS` applies in order, one transaction
 per step, inside ``BEGIN IMMEDIATE`` so that concurrent first opens migrate once; a database newer
@@ -54,6 +55,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -66,6 +68,8 @@ __all__ = [
     "MIGRATIONS",
     "SCHEMA_VERSION",
     "STATUSES",
+    "WAL_RETRY_DEADLINE_S",
+    "WAL_RETRY_STEP_S",
     "Database",
     "DatabaseError",
     "EnqueueReport",
@@ -237,6 +241,33 @@ def loads(text: str | None) -> Any:
     return None if text is None else json.loads(text)
 
 
+#: P1.16: how long a first open retries the switch to WAL when SQLite answers "database is locked"
+#: (the busy timeout's 30 s), and the backoff step (``attempt * WAL_RETRY_STEP_S`` seconds, at most
+#: 1 s per wait).
+WAL_RETRY_DEADLINE_S = 30.0
+WAL_RETRY_STEP_S = 0.05
+
+
+def _set_wal(conn: sqlite3.Connection) -> None:
+    """``PRAGMA journal_mode = WAL`` on a new connection, retried on "database is locked" (P1.16).
+
+    The journal-mode change does not wait in SQLite's busy handler: when several processes open a
+    fresh database at once, one of them can get "database is locked" at once (seen once under load
+    locally and once on the hosted runner, P1.15). It retries with a growing backoff until
+    :data:`WAL_RETRY_DEADLINE_S`; any other error, and a lock that outlives the deadline, raises."""
+    deadline = time.monotonic() + WAL_RETRY_DEADLINE_S
+    attempt = 0
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            attempt += 1
+            if "locked" not in str(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(min(1.0, attempt * WAL_RETRY_STEP_S))
+
+
 class Database:
     """One experiment database (module docstring). Safe to share between threads (one connection
     per thread) and processes (SQLite's locking, WAL)."""
@@ -275,7 +306,7 @@ class Database:
             conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 30000")
-            conn.execute("PRAGMA journal_mode = WAL")
+            _set_wal(conn)  # P1.16: retries a locked switch
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA foreign_keys = ON")
             self._local.conn = conn
