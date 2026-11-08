@@ -1,0 +1,396 @@
+{
+ "cases": {
+  "cells_apart": {
+   "preset": "cells_apart"
+  },
+  "memory_open": {
+   "preset": "memory_open"
+  },
+  "memory_open_queue9": {
+   "every": 500,
+   "from_step": 500,
+   "preset": "memory_open",
+   "to_step": 3000
+  },
+  "memory_open_windowed": {
+   "every": 100,
+   "from_step": 400,
+   "min_samples": 3,
+   "preset": "memory_open",
+   "to_step": 600,
+   "window": 50
+  },
+  "reads_state": {
+   "preset": "reads_state"
+  },
+  "reads_state_tuned": {
+   "follow_min": 0.6,
+   "preset": "reads_state",
+   "unchanged_max": 0.05
+  },
+  "reads_state_v2": {
+   "preset": "reads_state_v2"
+  },
+  "reads_state_v2_min20": {
+   "min_correct": 30,
+   "preset": "reads_state_v2"
+  }
+ },
+ "expansions": {
+  "cells_apart": {
+   "applies_to": {
+    "family": [
+     "hsn"
+    ]
+   },
+   "cases": [
+    {
+     "label": "apart",
+     "when": {
+      "all": [
+       {
+        "metric": "trained:rank_pr/answer",
+        "op": ">=",
+        "value": 2.0
+       },
+       {
+        "metric": "trained:diversity_live/answer",
+        "op": ">=",
+        "value": 0.2
+       }
+      ]
+     }
+    }
+   ],
+   "default": "not apart"
+  },
+  "memory_open": {
+   "applies_to": {
+    "family": [
+     "hsn"
+    ]
+   },
+   "cases": [
+    {
+     "label": "open",
+     "when": {
+      "all": [
+       {
+        "agg": "all",
+        "metric": "diag:gate/p50",
+        "op": ">=",
+        "steps": {
+         "every": 500,
+         "from": 500
+        },
+        "value": 0.01
+       },
+       {
+        "agg": "all",
+        "metric": "diag:grad_share/cell",
+        "op": ">=",
+        "steps": {
+         "every": 500,
+         "from": 500
+        },
+        "value": 0.01
+       }
+      ]
+     }
+    }
+   ],
+   "default": "shut"
+  },
+  "memory_open_queue9": {
+   "applies_to": {
+    "family": [
+     "hsn"
+    ]
+   },
+   "cases": [
+    {
+     "label": "open",
+     "when": {
+      "all": [
+       {
+        "agg": "all",
+        "metric": "diag:gate/p50",
+        "op": ">=",
+        "steps": {
+         "every": 500,
+         "from": 500,
+         "to": 3000
+        },
+        "value": 0.01
+       },
+       {
+        "agg": "all",
+        "metric": "diag:grad_share/cell",
+        "op": ">=",
+        "steps": {
+         "every": 500,
+         "from": 500,
+         "to": 3000
+        },
+        "value": 0.01
+       }
+      ]
+     }
+    }
+   ],
+   "default": "shut"
+  },
+  "memory_open_windowed": {
+   "applies_to": {
+    "family": [
+     "hsn"
+    ]
+   },
+   "cases": [
+    {
+     "label": "open",
+     "when": {
+      "all": [
+       {
+        "agg": "median",
+        "metric": "diag:gate/p50",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 350,
+         "to": 450
+        },
+        "value": 0.01
+       },
+       {
+        "agg": "median",
+        "metric": "diag:grad_share/cell",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 350,
+         "to": 450
+        },
+        "value": 0.01
+       },
+       {
+        "agg": "median",
+        "metric": "diag:gate/p50",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 450,
+         "to": 550
+        },
+        "value": 0.01
+       },
+       {
+        "agg": "median",
+        "metric": "diag:grad_share/cell",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 450,
+         "to": 550
+        },
+        "value": 0.01
+       },
+       {
+        "agg": "median",
+        "metric": "diag:gate/p50",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 550,
+         "to": 650
+        },
+        "value": 0.01
+       },
+       {
+        "agg": "median",
+        "metric": "diag:grad_share/cell",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 550,
+         "to": 650
+        },
+        "value": 0.01
+       }
+      ]
+     }
+    }
+   ],
+   "default": "shut"
+  },
+  "reads_state": {
+   "cases": [
+    {
+     "label": "no correct answers to probe",
+     "when": {
+      "metric": "probe:correct_n",
+      "op": "==",
+      "value": 0.0
+     }
+    },
+    {
+     "label": "reads state",
+     "when": {
+      "all": [
+       {
+        "metric": "probe:correct_follow_frac",
+        "op": ">=",
+        "value": 0.5
+       },
+       {
+        "metric": "probe:correct_unchanged_frac",
+        "op": "<=",
+        "value": 0.1
+       }
+      ]
+     }
+    },
+    {
+     "label": "does not read state",
+     "when": {
+      "metric": "probe:correct_follow_frac",
+      "op": "<",
+      "value": 0.2
+     }
+    }
+   ],
+   "default": "partial"
+  },
+  "reads_state_tuned": {
+   "cases": [
+    {
+     "label": "no correct answers to probe",
+     "when": {
+      "metric": "probe:correct_n",
+      "op": "==",
+      "value": 0.0
+     }
+    },
+    {
+     "label": "reads state",
+     "when": {
+      "all": [
+       {
+        "metric": "probe:correct_follow_frac",
+        "op": ">=",
+        "value": 0.6
+       },
+       {
+        "metric": "probe:correct_unchanged_frac",
+        "op": "<=",
+        "value": 0.05
+       }
+      ]
+     }
+    },
+    {
+     "label": "does not read state",
+     "when": {
+      "metric": "probe:correct_follow_frac",
+      "op": "<",
+      "value": 0.2
+     }
+    }
+   ],
+   "default": "partial"
+  },
+  "reads_state_v2": {
+   "cases": [
+    {
+     "label": "no matched probes",
+     "when": {
+      "metric": "probe_v2:correct_n",
+      "op": "==",
+      "value": 0.0
+     }
+    },
+    {
+     "label": "too few matched probes",
+     "when": {
+      "metric": "probe_v2:correct_n",
+      "op": "<",
+      "value": 20.0
+     }
+    },
+    {
+     "label": "reads state",
+     "when": {
+      "all": [
+       {
+        "metric": "probe_v2:correct_follow_frac",
+        "op": ">=",
+        "value": 0.5
+       },
+       {
+        "metric": "probe_v2:correct_unchanged_frac",
+        "op": "<=",
+        "value": 0.1
+       }
+      ]
+     }
+    },
+    {
+     "label": "does not read state",
+     "when": {
+      "metric": "probe_v2:correct_follow_frac",
+      "op": "<",
+      "value": 0.2
+     }
+    }
+   ],
+   "default": "partial"
+  },
+  "reads_state_v2_min20": {
+   "cases": [
+    {
+     "label": "no matched probes",
+     "when": {
+      "metric": "probe_v2:correct_n",
+      "op": "==",
+      "value": 0.0
+     }
+    },
+    {
+     "label": "too few matched probes",
+     "when": {
+      "metric": "probe_v2:correct_n",
+      "op": "<",
+      "value": 30.0
+     }
+    },
+    {
+     "label": "reads state",
+     "when": {
+      "all": [
+       {
+        "metric": "probe_v2:correct_follow_frac",
+        "op": ">=",
+        "value": 0.5
+       },
+       {
+        "metric": "probe_v2:correct_unchanged_frac",
+        "op": "<=",
+        "value": 0.1
+       }
+      ]
+     }
+    },
+    {
+     "label": "does not read state",
+     "when": {
+      "metric": "probe_v2:correct_follow_frac",
+      "op": "<",
+      "value": 0.2
+     }
+    }
+   ],
+   "default": "partial"
+  }
+ },
+ "source": "captured on the base commit 6e609b8 (evidence/P1.15/scripts/capture_presets.py)"
+}

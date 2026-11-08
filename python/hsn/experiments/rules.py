@@ -49,7 +49,9 @@ stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict, and
 ``group.min_agree`` is read by ``report`` at seed-group level ("counts as a finding" when that many
 seeds share a label).
 Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``reads_state_v2``
-(P1.14), ``memory_open``, ``cells_apart``.
+(P1.14; P1.15: ``min_vocab`` adds "vocabulary too small"), ``memory_open``, ``cells_apart``, and
+P1.15's ``reads_state_v3`` (probe v3's value edit), ``binds_keys`` (its key swap) and
+``memory_writes`` (the write rate and the cell's update ratio over a window).
 
 **Early stop.** ``{name, at_steps: [n, ...], outcome, when, applies_to}``: evaluated by the trainer
 callback right after step ``n``'s evaluation and diagnostics; when ``when`` holds the run stops with
@@ -532,9 +534,22 @@ def _preset_reads_state_v2(p: dict[str, Any]) -> dict[str, Any]:
         p.pop("follow_below", 0.2),
     )
     min_correct = p.pop("min_correct", 20)
+    # P1.15: an optional minimum answer vocabulary (None: no case, today's expansion)
+    min_vocab = p.pop("min_vocab", None)
+    vocab_case = (
+        []
+        if min_vocab is None
+        else [
+            {
+                "label": "vocabulary too small",
+                "when": _atom("probe_v2:vocab_size", "<", min_vocab),
+            }
+        ]
+    )
     return {
         "cases": [
             {"label": "no matched probes", "when": _atom("probe_v2:correct_n", "==", 0)},
+            *vocab_case,
             {
                 "label": "too few matched probes",
                 "when": _atom("probe_v2:correct_n", "<", min_correct),
@@ -554,6 +569,113 @@ def _preset_reads_state_v2(p: dict[str, Any]) -> dict[str, Any]:
             },
         ],
         "default": "partial",
+    }
+
+
+def _preset_reads_state_v3(p: dict[str, Any]) -> dict[str, Any]:
+    """P1.15: probe v3's value-edit verdict over the correct later queries
+    (:func:`hsn.experiments.probe.verdict_v3_value`): "no correct later queries", "vocabulary too
+    small" (below ``min_vocab``, default 20), "too few correct later queries" (below
+    ``min_correct``, default 20), then v1's thresholds. Needs reads_state version 3."""
+    follow_min, unchanged_max, follow_below = (
+        p.pop("follow_min", 0.5),
+        p.pop("unchanged_max", 0.1),
+        p.pop("follow_below", 0.2),
+    )
+    min_correct, min_vocab = p.pop("min_correct", 20), p.pop("min_vocab", 20)
+    return {
+        "cases": [
+            {
+                "label": "no correct later queries",
+                "when": _atom("probe_v3:correct_later_n", "==", 0),
+            },
+            {"label": "vocabulary too small", "when": _atom("probe_v3:vocab_size", "<", min_vocab)},
+            {
+                "label": "too few correct later queries",
+                "when": _atom("probe_v3:value/correct_n", "<", min_correct),
+            },
+            {
+                "label": "reads state",
+                "when": {
+                    "all": [
+                        _atom("probe_v3:value/follow_frac", ">=", follow_min),
+                        _atom("probe_v3:value/unchanged_frac", "<=", unchanged_max),
+                    ]
+                },
+            },
+            {
+                "label": "does not read state",
+                "when": _atom("probe_v3:value/follow_frac", "<", follow_below),
+            },
+        ],
+        "default": "partial",
+    }
+
+
+def _preset_binds_keys(p: dict[str, Any]) -> dict[str, Any]:
+    """P1.15: probe v3's key-swap verdict (:func:`hsn.experiments.probe.verdict_v3_swap`): "no
+    swap probes", "too few swap probes" (below ``min_correct``, default 20), "binds keys" (follow
+    >= 0.5 and unchanged <= 0.1), "does not bind keys" (follow < 0.2), else "partial". Needs
+    reads_state version 3."""
+    follow_min, unchanged_max, follow_below = (
+        p.pop("follow_min", 0.5),
+        p.pop("unchanged_max", 0.1),
+        p.pop("follow_below", 0.2),
+    )
+    min_correct = p.pop("min_correct", 20)
+    return {
+        "cases": [
+            {"label": "no swap probes", "when": _atom("probe_v3:swap/correct_n", "==", 0)},
+            {
+                "label": "too few swap probes",
+                "when": _atom("probe_v3:swap/correct_n", "<", min_correct),
+            },
+            {
+                "label": "binds keys",
+                "when": {
+                    "all": [
+                        _atom("probe_v3:swap/follow_frac", ">=", follow_min),
+                        _atom("probe_v3:swap/unchanged_frac", "<=", unchanged_max),
+                    ]
+                },
+            },
+            {
+                "label": "does not bind keys",
+                "when": _atom("probe_v3:swap/follow_frac", "<", follow_below),
+            },
+        ],
+        "default": "partial",
+    }
+
+
+def _preset_memory_writes(p: dict[str, Any]) -> dict[str, Any]:
+    """P1.15: the write-rate memory rule. "writes" when, over the diagnostics in ``[from_step,
+    to_step]`` (default 1,000 to 1,500), the ``agg`` (default median) of ``gate/write_rate`` is at
+    least ``write_rate_min`` (default 0.025) and that of ``update_ratio/cell`` at least
+    ``update_ratio_min`` (default 0.001), each window holding ``min_samples`` (default 3); else "no
+    writes". Healthy HSN memories write sparsely (gate p50 about 0, write rate 5 to 18 %), which
+    ``memory_open``'s gate-p50 rule reads as shut; the thresholds sit between the stored runs that
+    read state and the dead ones (P1.15 plan, D5; provisional, from 17 runs)."""
+    lo, hi = p.pop("from_step", 1000), p.pop("to_step", 1500)
+    if hi < lo:
+        raise RuleError(f"preset memory_writes: to_step {hi} < from_step {lo}")
+    rate, ratio = p.pop("write_rate_min", 0.025), p.pop("update_ratio_min", 0.001)
+    agg, least = p.pop("agg", "median"), p.pop("min_samples", 3)
+    span = {"from": lo, "to": hi}
+    return {
+        "cases": [
+            {
+                "label": "writes",
+                "when": {
+                    "all": [
+                        _atom("diag:gate/write_rate", ">=", rate, dict(span), agg, least),
+                        _atom("diag:update_ratio/cell", ">=", ratio, dict(span), agg, least),
+                    ]
+                },
+            }
+        ],
+        "default": "no writes",
+        "applies_to": {"family": ["hsn"]},
     }
 
 
@@ -616,6 +738,10 @@ def _preset_cells_apart(p: dict[str, Any]) -> dict[str, Any]:
 PRESETS = {
     "reads_state": _preset_reads_state,  # the audit's verdict (probe counts, correct answers)
     "reads_state_v2": _preset_reads_state_v2,  # P1.14: the same over probe v2's matched edits
+    # P1.15: probe v3's value edit over the later queries, and its key swap
+    "reads_state_v3": _preset_reads_state_v3,
+    "binds_keys": _preset_binds_keys,
+    "memory_writes": _preset_memory_writes,  # P1.15: write rate and the cell's update ratio
     "memory_open": _preset_memory_open,  # queue9 rule: gate p50 and the cell's grad share, x500
     "cells_apart": _preset_cells_apart,  # queue9 rule: rank_pr and diversity_live, trained model
 }
