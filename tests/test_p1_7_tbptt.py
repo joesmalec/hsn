@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ from cards import CUDA_PROFILE
 from hsn.config import RunConfig, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import Example, TaskSpec, generate, load_dataset_spec
-from hsn.device import DeviceContext, resolve, seed_everything
+from hsn.device import DeviceContext, resolve, seed_everything, set_deterministic
 from hsn.losses import TERMS, assemble_loss, prediction_terms
 from hsn.model.hsn import HSN
 from hsn.model.state import CellGraphState
@@ -54,6 +55,19 @@ mps_param = pytest.param("m_series", marks=pytest.mark.mps)
 # --------------------------------------------------------------------------------------------------
 # Fixtures: kv in-range documents (the P0.5 fixture recipe) and a small HSN from ref_a1
 # --------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_determinism() -> Iterator[None]:
+    """The resume test sets ``train.deterministic``, which the trainer applies process-wide
+    (``torch.use_deterministic_algorithms``); MPS tests of other chunks must not inherit it. A later
+    trainer of this module turns the flag off again, but a selection without one (``-k resume``)
+    would leak it."""
+    before = torch.are_deterministic_algorithms_enabled()
+    try:
+        yield
+    finally:
+        set_deterministic(before)
 
 
 def _tiny_task(

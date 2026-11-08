@@ -20,13 +20,14 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 from hsn.config import load_config, load_hardware_profile
-from hsn.device import resolve, seed_everything
+from hsn.device import resolve, seed_everything, set_deterministic
 from hsn.runner import build_model, make_trainer
 from hsn.train.lazy_adam import LazyAdamW, build_lazy_adamw
 from p1_13_support import CASES, FIXTURES, REF_A1, case_config, fingerprint, run_case
@@ -35,6 +36,18 @@ from p1_13_support import state_dict_layout as layout_of
 CPU_FIXTURE = FIXTURES / "defaults_cpu.json"
 CUDA_FIXTURE = FIXTURES / "defaults_cuda.json"
 RTOL = 1e-4  # off the capture platform: the floats of six fp32 steps of a small model
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_determinism() -> Iterator[None]:
+    """The golden cases set ``train.deterministic``, which the trainer applies process-wide
+    (``torch.use_deterministic_algorithms``); MPS tests of other chunks must not inherit it
+    (``scatter_reduce_mps`` has no deterministic implementation)."""
+    before = torch.are_deterministic_algorithms_enabled()
+    try:
+        yield
+    finally:
+        set_deterministic(before)
 
 
 def _fixture(path: Path) -> dict[str, Any]:
