@@ -1,0 +1,105 @@
+# Sweep 3, P2 (user approval 7 Nov 2026 20:58, via the coordinator): E2 at R with model.cand_norm=rms. Enqueued
+# only if P1 (sweep3_p1_r_cand_d128.yaml) passes and only on the coordinator's word after it has confirmed P1's
+# numbers. Rules, predictions and architecture notes were registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md
+# before any run.
+#
+# R = lr 2e-3, warm-up 200, 3,000 steps of a 9,000-step cosine schedule (train.steps 9000, protocol steps 3000),
+# at which the GRU detects width (128x1 reads state, exp 85; 64x1 does not, exp 83). Dense HSN, B32, compiled,
+# timing arms, evaluation every 500, diagnostics every 25 (the windowed memory rule); d=64 (exp 92 passed the
+# memory check at R with cand_norm) and d=128 (P1). Architecture note: amendment A4 (opt-in) for both, plus the d
+# design option for d=128. Expected step time about 0.240 s (d=64) and 0.35 to 0.36 s (d=128).
+#
+# Verdicts and early stops: queue9's, unchanged (copied from queue9.yaml): reads_state (a finding needs 2 of 3
+# seeds; seeds for any arm that reads state go back to the user), memory_open (registered, one sample per multiple
+# of 500), memory_open_windowed (the user's 7 Nov rule), cells_apart, cells_identical, nonfinite_skips; the early
+# stops on a shut memory (both medians below 0.01 over the trailing [c-200, c] at two consecutive checkpoints from
+# 1,000). Reading note 1 (under cand_norm the cell share scales as 1/||W||; read update_ratio/cell beside it).
+
+name: sweep3_p2_e2_r_cand
+description: E2 at R (lr 2e-3, 3k of a 9k schedule) with cand_norm=rms, dense HSN d=64 and d=128
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.002
+    - train.steps=9000
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.cand_norm=rms
+protocol: {name: reads_state, steps: 3000, diag_every: 25, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    # the audit's verdict (fixed in POST_A1_CHECKS.md before HSN's 5(c)); a finding needs 2 of 3 seeds
+    reads_state: {preset: reads_state, group: {min_agree: 2}}
+    # queue9's registered rule (6 Nov): gate p50 >= 0.01 and grad_share/cell >= 0.01 at every multiple of 500
+    # from step 500, one sample each (the cadence it was registered at)
+    memory_open: {preset: memory_open}
+    # the user's windowed rule (7 Nov): at each multiple of 500, the median over the diagnostics within 100 steps
+    memory_open_windowed: {preset: memory_open, window: 100, to_step: 3000}
+    # queue9's registered rule: rank_pr >= 2.0 and diversity_live >= 0.2 at answers on the trained model
+    cells_apart: {preset: cells_apart}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    # P1.12: optimiser steps the non-finite-gradient guard skipped (the trainer stops a run that keeps skipping)
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+  early_stop:
+    - name: memory_shut_1500
+      at_steps: [1500]
+      outcome: "fail-early: memory shut at 1,000 and 1,500"
+      applies_to: {family: [hsn]}
+      when:
+        all:
+          - {metric: "diag:gate/p50", steps: {from: 800, to: 1000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 800, to: 1000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:gate/p50", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+    - name: memory_shut_2000
+      at_steps: [2000]
+      outcome: "fail-early: memory shut at 1,500 and 2,000"
+      applies_to: {family: [hsn]}
+      when:
+        all:
+          - {metric: "diag:gate/p50", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1300, to: 1500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:gate/p50", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+    - name: memory_shut_2500
+      at_steps: [2500]
+      outcome: "fail-early: memory shut at 2,000 and 2,500"
+      applies_to: {family: [hsn]}
+      when:
+        all:
+          - {metric: "diag:gate/p50", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 1800, to: 2000, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:gate/p50", steps: {from: 2300, to: 2500, every: 25}, agg: median, op: "<", value: 0.01}
+          - {metric: "diag:grad_share/cell", steps: {from: 2300, to: 2500, every: 25}, agg: median, op: "<", value: 0.01}
+arms:
+  - name: p2_e2_r_cand_d64
+    family: hsn
+  - name: p2_e2_r_cand_d128
+    family: hsn
+    overrides: [model.d=128]

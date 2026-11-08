@@ -1,0 +1,49 @@
+# Sweep 3, GRU references at R (user approval 7 Nov 2026 20:58, via the coordinator): comparison controls only.
+# Rules and predictions were registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
+#
+# The queue9 GRU family recipe (configs/baselines/gru_2m.yaml; B32, warm-up 200, weight decay 0.01, cosine,
+# grad_clip 1.0, eager, sharing the card) at R: lr 2e-3, train.steps 9000 (the schedule), protocol steps 3000,
+# evaluation every 500. Arms: GRU 256x1, and gru_2m as configured (384x2, the design's parameter-matched baseline:
+# 1,977,856 parameters against HSN's 1,820,617). Expected step time about 0.005 to 0.02 s.
+
+name: sweep3_gru_refs_r
+description: "GRU references at R (lr 2e-3, 3k of a 9k schedule): 256x1 and gru_2m (384x2)"
+base:
+  config: configs/baselines/gru_2m.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=none
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.002
+    - train.steps=9000
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - train.warmup_steps=200
+    - train.weight_decay=0.01
+    - train.schedule=cosine
+    - train.grad_clip=1.0
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, steps: 3000, diag_every: 500, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: false
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: ref_gru256x1_r
+    family: gru
+    overrides: [baseline.gru.d_model=256, baseline.gru.n_layers=1]
+  - name: ref_gru_2m_r
+    family: gru
