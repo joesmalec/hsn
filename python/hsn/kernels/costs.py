@@ -470,7 +470,7 @@ def profile_dense_costs(
                     unit_out = cell.units.forward_all(v)
                 with profiler.segment("messages"):  # the per-cell work after the unit pass
                     mixed = (alpha.unsqueeze(-1) * unit_out).sum(dim=2)
-                    c = torch.tanh(cell.W_out(mixed))
+                    c = torch.tanh(cell.cand_norm(cell.W_out(mixed)))  # P1.13: Identity if none
                     h_new = (1 - b) * h_prev + b * c
                     if cell.disabled_cells:
                         h_new = torch.where(cell.disabled[None, :, None], h_prev, h_new)

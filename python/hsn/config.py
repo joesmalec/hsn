@@ -199,6 +199,9 @@ class ModelConfig(_StrictModel):
     # the gate's bias at init: sigmoid(-3.0) = 0.047, so cells retain 95 % per position at the start
     gate_bias_init: float = -3.0
     # --- end P1.5a ---
+    # --- P1.13: RMSNorm (learned gain of width d) on W_out(.) before the candidate's tanh, c =
+    # tanh(cand_norm(W_out . mixed)); "none" = the P1.5 candidate. HSN only (baselines refuse rms).
+    cand_norm: Literal["none", "rms"] = "none"
     scorer: Scorer = "linear"  # router scorer
     scorer_hidden: int = Field(default=128, ge=1)  # hidden width when scorer = mlp
     scorer_features: ScorerFeaturesConfig = ScorerFeaturesConfig()
@@ -693,13 +696,15 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
-        # --- P1.13: the cell group acts on the HSN cell only ---
+        # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
             if self.train.cell_lr_mult != 1.0:
                 ignored.append(f"train.cell_lr_mult={self.train.cell_lr_mult}")
             if self.train.cell_weight_decay is not None:
                 ignored.append(f"train.cell_weight_decay={self.train.cell_weight_decay}")
+            if self.model.cand_norm != "none":
+                ignored.append(f"model.cand_norm={self.model.cand_norm}")
             if ignored:
                 raise ValueError(
                     f"{', '.join(ignored)} act on the HSN cell (P1.13), but "

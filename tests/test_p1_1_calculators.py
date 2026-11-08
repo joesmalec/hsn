@@ -38,6 +38,7 @@ APPENDIX_C1 = {
     "v_msg": 4_096,
     "gate": 16_448,
     "cell_norm": 256,  # P1.5a (amendment A1): the RMSNorm gain over the 4d cell input
+    "cand_norm": 0,  # P1.13 (amendment A4): the candidate's RMSNorm gain, off by default
     "scorer": 1_608,
     "halting": 129,
     "decoder": 197_376,
@@ -152,6 +153,7 @@ def test_p1_1_tiny_gradcheck_loads() -> None:
         "v_msg": 16,
         "gate": 68,
         "cell_norm": 16,
+        "cand_norm": 0,  # P1.13: off by default
         "scorer": 42,
         "halting": 9,
         "decoder": 216,
