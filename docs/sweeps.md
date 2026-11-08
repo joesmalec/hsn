@@ -243,6 +243,22 @@ Batching is v1's (rows truncated after their last scored position, a fresh state
 `result.json` (`probes_v3`, `probes_v3_originals`), not in the database. Oracle models in the tests pin the
 meaning: a reader that binds keys reads `binds keys`, a key-blind positional reader `does not bind keys`.
 
+`probe-rerun --exp N` (P1.15) also compares v2 with the stored v2 probes and runs v3. On the stored checkpoints
+(CUDA, bf16, `probe_batch` 64; 8 Nov 2026) v1 reproduced every stored answer of all four runs and v2 every
+stored answer of exp 136. v3, over the later queries answered correctly before each edit (vocabulary 48 in all
+four):
+
+| exp | model | later-query accuracy (probe pass) | value edit: follow / other / unchanged | key swap: follow / other / unchanged | value verdict | swap verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| 136 | HSN d=64 + A4, WSD 9k | 0.604 | 535 / 140 / 5 of 680 | 2 / 4 / 671 of 677 | reads state | does not bind keys |
+| 154 | gru_2m, WSD 9k at 5e-4 | 0.604 | 532 / 139 / 9 of 680 | 0 / 1 / 676 of 677 | reads state | does not bind keys |
+| 161 | gru_2m, WSD 15k at 5e-4 | 0.607 | 544 / 130 / 10 of 684 | 0 / 0 / 681 of 681 | reads state | does not bind keys |
+| 119 | transformer_2m, 3k of 9k at 1.25e-4 | 0.239 | 92 / 153 / 24 of 269 | 0 / 1 / 265 of 266 | partial | does not bind keys |
+
+Every model reads its later answers from its state (on queries with a single key-blind candidate the value edit
+is followed 96 to 97 % of the time by HSN and gru_2m) and none binds keys: swapping two facts' keys changes
+almost no answer. This is the audit's key-blind finding shown by an intervention.
+
 **`train_eval`**: train and evaluate, with optional diagnostics and `trained_state`. No probe.
 
 **`overfit`**: the G1 overfit recipe. The first `n_docs` (64) training documents are both train and dev, and the
@@ -347,8 +363,14 @@ The status stays `failed` or `cancelled`, so the arm can be queued again. Every 
 
 A divergence can be one finite jump. Exp 171 ran with gradient norms of 0.3 to 0.56, then one batch gave
 2.2e10 at step 1,269; P1.12's guard skips only non-finite norms, so clipping applied it, and the model broke.
-Finite spikes are common in the stored runs: 17 of the 107 runs that did not fail have steps above 100 times
-their running median (the measured would-skip table is in the P1.15 pull request).
+Finite spikes are common in the stored runs. On the 108 stored runs that did not fail, the guard (window 100)
+would skip 55 steps in 17 runs at factor 100, 21 steps in 5 runs at 1,000, and 16 steps in 3 runs at 10^4. Many
+of those runs learned anyway: gru_2m exp 161 (0.793) spiked 1.5e5 times its median at step 3,791. Others stayed
+at chance after early spikes: the gru_2m seeds of exps 122, 123, 144 and 145, and HSN exp 170, whose burst
+reached 5e14 at steps 1,345 to 1,363. In exp 171 every step before 1,269 is at most 4.5 times its median, so
+every factor from 5 to 6e10 skips step 1,269 and nothing before it. After a first skip the stored norms are not
+a counterfactual: a guarded run's later batches meet another model. Ordinary steps stay below about 70 times
+their median, and 100 sits at the edge of that range.
 
 **The spike guard** (config, off by default):
 - `train.spike_factor` (None: off; recommended 100): skip a step whose finite pre-clip global norm exceeds the
@@ -362,13 +384,16 @@ their running median (the measured would-skip table is in the P1.15 pull request
 - On P2.8's compiled path the guard reads the norm the step already copies to the host, after the compiled
   backward: no device synchronisation and nothing changes in the captured graphs. It is refused under an fp16
   `GradScaler`.
+- Cost, measured on the RTX 3060 (E1's compiled dense recipe, B32, median of steps 11 to 60, 3 processes each):
+  defaults 0.2399 / 0.2391 / 0.2386 s per step against 0.2405 / 0.2395 / 0.2393 on the base commit; with the
+  guard at 100, 0.2391 / 0.2388 / 0.2392; with the dump off, 0.2387. All within noise.
 
 **The divergence dump** (`train.divergence_dump`, on by default): at the first step a guard skips (non-finite,
 or a spike with the guard on) the trainer writes `divergence_<step>.pt` into the run directory, with a JSON
 sidecar. It is a checkpoint at the step before: the parameters, optimiser and scheduler (still pre-step at that
 point), and the step snapshot every step keeps (loader position, every generator, copies of the carried state
 and the buffers, the counters). It adds the event, the step's windows with their document ids, the resolved
-configuration, the versions and per-parameter gradient finiteness. It is about 30 MB for ref_a1. The record's
+configuration, the versions and per-parameter gradient finiteness. It is 22.5 MB for ref_a1 at B32. The record's
 `divergence` names it. A failing write is logged and recorded, and training goes on.
 
 **Replay:**
@@ -387,6 +412,24 @@ when compiled), as P1.13's CUDA golden test does. It reports:
 - eager, with `model.cand_norm=rms`, the RMS of the candidate norm's input (the near-zero hypothesis of exp 171).
 
 `--cpu` replays a CUDA dump in fp32 on the CPU; it is approximate (another device and dtype).
+
+**A real one (8 Nov 2026).** Exp 170/171's arm (HSN d=64 + A4, WSD at 2e-3) was rerun for 1,500 steps with the guard
+at 100 (scratch database, P1.15 evidence).
+- **Seed 0:** step 908 gave a norm of 2.2e16 (4e16 times its median) at a normal loss (3.88). The guard skipped it
+  and wrote the dump (22.5 MB). The next nine batches, with the weights frozen at step 907, gave 1e13 to 3.5e18
+  at normal losses, and P1.12's stop ended the run at step 917 (kind `spike`).
+- **Seed 1:** ran 1,500 steps without a spike.
+
+**The replay of seed 0's dump:**
+- compiled, under the deterministic modes, two replays agree bit for bit and give 2.27e16 (1.3 % from the
+  recorded norm);
+- eager they give 6.2e13: still a spike, and also identical twice;
+- the candidate norm's input RMS is at least 2.41 (median 3.01): the near-zero RMSNorm hypothesis is refuted for
+  this event;
+- the exploding gradient is spread over the cell's gate, `W_out`, the byte embedding, the encoder and the
+  shared transform, at a normal forward: it points at the backward through time, not at one singular operation.
+
+So at that point the weights made many batches' backward explode, not one outlier batch.
 
 ## Rules
 
@@ -547,6 +590,13 @@ that spec's verdict rules are evaluated again on the stored records of its arms,
   with its later slots, and the recomputed overall accuracy against the stored one.
 
 `report --split-backfill FILE` fills the split columns of those runs.
+
+On 8 Nov 2026 (read-only snapshot of the database, CUDA) the backfill recomputed all 127 stored reads_state runs
+with a kept checkpoint. 113 reproduce their stored dev accuracy exactly, and the rest are within 4 answers of it
+(eager evaluation against the runs' compiled one). The derived split equals the audit's hand reconstruction
+(AUDIT.md, 02:52 and later). The recomputed later-query accuracy is within 2 answers of it for 12 of the 13
+runs listed there; exp 173 (d=128 at R*) is 7 answers off. Per later slot, HSN exp 136 scores 0.531 / 0.696 /
+0.803, and gru_2m exp 154 0.513 / 0.728 / 0.869.
 
 `import --audit-dir /home/joe/hsn-eff/evidence/EFF` backfills the audit's reads-state JSONs and its overfit
 summaries (`hsn/`, `e2/`) as imported runs of the pseudo-sweep `imported_audit`. Per file:
