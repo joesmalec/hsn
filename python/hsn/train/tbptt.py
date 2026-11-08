@@ -135,9 +135,21 @@ window loop::
   first evaluation; ``measured["window_compile_seconds"]`` is every variant's compile and
   recording time, evaluation included); the probes and ``capture=True`` stay eager.
 
+* **Non-finite gradients (P1.12).** Without a loss scaler, a step whose global gradient norm is not
+  finite is skipped by the generic trainer's guard (:mod:`hsn.train.loop`, "Non-finite gradients"):
+  gradients zeroed, no optimiser step (LazyAdamW's per-unit steps included), the scheduler and
+  :meth:`~hsn.model.hsn.HSN.update_target` still advance, the skip counted and logged, and the
+  stop rule raises when the run keeps skipping. Every step record carries the count so far as
+  ``stats["skipped_nonfinite"]``; ``measured["skipped_nonfinite_steps"]`` and the checkpoint carry
+  it too. Under the compiled window nothing changes for the captured graphs: the norm, the clipping,
+  the guard and the optimiser run eagerly after the compiled backward, a skipped step writes nothing
+  into the parameters (the graphs' static inputs keep their addresses and values), and zeroing the
+  gradients drops references the next window's graph step releases anyway.
+
 Guards: a model that is not an :class:`HSN`, a configuration whose ``model_name`` is not ``hsn``, a
-non-finite objective without a loss scaler, and a checkpoint of another configuration or without the
-P1.7 entries raise (plan §4.3: errors over silence).
+non-finite objective without a loss scaler (unless its step was skipped for a non-finite gradient,
+P1.12), and a checkpoint of another configuration or without the P1.7 entries raise (plan §4.3:
+errors over silence).
 """
 
 from __future__ import annotations
@@ -278,7 +290,8 @@ class TBPTTStepRecord(StepRecord):
     the step's windows), ``parts`` (every λ-weighted term, same mean), ``stats`` (the
     :data:`STAT_KEYS` every step — over the positions the windows computed, which exclude a
     trailing-padding tail cut by P1.10d — ``window_positions``, the mean number of columns
-    computed per window, and ``grad_norm/<group>`` on stats steps), the resync counters after the
+    computed per window, ``skipped_nonfinite``, the steps skipped so far for a non-finite gradient
+    (P1.12), and ``grad_norm/<group>`` on stats steps), the resync counters after the
     step and, in a routed run, ``active_units`` (P2.6: the sorted ids of the units the step's
     windows executed; ``None`` in dense routing, where every unit runs)."""
 
@@ -755,13 +768,14 @@ class TBPTTTrainer(Trainer):
                 group_norms = self._group_grad_norms(groups) if stats_step else {}
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
+                skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer, **step_kwargs)
                     self.scaler.update()
-                else:
+                elif not skipped:
                     self.optimizer.step(**step_kwargs)
                 self.scheduler.step()
                 self.hsn.update_target()
@@ -770,7 +784,7 @@ class TBPTTTrainer(Trainer):
             mean_total = total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
             accuracy = float(correct) / n_loss if n_loss else float("nan")
-            if self.scaler is None and not math.isfinite(mean_total):
+            if self.scaler is None and not math.isfinite(mean_total) and not skipped:
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
             seconds = time.perf_counter() - started
             compiled_now = self._compiled is not None and (
@@ -788,6 +802,7 @@ class TBPTTTrainer(Trainer):
                 "alpha_entropy": entropy_sum / n_windows,
                 "route_cost": cost_sum / n_windows,
                 "window_positions": positions_sum / n_windows,
+                "skipped_nonfinite": float(self.skipped_nonfinite),  # P1.12: the count so far
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
                 **(probe_counts if self.counterfactual else {}),
@@ -864,6 +879,7 @@ class TBPTTTrainer(Trainer):
             "window_compile_seconds": (
                 self._compiled.compile_seconds if self._compiled is not None else 0.0
             ),
+            "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
         }
         return history
 
@@ -883,6 +899,7 @@ class TBPTTTrainer(Trainer):
             "q_resync": q_resync_counter(self.windows, self.windows_since_resync, self.resyncs),
             "reinforce_baseline": self.reinforce_baseline,  # P2.2 (None unless reinforce ran)
             "cut_pending": self._cut_pending,  # P1.10d: the next window must reset every row
+            **self._guard_extra(),  # P1.12: the non-finite-gradient guard's counts
         }
         save_checkpoint(
             path,
@@ -927,6 +944,7 @@ class TBPTTTrainer(Trainer):
         self.windows = counters["windows"]
         self.windows_since_resync = counters["since_resync"]
         self.resyncs = counters["resyncs"]
+        self._restore_guard(extra, str(path))  # P1.12
         if "reinforce_baseline" in extra:
             baseline = extra["reinforce_baseline"]
             if baseline is not None and (

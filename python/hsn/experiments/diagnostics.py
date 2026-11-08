@@ -19,7 +19,9 @@ routed model.
 alone) and the parameters are cloned on sampled steps only. Samples are keyed by the trainer's step
 (the step being completed); the optimiser call count is recorded too, and without a loss scaler a
 difference between the two raises (a GradScaler may skip ``optimizer.step`` on non-finite fp16
-gradients, so with one the hook skips that sample). The state window runs under ``no_grad`` with
+gradients, so with one the hook skips that sample). A step the P1.12 non-finite-gradient guard
+skipped calls no optimiser step either: the count is compared net of the trainer's
+``skipped_nonfinite``, and that step has no sample. The state window runs under ``no_grad`` with
 the training mode restored and keeps nothing from the training window (P2.8: a compiled window is
 not disturbed). ``seconds`` is the wall time spent inside the hooks, which the trainer counts as
 training time; the harness subtracts it.
@@ -135,10 +137,12 @@ class Diagnostics:
         started = time.perf_counter()
         self.optimizer_calls += 1
         step = int(self._trainer.step) + 1  # the trainer increments its step after the update
-        if not self._scaled and step != self.optimizer_calls:
+        # P1.12: a step the non-finite-gradient guard skipped calls no optimiser step
+        taken = step - int(getattr(self._trainer, "skipped_nonfinite", 0))
+        if not self._scaled and taken != self.optimizer_calls:
             raise RuntimeError(
-                f"diagnostics: trainer step {step} != optimiser call {self.optimizer_calls} "
-                "without a loss scaler"
+                f"diagnostics: trainer step {step} ({taken} not skipped by the non-finite-gradient "
+                f"guard) != optimiser call {self.optimizer_calls} without a loss scaler"
             )
         self._pending = None
         if step % self.every == 0:
