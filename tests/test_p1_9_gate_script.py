@@ -240,6 +240,9 @@ def gate_argv(
         "2",
         "--after-overfit-failure",
         "continue",
+        # P1.16 (amendment A2): the --trial sets are the whole grid (no implicit trial 0)
+        "--trial",
+        "train.lr=1e-3",
         "--trial",
         "model.k_select=9",  # invalid for the tiny HSN (k_select > n_cells): a recorded failure
         "--search-steps",
@@ -340,6 +343,8 @@ def test_p1_9_gate_script_fails_below_threshold(gate_run: dict[str, Any], tmp_pa
     assert (
         hsn_trials[0]["status"] == "ok" and hsn_trials[0]["result"]["g1_mean_dev_accuracy"] >= 0.0
     )
+    assert hsn_trials[0]["overrides"] == ["train.lr=1e-3"]  # P1.16 (A2): an absolute override
+    assert hsn_trials[0]["recipe"]["lr"] == 1e-3  # and the trial's resolved recipe keys
     assert hsn_trials[1]["status"] == "failed" and "k_select" in hsn_trials[1]["error"]
     assert (
         search["methods"]["hsn"]["best_index"] == 0 and search["methods"]["hsn"]["trials_used"] == 2
@@ -639,14 +644,15 @@ def test_p1_9_experiment_config_matches_ref_a1() -> None:
     assert cfg.train.aux_enabled == [] and cfg.train.precision == "bf16"
     gate = load_script("gate_g1")
     gate.check_task_set(cfg, frozen, "experiment")
-    assert len(gate.trial_sets(None)) == cfg.train.search_trials
+    # P1.16 (amendment A2): every method searches the grid with search_trials = its size
+    trials = gate.trial_sets(None)
+    budget = gate.search_overrides(trials)
+    assert load_config(EXPERIMENT, overrides=budget).train.search_trials == len(trials)
     matched = gate.matched_overrides(cfg)
     assert f"train.steps={cfg.train.steps}" in matched and "data.tasks=[kv,delayed]" in matched
-    gru = load_config(REPO / "configs" / "baselines" / "gru_2m.yaml", overrides=matched)
+    gru = load_config(REPO / "configs" / "baselines" / "gru_2m.yaml", overrides=[*matched, *budget])
     assert gru.train.steps == cfg.train.steps and gru.train.batch == cfg.train.batch
-    assert (
-        gru.data.tasks == ["kv", "delayed"] and gru.train.search_trials == cfg.train.search_trials
-    )
+    assert gru.data.tasks == ["kv", "delayed"] and gru.train.search_trials == len(trials)
 
 
 def test_p1_9_pick_best_excludes_memory_infeasible() -> None:

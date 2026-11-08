@@ -26,12 +26,15 @@ stage):
 4. Overfit check (paper §18, chunk step 1): 64 training documents (half per task) must reach
    ``--overfit-target`` train accuracy within ``--overfit-steps``; the script stops with exit code 2
    otherwise (chunk: stop and diagnose rather than search). ``overfit.json``.
-5. Recipe search on dev (chunk step 3; paper §12 equal search budgets): ``train.search_trials``
-   trials, each the configuration plus one ``--trial`` override set, seed ``--search-seed`` for
-   ``--search-steps`` steps; the GRU and Transformer configurations get the same trials, the same
-   horizon and the matched recipe and budget keys of the experiment configuration (so that every
-   method's trial 0 is the recipe of record and every trial differs from it). ``search.json``
-   records every trial, including the failed ones. The winner of a method is its best trial
+5. Recipe search on dev (chunk step 3; paper §12 equal search budgets; amendment A2,
+   ``docs/amendments/A2_gate_protocol.md``, adopted with P1.16): every method runs the same grid of
+   absolute override sets (``DEFAULT_TRIALS``, or the ``--trial`` sets; there is no implicit
+   "configuration as is" trial), seed ``--search-seed``, for ``--search-steps`` steps (9,000), on
+   its **own** recipe: the GRU and Transformer configurations take only the budget keys of the
+   experiment configuration (``MATCHED_TRAIN_KEYS``), never its recipe keys, and every
+   configuration's ``train.search_trials`` is set to the grid size (``search_overrides``).
+   ``search.json`` records every trial, including the failed ones, with the method's resolved
+   recipe keys (``recipe``). The winner of a method is its best trial
    among those whose logged gradient norms were all finite (the gate's own criterion) and whose
    measured ``peak_bytes`` fit the seed stage: ``--jobs`` copies run side by side on one card, so
    a trial above ``vram_bytes * vram_cap_fraction * --memory-headroom / --jobs`` is marked
@@ -113,17 +116,22 @@ DEFAULT_BASELINES = (
     "configs/baselines/gru_2m.yaml",
     "configs/baselines/transformer_2m.yaml",
 )
-#: The default search grid: trial 0 is the configuration itself; each further trial is one override
-#: set on top of it (steps, learning rate and schedule, batch — chunk P1.9 "search the recipe").
-DEFAULT_TRIALS: tuple[tuple[str, ...], ...] = (
-    ("train.lr=1e-3",),
-    ("train.batch=32", "train.micro_batch=32"),
-    ("train.schedule=constant", "train.warmup_steps=0"),
+#: The search grid (amendment A2, revised 8 Nov 2026): the learning rate {3e-4, 5e-4, 1e-3, 2e-3,
+#: 3e-3}, which brackets the measured optima (gru_2m 5e-4, the Transformer 1e-3, HSN + A4 2e-3 to
+#: 2.5e-3), each on the warmup-stable-decay schedule (the last 20 % decays), so that the learning
+#: rate holds through a late onset. Every trial is an absolute override set on the method's own
+#: configuration; there is no "configuration as is" trial.
+SEARCH_LRS: tuple[str, ...] = ("3e-4", "5e-4", "1e-3", "2e-3", "3e-3")
+DEFAULT_TRIALS: tuple[tuple[str, ...], ...] = tuple(
+    (f"train.lr={lr}", "train.schedule=wsd", "train.decay_fraction=0.2") for lr in SEARCH_LRS
 )
-#: Keys of the experiment configuration every baseline inherits so that the budgets and the trial
-#: grid match (paper §12: equal search budgets; matched training compute): the budget keys, and the
-#: recipe keys the trials vary, so that trial 0 is the same recipe for every method and no trial
-#: repeats a baseline's own default (gru_2m/transformer_2m already train at lr 1e-3).
+#: The default search horizon (A2: 3,000 steps hides late onsets; gru_2m's comes at 3,500 to 4,500)
+SEARCH_STEPS = 9000
+#: The budget keys every baseline takes from the experiment configuration (A2 change 2: the matched
+#: training compute and evaluation cadence). Recipe keys (lr, betas, weight decay, warm-up,
+#: schedule, gradient clip) come from each method's own configuration or from the grid, never from
+#: another method's; ``train.search_trials`` is set to the grid size for every configuration
+#: (:func:`search_overrides`).
 MATCHED_TRAIN_KEYS = (
     "steps",
     "batch",
@@ -132,11 +140,15 @@ MATCHED_TRAIN_KEYS = (
     "eval_every",
     "ckpt_every",
     "stats_every",
-    "search_trials",
+)
+#: The recipe keys each trial's entry in ``search.json`` reports (A2: no inheritance, visibly).
+RECIPE_KEYS = (
     "lr",
+    "betas",
     "weight_decay",
     "warmup_steps",
     "schedule",
+    "decay_fraction",
     "grad_clip",
 )
 #: Fraction of the profile's device memory the concurrent seed runs may use in sum (their measured
@@ -861,20 +873,52 @@ def run_units(
 
 
 def trial_sets(items: Sequence[Sequence[str]] | None) -> list[list[str]]:
-    """Trial 0 is the configuration itself; every ``--trial`` adds one override set."""
-    extra = [list(t) for t in (items if items is not None else DEFAULT_TRIALS)]
-    for trial in extra:
+    """The search grid: the ``--trial`` override sets, else :data:`DEFAULT_TRIALS` (A2: every
+    trial an absolute override set; no implicit "configuration as is" trial 0)."""
+    trials = [list(t) for t in (items if items is not None else DEFAULT_TRIALS)]
+    if not trials:
+        raise ValueError("the search needs at least one trial")
+    for trial in trials:
         if not trial:
             raise ValueError("--trial needs at least one KEY=VALUE override")
-    return [[], *extra]
+    return trials
 
 
 def matched_overrides(cfg: RunConfig) -> list[str]:
-    """The budget and data keys every baseline takes from the experiment configuration."""
+    """The budget and data keys every baseline takes from the experiment configuration (A2: the
+    budget keys only, :data:`MATCHED_TRAIN_KEYS`)."""
     items = [f"train.{key}={getattr(cfg.train, key)}" for key in MATCHED_TRAIN_KEYS]
     items.append("data.tasks=[" + ",".join(cfg.data.tasks) + "]")
     items.append("data.variants=[" + ",".join(cfg.data.variants) + "]")
     return items
+
+
+def search_overrides(trials: Sequence[Sequence[str]]) -> list[str]:
+    """A2 change 4: every configuration in the comparison searches with ``train.search_trials``
+    equal to the grid size (the configuration files are not edited: they are the bases of the
+    sweep specs, whose arm ids they would change)."""
+    return [f"train.search_trials={len(trials)}"]
+
+
+def trial_recipe(cfg: RunConfig) -> dict[str, Any]:
+    """A trial's resolved recipe keys (:data:`RECIPE_KEYS`), for ``search.json`` (A2)."""
+    out: dict[str, Any] = {}
+    for key in RECIPE_KEYS:
+        value = getattr(cfg.train, key)
+        out[key] = list(value) if isinstance(value, tuple) else value
+    return out
+
+
+def search_table(record: Mapping[str, Any]) -> str:
+    """One method's search as a text table: index, status, recipe keys, mean dev accuracy (A2)."""
+    lines = [f"search {record['model']} ({record['config']}):"]
+    for t in record["trials"]:
+        recipe = t.get("recipe") or {}
+        keys = " ".join(f"{k}={recipe[k]}" for k in RECIPE_KEYS if k in recipe)
+        result = (t.get("result") or {}).get(SEARCH_METRIC)
+        score = f"{result:.4f}" if isinstance(result, int | float) else "-"
+        lines.append(f"  trial {t['index']}: {t.get('status')} {score} {keys}")
+    return "\n".join(lines)
 
 
 def g1_result(metrics: Mapping[str, Any], frozen: MetricsFreeze) -> dict[str, float]:
@@ -963,7 +1007,7 @@ def search_method(
     if len(trials) != budget.trials_allowed:
         raise ValueError(
             f"{config}: train.search_trials={budget.trials_allowed} but {len(trials)} trials were "
-            "given (trial 0 is the configuration itself); the budget is the same for every method"
+            "given; the budget is the grid's size for every method (search_overrides)"
         )
     units: list[Unit] = []
     planned: list[dict[str, Any]] = []
@@ -979,6 +1023,7 @@ def search_method(
         try:
             cfg = load_config(config, overrides=overrides)
             entry["config_hash"] = config_hash(cfg)
+            entry["recipe"] = trial_recipe(cfg)  # A2: the method's own recipe keys, as resolved
         except Exception as exc:  # noqa: BLE001 - an invalid trial is a recorded failure
             entry.update(status="failed", error=f"{type(exc).__name__}: {exc}")
             budget.record(  # it still counts: every method gets the same number of trials
@@ -1400,9 +1445,15 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         nargs="+",
         metavar="KEY=VALUE",
-        help="one override set per --trial (trial 0 is the config itself); default grid otherwise",
+        help="one override set per --trial, the whole grid (A2: no implicit trial 0); default: "
+        "DEFAULT_TRIALS",
     )
-    parser.add_argument("--search-steps", type=int, default=2000)
+    parser.add_argument(
+        "--search-steps",
+        type=int,
+        default=SEARCH_STEPS,
+        help="search horizon (A2: 9,000; 3,000 hides late onsets)",
+    )
     parser.add_argument("--search-seed", type=int, default=0)
     parser.add_argument("--eval-batch", type=int, default=32, help="batch of the test evaluation")
     parser.add_argument(
@@ -1659,13 +1710,14 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
         max_peak = memory_budget / args.jobs if hardware.vram_bytes > 0 else None
         plan = [(cfg.model_name, config, [])]
         plan += [(load_config(b).model_name, b, matched) for b in baselines]
+        budget_overrides = search_overrides(trials)  # A2 change 4: the grid's size, every method
         for model, path, extra in plan:
             if model in methods:
                 raise ValueError(f"two configurations name model {model!r}: {path}")
             methods[model] = search_method(
                 model=model,
                 config=path,
-                base_overrides=[*base_overrides, *extra],
+                base_overrides=[*base_overrides, *extra, *budget_overrides],
                 trials=trials,
                 frozen=frozen,
                 search_steps=args.search_steps,
@@ -1706,6 +1758,7 @@ def _main(args: argparse.Namespace, parser: argparse.ArgumentParser, out: Path) 
     timings["search"] = float(search["seconds"])
     gpu["after_search"] = gpu_processes()
     for model, record in search["methods"].items():
+        logger.info("%s", search_table(record))  # A2: every trial's own recipe keys
         logger.info(
             "search %s: best trial %s %s (unconstrained best %s)",
             model,
