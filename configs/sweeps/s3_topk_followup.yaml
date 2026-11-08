@@ -1,0 +1,100 @@
+# Approved by the user (via the coordinator, 8 Nov 2026 about 11:30): the T0 follow-ups and one low-factor spike-guard arm,
+# enqueued after S2 (exps 189 / 190). Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any
+# run. T0 (exps 185 / 187 / 188: top-K k 4 STE + cand_norm at 2.5e-3 / 2e-3 / 3e-3, WSD 3k) exploded through router -> byte_emb
+# within 450 to 860 steps (pre-clip norm medians 5e5 to 7e6); these arms separate A4 from the lr and test an early guard:
+#   (1) s3f_topk_nocand_3k: top-K WITHOUT A4 (model.cand_norm=none) at 2.5e-3, unguarded (design option only); comparators
+#       exp 185 and, for the no-A4 side, exp 53 (top-K at 1e-3, cosine over 3k);
+#   (2) s3f_topk_cand_lr1e3_3k: top-K + A4 at 1e-3, WSD 3k, unguarded (exp 53 ran a cosine schedule: not schedule-matched);
+#   (3) s3f_topk_cand_lr2e3_guard20: exp 187's recipe (top-K + A4 at 2e-3) with train.spike_factor=20 (window 100, the default;
+#       dump on): the user's "spike guard lower for some tests". 20 is the lowest factor that stops none of the 50 stored
+#       learners on the replayed rule (coordinator's scan of 122 runs); in exp 187 it would first skip at step 820.
+# Architecture notes: (1) the routing design options only; (2), (3) the design options + A4. About 0.105 s per step.
+
+name: s3_topk_followup
+description: "T0 follow-ups: top-K without A4 at 2.5e-3, top-K + A4 at 1e-3, top-K + A4 at 2e-3 with spike guard 20 (WSD 3k)"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.0025
+    - train.steps=3000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.cand_norm=rms
+    - model.routing=topk
+    - model.k_select=4
+    - train.gate_mode=ste
+protocol: {name: reads_state, version: 3, steps: 3000, diag_every: 250, diag_dense_every: 25, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0]
+rules:
+  verdicts:
+    healthy_3k:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: healthy
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+              - {metric: "diag:grad_share/cell", steps: {from: 1500, to: 3000, every: 25}, agg: median, op: ">=", value: 0.01, min_samples: 5}
+              - {metric: "diag:gate/write_rate", steps: {from: 1500, to: 3000, every: 25}, agg: median, op: ">=", value: 0.02, min_samples: 5}
+      default: unhealthy
+    reads_state: {preset: reads_state}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20}
+    reads_state_v3: {preset: reads_state_v3} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys} # the key swap: does the read follow the key
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    memory_writes: {preset: memory_writes} # write rate >= 0.025 and cell update ratio >= 0.001, 1,000 to 1,500
+    cells_apart: {preset: cells_apart}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    guard_fired:
+      cases:
+        - label: spikes skipped
+          when: {metric: "final:skipped_spike_steps", op: ">", value: 0}
+      default: no spike skipped
+    rescued:
+      cases:
+        - label: rescued
+          when: {metric: "verdict:healthy_3k", op: "==", value: "healthy"}
+      default: not rescued
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s3f_topk_nocand_3k
+    family: hsn
+    overrides: [model.cand_norm=none]
+  - name: s3f_topk_cand_lr1e3_3k
+    family: hsn
+    overrides: [train.lr=0.001]
+  - name: s3f_topk_cand_lr2e3_guard20
+    family: hsn
+    overrides: [train.lr=0.002, train.spike_factor=20]
