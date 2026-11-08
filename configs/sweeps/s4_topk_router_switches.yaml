@@ -1,0 +1,95 @@
+# Approved by the user (via the coordinator, 8 Nov 2026 about 16:02: "measure first, test the existing switches, then plan
+# P1.17"): two no-code arms with existing switches, enqueued after exp 209. Rules and predictions registered in
+# /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
+# Exp 196's recipe (top-K k 4, STE, cand_norm none, linear scorer, WSD 0.2 over 9,000 at lr 2.5e-3, compiled, unguarded), seeds
+# 0 and 1, with: (i) counterfactual utility (P2.3): train.lambda_u=1.0, P2.3's chosen value (configs/experiments/
+# p2_3_kv_probes.yaml: "a unit weight chosen before any run"), probe_fraction 0.05, n_probe 4, probe_horizon 16, ema_decay 0.99
+# (the defaults, as P2.3); (ii) a soft warm-up: train.soft_until_step=1000 (soft gates, dense cost, for 1,000 steps, then STE).
+# Both are in P2.8's compiled scope (routing topk, gates soft / ste, constant temperature, no exploration, not reinforce; the P2.3
+# probes run eagerly inside about 5 % of windows). The 0.5 s step-time guard stays on. Question: does either switch give the
+# router a real gradient (exps 196 to 198: router grad share median 6e-6 to 2.5e-5), key-dependent routing or key binding?
+# Architecture note: design options / P2.3 training terms only.
+
+name: s4_topk_router_switches
+description: "Top-K without A4 (exp 196's recipe): counterfactual utility (lambda_u 1.0) or a 1,000-step soft warm-up, seeds 0-1"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.0025
+    - train.steps=9000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.routing=topk
+    - model.k_select=4
+    - train.gate_mode=ste
+protocol: {name: reads_state, version: 3, steps: 9000, diag_every: 250, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0, 1]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state, group: {min_agree: 2}}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20, group: {min_agree: 2}}
+    reads_state_v3: {preset: reads_state_v3, group: {min_agree: 2}} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys, group: {min_agree: 2}} # the key swap: does the read follow the key
+    later_above_key_blind:
+      group: {min_agree: 2}
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    no_explosion:
+      group: {min_agree: 2}
+      cases:
+        - label: no explosion
+          when: {metric: "train:grad_norm", steps: {from: 501, to: 9000, every: 1}, agg: max, op: "<", value: 1000, min_samples: 8000}
+      default: explosion
+    beats_bar:
+      cases:
+        - label: above 0.7930
+          when:
+            all:
+              - {metric: "eval:delayed/in_range/accuracy", steps: {at: 9000}, op: ">", value: 0.7930}
+      default: not above 0.7930
+    memory_writes: {preset: memory_writes, group: {min_agree: 2}} # write rate >= 0.025 and cell update ratio >= 0.001, 1,000 to 1,500
+    cells_apart: {preset: cells_apart}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    router_gradient:
+      cases:
+        - label: router gets gradient
+          when: {metric: "diag:grad_share/router", steps: {from: 1000, to: 9000, every: 250}, agg: median, op: ">=", value: 0.001, min_samples: 10}
+      default: tiny router gradient
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s4r_topk_nocand_cf
+    family: hsn
+    overrides: [train.lambda_u=1.0]
+  - name: s4r_topk_nocand_softwarm
+    family: hsn
+    overrides: [train.soft_until_step=1000]
