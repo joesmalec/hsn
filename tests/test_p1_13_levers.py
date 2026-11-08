@@ -28,7 +28,7 @@ import test_p2_8_compile as p28
 import torch
 from cards import CUDA_PROFILE
 from hsn.config import RunConfig, load_config, load_hardware_profile, wsd_decay_steps
-from hsn.device import resolve, seed_everything
+from hsn.device import resolve, seed_everything, set_deterministic
 from hsn.experiments.variants import install_variant
 from hsn.kernels.costs import profile_dense_costs
 from hsn.model.hsn import HSN, PARAM_REPORT_ROWS
@@ -53,6 +53,18 @@ SMALL_HSN = [
     "train.micro_batch=4",
     "train.unroll=32",
 ]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_determinism() -> Iterator[None]:
+    """The P1.13 cases set ``train.deterministic``, which the trainer applies process-wide
+    (``torch.use_deterministic_algorithms``); MPS tests of other chunks must not inherit it
+    (``scatter_reduce_mps`` has no deterministic implementation)."""
+    before = torch.are_deterministic_algorithms_enabled()
+    try:
+        yield
+    finally:
+        set_deterministic(before)
 
 
 def _trainer(cfg: RunConfig) -> Any:
