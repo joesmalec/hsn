@@ -309,6 +309,10 @@ class TrainConfig(_StrictModel):
     # schedule = wsd: the decay over the last round(decay_fraction * steps) steps (1 - sqrt to 0);
     # required with wsd, refused with any other schedule
     decay_fraction: float | None = None
+    # the HSN cell's parameter group (every trainable parameter of HSN.cell): lr = lr * cell_lr_mult
+    # and, on its tensors of ndim >= 2, weight decay cell_weight_decay (None = weight_decay)
+    cell_lr_mult: float = Field(default=1.0, gt=0.0)
+    cell_weight_decay: float | None = Field(default=None, ge=0.0)
     # --- end P1.13 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
@@ -689,6 +693,19 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
+        # --- P1.13: the cell group acts on the HSN cell only ---
+        if self.model_name != "hsn":
+            ignored = []
+            if self.train.cell_lr_mult != 1.0:
+                ignored.append(f"train.cell_lr_mult={self.train.cell_lr_mult}")
+            if self.train.cell_weight_decay is not None:
+                ignored.append(f"train.cell_weight_decay={self.train.cell_weight_decay}")
+            if ignored:
+                raise ValueError(
+                    f"{', '.join(ignored)} act on the HSN cell (P1.13), but "
+                    f"model_name={self.model_name!r} has none; leave them at their defaults"
+                )
+        # --- end P1.13 ---
         # --- P2.2: routing controls that would be silently ignored are refused ---
         routing, train = self.model.routing, self.train
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0

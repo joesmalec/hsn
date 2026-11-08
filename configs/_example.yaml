@@ -67,6 +67,8 @@ train: # Appendix A.3
   warmup_steps: 0
   schedule: constant # constant | cosine | linear | wsd (P1.13: warmup-stable-decay)
   decay_fraction: null # P1.13: wsd only (required there): decay (1 - sqrt, to 0) over this fraction of steps
+  cell_lr_mult: 1.0 # P1.13: the HSN cell's parameter group trains at lr * cell_lr_mult
+  cell_weight_decay: null # P1.13: weight decay of the cell's tensors with ndim >= 2; null = weight_decay
   unroll: 256 # TBPTT window
   batch: 4
   micro_batch: 4
