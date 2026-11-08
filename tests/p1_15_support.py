@@ -236,3 +236,85 @@ class StepProbe:
     def unchanged(self, step: int) -> bool:
         before, after = self.params[step - 1], self.params[step]
         return all(torch.equal(a, b) for a, b in zip(before, after, strict=True))
+
+
+def window_tokens(cfg: RunConfig, train_ds: ByteDataset, step: int) -> Tensor:
+    """The CPU tokens of training step ``step``'s window (one window per step), drawn from a fresh
+    loader as the trainer draws them."""
+    from hsn.train.loop import StreamLoader
+
+    loader = StreamLoader(
+        train_ds,
+        batch=cfg.train.batch,
+        unroll=cfg.train.unroll,
+        seed=cfg.seed,
+        shuffle=True,
+        align_docs=cfg.data.align_docs,
+        epochs=None,
+    )
+    window = None
+    for _ in range(step):
+        window = next(loader)
+    assert window is not None
+    return window["tokens"]
+
+
+def plant_on_window(monkeypatch: pytest.MonkeyPatch, target: Tensor, kind: str) -> None:
+    """Plant ``kind`` in the TBPTT objective of every window whose tokens are ``target``'s (or its
+    first columns, after the trailing cut): a plant that a replay's own trainer meets too."""
+
+    def planted(
+        out: Mapping[str, Tensor],
+        batch: Mapping[str, Tensor],
+        cfg: RunConfig,
+        extras: Mapping[str, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
+        tokens = batch["tokens"].cpu()
+        hit = torch.equal(tokens, target[:, : tokens.shape[1]])
+        return poisoned_terms(kind if hit else None, out, batch, cfg, extras)
+
+    monkeypatch.setattr(tbptt, "assemble_terms", planted)
+
+
+def plant_gru_on_window(monkeypatch: pytest.MonkeyPatch, target: Tensor) -> None:
+    """A finite spike in the generic trainer's objective for the window ``target``: its
+    ``F.cross_entropy`` (the trainer's own reference to torch.nn.functional) scaled by
+    :data:`SPIKE_SCALE` when the targets are that window's. Evaluation uses its own import."""
+    import types
+
+    import torch.nn.functional as functional
+    from hsn.train import loop
+
+    flat = target  # the window's targets at its loss positions, computed by the caller
+    real = functional.cross_entropy
+
+    def cross_entropy(logits: Tensor, targets: Tensor, *args: Any, **kwargs: Any) -> Tensor:
+        loss = real(logits, targets, *args, **kwargs)
+        if targets.shape == flat.shape and torch.equal(targets.cpu(), flat):
+            return loss * SPIKE_SCALE
+        return loss
+
+    proxy = types.SimpleNamespace(**{k: getattr(functional, k) for k in dir(functional)})
+    proxy.cross_entropy = cross_entropy
+    monkeypatch.setattr(loop, "F", proxy)
+
+
+def window_targets(cfg: RunConfig, train_ds: ByteDataset, step: int) -> Tensor:
+    """The targets at the loss positions of step ``step``'s window (the generic trainer's
+    ``flat_targets``)."""
+    from hsn.train.loop import StreamLoader
+
+    loader = StreamLoader(
+        train_ds,
+        batch=cfg.train.batch,
+        unroll=cfg.train.unroll,
+        seed=cfg.seed,
+        shuffle=True,
+        align_docs=cfg.data.align_docs,
+        epochs=None,
+    )
+    window = None
+    for _ in range(step):
+        window = next(loader)
+    assert window is not None
+    return window["targets"][window["loss_mask"]]

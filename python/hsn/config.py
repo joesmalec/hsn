@@ -324,6 +324,9 @@ class TrainConfig(_StrictModel):
     # about 70x). spike_window is read only with spike_factor set (the user's request, 8 Nov).
     spike_factor: float | None = Field(default=None, gt=1.0)
     spike_window: int = Field(default=100, ge=1)
+    # write a dump of the pre-step state at the first step a guard skips (non-finite, or a spike
+    # with spike_factor set), for a deterministic replay (python/hsn/train/divergence.py)
+    divergence_dump: bool = True
     # --- end P1.15 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)

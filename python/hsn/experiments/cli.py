@@ -17,6 +17,8 @@
     probe-check --exp N [--batch-rows 64]
     probe-rerun --exp N [--cpu] [--batch-rows N] [--out FILE]   v1 vs the stored probes, then v2
     split-backfill [--exp N ...] [--recompute] [--cpu] --out FILE   (P1.15; read-only database)
+    replay   --dump FILE | --exp N [--eager | --compiled] [--no-deterministic] [--repeats 2]
+             [--cpu] [--out FILE]      (P1.15: the divergence dump's step again)
     run-arm  --db DB --exp N --root ROOT       (the worker's child; not for direct use)
 
 Every command takes ``--db`` (default ``$HSN_EXPERIMENTS_DB`` or
@@ -130,6 +132,18 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--exp", type=int, required=True)
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
     p.add_argument("--batch-rows", type=int, default=None, help="default: the run's probe_batch")
+    p.add_argument("--out", default=None)
+
+    p = sub.add_parser("replay", help="replay a divergence dump's step (P1.15)")
+    where = p.add_mutually_exclusive_group(required=True)
+    where.add_argument("--dump", default=None, help="a divergence_<step>.pt file")
+    where.add_argument("--exp", type=int, default=None, help="the experiment's first dump")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--eager", dest="eager", action="store_true", default=None)
+    mode.add_argument("--compiled", dest="eager", action="store_false")
+    p.add_argument("--no-deterministic", dest="deterministic", action="store_false")
+    p.add_argument("--repeats", type=int, default=2)
+    p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32 (approximate)")
     p.add_argument("--out", default=None)
 
     p = sub.add_parser("run-arm", help=argparse.SUPPRESS)
@@ -495,6 +509,34 @@ def cmd_split_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """P1.15: replay a divergence dump's step (hsn.train.divergence.replay)."""
+    from hsn.train.divergence import dump_paths, replay
+
+    if args.dump:
+        path = Path(args.dump)
+    else:
+        db = Database(Path(args.db) if args.db else default_db_path(), read_only=True)
+        exp = db.experiment(args.exp)
+        result = db.row("SELECT json_path FROM results WHERE exp_id = ?", (args.exp,))
+        run_dir = exp["run_dir"] or (
+            str(Path(result["json_path"]).parent) if result and result["json_path"] else None
+        )
+        found = dump_paths(run_dir) if run_dir else []
+        if not found:
+            print(f"error: experiment {args.exp} has no divergence dump", file=sys.stderr)
+            return 2
+        path = found[0]
+    out = replay(
+        path, eager=args.eager, deterministic=args.deterministic, repeats=args.repeats, cpu=args.cpu
+    )
+    text = json.dumps(out, indent=1, default=str)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+    print(text)
+    return 0
+
+
 def cmd_run_arm(args: argparse.Namespace) -> int:
     from hsn.experiments.run_arm import main as run_arm
 
@@ -515,6 +557,7 @@ COMMANDS = {
     "probe-check": cmd_probe_check,
     "probe-rerun": cmd_probe_rerun,
     "split-backfill": cmd_split_backfill,
+    "replay": cmd_replay,
     "run-arm": cmd_run_arm,
 }
 

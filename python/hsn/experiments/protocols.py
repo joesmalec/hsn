@@ -54,6 +54,9 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
 - The gradient-spike guard (``train.spike_factor``): ``final.skipped_spike_steps`` (``None`` with
   the guard off), ``skipped_steps`` (every step a guard skipped, with its reason), a ``skipped``
   mark on those train entries, and the failure kind ``spike`` when spike skips stopped the run.
+- ``divergence``: the divergence dump's summary (``train.divergence_dump``, on by default: kind,
+  step, norm, path; :mod:`hsn.train.divergence`), in full and partial records; ``None`` without a
+  skipped step.
 """
 
 from __future__ import annotations
@@ -417,6 +420,13 @@ def _train(
     timer = _EvalTimer()
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
     trainer.eval_batch = params.eval_batch
+    # P1.15: what a divergence dump needs to rebuild this arm's model (hsn.train.divergence)
+    trainer.dump_notes = {
+        "variant": arm.variant,
+        "variant_params": dict(arm.variant_params),
+        "run_id": cfg.run_id,
+        "protocol": params.name,
+    }
     if isinstance(params, ReadsStateParams):  # P1.15: the first/later split of every evaluation
         from hsn.experiments.split import QuerySlots
 
@@ -511,6 +521,7 @@ def _train(
             "skipped_spike_steps": measured.get("skipped_spike_steps"),
         },
         "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+        "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
         "stopped": callback.stop,
         "early_stop_log": callback.log,
         "eval_count": timer.count,
@@ -612,6 +623,7 @@ def _partial_training(
                 "skipped_spike_steps": spikes,
             },
             "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+            "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
             "stopped": None,
             "early_stop_log": list(callback.log),
             "eval_count": timer.count,
