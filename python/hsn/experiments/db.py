@@ -347,6 +347,11 @@ class Database:
             (host,),
         )
 
+    def step_time_estimate(self, memory_key: str) -> tuple[float, int] | None:
+        """P1.14: the median recorded step time of this memory key's runs (not imported) and how
+        many runs it comes from (:func:`hsn.experiments.steptime.step_time_estimate`)."""
+        return _step_time_estimate(self.conn, memory_key)
+
     def memory_estimate(self, memory_key: str) -> float | None:
         """The largest peak GPU memory (MiB) recorded for an arm with this memory key."""
         row = self.row(
@@ -361,6 +366,22 @@ class Database:
 # --------------------------------------------------------------------------------------------------
 # Enqueue
 # --------------------------------------------------------------------------------------------------
+
+
+def _step_time_estimate(conn: sqlite3.Connection, memory_key: str) -> tuple[float, int] | None:
+    from hsn.experiments.steptime import step_time_estimate
+
+    rows = conn.execute(
+        "SELECT json_extract(r.record_json, '$.step_time.run_median_s') AS run_median_s, "
+        "json_extract(r.record_json, '$.walls.train_s') AS train_s, "
+        "json_extract(r.record_json, '$.final.steps') AS steps, "
+        "json_extract(r.record_json, '$.measured.compile_steps') AS compile_steps, "
+        "json_extract(r.record_json, '$.failure') IS NOT NULL AS failed "
+        "FROM results r JOIN experiments e ON e.exp_id = r.exp_id JOIN arms a "
+        "ON a.arm_id = e.arm_id WHERE a.memory_key = ? AND e.imported = 0",
+        (memory_key,),
+    ).fetchall()
+    return step_time_estimate([dict(r) for r in rows])
 
 
 @dataclass
@@ -465,7 +486,13 @@ def enqueue_arms(
 ) -> EnqueueReport:
     """Register the sweep version and queue every arm that has no queued, running, done or
     stopped-early experiment (``force`` queues anyway; imported runs never block unless
-    ``skip_imported``). One transaction."""
+    ``skip_imported``). One transaction. P1.14: every arm it would add passes the step-time rule
+    (:func:`hsn.experiments.steptime.enqueue_refusal`); any refusal raises
+    :class:`~hsn.experiments.steptime.StepTimeRefused` and queues nothing. Each added entry
+    carries the arm's expected step time (``step_s``, None when no run of its memory key exists)."""
+    from hsn.experiments.steptime import StepTimeRefused, enqueue_refusal
+
+    refused: list[str] = []
     with db.write() as conn:
         sweep_id = register_sweep(conn, name, spec_hash, spec_text, spec_path, rules_json)
         report = EnqueueReport(sweep_id)
@@ -495,6 +522,11 @@ def enqueue_arms(
                     {**entry, "exp_id": imported[-1]["exp_id"], "status": "imported"}
                 )
                 continue
+            estimate = _step_time_estimate(conn, arm.memory_key)
+            why = enqueue_refusal(arm, estimate)
+            if why is not None:
+                refused.append(why)
+                continue
             exp_id = insert_experiment(
                 conn,
                 arm_id=arm.arm_id,
@@ -507,7 +539,14 @@ def enqueue_arms(
                 protocol_json=dumps(arm.protocol.model_dump(mode="json")),
                 config_json=dumps(arm.config.model_dump(mode="json")),
             )
-            report.added.append({**entry, "exp_id": exp_id})
+            report.added.append(
+                {**entry, "exp_id": exp_id, "step_s": estimate[0] if estimate else None}
+            )
+        if refused:  # raising inside the transaction rolls every write of this enqueue back
+            raise StepTimeRefused(
+                f"{len(refused)} arm(s) refused under the 0.5 s step-time rule; nothing was "
+                "queued:\n  " + "\n  ".join(refused)
+            )
     return report
 
 

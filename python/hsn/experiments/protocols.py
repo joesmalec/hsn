@@ -49,6 +49,7 @@ from hsn.experiments.spec import (
     ReadsStateParams,
     TrainEvalParams,
 )
+from hsn.experiments.steptime import StepTimeGuard
 
 __all__ = ["ArmRun", "run_protocol"]
 
@@ -247,12 +248,22 @@ def _final(evals: list[dict[str, Any]], train: list[dict[str, Any]]) -> dict[str
 
 
 class _StepCallback:
-    """Progress at every evaluation; the early-stop rules at their steps."""
+    """Progress at every evaluation; the step-time guard (P1.14) at every step; the early-stop rules
+    at their steps."""
 
-    def __init__(self, arm: ArmRun, diagnostics: Any, *, audit_keys: bool) -> None:
+    def __init__(
+        self,
+        arm: ArmRun,
+        diagnostics: Any,
+        *,
+        audit_keys: bool,
+        guard: StepTimeGuard | None = None,
+    ) -> None:
         self.arm = arm
         self.diag = diagnostics
         self.audit_keys = audit_keys
+        self.guard = guard
+        self._compile_seen = 0.0
         self.at_steps = {s for r in arm.rules.early_stop for s in r.at_steps}
         self.stop: dict[str, Any] | None = None
         self.log: list[dict[str, Any]] = []
@@ -262,7 +273,16 @@ class _StepCallback:
     def __call__(self, trainer: Any, history: Any) -> bool:
         self.history = history
         step = int(trainer.step)
-        if history.evals and int(history.evals[-1]["step"]) == step:
+        evaluated = bool(history.evals) and int(history.evals[-1]["step"]) == step
+        if self.guard is not None and history.steps and int(history.steps[-1].step) == step:
+            # a compile or CUDA-graph recording during this step or its evaluation (P2.8)
+            window = getattr(trainer, "compiled_window", None)
+            compiled_s = float(window.compile_seconds) if window is not None else 0.0
+            compiled, self._compile_seen = compiled_s > self._compile_seen, compiled_s
+            self.guard.observe(
+                step, float(history.steps[-1].seconds), compiled=compiled, evaluated=evaluated
+            )  # raises StepTimeExceeded above the arm's max_step_s
+        if evaluated:
             last = history.evals[-1]
             self.arm.on_progress(
                 {
@@ -353,7 +373,13 @@ def _train(
     if diag_every:
         diag.attach(trainer)
     audit_keys = isinstance(params, ReadsStateParams)
-    callback = _StepCallback(arm, diag if diag_every else None, audit_keys=audit_keys)
+    guard = StepTimeGuard(
+        limit_s=params.max_step_s,
+        approval=params.step_time_approval,
+        diag_steps=frozenset(range(diag_every, arm.steps + 1, diag_every)) if diag_every else (),
+        stats_every=cfg.train.stats_every,
+    )
+    callback = _StepCallback(arm, diag if diag_every else None, audit_keys=audit_keys, guard=guard)
     arm.walls["setup_s"] = time.perf_counter() - t0
 
     arm.stage = "train"
@@ -418,6 +444,7 @@ def _train(
         "early_stop_log": callback.log,
         "eval_count": timer.count,
         "checkpoints": history.checkpoints,
+        "step_time": guard.summary(),  # P1.14
     }
     record = arm.record  # P1.14: filled in place, so that a later stage's failure keeps it
     record.clear()
@@ -493,6 +520,7 @@ def _partial_training(
             "early_stop_log": list(callback.log),
             "eval_count": timer.count,
             "checkpoints": list(history.checkpoints) if history else [],
+            "step_time": callback.guard.summary() if callback.guard is not None else None,
         }
     )
 

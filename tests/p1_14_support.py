@@ -1,5 +1,5 @@
-"""Shared helpers of the P1.14 tests (the sweep-harness follow-ups): tiny specs on the P1.11 tiny data,
-running one claimed experiment's child in-process, and P1.12's planted divergence.
+"""Shared helpers of the P1.14 tests (the sweep-harness follow-ups): tiny specs on the P1.11 tiny
+data, running one claimed experiment's child in-process, and P1.12's planted divergence.
 
 Not a test module (no ``test_`` prefix); the P1.14 test files import it from ``tests/``.
 """
@@ -88,9 +88,7 @@ def plant_inf_gradient(monkeypatch: pytest.MonkeyPatch, from_call: int) -> None:
     def inf(grad: Tensor) -> Tensor:
         return torch.full_like(grad, math.inf)
 
-    def planted(
-        out: Any, batch: Any, cfg: Any, extras: Any = None
-    ) -> dict[str, Tensor]:
+    def planted(out: Any, batch: Any, cfg: Any, extras: Any = None) -> dict[str, Tensor]:
         calls[0] += 1
         if calls[0] >= from_call:
             logits = out["logits"] * 1.0

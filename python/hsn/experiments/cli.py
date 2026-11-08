@@ -190,8 +190,16 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
         print("added:")
         print(
             _table(
-                [(a["exp_id"], a["label"], a["arm_id"]) for a in report.added],
-                ["exp", "label", "arm id"],
+                [
+                    (
+                        a["exp_id"],
+                        a["label"],
+                        a["arm_id"],
+                        f"{a['step_s']:.3g}" if a.get("step_s") is not None else "unknown",
+                    )
+                    for a in report.added
+                ],
+                ["exp", "label", "arm id", "expected s/step"],
             )
         )
     if report.skipped:
@@ -439,9 +447,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     from hsn.experiments.rules import RuleError
     from hsn.experiments.spec import SpecError
+    from hsn.experiments.steptime import StepTimeRefused
 
     try:
         return COMMANDS[args.command](args)
-    except (SpecError, RuleError, dbm.DatabaseError) as exc:
+    except (SpecError, RuleError, StepTimeRefused, dbm.DatabaseError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

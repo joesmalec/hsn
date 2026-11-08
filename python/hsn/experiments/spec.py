@@ -74,6 +74,7 @@ from hsn.experiments.rules import (
     parse_rules,
     resolved_early_stop,
 )
+from hsn.experiments.steptime import STEP_TIME_LIMIT_S
 
 __all__ = [
     "EXECUTION_ONLY",
@@ -93,7 +94,11 @@ __all__ = [
 
 FAMILIES = ("hsn", "gru", "transformer")
 Family = Literal["hsn", "gru", "transformer"]
-EXECUTION_ONLY = frozenset({"eval_batch", "probe_batch", "checkpoint", "sleep_s"})
+# P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
+# computes
+EXECUTION_ONLY = frozenset(
+    {"eval_batch", "probe_batch", "checkpoint", "sleep_s", "max_step_s", "step_time_approval"}
+)
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
@@ -134,6 +139,11 @@ class _TrainParams(_Strict):
     eval_batch: int | None = Field(default=None, ge=1)  # None: train.batch
     checkpoint: Literal["final", "none"] = "final"
     diag_window_docs: int = Field(default=4, ge=1)  # documents of the diagnostics window
+    # P1.14, the step-time guard (hsn.experiments.steptime): the limit on the median step time,
+    # and the approval note ("<who, when>") an arm above the 0.5 s rule (or an eager CUDA HSN arm)
+    # needs at enqueue; both execution-only
+    max_step_s: float = Field(default=STEP_TIME_LIMIT_S, gt=0.0)
+    step_time_approval: str = ""
 
 
 class ReadsStateParams(_TrainParams):

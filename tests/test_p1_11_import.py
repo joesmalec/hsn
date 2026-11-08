@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from hsn.experiments import db as dbm
@@ -107,7 +108,20 @@ def test_p1_11_imported_runs_do_not_block_enqueue(
 
     monkeypatch.setattr(spec_module, "REPO_ROOT", repo)
     original = spec_module.expand
-    monkeypatch.setattr(spec_module, "expand", lambda spec, repo=repo: original(spec, repo=repo))
+
+    def expand(spec: Any, repo: Path = repo) -> list[Any]:
+        # P1.14: the 0.5 s rule refuses an eager CUDA HSN arm without an approval at enqueue; the
+        # validation sweep's eager bridge ran as exp 46 before the rule (the approval is
+        # execution-only: the arm id is unchanged)
+        arms = original(spec, repo=repo)
+        for arm in arms:
+            if arm.config.hardware.compile_mode == "none" and arm.family == "hsn":
+                arm.protocol = arm.protocol.model_copy(
+                    update={"max_step_s": 1.0, "step_time_approval": "test: exp 46's eager bridge"}
+                )
+        return arms
+
+    monkeypatch.setattr(spec_module, "expand", expand)
     report = enqueue_spec(db, REPO / "configs" / "sweeps" / "p1_11_validation.yaml")
     assert len(report.added) == 5
     assert [m["label"] for m in report.imported_matches] == ["hsn_pdg_b32_lr1e-3_bridge/s0"]
