@@ -27,6 +27,18 @@ the end the dev set is evaluated (:func:`hsn.eval.evaluate.evaluate_windows`); e
 returns a :class:`History` with one record per step, every evaluation, the model's parameter
 report and the *measured* numbers the run manifest needs (plan §0.5: measured, not assumed).
 
+**Schedules.** The learning-rate factor of step ``s`` (``LambdaLR``'s count of scheduler steps, so
+optimiser step ``k`` trains at the factor of ``k - 1``) is ``(s + 1) / warmup_steps`` during the
+warm-up, then ``constant`` 1, ``cosine`` ``0.5 (1 + cos(pi p))`` or ``linear`` ``1 - p`` with ``p``
+the progress from the warm-up's end to ``train.steps``. **P1.13:** ``wsd`` (warmup-stable-decay,
+Hägele et al. 2024) holds 1 after the warm-up and decays over the last
+``D = round(train.decay_fraction * train.steps)`` steps as ``1 - sqrt((s - (steps - D)) / D)``,
+reaching 0 at ``train.steps`` like the other decays (the 1 - sqrt shape gave a lower final loss
+than a linear decay there; a 20 % decay matched cosine). Its value is a function of the step and
+``train.steps`` only, so a run that stops before the decay (P1.11's protocol ``steps`` below
+``train.steps``) trains at the peak throughout. Every parameter group follows the same factor of
+its own base rate.
+
 **Hooks (P1.11).** ``fit(..., callback=f)`` calls ``f(trainer, history)`` once per step, after the
 step's evaluation and checkpoint; when it returns True before the last step, the trainer writes a
 checkpoint (unless that step already wrote one) and stops there (the sweep harness's early-stop
@@ -90,7 +102,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from hsn.config import RunConfig, config_hash
+from hsn.config import RunConfig, config_hash, wsd_decay_steps
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import PAD
 from hsn.device import (
@@ -132,7 +144,7 @@ __all__ = [
 logger = logging.getLogger("hsn.train")
 
 Batch = dict[str, Tensor]
-SCHEDULES: tuple[str, ...] = ("constant", "cosine", "linear")
+SCHEDULES: tuple[str, ...] = ("constant", "cosine", "linear", "wsd")
 # P1.11: called once per step after evaluation and checkpoint; True stops the fit there
 FitCallback = Callable[["Trainer", "History"], bool]
 _WINDOW_FIELDS = ("tokens", "targets", "context", "loss_mask", "reset", "dep", "doc")
@@ -509,10 +521,17 @@ class Trainer:
     def _make_scheduler(self) -> torch.optim.lr_scheduler.LambdaLR:
         train = self.cfg.train
         warmup, total, schedule = train.warmup_steps, train.steps, train.schedule
+        # P1.13: the start of the WSD decay (the config validated the fraction against the warm-up)
+        decay = 0 if train.decay_fraction is None else wsd_decay_steps(train.decay_fraction, total)
+        decay_start = total - decay
 
         def factor(step: int) -> float:
             if warmup > 0 and step < warmup:
                 return (step + 1) / warmup
+            if schedule == "wsd":  # P1.13: constant, then 1 - sqrt over the last `decay` steps
+                if step < decay_start:
+                    return 1.0
+                return 1.0 - math.sqrt(min(1.0, (step - decay_start) / decay))
             progress = min(1.0, max(0.0, (step - warmup) / max(1, total - warmup)))
             if schedule == "cosine":
                 return 0.5 * (1.0 + math.cos(math.pi * progress))

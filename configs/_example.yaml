@@ -65,7 +65,8 @@ train: # Appendix A.3
   betas: [0.9, 0.999]
   weight_decay: 0.01
   warmup_steps: 0
-  schedule: constant
+  schedule: constant # constant | cosine | linear | wsd (P1.13: warmup-stable-decay)
+  decay_fraction: null # P1.13: wsd only (required there): decay (1 - sqrt, to 0) over this fraction of steps
   unroll: 256 # TBPTT window
   batch: 4
   micro_batch: 4

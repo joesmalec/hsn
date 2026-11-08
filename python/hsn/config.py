@@ -91,6 +91,7 @@ __all__ = [
     "load_hardware_profile",
     "profile_path",
     "write_run_manifest",
+    "wsd_decay_steps",
 ]
 
 # --------------------------------------------------------------------------------------------------
@@ -122,6 +123,13 @@ ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
 #: Auxiliary loss terms that ``train.aux_enabled`` may name (Appendix A.3: cost / balance / graph).
 #: P2.4 registers its term names here.
 AUX_TERMS: tuple[str, ...] = ("cost", "balance", "graph")
+
+
+def wsd_decay_steps(decay_fraction: float, steps: int) -> int:
+    """P1.13: the length of the warmup-stable-decay schedule's final decay in optimiser steps,
+    ``round(decay_fraction * steps)`` (``train.decay_fraction``, ``train.steps``)."""
+    return round(decay_fraction * steps)
+
 
 #: Hardware profile names (Appendix A.5 / E.1). ``gpu8gb`` gets its file in P4.3.
 PROFILES: tuple[str, ...] = tuple(get_args(Profile))
@@ -296,7 +304,12 @@ class TrainConfig(_StrictModel):
     betas: tuple[float, float] = (0.9, 0.999)
     weight_decay: float = Field(default=0.01, ge=0.0)
     warmup_steps: int = Field(default=0, ge=0)
-    schedule: str = "constant"
+    schedule: str = "constant"  # constant | cosine | linear | wsd (P1.13)
+    # --- P1.13: recurrent stability levers (python/hsn/train/loop.py) ---
+    # schedule = wsd: the decay over the last round(decay_fraction * steps) steps (1 - sqrt to 0);
+    # required with wsd, refused with any other schedule
+    decay_fraction: float | None = None
+    # --- end P1.13 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
     micro_batch: int = Field(default=4, ge=1)
@@ -385,6 +398,34 @@ class TrainConfig(_StrictModel):
             )
         if not all(0.0 <= b < 1.0 for b in self.betas):
             raise ValueError(f"train.betas={self.betas} must lie in [0, 1)")
+        # --- P1.13: the WSD decay length is read by schedule = wsd only ---
+        if self.schedule == "wsd":
+            fraction = self.decay_fraction
+            if fraction is None:
+                raise ValueError(
+                    "train.schedule=wsd needs train.decay_fraction, the length of the final decay "
+                    "as a fraction of train.steps (e.g. 0.2)"
+                )
+            if not 0.0 < fraction <= 1.0:
+                raise ValueError(f"train.decay_fraction={fraction} must lie in (0, 1]")
+            decay = wsd_decay_steps(fraction, self.steps)
+            if decay < 1:
+                raise ValueError(
+                    f"train.decay_fraction={fraction} of train.steps={self.steps} rounds to "
+                    f"{decay} decay steps; the decay needs at least one"
+                )
+            if self.steps - decay < self.warmup_steps:
+                raise ValueError(
+                    f"train.schedule=wsd: the decay over the last {decay} of {self.steps} steps "
+                    f"would start at step {self.steps - decay}, inside the warm-up of "
+                    f"train.warmup_steps={self.warmup_steps}; shorten one of them"
+                )
+        elif self.decay_fraction is not None:
+            raise ValueError(
+                f"train.decay_fraction={self.decay_fraction} is read by train.schedule=wsd only, "
+                f"but train.schedule={self.schedule!r}; drop it or use wsd"
+            )
+        # --- end P1.13 ---
         return self
 
 
