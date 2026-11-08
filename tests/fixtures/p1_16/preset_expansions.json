@@ -1,0 +1,858 @@
+{
+ "cases": {
+  "memory_writes": {
+   "preset": "memory_writes"
+  },
+  "memory_writes_run": {
+   "preset": "memory_writes_run",
+   "to_step": 8750
+  },
+  "memory_writes_run_w500": {
+   "gate_key": "gate/write_rate",
+   "gate_min": 0.05,
+   "preset": "memory_writes_run",
+   "to_step": 8500,
+   "window": 500
+  }
+ },
+ "expansions": {
+  "memory_writes": {
+   "applies_to": {
+    "family": [
+     "hsn"
+    ]
+   },
+   "cases": [
+    {
+     "label": "writes",
+     "when": {
+      "all": [
+       {
+        "agg": "median",
+        "metric": "diag:gate/write_rate",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 1000,
+         "to": 1500
+        },
+        "value": 0.025
+       },
+       {
+        "agg": "median",
+        "metric": "diag:update_ratio/cell",
+        "min_samples": 3,
+        "op": ">=",
+        "steps": {
+         "from": 1000,
+         "to": 1500
+        },
+        "value": 0.001
+       }
+      ]
+     }
+    }
+   ],
+   "default": "no writes"
+  },
+  "memory_writes_run": {
+   "applies_to": {
+    "family": [
+     "hsn"
+    ]
+   },
+   "cases": [
+    {
+     "label": "writes",
+     "when": {
+      "all": [
+       {
+        "any": [
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 250,
+           "to": 750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 750,
+           "to": 1250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1250,
+           "to": 1750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1750,
+           "to": 2250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2250,
+           "to": 2750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2750,
+           "to": 3250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3250,
+           "to": 3750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3750,
+           "to": 4250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4250,
+           "to": 4750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4750,
+           "to": 5250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5250,
+           "to": 5750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5750,
+           "to": 6250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6250,
+           "to": 6750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6750,
+           "to": 7250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7250,
+           "to": 7750
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7750,
+           "to": 8250
+          },
+          "value": 0.095
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/p90",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 8250,
+           "to": 8750
+          },
+          "value": 0.095
+         }
+        ]
+       },
+       {
+        "any": [
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 250,
+           "to": 750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 750,
+           "to": 1250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1250,
+           "to": 1750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1750,
+           "to": 2250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2250,
+           "to": 2750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2750,
+           "to": 3250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3250,
+           "to": 3750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3750,
+           "to": 4250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4250,
+           "to": 4750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4750,
+           "to": 5250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5250,
+           "to": 5750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5750,
+           "to": 6250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6250,
+           "to": 6750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6750,
+           "to": 7250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7250,
+           "to": 7750
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7750,
+           "to": 8250
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 8250,
+           "to": 8750
+          },
+          "value": 0.0027
+         }
+        ]
+       }
+      ]
+     }
+    }
+   ],
+   "default": "no writes"
+  },
+  "memory_writes_run_w500": {
+   "applies_to": {
+    "family": [
+     "hsn"
+    ]
+   },
+   "cases": [
+    {
+     "label": "writes",
+     "when": {
+      "all": [
+       {
+        "any": [
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1,
+           "to": 1000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 500,
+           "to": 1500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1000,
+           "to": 2000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1500,
+           "to": 2500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2000,
+           "to": 3000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2500,
+           "to": 3500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3000,
+           "to": 4000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3500,
+           "to": 4500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4000,
+           "to": 5000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4500,
+           "to": 5500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5000,
+           "to": 6000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5500,
+           "to": 6500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6000,
+           "to": 7000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6500,
+           "to": 7500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7000,
+           "to": 8000
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7500,
+           "to": 8500
+          },
+          "value": 0.05
+         },
+         {
+          "agg": "median",
+          "metric": "diag:gate/write_rate",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 8000,
+           "to": 9000
+          },
+          "value": 0.05
+         }
+        ]
+       },
+       {
+        "any": [
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1,
+           "to": 1000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 500,
+           "to": 1500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1000,
+           "to": 2000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 1500,
+           "to": 2500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2000,
+           "to": 3000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 2500,
+           "to": 3500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3000,
+           "to": 4000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 3500,
+           "to": 4500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4000,
+           "to": 5000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 4500,
+           "to": 5500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5000,
+           "to": 6000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 5500,
+           "to": 6500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6000,
+           "to": 7000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 6500,
+           "to": 7500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7000,
+           "to": 8000
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 7500,
+           "to": 8500
+          },
+          "value": 0.0027
+         },
+         {
+          "agg": "median",
+          "metric": "diag:update_ratio/cell",
+          "min_samples": 3,
+          "op": ">=",
+          "steps": {
+           "from": 8000,
+           "to": 9000
+          },
+          "value": 0.0027
+         }
+        ]
+       }
+      ]
+     }
+    }
+   ],
+   "default": "no writes"
+  }
+ },
+ "source": "P1.16 (8 Nov 2026): memory_writes_run as calibrated; memory_writes as on 80b893d"
+}

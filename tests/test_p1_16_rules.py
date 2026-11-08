@@ -4,12 +4,13 @@ the ``(from step X: <label>)`` suffix, never a pass), the report's failure cell,
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
 from hsn.experiments.report import _failure_cell
 from hsn.experiments.rules import (
-    MEMORY_WRITES_RUN_RATE,
+    MEMORY_WRITES_RUN_GATE,
     MEMORY_WRITES_RUN_RATIO,
     RuleError,
     evaluate_verdicts,
@@ -180,31 +181,54 @@ def _writes(rates: dict[int, tuple[float, float]]) -> dict[str, Any]:
     return {
         "protocol": "reads_state",
         "diagnostics": [
-            {"step": s, "gate/write_rate": r, "update_ratio/cell": u} for s, (r, u) in rates.items()
+            {"step": s, "gate/p90": g, "update_ratio/cell": u} for s, (g, u) in rates.items()
         ],
     }
 
 
 def test_p1_16_memory_writes_run_reads_late_writers() -> None:
+    """Strong gates in one part of the run and a moving cell in another read "writes" (the
+    mlp-scorer runs open their gates early and update later); one noisy sample does not; a run
+    whose gates never open reads "no writes"; the GRU reads n/a."""
     rules = parse_rules({"verdicts": {"w": {"preset": "memory_writes_run", "to_step": 8750}}})
     (case,) = rules.verdicts["w"].cases
-    assert case.label == "writes" and case.when.kind == "any"
-    assert len(case.when.parts) == len(range(500, 8751, 500))
-    quiet = (0.0, 0.0)
-    loud = (MEMORY_WRITES_RUN_RATE * 2, MEMORY_WRITES_RUN_RATIO * 2)
-    late = _writes({s: (loud if s >= 6000 else quiet) for s in range(250, 9001, 250)})
-    never = _writes(dict.fromkeys(range(250, 9001, 250), quiet))
-    one_spike = _writes({s: (loud if s == 4000 else quiet) for s in range(250, 9001, 250)})
+    assert case.label == "writes" and case.when.kind == "all"
+    gates, moves = case.when.parts
+    assert gates.kind == moves.kind == "any"
+    assert len(gates.parts) == len(moves.parts) == len(range(500, 8751, 500))
+    steps = range(250, 9001, 250)
+    g, u = MEMORY_WRITES_RUN_GATE * 2, MEMORY_WRITES_RUN_RATIO * 2
+    late = _writes({s: (g if s >= 6000 else 0.0, u if s >= 6000 else 0.0) for s in steps})
+    split = _writes({s: (g if s <= 1000 else 0.0, u if s >= 5000 else 0.0) for s in steps})
+    never = _writes({s: (0.0, u) for s in steps})
+    one = _writes({s: (g if s == 4000 else 0.0, u) for s in steps})
     labels = {
         name: evaluate_verdicts(rules, rec, {}, "hsn")["w"]["label"]
-        for name, rec in (("late", late), ("never", never), ("one", one_spike))
+        for name, rec in (("late", late), ("split", split), ("never", never), ("one", one))
     }
-    assert labels == {"late": "writes", "never": "no writes", "one": "no writes"}
+    assert labels == {"late": "writes", "split": "writes", "never": "no writes", "one": "no writes"}
     assert evaluate_verdicts(rules, late, {}, "gru")["w"]["label"].startswith("n/a")
 
 
-def test_p1_16_memory_writes_run_needs_to_step() -> None:
+def test_p1_16_memory_writes_run_parameters() -> None:
     with pytest.raises(RuleError, match="to_step"):
         parse_rules({"verdicts": {"w": {"preset": "memory_writes_run"}}})
     with pytest.raises(RuleError):
         parse_rules({"verdicts": {"w": {"preset": "memory_writes_run", "to_step": 100}}})
+    with pytest.raises(RuleError, match="gate_key"):
+        parse_rules(
+            {"verdicts": {"w": {"preset": "memory_writes_run", "to_step": 900, "gate_key": "x"}}}
+        )
+    assert (MEMORY_WRITES_RUN_GATE, MEMORY_WRITES_RUN_RATIO) == (0.095, 0.0027)
+
+
+def test_p1_16_preset_expansions_pinned() -> None:
+    """memory_writes_run expands as calibrated, and memory_writes as on 80b893d."""
+    from pathlib import Path
+
+    data = json.loads(
+        (Path(__file__).parent / "fixtures" / "p1_16" / "preset_expansions.json").read_text()
+    )
+    for name, raw in data["cases"].items():
+        got = parse_rules({"verdicts": {name: raw}}).to_json()["verdicts"][name]
+        assert json.loads(json.dumps(got)) == data["expansions"][name], name

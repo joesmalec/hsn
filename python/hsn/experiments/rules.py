@@ -58,7 +58,8 @@ Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``r
 (P1.14; P1.15: ``min_vocab`` adds "vocabulary too small"), ``memory_open``, ``cells_apart``, and
 P1.15's ``reads_state_v3`` (probe v3's value edit), ``binds_keys`` (its key swap) and
 ``memory_writes`` (the write rate and the cell's update ratio over a window); P1.16's
-``memory_writes_run`` (the same in any of a run's sliding windows, for top-K and late learners).
+``memory_writes_run`` (the gate's 90th percentile and the cell's update ratio, each in some window
+of the run, for top-K and late learners).
 
 **Early stop.** ``{name, at_steps: [n, ...], outcome, when, applies_to}``: evaluated by the trainer
 callback right after step ``n``'s evaluation and diagnostics; when ``when`` holds the run stops with
@@ -136,9 +137,12 @@ SPLIT_PREFIX = "split/"
 #: P1.14: the minimum the docs recommend for a windowed rule (``min_samples`` is set per rule)
 MIN_SAMPLES_DOC = 5
 TRAIN_METRICS = ("loss", "accuracy", "grad_norm")
-#: P1.16: memory_writes_run's default thresholds (calibrated on the stored HSN runs)
-MEMORY_WRITES_RUN_RATE = 0.025
-MEMORY_WRITES_RUN_RATIO = 0.0005
+#: P1.16: memory_writes_run's gate statistic and default thresholds (calibrated on the 34 stored HSN
+#: reads_state runs with write diagnostics, 8 Nov 2026: 16 of 16 learners "writes", 9 of 9 dead "no
+#: writes"), and the gate statistics it may read instead
+MEMORY_WRITES_RUN_GATE = 0.095
+MEMORY_WRITES_RUN_RATIO = 0.0027
+MEMORY_WRITES_RUN_KEYS = ("gate/p90", "gate/p50", "gate/mean", "gate/write_rate")
 
 
 class RuleError(ValueError):
@@ -705,23 +709,34 @@ def _preset_memory_writes(p: dict[str, Any]) -> dict[str, Any]:
 
 
 def _preset_memory_writes_run(p: dict[str, Any]) -> dict[str, Any]:
-    """P1.16: :func:`_preset_memory_writes` over a whole run. "writes" when, in **any** of the
-    sliding windows ``[s - window, s + window]`` centred at the multiples ``s`` of ``every`` from
-    ``from_step`` to ``to_step`` (required: the last centre whose window the arm still records),
-    the ``agg`` (default median) of ``gate/write_rate`` is at least ``write_rate_min`` and that of
-    ``update_ratio/cell`` at least ``update_ratio_min``, each window holding ``min_samples``
-    (default 3) diagnostics; else "no writes". ``memory_writes`` reads one early window (1,000 to
-    1,500), so it misreads runs that start writing later (exp 190) and top-K runs, whose onset
-    comes at 4,000 to 8,000 (exps 196 to 198); one window anywhere in the run reads them. A median
-    over three samples, not a single sample, so one noisy diagnostic cannot pass a run. The default
-    thresholds are calibrated on the stored HSN runs (docs/sweeps.md, "memory_writes_run")."""
+    """P1.16: the memory-writes rule over a whole run, for top-K and late learners. "writes" when
+    **some** sliding window ``[s - window, s + window]`` (``window`` 250; centres ``s`` at the
+    multiples of ``every``, 500, from ``from_step``, 500, to ``to_step``, required: the last centre
+    whose window the arm records) has an ``agg`` (median) of ``gate_key`` (``gate/p90``, the 90th
+    percentile of the written cells' gates) of at least ``gate_min`` (0.095), **and** some window
+    has an ``agg`` of ``update_ratio/cell`` of at least ``update_ratio_min`` (0.0027), every window
+    holding ``min_samples`` (3) diagnostics; else "no writes".
+
+    Calibrated on the 34 stored HSN reads_state runs with write diagnostics (8 Nov 2026,
+    ``docs/sweeps.md``): it reads all 16 that read state "writes" (dense and top-K, the late exp
+    190 and the mlp-scorer exps 202 and 203 included) and all 9 dead ones "no writes". The gate
+    write rate itself cannot separate top-K runs (learner exp 198 peaks at 0.009, dead exp 192 at
+    0.017), and requiring both in one window misses learners whose gates open early and whose
+    updates grow later (exps 202, 203). Margins are thin: dead exp 192's p90 0.088 against learner
+    exp 198's 0.102; dead exp 171's update ratio 0.0024 against learner exp 173's 0.0029. Under
+    Adam ``update_ratio/cell`` scales with the learning rate (calibrated for 1e-3 to 3e-3)."""
     start, every = p.pop("from_step", 500), p.pop("every", 500)
     if "to_step" not in p:
         raise RuleError("preset memory_writes_run needs to_step (the last window centre)")
     stop = p.pop("to_step")
     window = p.pop("window", 250)
-    rate, ratio = (
-        p.pop("write_rate_min", MEMORY_WRITES_RUN_RATE),
+    key = p.pop("gate_key", "gate/p90")
+    if key not in MEMORY_WRITES_RUN_KEYS:
+        raise RuleError(
+            f"preset memory_writes_run: gate_key {key!r} is not one of {MEMORY_WRITES_RUN_KEYS}"
+        )
+    gate, ratio = (
+        p.pop("gate_min", MEMORY_WRITES_RUN_GATE),
         p.pop("update_ratio_min", MEMORY_WRITES_RUN_RATIO),
     )
     agg, least = p.pop("agg", "median"), p.pop("min_samples", 3)
@@ -731,21 +746,30 @@ def _preset_memory_writes_run(p: dict[str, Any]) -> dict[str, Any]:
             f"got from {start}, to {stop}, every {every}, window {window}"
         )
     centres = range(-(-start // every) * every, stop + 1, every)
-    windows: list[Any] = []
-    for s in centres:
-        span = {"from": max(1, s - window), "to": s + window}
-        windows.append(
-            {
-                "all": [
-                    _atom("diag:gate/write_rate", ">=", rate, dict(span), agg, least),
-                    _atom("diag:update_ratio/cell", ">=", ratio, dict(span), agg, least),
-                ]
-            }
-        )
-    if not windows:
+    spans = [{"from": max(1, s - window), "to": s + window} for s in centres]
+    if not spans:
         raise RuleError(f"preset memory_writes_run: no window centre in [{start}, {stop}]")
     return {
-        "cases": [{"label": "writes", "when": {"any": windows}}],
+        "cases": [
+            {
+                "label": "writes",
+                "when": {
+                    "all": [
+                        {
+                            "any": [
+                                _atom(f"diag:{key}", ">=", gate, dict(w), agg, least) for w in spans
+                            ]
+                        },
+                        {
+                            "any": [
+                                _atom("diag:update_ratio/cell", ">=", ratio, dict(w), agg, least)
+                                for w in spans
+                            ]
+                        },
+                    ]
+                },
+            }
+        ],
         "default": "no writes",
         "applies_to": {"family": ["hsn"]},
     }

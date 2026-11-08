@@ -1,0 +1,55 @@
+# Example sweep for P1.16's additions (docs/sweeps.md): the standard HSN recipe file (beta2 0.95), the
+# rollback (train.rollback_*), kept checkpoints with partial results for a failed arm (protocol keep_every /
+# keep_last) and the write-rate preset over the whole run (memory_writes_run). Expand-only: it shows the keys
+# and is checked by the committed-spec test; it registers no experiment of the plan. route-check
+# (python -m hsn.experiments route-check --exp N) reads a routed arm's checkpoint after the run.
+#
+#   python -m hsn.experiments expand configs/sweeps/example_p1_16.yaml
+
+name: example_p1_16
+description: the beta2 0.95 HSN recipe, the rollback, kept checkpoints and memory_writes_run
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml # exp 194's recipe: d=64 + A4, WSD 0.2 over 9k at 2e-3, beta2 0.95
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead # a CUDA arm pins it (P1.11); about 0.24 s per step at B32
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000 # with this protocol the recipe arm is exp 194's arm (id 612f783264abbd77)
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  keep_every: 1000 # a mid-run checkpoint every 1,000 steps (execution-only: no arm id changes)
+  keep_last: 2 # the newest two stay (and the newest before the first guard event); a finished run drops them
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+seeds: [0]
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+    memory_writes_run: {preset: memory_writes_run, to_step: 8750} # any window of the run
+    rolled_back: # n/a with the rollback off (final.rollbacks is None there, never a false 0)
+      cases:
+        - label: rolled back
+          when: {metric: "final:rollbacks", op: ">", value: 0}
+      default: no rollback
+    partial_reads_state:
+      cases:
+        - label: the kept checkpoint reads state
+          when: {metric: "partial:split/later/accuracy", op: ">", value: chance}
+      default: no partial result above chance
+arms:
+  - name: hsn_recipe # exp 194's arm (the same arm id at seed 0)
+    family: hsn
+  - name: hsn_rollback # the rollback at its recommended values; spike_factor 1e4 comes from the recipe
+    family: hsn
+    overrides:
+      - train.rollback_every=50
+      - train.rollback_skip=10
+      - train.rollback_lr_mult=0.5
+      - train.rollback_lr_steps=200
+      - train.rollback_max=5
