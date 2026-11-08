@@ -1,6 +1,7 @@
 """``probe-check`` (P1.11): the batched edit probe against the audit's per-document probe on a
 trained checkpoint of one experiment. ``probe-rerun`` (P1.14, :func:`probe_rerun`): v1 again on the
-checkpoint against the stored per-document probes and summary, then probe v2 on it.
+checkpoint against the stored per-document probes and summary, then probe v2 on it (P1.15: against
+the stored v2 probes when the run has them), then probe v3.
 
 The model is rebuilt from the arm's stored configuration (seeded as the run, the variant installed
 the same way), the run's last checkpoint is loaded, and both probes run on the dev documents under
@@ -140,7 +141,14 @@ def probe_rerun(
     summary; then probe v2 on the same model. Every answer that differs from the stored one is
     listed with both top-2 margins (a near-tie under other rounding, as ``probe-check``), and so is
     every original answer of v2's pass that differs from v1's."""
-    from hsn.experiments.probe import edit_probe, edit_probe_v2, summarize, summarize_v2
+    from hsn.experiments.probe import (
+        edit_probe,
+        edit_probe_v2,
+        edit_probe_v3,
+        summarize,
+        summarize_v2,
+        summarize_v3,
+    )
 
     result = db.row("SELECT json_path FROM results WHERE exp_id = ?", (exp_id,))
     if result is None or not result["json_path"]:
@@ -151,6 +159,7 @@ def probe_rerun(
     stored_full = json.loads(json_path.read_text(encoding="utf-8"))
     block = stored_full if stored_full.get("probes") else (stored_full.get("at_stop") or {})
     stored, stored_summary = block.get("probes") or [], block.get("probe") or {}
+    stored_v2, stored_summary_v2 = block.get("probes_v2") or [], block.get("probe_v2") or {}
     rows = batch_rows or params.probe_batch
     t0 = time.perf_counter()
     v1 = edit_probe(model, ctx, dev, batch_rows=rows, margins=True)
@@ -189,6 +198,27 @@ def probe_rerun(
         for a, b in zip(v1, v2, strict=True)
         if not b["original_matches_v1"]
     ]
+    # P1.15: v2 against the stored v2 probes (runs of reads_state version 2 or 3)
+    v2_differ: list[dict[str, Any]] = []
+    if stored_v2:
+        if [p["doc"] for p in v2] != [p["doc"] for p in stored_v2]:
+            raise ValueError(f"experiment {exp_id}: the stored v2 probes are of other documents")
+        for now, then in zip(v2, stored_v2, strict=True):
+            for which in ("original", "modified"):
+                if now[f"argmax_{which}"] != then[f"argmax_{which}"]:
+                    v2_differ.append(
+                        {
+                            "doc": now["doc"],
+                            "which": which,
+                            "stored": then[f"argmax_{which}"],
+                            "rerun": now[f"argmax_{which}"],
+                            "margin_rerun": now.get(f"margin_{which}"),
+                        }
+                    )
+    keys_v2 = ("n_probed", "vocab_size", "matched_n", "correct_before_edit", "verdict")
+    t2 = time.perf_counter()
+    v3, v3_originals = edit_probe_v3(model, ctx, dev, batch_rows=rows, margins=True)
+    v3_s = time.perf_counter() - t2
     return {
         "exp_id": exp_id,
         "label": exp["label"],
@@ -204,5 +234,13 @@ def probe_rerun(
         "v1_stored": {k: stored_summary.get(k) for k in keys},
         "v2": summary_v2,
         "v2_original_mismatches": mismatches,
+        "v2_stored": bool(stored_v2),
+        "v2_answers_differing": len(v2_differ) if stored_v2 else None,
+        "v2_summary_equal": (
+            all(summary_v2[k] == stored_summary_v2.get(k) for k in keys_v2) if stored_v2 else None
+        ),
+        "v2_differ": v2_differ,
+        "v3_s": round(v3_s, 2),
+        "v3": summarize_v3(v3, v3_originals),
         "differ": differ,
     }

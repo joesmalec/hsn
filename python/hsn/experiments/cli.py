@@ -487,7 +487,8 @@ def cmd_probe_rerun(args: argparse.Namespace) -> int:
     text = json.dumps(out, indent=1, default=str)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
-    print(json.dumps({k: v for k, v in out.items() if k != "differ"}, indent=1, default=str))
+    shown = {k: v for k, v in out.items() if k not in ("differ", "v2_differ")}
+    print(json.dumps(shown, indent=1, default=str))
     return 0
 
 

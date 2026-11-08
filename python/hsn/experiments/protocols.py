@@ -54,6 +54,8 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
 - The gradient-spike guard (``train.spike_factor``): ``final.skipped_spike_steps`` (``None`` with
   the guard off), ``skipped_steps`` (every step a guard skipped, with its reason), a ``skipped``
   mark on those train entries, and the failure kind ``spike`` when spike skips stopped the run.
+- reads_state version 3 runs probe v3 after v1 and v2 (``probe_v3``, ``probes_v3``,
+  ``probes_v3_originals``; :mod:`hsn.experiments.probe`).
 - ``divergence``: the divergence dump's summary (``train.divergence_dump``, on by default: kind,
   step, norm, path; :mod:`hsn.train.divergence`), in full and partial records; ``None`` without a
   skipped step.
@@ -387,7 +389,14 @@ def _train(
     from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything
     from hsn.experiments.diagnostics import Diagnostics, trained_state
-    from hsn.experiments.probe import edit_probe, edit_probe_v2, summarize, summarize_v2
+    from hsn.experiments.probe import (
+        edit_probe,
+        edit_probe_v2,
+        edit_probe_v3,
+        summarize,
+        summarize_v2,
+        summarize_v3,
+    )
     from hsn.experiments.variants import install_variant
     from hsn.runner import build_model, load_datasets, make_trainer
 
@@ -547,7 +556,7 @@ def _train(
             probes = edit_probe(model, ctx, dev_ds, batch_rows=params.probe_batch)
             summary = summarize(probes)
             arm.walls["probe_s"] = time.perf_counter() - t3
-            if params.version == 2:
+            if params.version >= 2:
                 arm.stage = "probe_v2"
                 t4 = time.perf_counter()
                 probes_v2 = edit_probe_v2(
@@ -555,6 +564,16 @@ def _train(
                 )
                 v2 = {"probe_v2": summarize_v2(probes_v2, v1=probes), "probes_v2": probes_v2}
                 arm.walls["probe_v2_s"] = time.perf_counter() - t4
+            if params.version >= 3:  # P1.15: probe v3, the later queries' key-addressed edits
+                arm.stage = "probe_v3"
+                t5 = time.perf_counter()
+                probes_v3, originals_v3 = edit_probe_v3(
+                    model, ctx, dev_ds, batch_rows=params.probe_batch
+                )
+                v2["probe_v3"] = summarize_v3(probes_v3, originals_v3)
+                v2["probes_v3"] = probes_v3
+                v2["probes_v3_originals"] = originals_v3
+                arm.walls["probe_v3_s"] = time.perf_counter() - t5
         if callback.stop is not None:
             record["at_stop"] = {
                 "step": callback.stop["step"],

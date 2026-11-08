@@ -57,7 +57,8 @@ beyond the schedule, duplicate labels, and every check of :func:`hsn.experiments
   arm's rules at expansion; both keys are in the id only when not at their defaults, see
   :data:`IDENTITY_DEFAULTS`.
 - reads_state ``version``: 2 adds probe v2. It fills the id's existing protocol-version slot, so
-  version 1 is today's payload.
+  version 1 is today's payload. P1.15: 3 adds probe v3 after v1 and v2 (the same slot: version 1
+  and 2 arms keep their ids).
 
 The step-time refusals happen at enqueue (:func:`hsn.experiments.db.enqueue_arms`), not here, so
 expansion of every existing spec is unchanged.
@@ -184,8 +185,9 @@ class ReadsStateParams(_DiagCadence):
 
     name: Literal["reads_state"]
     # P1.14: version 2 adds probe v2, the vocabulary-matched edit (hsn.experiments.probe); the
-    # version is the arm id's protocol version, so version 1 arms keep their ids
-    version: Literal[1, 2] = 1
+    # version is the arm id's protocol version, so version 1 arms keep their ids. P1.15: version
+    # 3 adds probe v3 (key-addressed edits of the later queries) after v1 and v2
+    version: Literal[1, 2, 3] = 1
     diag_every: int = Field(default=500, ge=0)  # 0: no diagnostics during training
     diag_docs: int = Field(default=32, ge=1)  # documents of trained_state
     n_train: int = Field(default=0, ge=0)  # 0: the whole split
@@ -234,15 +236,19 @@ PROTOCOL_SOURCES: dict[str, tuple[str, ...]] = {
     "reads_state": ("trained", "probe", "final"),
     "train_eval": ("trained", "final"),
     "overfit": ("overfit", "final"),
-    "dry_run": ("trained", "probe", "probe_v2", "overfit", "final"),
+    "dry_run": ("trained", "probe", "probe_v2", "probe_v3", "overfit", "final"),
 }
 
 
 def protocol_sources(params: Any) -> tuple[str, ...]:
-    """The scalar rule sources a protocol writes (P1.14: reads_state version 2 adds probe_v2)."""
+    """The scalar rule sources a protocol writes (P1.14: reads_state version 2 adds probe_v2;
+    P1.15: version 3 adds probe_v3 too)."""
     sources = PROTOCOL_SOURCES[params.name]
-    if params.name == "reads_state" and getattr(params, "version", 1) == 2:
+    version = getattr(params, "version", 1)
+    if params.name == "reads_state" and version >= 2:
         sources = (*sources, "probe_v2")
+    if params.name == "reads_state" and version >= 3:
+        sources = (*sources, "probe_v3")
     return sources
 
 

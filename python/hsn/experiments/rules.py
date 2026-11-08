@@ -17,6 +17,8 @@ their expanded form. They are experiment rules registered before the run, not ga
   Scalars: ``trained:<key>`` (the trained model's state statistics), ``probe:<key>`` (the edit
   probe, :func:`hsn.experiments.probe.summarize`), ``probe_v2:<key>`` (P1.14: the
   vocabulary-matched edit of reads_state version 2, :func:`hsn.experiments.probe.summarize_v2`),
+  ``probe_v3:<key>`` (P1.15: the key-addressed edits of reads_state version 3,
+  :func:`hsn.experiments.probe.summarize_v3`: ``value/...`` and ``swap/...`` keys),
   ``overfit:<key>``, ``final:<key>`` (the last
   evaluation flattened, ``train_loss``, ``steps``) and ``verdict:<rule>`` (another rule's label).
 * ``steps`` (series only) selects samples: ``{at: n}`` or ``{from: a, to: b, every: k}`` (every
@@ -100,7 +102,7 @@ __all__ = [
 ]
 
 SERIES_SOURCES = ("eval", "diag", "train")
-SCALAR_SOURCES = ("trained", "probe", "probe_v2", "overfit", "final", "verdict")
+SCALAR_SOURCES = ("trained", "probe", "probe_v2", "probe_v3", "overfit", "final", "verdict")
 SOURCES = SERIES_SOURCES + SCALAR_SOURCES
 AGGS = ("all", "any", "median", "mean", "min", "max", "first", "last")
 OPS = (">=", ">", "<=", "<", "==", "!=", "between")
@@ -798,6 +800,7 @@ class RecordView:
             "trained": self.record.get("trained_state"),
             "probe": self.record.get("probe"),
             "probe_v2": self.record.get("probe_v2"),
+            "probe_v3": self.record.get("probe_v3"),  # P1.15
             "overfit": self.record.get("overfit"),
             "final": self.record.get("final"),
         }[source]
@@ -1125,7 +1128,10 @@ def _check_atom(
         if upto is not None:
             raise RuleError(f"{where}: an early stop reads step series only, not {atom.metric}")
         if atom.source != "verdict" and atom.source not in cadence.scalar_sources:
-            hint = " (probe_v2 needs reads_state version 2)" if atom.source == "probe_v2" else ""
+            hint = {
+                "probe_v2": " (probe_v2 needs reads_state version 2)",
+                "probe_v3": " (probe_v3 needs reads_state version 3)",
+            }.get(atom.source, "")
             raise RuleError(
                 f"{where}: protocol {cadence.protocol} writes no {atom.source}: values "
                 f"({atom.metric}){hint}; restrict the rule with applies_to: {{protocol: [...]}}"

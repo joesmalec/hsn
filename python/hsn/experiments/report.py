@@ -15,6 +15,8 @@ attempt (``done`` or ``stopped_early``), else the latest attempt. Columns:
   the follow / unchanged fractions of the edit probe (P1.14: and of probe v2, with its vocabulary
   size and the share of documents with a matched edit); the trained model's write rate (P1.14: the
   share of gates >= 0.5) and the median step time (P1.14: ``step_time.run_median_s``);
+* P1.15: probe v3's value-edit follow / unchanged fractions with its vocabulary, and the key
+  swap's (``v3_follow``, ``v3_unchanged``, ``v3_vocab``, ``swap_follow``, ``swap_unchanged``);
 * P1.15: the first/later split of the final evaluation (``first_acc``, ``later_acc``, ``later_1`` to
   ``later_3``, :mod:`hsn.experiments.split`) and where it comes from (``split_src``: ``record``, or
   for a run stored before P1.15 the ``derived`` / ``recomputed`` values of a ``split-backfill``
@@ -167,6 +169,8 @@ def _verdict_labels(
     return {k: v["label"] for k, v in fresh.items()}
 
 
+#: P1.15: probe v3's columns (the value edit's and the key swap's fractions, the vocabulary)
+V3_COLUMNS = ("v3_follow", "v3_unchanged", "v3_vocab", "swap_follow", "swap_unchanged")
 #: P1.15: the report's split columns and the record's final keys they read
 SPLIT_COLUMNS = {
     "first_acc": "split/first/accuracy",
@@ -203,6 +207,7 @@ def _per_seed_row(
     failure = record.get("failure")
     trained = record.get("trained_state") or (record.get("at_stop") or {}).get("trained_state")
     v2 = record.get("probe_v2") or {}
+    v3 = record.get("probe_v3") or {}  # P1.15
     step_time = record.get("step_time") or {}
     return {
         "label": row["label"],
@@ -223,6 +228,11 @@ def _per_seed_row(
         "v2_unchanged": v2.get("correct_unchanged_frac"),
         "v2_vocab": v2.get("vocab_size"),
         "v2_matched": v2.get("matched_frac"),
+        "v3_follow": v3.get("value/follow_frac"),
+        "v3_unchanged": v3.get("value/unchanged_frac"),
+        "v3_vocab": v3.get("vocab_size"),
+        "swap_follow": v3.get("swap/follow_frac"),
+        "swap_unchanged": v3.get("swap/unchanged_frac"),
         "write_rate": (trained or {}).get("gate/write_rate"),
         "step_s": step_time.get("run_median_s"),
         "early_stop": f"{stopped['outcome']} @ {stopped['step']}" if stopped else "",
@@ -327,6 +337,7 @@ def build_report(
             "v2_unchanged",
             "v2_vocab",
             "v2_matched",
+            *V3_COLUMNS,
             "write_rate",
             "step_s",
             "early_stop",
@@ -383,7 +394,7 @@ def build_report(
         row["unchanged"] = _spread(
             [m["unchanged"] for m in finished if m["unchanged"] is not None], 3
         )
-        for key in ("v2_follow", "v2_unchanged", "v2_vocab", "v2_matched"):
+        for key in ("v2_follow", "v2_unchanged", "v2_vocab", "v2_matched", *V3_COLUMNS):
             row[key] = _spread([float(m[key]) for m in finished if m[key] is not None], 3)
         row["write_rate"] = _spread(
             [m["write_rate"] for m in finished if m["write_rate"] is not None], 3
@@ -418,6 +429,7 @@ def build_report(
         "v2_unchanged",
         "v2_vocab",
         "v2_matched",
+        *V3_COLUMNS,
         "write_rate",
         "step_s",
         "early_stop",
