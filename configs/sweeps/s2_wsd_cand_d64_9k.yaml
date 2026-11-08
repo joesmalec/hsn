@@ -1,0 +1,66 @@
+# Overnight: exp 130's arm (dense HSN d=64 + cand_norm, amendment A4; WSD 0.2 at lr 2.5e-3; B32, warm-up 200,
+# compiled) trained 9,000 steps on a WSD 0.2 schedule over 9,000 (constant to 7,200, then the 1 - sqrt decay), with
+# probe v2 (approved by the coordinator under the user's overnight mandate, 7 Nov 2026, after exp 130 read state with
+# dev 0.660 still climbing at 3,000). Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md
+# before the run. The question: does HSN pass the open baselines' best (gru_2m 0.763) while reading state?
+#
+# Architecture note: amendment A4 (opt-in). Expected 0.248 s per step, about 37 min plus a cached compile. Diagnostics
+# every 250 steps reported (gate p50 / p90, write rate, gate mean, cell share, sat99). No gate-p50 rule or stop
+# (exps 128, 130: that rule misreads a sparse-write memory); stops only by P1.12's non-finite guard and P1.14's
+# step-time guard. If it beats 0.763 while reading state, seeds 1 and 2 are pre-approved.
+
+name: s2_wsd_cand_d64_9k
+description: "Dense HSN d=64 + cand_norm on WSD 0.2 over 9,000 steps at lr 2.5e-3, probe v2"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.0025
+    - train.steps=9000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.cand_norm=rms
+protocol: {name: reads_state, version: 2, steps: 9000, diag_every: 250, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state, group: {min_agree: 2}}
+    reads_state_v2: {preset: reads_state_v2, group: {min_agree: 2}}
+    beats_bar:
+      cases:
+        - label: above 0.763
+          when:
+            all:
+              - {metric: "eval:delayed/in_range/accuracy", steps: {at: 9000}, op: ">", value: 0.763}
+      default: not above 0.763
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s2_wsd_cand_d64_9k
+    family: hsn
