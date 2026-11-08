@@ -144,6 +144,9 @@ def run_protocol(arm: ArmRun) -> dict[str, Any]:
 _NONFINITE_STOP = "P1.12 stop rule"
 #: P1.15: a stop rule message that counted spike skips names them
 _SPIKE = "gradient spike"
+#: P1.16: the rollback limit's message (hsn.train.loop.ROLLBACK_LIMIT; a literal here, so that the
+#: queue side stays torch-free; test_p1_16_rollback_limit_stops checks the two agree)
+_ROLLBACK_LIMIT = "P1.16 rollback limit"
 
 
 def failure_info(
@@ -155,7 +158,8 @@ def failure_info(
     skipped_spike: int | None = None,
 ) -> dict[str, Any]:
     """The ``failure`` block of a partial record: ``kind`` (``nonfinite``: P1.12's stop rule;
-    ``spike``: the same rule with P1.15's spike skips among the skipped steps; ``step_time``: the
+    ``spike``: the same rule with P1.15's spike skips among the skipped steps; ``rollback``:
+    P1.16's rollback limit (``train.rollback_max``); ``step_time``: the
     0.5 s rule; ``oom``; ``cancelled``: SIGTERM; ``interrupted``; ``error``), a short ``reason``
     (the verdicts read ``failed: <reason> @ <last_step>``), the error's type and message, the
     traceback's tail, the stage (``setup``, ``train``, ``trained_state``, ``probe``) and
@@ -174,6 +178,8 @@ def failure_info(
         kind, reason = "step_time", first
     elif name == "OutOfMemoryError":
         kind, reason = "oom", "out of memory"
+    elif isinstance(exc, RuntimeError) and _ROLLBACK_LIMIT in message:  # P1.16
+        kind, reason = "rollback", "kept diverging after rollbacks (P1.16 rollback limit)"
     elif isinstance(exc, RuntimeError) and _NONFINITE_STOP in message and _SPIKE in message:
         kind, reason = "spike", "gradient spikes or non-finite gradients (P1.12 stop)"  # P1.15
     elif isinstance(exc, RuntimeError) and _NONFINITE_STOP in message:

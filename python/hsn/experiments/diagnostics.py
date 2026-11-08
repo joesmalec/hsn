@@ -144,9 +144,10 @@ class Diagnostics:
         self.optimizer_calls += 1
         step = int(self._trainer.step) + 1  # the trainer increments its step after the update
         # P1.12: a step the non-finite-gradient guard skipped calls no optimiser step (P1.15: nor
-        # does one the spike guard skipped)
+        # does one the spike guard skipped; P1.16: nor a rollback's trigger step)
         skipped = int(getattr(self._trainer, "skipped_nonfinite", 0))
         skipped += int(getattr(self._trainer, "skipped_spike", 0))
+        skipped += len(getattr(self._trainer, "rollbacks", ()))
         taken = step - skipped
         if not self._scaled and taken != self.optimizer_calls:
             raise RuntimeError(
