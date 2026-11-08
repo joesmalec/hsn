@@ -15,6 +15,10 @@ attempt (``done`` or ``stopped_early``), else the latest attempt. Columns:
   the follow / unchanged fractions of the edit probe (P1.14: and of probe v2, with its vocabulary
   size and the share of documents with a matched edit); the trained model's write rate (P1.14: the
   share of gates >= 0.5) and the median step time (P1.14: ``step_time.run_median_s``);
+* P1.15: the first/later split of the final evaluation (``first_acc``, ``later_acc``, ``later_1`` to
+  ``later_3``, :mod:`hsn.experiments.split`) and where it comes from (``split_src``: ``record``, or
+  for a run stored before P1.15 the ``derived`` / ``recomputed`` values of a ``split-backfill``
+  file given as ``split_backfill``);
 * early stops; failures (P1.14: ``<reason> @ <last step>`` of an attempt that failed or was
   cancelled, from its partial record); median train and total wall seconds and compile seconds;
 * card status, commits, imported.
@@ -163,7 +167,35 @@ def _verdict_labels(
     return {k: v["label"] for k, v in fresh.items()}
 
 
-def _per_seed_row(row: dict[str, Any], labels: dict[str, str], overrides: str) -> dict[str, Any]:
+#: P1.15: the report's split columns and the record's final keys they read
+SPLIT_COLUMNS = {
+    "first_acc": "split/first/accuracy",
+    "later_acc": "split/later/accuracy",
+    "later_1": "split/later/1/accuracy",
+    "later_2": "split/later/2/accuracy",
+    "later_3": "split/later/3/accuracy",
+}
+
+
+def _split_cells(
+    record: Mapping[str, Any], exp_id: int, backfill: Mapping[int, Mapping[str, Any]] | None
+) -> dict[str, Any]:
+    """P1.15: the split columns from the record's final block, else from a backfill entry."""
+    final = record.get("final") or {}
+    if final.get("split/first/accuracy") is not None:
+        return {**{c: final.get(k) for c, k in SPLIT_COLUMNS.items()}, "split_src": "record"}
+    entry = (backfill or {}).get(int(exp_id))
+    if entry is None:
+        return {**dict.fromkeys(SPLIT_COLUMNS), "split_src": ""}
+    return {**{c: entry.get(c) for c in SPLIT_COLUMNS}, "split_src": str(entry.get("tier", ""))}
+
+
+def _per_seed_row(
+    row: dict[str, Any],
+    labels: dict[str, str],
+    overrides: str,
+    backfill: Mapping[int, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     record = loads(row["record_json"]) or {}
     probe = record.get("probe") or {}
     walls = record.get("walls") or {}
@@ -184,6 +216,7 @@ def _per_seed_row(row: dict[str, Any], labels: dict[str, str], overrides: str) -
         "dev_acc": row["final_dev_accuracy"],
         "dev_loss": row["final_dev_loss"],
         "first_query_acc": probe.get("first_query_accuracy"),
+        **_split_cells(record, row["exp_id"], backfill),
         "follow": probe.get("correct_follow_frac"),
         "unchanged": probe.get("correct_unchanged_frac"),
         "v2_follow": v2.get("correct_follow_frac"),
@@ -218,7 +251,10 @@ def build_report(
     protocol: str | None = None,
     imported: bool | None = None,
     per_seed: bool = False,
+    split_backfill: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> Report:
+    """The report (module docstring). ``split_backfill`` (P1.15): exp id -> the split columns of a
+    ``split-backfill`` file, for runs whose record has no split."""
     rules: RuleSet | None = None
     constants_by_arm: dict[str, dict[str, Any]] = {}
     label_by_arm: dict[str, str] = {}
@@ -268,7 +304,7 @@ def build_report(
         for name in labels:
             if name not in verdict_names:
                 verdict_names.append(name)
-        per.append(_per_seed_row(r, labels, overrides[r["exp_id"]]))
+        per.append(_per_seed_row(r, labels, overrides[r["exp_id"]], split_backfill))
     vcols = [f"verdict:{v}" for v in verdict_names]
     if per_seed:
         columns = [
@@ -283,6 +319,8 @@ def build_report(
             "dev_acc",
             "dev_loss",
             "first_query_acc",
+            *SPLIT_COLUMNS,
+            "split_src",
             "follow",
             "unchanged",
             "v2_follow",
@@ -338,6 +376,9 @@ def build_report(
         row["first_query_acc"] = _spread(
             [m["first_query_acc"] for m in finished if m["first_query_acc"] is not None], 3
         )
+        for key in SPLIT_COLUMNS:  # P1.15
+            row[key] = _spread([float(m[key]) for m in finished if m[key] is not None], 3)
+        row["split_src"] = ", ".join(sorted({m["split_src"] for m in finished if m["split_src"]}))
         row["follow"] = _spread([m["follow"] for m in finished if m["follow"] is not None], 3)
         row["unchanged"] = _spread(
             [m["unchanged"] for m in finished if m["unchanged"] is not None], 3
@@ -369,6 +410,8 @@ def build_report(
         "dev_acc",
         "dev_loss",
         "first_query_acc",
+        *SPLIT_COLUMNS,
+        "split_src",
         "follow",
         "unchanged",
         "v2_follow",

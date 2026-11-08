@@ -45,7 +45,10 @@ checkpoint (unless that step already wrote one) and stops there (the sweep harne
 rules, :mod:`hsn.experiments`). The step it stops at is not a statistics step of the TBPTT trainer
 (those key on the last step of ``fit``). :attr:`Trainer.eval_batch` (``None`` = ``train.batch``)
 sets the number of parallel streams of :meth:`Trainer.evaluate` only; training is unaffected and
-the per-document metrics change by rounding at most.
+the per-document metrics change by rounding at most. **P1.15:** :attr:`Trainer.eval_position_groups`
+(``None`` by default) labels the evaluation's loss positions
+(:func:`hsn.eval.evaluate.evaluate_windows`, ``position_groups``); the result gains
+``per_position_group``, everything else is computed as before.
 
 **Search budget.** :class:`SearchBudget` counts hyperparameter-search trials against
 ``train.search_trials`` so that every method in the baseline ladder gets the same number of
@@ -124,7 +127,7 @@ from hsn.device import (
     set_deterministic,
     synchronize,
 )
-from hsn.eval.evaluate import DEFAULT_METRICS, Metric, evaluate_windows
+from hsn.eval.evaluate import DEFAULT_METRICS, Metric, PositionGroups, evaluate_windows
 from hsn.train.amp import autocast_ctx, autocast_name, make_grad_scaler
 from hsn.train.checkpoint import (
     capture_rng_state,
@@ -509,6 +512,9 @@ class Trainer:
         self._carried_state: Any = None
         # P1.11: parallel streams of evaluate() (None = train.batch); a harness setting, not config
         self.eval_batch: int | None = None
+        # P1.15: labels of evaluate()'s loss positions (the reads-state harness's query slots,
+        # hsn.experiments.split); a harness setting, not config. None: today's evaluation
+        self.eval_position_groups: PositionGroups | None = None
 
     # construction ----------------------------------------------------------------------------
 
@@ -914,6 +920,7 @@ class Trainer:
                 autocast=autocast_ctx(self.ctx),
                 group_of_doc=torch.tensor(ids, dtype=torch.int64),
                 group_names=names,
+                position_groups=self.eval_position_groups,  # P1.15 (None: no extra groups)
             )
         result["n_docs"] = len(ds)
         return result

@@ -45,6 +45,12 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
     early-stop log and the walls, read from the live ``History`` the callback holds;
   - otherwise what the earlier stages wrote.
   ``run-arm`` stores it.
+
+**P1.15.**
+- Every reads_state evaluation is labelled by query slot (:class:`hsn.experiments.split.QuerySlots`,
+  the trainer's ``eval_position_groups``): each evaluation entry carries ``split`` (``first``,
+  ``later``, ``later/1`` to ``later/3``: accuracy, loss, ``n``), checked against the frozen
+  delayed/in_range metric, and ``final`` carries it flattened (``split/<g>/<key>``).
 """
 
 from __future__ import annotations
@@ -215,6 +221,13 @@ def _eval_entry(e: Mapping[str, Any], *, audit_keys: bool) -> dict[str, Any]:
     if audit_keys:
         out["dev_answer_accuracy"] = {g: v["accuracy"] for g, v in groups.items()}
         out["dev_answer_loss"] = {g: v["loss"] for g, v in groups.items()}
+    if e.get("per_position_group") is not None:  # P1.15: the first/later split
+        from hsn.experiments.split import SPLIT_GROUP, split_block
+
+        group = (e.get("per_group") or {}).get("/".join(SPLIT_GROUP)) or {}
+        out["split"] = split_block(
+            e["per_position_group"], group, total_positions=e.get("n_positions")
+        )
     return out
 
 
@@ -255,6 +268,9 @@ def _final(evals: list[dict[str, Any]], train: list[dict[str, Any]]) -> dict[str
         )
         for g, v in last["per_group"].items():
             out[f"{g}/accuracy"], out[f"{g}/loss"] = v["accuracy"], v["loss"]
+        for g, v in (last.get("split") or {}).items():  # P1.15
+            for key in ("accuracy", "loss", "n"):
+                out[f"split/{g}/{key}"] = v[key]
     return out
 
 
@@ -379,6 +395,10 @@ def _train(
     timer = _EvalTimer()
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
     trainer.eval_batch = params.eval_batch
+    if isinstance(params, ReadsStateParams):  # P1.15: the first/later split of every evaluation
+        from hsn.experiments.split import QuerySlots
+
+        trainer.eval_position_groups = QuerySlots(dev_ds)
     diag_every = params.diag_every
     # P1.14: the mixed cadence samples an explicit schedule; the single cadence keeps diag_every
     dense = params.diag_dense_every > 0

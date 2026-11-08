@@ -10,7 +10,9 @@ their expanded form. They are experiment rules registered before the run, not ga
      op: ">=", value: 0.01}
 
 * ``metric`` is ``<source>:<key>``. Step series: ``eval:`` (``accuracy``, ``loss`` or
-  ``<task>/<variant>/accuracy|loss`` of the dev evaluations), ``diag:<key>`` (the diagnostics
+  ``<task>/<variant>/accuracy|loss`` of the dev evaluations; P1.15: ``split/<g>/accuracy|loss``
+  with ``g`` one of ``first``, ``later``, ``later/1`` to ``later/3``, the first/later split of
+  reads_state runs, :mod:`hsn.experiments.split`), ``diag:<key>`` (the diagnostics
   records, :mod:`hsn.experiments.diagnostics`), ``train:loss|accuracy|grad_norm`` (every step).
   Scalars: ``trained:<key>`` (the trained model's state statistics), ``probe:<key>`` (the edit
   probe, :func:`hsn.experiments.probe.summarize`), ``probe_v2:<key>`` (P1.14: the
@@ -107,6 +109,9 @@ _CONST_EXPR = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:([+-])\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?))?\s*$"
 )
 EVAL_METRICS = ("accuracy", "loss")
+#: P1.15: ``eval:split/<group>/<metric>`` reads an evaluation's first/later split
+#: (:mod:`hsn.experiments.split`); no task is named ``split``
+SPLIT_PREFIX = "split/"
 #: P1.14: the minimum the docs recommend for a windowed rule (``min_samples`` is set per rule)
 MIN_SAMPLES_DOC = 5
 TRAIN_METRICS = ("loss", "accuracy", "grad_norm")
@@ -777,6 +782,9 @@ class RecordView:
             for step, e in self.evals.items():
                 if group is None:
                     out[step] = _num(e.get(metric))
+                elif group.startswith(SPLIT_PREFIX):  # P1.15: the first/later split
+                    split = (e.get("split") or {}).get(group[len(SPLIT_PREFIX) :]) or {}
+                    out[step] = _num(split.get(metric))
                 else:
                     out[step] = _num((e.get("per_group") or {}).get(group, {}).get(metric))
             return out
