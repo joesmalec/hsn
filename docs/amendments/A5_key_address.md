@@ -54,8 +54,20 @@ Status: **draft of 8 Nov 2026 (P1.16), not adopted.**
      input cannot change the cell ranking except through the per-unit maximum.
   3. **Adam's rescaling.** Adam rescales a gradient of about 1e-5 into updates of normal size, which
      are then mostly noise.
+- **The audit's gradient probe** (`evidence/EFF/router_probe/router_grad_probe.md`, branch
+  `hsn-efficiency`, 8 Nov) refines the first cause:
+  - the selected cells' STE margins are near 0 (σ′ about 0.25), so they are not saturated;
+  - but dL/dα at the selected cells is about 0 (median 0), because top-K cells barely write (a write
+    rate of 0.2 to 2 %);
+  - unselected cells get exactly 0;
+  - the router's first-layer gradient comes mostly from `u`, hardly from `h`.
+  - The audit's reading: the router needs an objective that does not pass through α (the
+    counterfactual utility of P2.3), or a design where the selection decides the write. A
+    temperature alone does not help.
 - These are what P1.17's "a router that learns" addresses. A5 depends on it: A5's address features
-  reach the selection only through the router's training.
+  reach the selection only through the router's training. The selected-cell readout gives the
+  selection a direct path to the loss (the decoder reads the chosen cells), which is one form of
+  "selection decides the write".
 
 ## The change (opt-in; routed models only)
 
