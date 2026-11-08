@@ -1,0 +1,334 @@
+{
+ "level": "L0",
+ "profile": "m_series",
+ "tag": "",
+ "git_revision": "0fb3c38f1a93577745c841e13cbc441179c912c8",
+ "torch": "2.15.0",
+ "config": "configs/experiments/g1_ref_a1.yaml",
+ "overrides": [
+  "model.routing=topk",
+  "train.gate_mode=ste"
+ ],
+ "config_hash": "f8f34bd15d3e7d7b2ccbeb9d92b6980525714214baf20f6a29654d39db78e2e4",
+ "routing": "topk",
+ "gate_mode": "ste",
+ "batch": 16,
+ "unroll": 256,
+ "precision": "bf16",
+ "autocast": "torch.float16",
+ "compile_mode": "none",
+ "block": null,
+ "card": {
+  "status": "shared",
+  "rule": "shared when another process used >= 50% CPU in a listing (processes at >= 10% CPU listed, base names only)",
+  "cpu_processes": [
+   [
+    {
+     "pid": "766",
+     "cpu": "100.0",
+     "rss_kib": "7696",
+     "name": "BTLEServer"
+    },
+    {
+     "pid": "10499",
+     "cpu": "94.3",
+     "rss_kib": "89696",
+     "name": "spotlightknowledged"
+    },
+    {
+     "pid": "10837",
+     "cpu": "84.3",
+     "rss_kib": "244576",
+     "name": "python"
+    }
+   ],
+   [
+    {
+     "pid": "766",
+     "cpu": "98.4",
+     "rss_kib": "7696",
+     "name": "BTLEServer"
+    },
+    {
+     "pid": "10499",
+     "cpu": "96.7",
+     "rss_kib": "169184",
+     "name": "spotlightknowledged"
+    },
+    {
+     "pid": "10837",
+     "cpu": "58.1",
+     "rss_kib": "2006000",
+     "name": "python"
+    }
+   ]
+  ]
+ },
+ "compile": {
+  "warm_steps": 3,
+  "warm_wall_s": 4.26,
+  "compile_seconds": 0.0,
+  "compile_steps": 0,
+  "startup_step_s": 1.581,
+  "note": "compile (cold: inductor's graph caches off); MPS has no CUDA Graphs; never inside the steady-state numbers"
+ },
+ "train_step": {
+  "steps": 60,
+  "repeats": 3,
+  "wall_ms_p50": 828.16,
+  "wall_ms_p95": 1046.831,
+  "wall_ms_p50_by_repeat": [
+   1010.278,
+   813.613,
+   823.777
+  ],
+  "tokens_per_s": 3639.8,
+  "launches_host": 106746,
+  "kernels_device": 106792,
+  "device_ms": 419.846,
+  "gpu_busy_fraction": 0.507,
+  "bytes": {
+   "peak": 40227840,
+   "reserved": 1896480768
+  },
+  "launch_definitions": {
+   "launches_host": "dispatches of the serialised plain step that ran GPU work: aten ops at the dispatcher (a TorchDispatchMode) and inductor-generated Metal kernel calls",
+   "kernels_device": "GPU command buffers of the serialised plain step (Metal System Trace metal-gpu-intervals; one per dispatch there)",
+   "device_ms": "GPU busy time of a natural (unserialised) plain step: the union of its command buffers' GPU intervals"
+  }
+ },
+ "serving_step": [
+  {
+   "batch": 1,
+   "tokens": 200,
+   "latency_ms_p50": 2.2265,
+   "latency_ms_p95": 2.8685,
+   "launches_host_per_token": -1,
+   "compile_s": 0.0
+  },
+  {
+   "batch": 16,
+   "tokens": 200,
+   "latency_ms_p50": 2.5769,
+   "latency_ms_p95": 2.6674,
+   "launches_host_per_token": -1,
+   "compile_s": 0.0
+  }
+ ],
+ "segments": {
+  "shared_path": {
+   "kernels_device": 6189.0,
+   "device_ms": 34.109,
+   "share_of_step": 0.0412,
+   "device_ms_serialised": 73.837
+  },
+  "scorer": {
+   "kernels_device": 35340.0,
+   "device_ms": 113.997,
+   "share_of_step": 0.1377,
+   "device_ms_serialised": 247.915
+  },
+  "messages": {
+   "kernels_device": 36117.0,
+   "device_ms": 147.905,
+   "share_of_step": 0.1786,
+   "device_ms_serialised": 317.375
+  },
+  "selected_cells": {
+   "kernels_device": 16641.0,
+   "device_ms": 74.093,
+   "share_of_step": 0.0895,
+   "device_ms_serialised": 157.697
+  },
+  "decode": {
+   "kernels_device": 16.0,
+   "device_ms": 1.473,
+   "share_of_step": 0.0018,
+   "device_ms_serialised": 3.135
+  },
+  "loss": {
+   "kernels_device": 42.0,
+   "device_ms": 0.296,
+   "share_of_step": 0.0004,
+   "device_ms_serialised": 0.629
+  },
+  "optimizer": {
+   "kernels_device": 346.0,
+   "device_ms": 2.098,
+   "share_of_step": 0.0025,
+   "device_ms_serialised": 4.516
+  },
+  "grad_accumulation": {
+   "kernels_device": 9698.0,
+   "device_ms": 29.309,
+   "share_of_step": 0.0354,
+   "device_ms_serialised": 62.379
+  },
+  "other": {
+   "kernels_device": 2403.0,
+   "device_ms": 13.889,
+   "share_of_step": 0.0168,
+   "device_ms_serialised": 30.212
+  }
+ },
+ "attribution": {
+  "method": "MPS: Metal System Trace (xctrace) GPU intervals of a serialised plain step, each assigned to the dispatch range containing it (aten ops at the dispatcher); the range classified as on CUDA (Python stacks, backward through sequence_nr); segment from the HSN frames of the stack",
+  "kernels_total": 106792,
+  "unattributed_kernels": 24,
+  "unattributed_device_ms": 0.049,
+  "unattributed_top": {
+   "(no dispatch)": 24
+  },
+  "other_top_ms": {
+   "hsn.py:277 _stack_record / aten.stack.default": 4.982,
+   "hsn.py:1073 _selection_record / aten.mean.default": 1.858,
+   "hsn.py:1075 _selection_record / aten.mean.default": 1.762,
+   "hsn.py:1076 _selection_record / aten.mean.default": 1.757,
+   "hsn.py:1077 _selection_record / aten.mean.default": 1.756,
+   "hsn.py:1076 _selection_record / aten.sum.dim_IntList": 1.301,
+   "hsn.py:1075 _selection_record / aten.any.dim": 1.293,
+   "hsn.py:1075 _selection_record / aten._to_copy.default": 1.056,
+   "hsn.py:1076 _selection_record / aten._to_copy.default": 1.024,
+   "hsn.py:1077 _selection_record / aten._to_copy.default": 1.023,
+   "hsn.py:1116 _window_epilogue / aten.amax.default": 0.914,
+   "hsn.py:929 forward / aten.stack.default": 0.699
+  },
+  "bytes_note": "allocator peak/reserved per step only; not separable per segment inside one window; DRAM traffic not measured; MPS: peak is a sampled high-water mark (hsn.device.memory_stats), reserved is torch.mps.driver_allocated_memory()"
+ },
+ "metal_trace": {
+  "xctrace": "xctrace version 16.0 (17E202)",
+  "template": "Metal System Trace",
+  "repeats": 3,
+  "natural": {
+   "step_wall_ms": [
+    1053.758,
+    1014.693,
+    934.726
+   ],
+   "command_buffers": [
+    2390,
+    2230,
+    2402
+   ],
+   "gpu_busy_ms": [
+    419.846,
+    443.882,
+    350.587
+   ],
+   "gpu_busy_ms_median": 419.846
+  },
+  "serialised": {
+   "step_wall_ms": [
+    204853.847,
+    206465.18,
+    209084.854
+   ],
+   "command_buffers": [
+    106792,
+    106788,
+    106790
+   ],
+   "gpu_ms": [
+    893.583,
+    860.325,
+    913.254
+   ],
+   "dispatches_with_gpu_work": [
+    106746,
+    106746,
+    106746
+   ],
+   "aten_ops": 436715,
+   "compiled_kernel_calls": 0,
+   "encoders_per_command_buffer": {
+    "1": 320304,
+    "2": 33
+   },
+   "trace_chunks": 22,
+   "dispatches_per_chunk": 20000,
+   "chunk_pause_s": 571.2,
+   "intervals_contained": [
+    106768,
+    106764,
+    106765
+   ],
+   "intervals_partial": [
+    0,
+    0,
+    0
+   ],
+   "intervals_unassigned": [
+    24,
+    24,
+    25
+   ],
+   "assigned_fraction": [
+    0.9999,
+    0.9999,
+    0.9999
+   ]
+  },
+  "serialised_over_natural": [
+   2.128,
+   2.049,
+   2.175
+  ],
+  "traces_kept": null,
+  "ktrace_temp_bytes_deleted": 13219593336,
+  "shares_by_repeat": {
+   "shared_path": [
+    0.0419,
+    0.0401,
+    0.0412
+   ],
+   "scorer": [
+    0.1422,
+    0.1377,
+    0.1376
+   ],
+   "messages": [
+    0.1801,
+    0.1739,
+    0.1786
+   ],
+   "selected_cells": [
+    0.0895,
+    0.0862,
+    0.0919
+   ],
+   "decode": [
+    0.0018,
+    0.0025,
+    0.0011
+   ],
+   "loss": [
+    0.0004,
+    0.0007,
+    0.0002
+   ],
+   "optimizer": [
+    0.0025,
+    0.0027,
+    0.0025
+   ],
+   "grad_accumulation": [
+    0.0354,
+    0.0342,
+    0.037
+   ],
+   "other": [
+    0.0133,
+    0.0291,
+    0.0168
+   ]
+  },
+  "decision_by_repeat": [
+   "(L0 shares, not the decision) L2 justified: no \u2014 messages is 18.0% of step time at L0",
+   "(L0 shares, not the decision) L2 justified: no \u2014 messages is 17.4% of step time at L0",
+   "(L0 shares, not the decision) L2 justified: no \u2014 messages is 17.9% of step time at L0"
+  ],
+  "share_method": "proportional, median of repeats (the user's choices, 7 Nov 2026): per repeat, serialised segment GPU ms x median natural step GPU busy / that repeat's serialised GPU total; device_ms the median over repeats; share = that / step p50",
+  "decision_raw_cuda_formula": "(L0 shares, not the decision) L2 justified: yes \u2014 messages is 38.3% of step time at L0"
+ },
+ "decision": "(L0 shares, not the decision) L2 justified: no \u2014 messages is 17.9% of step time at L0"
+}
