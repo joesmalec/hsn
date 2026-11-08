@@ -1,0 +1,57 @@
+# Stage 1 (c): L2 (cell_lr_mult 0.33) and L3 (cand_norm) at E1's recipe (lr 3e-3, cosine over 3,000), 600 steps,
+# diagnostics every 5 steps inside [300, 600] and every 25 elsewhere, to diagnose their divergences (exps 90, 91:
+# inf gradients from 396 / 461). P1.14 keeps a failed arm's partial record. Architecture notes: recipe-only; A4.
+# Step time about 0.24 s.
+# Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run (overnight mandate,
+# 7 Nov 2026; batches approved by the coordinator). Probe v2 (P1.14) runs alongside v1; diagnostics every 25 steps
+# inside the rule windows and every 500 elsewhere (full runs); min_samples 5 on windowed rules; gate/write_rate and
+# gate/mean reported; max_step_s 0.5 (the default).
+
+name: s1c_l2l3_rerun
+description: "Stage 1 (c): L2 / L3 reruns at 3e-3 with dense diagnostics around the divergence"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.003
+    - train.steps=3000
+    - train.eval_every=200
+    - train.ckpt_every=3000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+protocol: {name: reads_state, version: 2, steps: 600, diag_every: 25, diag_dense_every: 5, diag_windows: [[300, 600]], diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+seeds: [0]
+rules:
+  verdicts:
+    memory_check_600:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: pass
+          when:
+            all:
+              - {metric: "diag:gate/p50", steps: {from: 400, to: 600, every: 25}, agg: median, op: ">=", value: 0.01, min_samples: 5}
+              - {metric: "diag:grad_share/cell", steps: {from: 400, to: 600, every: 25}, agg: median, op: ">=", value: 0.01, min_samples: 5}
+      default: fail
+    reads_state: {preset: reads_state}
+    reads_state_v2: {preset: reads_state_v2}
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s1c_l2_cell_lr
+    family: hsn
+    overrides: [train.cell_lr_mult=0.33]
+  - name: s1c_l3_cand_norm
+    family: hsn
+    overrides: [model.cand_norm=rms]
