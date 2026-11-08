@@ -15,6 +15,7 @@
              [--imported | --no-imported] [--per-seed] [--format md|csv] [--out FILE]
     import   --audit-dir DIR [--dry-run]
     probe-check --exp N [--batch-rows 64]
+    probe-rerun --exp N [--cpu] [--batch-rows N] [--out FILE]   v1 vs the stored probes, then v2
     run-arm  --db DB --exp N --root ROOT       (the worker's child; not for direct use)
 
 Every command takes ``--db`` (default ``$HSN_EXPERIMENTS_DB`` or
@@ -109,6 +110,12 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("probe-check", help="batched vs per-document edit probe on a checkpoint")
     p.add_argument("--exp", type=int, required=True)
     p.add_argument("--batch-rows", type=int, default=64)
+    p.add_argument("--out", default=None)
+
+    p = sub.add_parser("probe-rerun", help="v1 again vs the stored probes, then probe v2 (P1.14)")
+    p.add_argument("--exp", type=int, required=True)
+    p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
+    p.add_argument("--batch-rows", type=int, default=None, help="default: the run's probe_batch")
     p.add_argument("--out", default=None)
 
     p = sub.add_parser("run-arm", help=argparse.SUPPRESS)
@@ -416,6 +423,18 @@ def cmd_probe_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe_rerun(args: argparse.Namespace) -> int:
+    from hsn.experiments.probe_check import probe_rerun
+
+    db = _db(args)
+    out = probe_rerun(db, args.exp, cpu=args.cpu, batch_rows=args.batch_rows)
+    text = json.dumps(out, indent=1, default=str)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+    print(json.dumps({k: v for k, v in out.items() if k != "differ"}, indent=1, default=str))
+    return 0
+
+
 def cmd_run_arm(args: argparse.Namespace) -> int:
     from hsn.experiments.run_arm import main as run_arm
 
@@ -434,6 +453,7 @@ COMMANDS = {
     "report": cmd_report,
     "import": cmd_import,
     "probe-check": cmd_probe_check,
+    "probe-rerun": cmd_probe_rerun,
     "run-arm": cmd_run_arm,
 }
 

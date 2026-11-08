@@ -172,6 +172,9 @@ class ReadsStateParams(_DiagCadence):
     """The 5(b) training recipe (in the spec's overrides) plus the 5(c) edit probe."""
 
     name: Literal["reads_state"]
+    # P1.14: version 2 adds probe v2, the vocabulary-matched edit (hsn.experiments.probe); the
+    # version is the arm id's protocol version, so version 1 arms keep their ids
+    version: Literal[1, 2] = 1
     diag_every: int = Field(default=500, ge=0)  # 0: no diagnostics during training
     diag_docs: int = Field(default=32, ge=1)  # documents of trained_state
     n_train: int = Field(default=0, ge=0)  # 0: the whole split
@@ -220,8 +223,16 @@ PROTOCOL_SOURCES: dict[str, tuple[str, ...]] = {
     "reads_state": ("trained", "probe", "final"),
     "train_eval": ("trained", "final"),
     "overfit": ("overfit", "final"),
-    "dry_run": ("trained", "probe", "overfit", "final"),
+    "dry_run": ("trained", "probe", "probe_v2", "overfit", "final"),
 }
+
+
+def protocol_sources(params: Any) -> tuple[str, ...]:
+    """The scalar rule sources a protocol writes (P1.14: reads_state version 2 adds probe_v2)."""
+    sources = PROTOCOL_SOURCES[params.name]
+    if params.name == "reads_state" and getattr(params, "version", 1) == 2:
+        sources = (*sources, "probe_v2")
+    return sources
 
 
 def protocol_params(
@@ -415,14 +426,16 @@ def arm_identity(
         k: v
         for k, v in protocol.items()
         if k not in EXECUTION_ONLY
+        and k != "version"
         and not (k in IDENTITY_DEFAULTS and _plain(v) == IDENTITY_DEFAULTS[k])
     }
+    version = int(protocol.get("version", PROTOCOL_VERSION[name]))  # P1.14: reads_state v2
     payload: dict[str, Any] = {
         "config": config_view(cfg),
         "data": data,
         "family": family,
         "variant": {"name": variant, **dict(variant_params)},
-        "protocol": {**science, "version": PROTOCOL_VERSION[name]},
+        "protocol": {**science, "version": version},
         "early_stop": list(early_stop),
     }
     arm_id = digest(payload)
@@ -609,7 +622,7 @@ def _expand_one(
         steps,
         cfg.train.eval_every,
         diag_every,
-        PROTOCOL_SOURCES[protocol.name],
+        protocol_sources(protocol),
         protocol.name,
         dense_every=dense,
         windows=windows,

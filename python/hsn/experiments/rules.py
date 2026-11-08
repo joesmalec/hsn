@@ -13,7 +13,9 @@ their expanded form. They are experiment rules registered before the run, not ga
   ``<task>/<variant>/accuracy|loss`` of the dev evaluations), ``diag:<key>`` (the diagnostics
   records, :mod:`hsn.experiments.diagnostics`), ``train:loss|accuracy|grad_norm`` (every step).
   Scalars: ``trained:<key>`` (the trained model's state statistics), ``probe:<key>`` (the edit
-  probe, :func:`hsn.experiments.probe.summarize`), ``overfit:<key>``, ``final:<key>`` (the last
+  probe, :func:`hsn.experiments.probe.summarize`), ``probe_v2:<key>`` (P1.14: the
+  vocabulary-matched edit of reads_state version 2, :func:`hsn.experiments.probe.summarize_v2`),
+  ``overfit:<key>``, ``final:<key>`` (the last
   evaluation flattened, ``train_loss``, ``steps``) and ``verdict:<rule>`` (another rule's label).
 * ``steps`` (series only) selects samples: ``{at: n}`` or ``{from: a, to: b, every: k}`` (every
   bound optional; ``every`` keeps the multiples of ``k``). Without ``steps`` every sample counts.
@@ -42,8 +44,8 @@ stopped early reads ``stopped early: <outcome> @ <step>`` for every verdict, and
 (P1.14: a partial record with a ``failure`` block) ``failed: <reason> @ <last step>``.
 ``group.min_agree`` is read by ``report`` at seed-group level ("counts as a finding" when that many
 seeds share a label).
-Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``memory_open``,
-``cells_apart``.
+Presets (:data:`PRESETS`) expand into this form at enqueue: ``reads_state``, ``reads_state_v2``
+(P1.14), ``memory_open``, ``cells_apart``.
 
 **Early stop.** ``{name, at_steps: [n, ...], outcome, when, applies_to}``: evaluated by the trainer
 callback right after step ``n``'s evaluation and diagnostics; when ``when`` holds the run stops with
@@ -96,7 +98,7 @@ __all__ = [
 ]
 
 SERIES_SOURCES = ("eval", "diag", "train")
-SCALAR_SOURCES = ("trained", "probe", "overfit", "final", "verdict")
+SCALAR_SOURCES = ("trained", "probe", "probe_v2", "overfit", "final", "verdict")
 SOURCES = SERIES_SOURCES + SCALAR_SOURCES
 AGGS = ("all", "any", "median", "mean", "min", "max", "first", "last")
 OPS = (">=", ">", "<=", "<", "==", "!=", "between")
@@ -513,6 +515,41 @@ def _preset_reads_state(p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _preset_reads_state_v2(p: dict[str, Any]) -> dict[str, Any]:
+    """P1.14: the v2 verdict (decision D4, A) over the matched documents answered correctly before
+    the edit: v1's thresholds, after "no matched probes" (0) and "too few matched probes" (below
+    ``min_correct``, default 20). Needs reads_state version 2 (or a dry run)."""
+    follow_min, unchanged_max, follow_below = (
+        p.pop("follow_min", 0.5),
+        p.pop("unchanged_max", 0.1),
+        p.pop("follow_below", 0.2),
+    )
+    min_correct = p.pop("min_correct", 20)
+    return {
+        "cases": [
+            {"label": "no matched probes", "when": _atom("probe_v2:correct_n", "==", 0)},
+            {
+                "label": "too few matched probes",
+                "when": _atom("probe_v2:correct_n", "<", min_correct),
+            },
+            {
+                "label": "reads state",
+                "when": {
+                    "all": [
+                        _atom("probe_v2:correct_follow_frac", ">=", follow_min),
+                        _atom("probe_v2:correct_unchanged_frac", "<=", unchanged_max),
+                    ]
+                },
+            },
+            {
+                "label": "does not read state",
+                "when": _atom("probe_v2:correct_follow_frac", "<", follow_below),
+            },
+        ],
+        "default": "partial",
+    }
+
+
 def _preset_memory_open(p: dict[str, Any]) -> dict[str, Any]:
     """Gate p50 and the cell's gradient share at or above their thresholds at the multiples of
     ``every`` from ``from_step``. Without ``window``: the one sample at each such step (``agg``
@@ -571,6 +608,7 @@ def _preset_cells_apart(p: dict[str, Any]) -> dict[str, Any]:
 
 PRESETS = {
     "reads_state": _preset_reads_state,  # the audit's verdict (probe counts, correct answers)
+    "reads_state_v2": _preset_reads_state_v2,  # P1.14: the same over probe v2's matched edits
     "memory_open": _preset_memory_open,  # queue9 rule: gate p50 and the cell's grad share, x500
     "cells_apart": _preset_cells_apart,  # queue9 rule: rank_pr and diversity_live, trained model
 }
@@ -751,6 +789,7 @@ class RecordView:
         block = {
             "trained": self.record.get("trained_state"),
             "probe": self.record.get("probe"),
+            "probe_v2": self.record.get("probe_v2"),
             "overfit": self.record.get("overfit"),
             "final": self.record.get("final"),
         }[source]
@@ -1078,9 +1117,10 @@ def _check_atom(
         if upto is not None:
             raise RuleError(f"{where}: an early stop reads step series only, not {atom.metric}")
         if atom.source != "verdict" and atom.source not in cadence.scalar_sources:
+            hint = " (probe_v2 needs reads_state version 2)" if atom.source == "probe_v2" else ""
             raise RuleError(
                 f"{where}: protocol {cadence.protocol} writes no {atom.source}: values "
-                f"({atom.metric}); restrict the rule with applies_to: {{protocol: [...]}}"
+                f"({atom.metric}){hint}; restrict the rule with applies_to: {{protocol: [...]}}"
             )
 
 

@@ -335,7 +335,7 @@ def _train(
     from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything
     from hsn.experiments.diagnostics import Diagnostics, trained_state
-    from hsn.experiments.probe import edit_probe, summarize
+    from hsn.experiments.probe import edit_probe, edit_probe_v2, summarize, summarize_v2
     from hsn.experiments.variants import install_variant
     from hsn.runner import build_model, load_datasets, make_trainer
 
@@ -436,6 +436,7 @@ def _train(
         )
     full: dict[str, Any] = {
         "protocol": params.name,
+        "protocol_version": getattr(params, "version", 1),  # P1.14
         "family": arm.family,
         "variant": variant,
         "autocast": history.autocast,
@@ -470,22 +471,34 @@ def _train(
         arm.walls["trained_s"] = time.perf_counter() - t2
         probes: list[dict[str, Any]] | None = None
         summary: dict[str, Any] | None = None
+        v2: dict[str, Any] = {}  # P1.14: probe v2 (reads_state version 2 only)
         if isinstance(params, ReadsStateParams):
             arm.stage = "probe"
             t3 = time.perf_counter()
             probes = edit_probe(model, ctx, dev_ds, batch_rows=params.probe_batch)
             summary = summarize(probes)
             arm.walls["probe_s"] = time.perf_counter() - t3
+            if params.version == 2:
+                arm.stage = "probe_v2"
+                t4 = time.perf_counter()
+                probes_v2 = edit_probe_v2(
+                    model, ctx, dev_ds, v1=probes, batch_rows=params.probe_batch
+                )
+                v2 = {"probe_v2": summarize_v2(probes_v2, v1=probes), "probes_v2": probes_v2}
+                arm.walls["probe_v2_s"] = time.perf_counter() - t4
         if callback.stop is not None:
             record["at_stop"] = {
                 "step": callback.stop["step"],
                 "trained_state": state,
                 "probe": summary,
                 "probes": probes,
+                **v2,
             }
             record["trained_state"], record["probe"], record["probes"] = None, None, None
+            record.update(dict.fromkeys(v2))
         else:
             record["trained_state"], record["probe"], record["probes"] = state, summary, probes
+            record.update(v2)
     if params.checkpoint == "none":
         for path in history.checkpoints:
             Path(path).unlink(missing_ok=True)
