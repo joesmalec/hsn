@@ -299,10 +299,13 @@
  "cuda_max_block": null,
  "fingerprint": {
   "cpu_capability": "AVX2",
+  "cpu_model": "AMD Ryzen 9 3950X 16-Core Processor",
   "device": "cpu",
   "machine": "x86_64",
+  "threads": "4",
   "torch": "2.15.0+cu132"
  },
+ "fingerprint_note": "cpu_model and threads added 7 Nov 2026 ~20:10 MST (CI: a runner with the same torch build and ISA gave other gradient bits); both are the capture's facts: this machine, OMP_NUM_THREADS=4",
  "git_rev_of_capture_tree": "8eb2f01b361c94580e9c28f466779cf74435e17f",
  "hsn_file": "/home/joe/hsn-p1.13/python/hsn/__init__.py",
  "repeats": 2,

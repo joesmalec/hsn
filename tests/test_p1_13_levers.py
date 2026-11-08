@@ -468,7 +468,11 @@ def test_p1_13_cand_norm_unit_rms_per_round(mode: str) -> None:
 
 
 def test_p1_13_cand_norm_static_sparse_round() -> None:
-    """P2.8's capturable sparse round (``static=True``) normalises the same way."""
+    """P2.8's capturable sparse round (``static=True``) normalises the same way. It computes the
+    messages, the input, its norm and the gate with the same ops as the eager round (bit for bit
+    here) and the unit bank differently (every unit on the pairs, then a gather, against the
+    grouped addmm: P2.8's "the unit outputs agree to rounding"), so the candidates agree to fp32
+    reassociation: P2.5's 1e-5 (measured 1.7e-6 on a CI runner, 0 here)."""
     cfg, model = p25._model(
         REF_A1, [*RMS, "model.routing=topk", "train.gate_mode=ste"], perturb=46, scale=0.1
     )
@@ -486,7 +490,10 @@ def test_p1_13_cand_norm_static_sparse_round() -> None:
         finally:
             capture.close()
     _assert_unit_rms(*capture.calls[0], gain)
-    torch.testing.assert_close(static["c"], eager["c"], atol=1e-6, rtol=0)
+    for name in ("m", "v", "b"):  # the shared ops: identical
+        assert torch.equal(static[name], eager[name]), name  # type: ignore[arg-type]
+    for name in ("unit_out", "c"):  # the unit bank's two passes: rounding only
+        torch.testing.assert_close(static[name], eager[name], atol=p25.ATOL, rtol=0, msg=name)
 
 
 def test_p1_13_cand_norm_window_path() -> None:
@@ -746,6 +753,8 @@ def test_p1_13_compiled_training_steps_cuda(lever: str, tmp_path: Path) -> None:
     """A few training steps of the HSN trainer in P2.8's compiled window on CUDA under bf16
     autocast with each lever alone: finite losses, the lever in effect (the WSD learning rates,
     the cell groups' rates, the norm in the model) and no compile after the first steps."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device on this machine")
     cfg = load_config(
         REF_A1,
         overrides=[

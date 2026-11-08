@@ -220,11 +220,26 @@ def _params(model: nn.Module) -> dict[str, Tensor]:
     return {name: p.detach() for name, p in model.named_parameters()}
 
 
+def _cpu_model() -> str:
+    """The CPU's model name (``/proc/cpuinfo`` on Linux, else ``platform.processor()``)."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
+
+
 def fingerprint(device: str) -> dict[str, str]:
-    """What a bitwise comparison depends on: torch, the CPU kernels' ISA, the card."""
+    """What a bitwise comparison depends on: torch, the CPU kernels' ISA, the CPU model and
+    torch's thread count (BLAS picks its kernels and blocking by microarchitecture and threads:
+    a CI runner with the same torch build and ISA gave other gradient bits), the card."""
     out = {
         "torch": torch.__version__,
         "cpu_capability": str(torch.backends.cpu.get_cpu_capability()),
+        "cpu_model": _cpu_model(),
+        "threads": str(torch.get_num_threads()),
         "machine": platform.machine(),
         "device": device,
     }

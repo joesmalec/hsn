@@ -90,6 +90,8 @@ def test_p1_13_defaults_bitwise_cuda() -> None:
     cache can change the numerics (the gradients from step 1, the loss at step 6); without the
     former, two reduction gradients (``cell.norm.weight``, ``cell.units.b1``) differ by about
     1e-10 between processes. With both, two processes with fresh caches agree bit for bit."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device on this machine")
     from cards import cuda_profile
 
     fixture = _fixture(CUDA_FIXTURE)

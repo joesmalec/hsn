@@ -106,11 +106,14 @@
  "fingerprint": {
   "card": "NVIDIA GeForce RTX 3060",
   "cpu_capability": "AVX2",
+  "cpu_model": "AMD Ryzen 9 3950X 16-Core Processor",
   "cuda": "13.2",
   "device": "cuda",
   "machine": "x86_64",
+  "threads": "4",
   "torch": "2.15.0+cu132"
  },
+ "fingerprint_note": "cpu_model and threads added 7 Nov 2026 ~20:10 MST (CI: a runner with the same torch build and ISA gave other gradient bits); both are the capture's facts: this machine, OMP_NUM_THREADS=4",
  "git_rev_of_capture_tree": "d49f2c050c3e0e6052843dd019f33539af307457",
  "hsn_file": "/tmp/claude-1000/-home-joe-hsn-p1-13/6eb2c05e-6e5f-4184-8701-3d95a81c6804/scratchpad/base/python/hsn/__init__.py",
  "inductor_deterministic": true,
