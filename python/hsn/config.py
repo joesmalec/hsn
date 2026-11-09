@@ -339,6 +339,10 @@ class TrainConfig(_StrictModel):
     # and, on its tensors of ndim >= 2, weight decay cell_weight_decay (None = weight_decay)
     cell_lr_mult: float = Field(default=1.0, gt=0.0)
     cell_weight_decay: float | None = Field(default=None, ge=0.0)
+    # A5 stability: HSN.router and the whole HSN.decoder get independent learning rates.
+    # Defaults preserve the existing optimiser groups and checkpoint layout.
+    router_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    readout_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     # --- end P1.13 ---
     # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
     # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
@@ -351,6 +355,10 @@ class TrainConfig(_StrictModel):
     # user's request, 8 Nov).
     spike_factor: float | None = Field(default=None, gt=1.0)
     spike_window: int = Field(default=100, ge=1)
+    # Compare the recent spike_window median with the median slow_burst_window applied steps
+    # earlier, as well as checking the current norm. Requires spike_factor; None disables it.
+    slow_burst_factor: float | None = Field(default=None, gt=1.0, allow_inf_nan=False)
+    slow_burst_window: int = Field(default=250, ge=1)
     # write a dump of the pre-step state at the first step a guard skips (non-finite, or a spike
     # with spike_factor set), for a deterministic replay (python/hsn/train/divergence.py)
     divergence_dump: bool = True
@@ -495,6 +503,10 @@ class TrainConfig(_StrictModel):
                 "but train.spike_factor is not set; drop it or set the factor"
             )
         # --- end P1.15 ---
+        if self.slow_burst_factor is not None and self.spike_factor is None:
+            raise ValueError("train.slow_burst_factor requires train.spike_factor")
+        if self.slow_burst_factor is None and self.slow_burst_window != 250:
+            raise ValueError("train.slow_burst_window requires train.slow_burst_factor")
         # --- P1.16: the rollback's other keys are read only with rollback_every set ---
         if self.rollback_every is None:
             ignored = [
@@ -774,6 +786,8 @@ class RunConfig(_StrictModel):
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
+            if self.train.router_lr_mult != 1.0 or self.train.readout_lr_mult != 1.0:
+                raise ValueError("train.router_lr_mult and train.readout_lr_mult are HSN-only")
             if self.model.key_address or self.model.selected_readout:
                 raise ValueError(
                     "model.key_address and model.selected_readout are HSN-only A5 features"
@@ -792,6 +806,10 @@ class RunConfig(_StrictModel):
         # --- end P1.13 ---
         # --- P2.2: routing controls that would be silently ignored are refused ---
         routing, train = self.model.routing, self.train
+        if routing in ("dense", "random", "fixed") and train.router_lr_mult != 1.0:
+            raise ValueError(
+                "train.router_lr_mult requires learned routing (topk or greedy_budget)"
+            )
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
         if train.gate_mode == "reinforce" and routing != "topk":
             raise ValueError(
@@ -1050,6 +1068,10 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     *tuple(f"train.{key}" for key in ROLLBACK_KEYS),
     "model.key_address",
     "model.selected_readout",
+    "train.router_lr_mult",
+    "train.readout_lr_mult",
+    "train.slow_burst_factor",
+    "train.slow_burst_window",
 )
 
 

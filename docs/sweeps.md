@@ -584,7 +584,19 @@ and `keep_last` (2), both execution-only:
   its hash and the training are unchanged);
 - after each step the newest `keep_last` of those stay, and so does the newest one before the run's first guard
   event (a skipped or rolled-back step), which is never pruned;
-- a run that finishes deletes them (its final checkpoint follows `checkpoint`).
+- with the default `checkpoint: final`, a run that finishes deletes them;
+- `checkpoint: retained` keeps them after completion and also pins the checkpoint with the best
+  dev accuracy at its exact saved step, even if the guard never fires. Set `keep_every` to the
+  evaluation cadence to capture every evaluated peak. `keep_last` bounds the recent checkpoints;
+  the best and the pre-guard checkpoint are additional pins. The result records
+  `retained_checkpoints` and `best_checkpoint` separately; final scores and verdicts still use the
+  final weights. `checkpoint: none` still deletes all checkpoints after completion.
+
+Both `probe-rerun` and `route-check` accept `--checkpoint-step N` to read one retained checkpoint.
+It must exist in that experiment's run directory; a missing step is an error, never a fallback to
+the final weights. Earlier weights are not compared with stored final probes, and the diagnostic
+does not overwrite the experiment's results. `--checkpoint-step` cannot be combined with
+`probe-rerun --weights dump`.
 
 When a run fails on a guard (`nonfinite`, `spike`, `rollback`), the newest checkpoint on disk before the first
 guard event (before the failure if there was none) is loaded into the model and evaluated (with the split), its

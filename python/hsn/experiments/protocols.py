@@ -334,6 +334,7 @@ class _Keeper:
     keep_every: int
     keep_last: int
     ckpt_every: int
+    keep_best: bool = False
 
     @staticmethod
     def on_disk(history: Any) -> list[tuple[int, Path]]:
@@ -353,6 +354,24 @@ class _Keeper:
             if step % self.keep_every == 0 and step % self.ckpt_every != 0
         ]
 
+    @staticmethod
+    def best(history: Any) -> dict[str, Any] | None:
+        """Best dev accuracy among checkpoints evaluated at their exact saved step.
+
+        Ties keep the earlier checkpoint. No score is inferred for unevaluated checkpoints.
+        """
+        on_disk = dict(_Keeper.on_disk(history))
+        candidates = [
+            e
+            for e in history.evals
+            if int(e["step"]) in on_disk and math.isfinite(float(e["accuracy"]))
+        ]
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda e: (float(e["accuracy"]), -int(e["step"])))
+        step = int(best["step"])
+        return {"step": step, "accuracy": float(best["accuracy"]), "path": str(on_disk[step])}
+
     def prune(self, trainer: Any, history: Any) -> None:
         kept = self.kept(history)
         first = _first_guard_event(trainer)
@@ -360,8 +379,9 @@ class _Keeper:
         if first is not None:
             before = [k for k in kept if k[0] < first]
             pinned = before[-1] if before else None
+        best = self.best(history) if self.keep_best else None
         for entry in kept[: -self.keep_last]:
-            if entry != pinned:
+            if entry != pinned and (best is None or entry[0] != best["step"]):
                 entry[1].unlink(missing_ok=True)
 
 
@@ -563,7 +583,12 @@ def _train(
     )
     callback = _StepCallback(arm, diag if sampling else None, audit_keys=audit_keys, guard=guard)
     if params.keep_every:
-        callback.keeper = _Keeper(params.keep_every, params.keep_last, cfg.train.ckpt_every)
+        callback.keeper = _Keeper(
+            params.keep_every,
+            params.keep_last,
+            cfg.train.ckpt_every,
+            keep_best=params.checkpoint == "retained",
+        )
     arm.walls["setup_s"] = time.perf_counter() - t0
 
     arm.stage = "train"
@@ -697,7 +722,12 @@ def _train(
     if params.checkpoint == "none":
         for path in history.checkpoints:
             Path(path).unlink(missing_ok=True)
-    elif callback.keeper is not None:  # P1.16: a finished run keeps no mid-run kept checkpoint
+    elif params.checkpoint == "retained":
+        record["retained_checkpoints"] = [
+            {"step": step, "path": str(path)} for step, path in _Keeper.on_disk(history)
+        ]
+        record["best_checkpoint"] = _Keeper.best(history)
+    elif callback.keeper is not None:  # legacy final-only policy
         for _step, kept in callback.keeper.kept(history):
             kept.unlink(missing_ok=True)
     arm.stage = "done"

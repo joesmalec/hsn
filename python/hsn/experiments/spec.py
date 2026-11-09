@@ -160,7 +160,9 @@ class _Strict(BaseModel):
 class _TrainParams(_Strict):
     steps: int | None = Field(default=None, ge=1)  # None: train.steps (the schedule horizon)
     eval_batch: int | None = Field(default=None, ge=1)  # None: train.batch
-    checkpoint: Literal["final", "none"] = "final"
+    # retained also keeps intermediate evidence after success, including the best evaluated
+    # checkpoint. This is storage policy only; final metrics still come from the final weights.
+    checkpoint: Literal["final", "retained", "none"] = "final"
     diag_window_docs: int = Field(default=4, ge=1)  # documents of the diagnostics window
     # P1.14, the step-time guard (hsn.experiments.steptime): the limit on the median step time,
     # and the approval note ("<who, when>") an arm above the 0.5 s rule (or an eager CUDA HSN arm)

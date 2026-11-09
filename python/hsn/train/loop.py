@@ -263,6 +263,26 @@ def spike_decision(
     return bool(grad_norm > factor * median), float(median)
 
 
+def slow_burst_decision(
+    grad_norm: float, history: Collection[float], factor: float, window: int, lag: int
+) -> tuple[bool, float | None]:
+    """Detect sustained growth against an older median that cannot follow the same ramp.
+
+    Include the candidate in the recent window, but never in the applied history until accepted.
+    Requiring the candidate itself to exceed the old reference lets a healthy step recover after
+    a skip. Both windows must be full; ``lag`` counts applied steps between their endpoints.
+    """
+    if window < 1 or lag < 1:
+        raise ValueError("slow-burst window and lag must be positive")
+    values = [*history, grad_norm]
+    if len(values) < window + lag:
+        return False, None
+    baseline = float(statistics.median(values[-(window + lag) : -lag]))
+    recent = float(statistics.median(values[-window:]))
+    threshold = factor * baseline
+    return bool(recent > threshold and grad_norm > threshold), baseline
+
+
 def _skipped_counter(extra: Mapping[str, Any], key: str, path: str) -> int:
     """A count of the non-finite-gradient guard from a checkpoint's ``extra``: absent in
     checkpoints written before the guard (P1.12), then 0; otherwise a non-negative int."""
@@ -625,13 +645,20 @@ class Trainer:
         # of applied finite norms its median reads; every skipped step with its reason
         self.spike_factor: float | None = train.spike_factor
         self.spike_window = train.spike_window
+        self.slow_burst_factor = train.slow_burst_factor
+        self.slow_burst_window = train.slow_burst_window
+        self._spike_history_limit = self.spike_window + (
+            self.slow_burst_window if self.slow_burst_factor is not None else 0
+        )
         if self.spike_factor is not None and self.scaler is not None:
             raise NotImplementedError(
                 f"train.spike_factor={self.spike_factor} under an fp16 GradScaler: the scaler "
                 "skips steps itself and the spike guard is not defined there"
             )
         self.skipped_spike = 0
-        self._spike_history: collections.deque[float] = collections.deque(maxlen=self.spike_window)
+        self._spike_history: collections.deque[float] = collections.deque(
+            maxlen=self._spike_history_limit
+        )
         self.skipped_steps: list[dict[str, Any]] = []
         # P1.15: the divergence dump (train.divergence_dump; hsn.train.divergence): the current
         # step's snapshot, the written dump's summary, notes the harness adds to it, and a hook
@@ -656,6 +683,36 @@ class Trainer:
     # construction ----------------------------------------------------------------------------
 
     def _make_optimizer(self) -> torch.optim.Optimizer:
+        optimizer = self._make_base_optimizer()
+        train = self.cfg.train
+        if train.router_lr_mult == train.readout_lr_mult == 1.0:
+            return optimizer
+        # Split the existing groups before any state or scheduler exists. This preserves the
+        # cell's overrides, lazy unit metadata and ndim-based decay rules for both optimisers.
+        by_id: dict[int, str] = {}
+        multipliers = {"router": train.router_lr_mult, "decoder": train.readout_lr_mult}
+        for name, mult in multipliers.items():
+            if mult != 1.0:
+                module = getattr(self.model, name, None)
+                if not isinstance(module, nn.Module):
+                    raise ValueError(f"learning-rate multiplier requires HSN.{name}")
+                by_id.update((id(p), name) for p in module.parameters())
+        grouped: dict[str, list[dict[str, Any]]] = {"shared": [], "router": [], "decoder": []}
+        for group in optimizer.param_groups:
+            buckets: dict[str, list[nn.Parameter]] = {}
+            for p in group["params"]:
+                buckets.setdefault(by_id.get(id(p), "shared"), []).append(p)
+            for name, params in buckets.items():
+                grouped[name].append(
+                    {**group, "params": params, "lr": group["lr"] * multipliers.get(name, 1.0)}
+                )
+        optimizer.param_groups.clear()
+        for groups in grouped.values():
+            for group in groups:
+                optimizer.add_param_group(group)
+        return optimizer
+
+    def _make_base_optimizer(self) -> torch.optim.Optimizer:
         train = self.cfg.train
         if train.optimizer == "lazy_adamw":  # P2.6: the unit bank's tensors in unit groups
             return build_lazy_adamw(
@@ -784,6 +841,17 @@ class Trainer:
         if factor is None:
             return False
         skip, median = spike_decision(grad_norm, self._spike_history, factor, self.spike_window)
+        guard = "spike"
+        if not skip and self.slow_burst_factor is not None:
+            skip, median = slow_burst_decision(
+                grad_norm,
+                self._spike_history,
+                self.slow_burst_factor,
+                self.spike_window,
+                self.slow_burst_window,
+            )
+            if skip:
+                guard, factor = "slow_burst", self.slow_burst_factor
         if not skip:
             self._skip_streak = 0
             self._spike_history.append(float(grad_norm))
@@ -792,20 +860,25 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         if self._can_roll_back():  # P1.16: a rollback, not a skip
             self._roll_back(step, "spike", grad_norm, median)
+            if guard == "slow_burst":
+                self.rollbacks[-1]["guard"] = guard
+                self.skipped_steps[-1]["guard"] = guard
             return True
         self.skipped_spike += 1
         self._skip_streak += 1
         self.skipped_steps.append(
             {"step": step, "reason": "spike", "grad_norm": float(grad_norm), "median": median}
         )
+        if guard == "slow_burst":
+            self.skipped_steps[-1]["guard"] = guard
         logger.warning(
-            "step %d: gradient norm %.4g is %.3g times the median %.4g of the last %d applied "
-            "steps (train.spike_factor %g); optimizer step skipped (%d spikes skipped so far)",
+            "step %d: gradient norm %.4g is %.3g times the median %.4g "
+            "(%s factor %g); optimizer step skipped (%d spikes skipped so far)",
             step,
             grad_norm,
             grad_norm / median if median else math.inf,
             median,
-            len(self._spike_history),
+            guard,
             factor,
             self.skipped_spike,
         )
@@ -824,7 +897,12 @@ class Trainer:
         if self.rollback is None:
             raise RuntimeError("take_rollback_snapshot without a rollback policy")
         if self._ring is None:
-            self._ring = SnapshotRing(self.model, self.optimizer)
+            # A two-slot ring can already be inside a slow ramp by the time it is detected.
+            # Retain enough snapshots to reach before the detector's older reference window.
+            capacity = 2
+            if self.slow_burst_factor is not None:
+                capacity += math.ceil(self._spike_history_limit / self.rollback.every)
+            self._ring = SnapshotRing(self.model, self.optimizer, capacity=capacity)
         self._ring.take(self.step, self._spike_history)
 
     def _roll_back(self, step: int, kind: str, grad_norm: float, median: float | None) -> None:
@@ -842,7 +920,9 @@ class Trainer:
                 f"({ROLLBACK_LIMIT})"
             )
         snap = self._ring.restore()
-        self._spike_history = collections.deque(snap.spike_history, maxlen=self.spike_window)
+        self._spike_history = collections.deque(
+            snap.spike_history, maxlen=self._spike_history_limit
+        )
         self._skip_streak = 0
         if policy.lr_steps:
             self._lr_cut_until = step + policy.lr_steps
@@ -961,11 +1041,12 @@ class Trainer:
             raw = extra.get("spike_history", [])
             if (
                 not isinstance(raw, list)
-                or len(raw) > self.spike_window
+                or len(raw) > self._spike_history_limit
                 or not all(isinstance(x, float) and math.isfinite(x) and x >= 0.0 for x in raw)
             ):
                 raise ValueError(
-                    f"{path}: spike_history must be a list of at most {self.spike_window} finite "
+                    f"{path}: spike_history must be a list of at most "
+                    f"{self._spike_history_limit} finite "
                     "non-negative floats"
                 )
             history = list(raw)
@@ -976,7 +1057,7 @@ class Trainer:
             )
         self.skipped_nonfinite = skipped
         self.skipped_spike = spikes
-        self._spike_history = collections.deque(history, maxlen=self.spike_window)
+        self._spike_history = collections.deque(history, maxlen=self._spike_history_limit)
         self._skip_streak = streak
         if self.rollback is not None:  # P1.16 (absent: written without the rollback)
             events = extra.get("rollbacks", [])

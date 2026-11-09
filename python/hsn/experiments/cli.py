@@ -135,6 +135,9 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("probe-rerun", help="v1 again vs the stored probes, then probe v2 (P1.14)")
     p.add_argument("--exp", type=int, required=True)
+    p.add_argument(
+        "--checkpoint-step", type=int, help="probe this retained step instead of the last"
+    )
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
     p.add_argument("--batch-rows", type=int, default=None, help="default: the run's probe_batch")
     p.add_argument(
@@ -153,6 +156,9 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("route-check", help="does routing follow the key (P1.16; read-only)")
     p.add_argument("--exp", type=int, required=True)
+    p.add_argument(
+        "--checkpoint-step", type=int, help="probe this retained step instead of the last"
+    )
     p.add_argument("--split", choices=("dev", "train"), default="dev")
     p.add_argument("--n-docs", type=int, default=1000)
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
@@ -523,6 +529,7 @@ def cmd_probe_rerun(args: argparse.Namespace) -> int:
         batch_rows=args.batch_rows,
         weights=args.weights,
         key_alphabet=args.key_alphabet,
+        checkpoint_step=args.checkpoint_step,
     )
     text = json.dumps(out, indent=1, default=str)
     if args.out:
@@ -610,6 +617,7 @@ def cmd_route_check(args: argparse.Namespace) -> int:
         n_docs=args.n_docs,
         cpu=args.cpu,
         batch_rows=args.batch_rows,
+        checkpoint_step=args.checkpoint_step,
     )
     text = json.dumps(out, indent=1, default=str)
     if args.out:

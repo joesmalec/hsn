@@ -53,6 +53,10 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         *tuple(f"train.{k}" for k in ROLLBACK_KEYS),
         "model.key_address",
         "model.selected_readout",
+        "train.router_lr_mult",
+        "train.readout_lr_mult",
+        "train.slow_burst_factor",
+        "train.slow_burst_window",
     )
 
 

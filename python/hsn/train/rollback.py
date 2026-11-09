@@ -150,12 +150,17 @@ class Snapshot:
 
 
 class SnapshotRing:
-    """The two newest snapshots of a model and its optimiser (module docstring)."""
+    """The newest ``capacity`` snapshots (two by default), restored from the oldest slot."""
 
-    def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer) -> None:
+    def __init__(
+        self, model: nn.Module, optimizer: torch.optim.Optimizer, *, capacity: int = 2
+    ) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 2:
+            raise ValueError("snapshot capacity must be an integer >= 2")
         self.model = model
         self.optimizer = optimizer
-        self.slots: list[Snapshot] = []  # oldest first, at most two
+        self.capacity = capacity
+        self.slots: list[Snapshot] = []  # oldest first
 
     @property
     def steps(self) -> list[int]:
@@ -178,10 +183,10 @@ class SnapshotRing:
         return model, keys, tensors, other
 
     def take(self, step: int, spike_history: Iterable[float] = ()) -> Snapshot:
-        """Copy the live state into a slot: a new one while fewer than two exist, else the oldest
+        """Copy the live state into a slot: a new one while below capacity, else the oldest
         one's buffers (reallocated only when the layout changed, e.g. optimiser state appeared)."""
         model, keys, tensors, other = self._live()
-        reuse = self.slots.pop(0) if len(self.slots) == 2 else None
+        reuse = self.slots.pop(0) if len(self.slots) == self.capacity else None
         layout = (
             tuple((t.shape, t.dtype, t.device) for t in model),
             tuple(keys),
@@ -207,7 +212,7 @@ class SnapshotRing:
         return snap
 
     def restore(self) -> Snapshot:
-        """Restore the oldest snapshot (the older of two; the only one otherwise) in place and drop
+        """Restore the oldest snapshot in place and drop
         every newer one; returns it. Raises when the ring is empty."""
         if not self.slots:
             raise RuntimeError("no snapshot to roll back to")
