@@ -281,3 +281,16 @@ event cap and reference count. `divergence` remains the first-event summary; `di
 all captured events and survives normal checkpoint resume. Per-parameter norms in captures are
 post-clip; reconstructed raw norms are explicitly labelled. Diagnostic backward records measure
 raw parameter gradients directly.
+
+Objective and document attribution also support `modes: [compiled]`. These interventions mask
+only the loss's backward inputs, preserving the compiled forward. Reports identify each execution
+mode separately and enforce the same repeatability, unchanged-forward and gradient-reconstruction
+checks. An eager trace does not identify the compiled gradient path when the routes differ.
+
+`reference_mode: same_window_weights` loads an earlier checkpoint's model parameters and buffers
+onto the spike's exact saved stream, RNG, carried state and previous byte. The reference is
+replayed twice in every requested mode, without any optimizer update. Both sides record the same
+window fingerprint, weight source and whether every row resets at the first position. This is a
+controlled weight intervention, not a reconstruction of the earlier training trajectory. The
+default `reference_mode: next_window` instead uses the earlier checkpoint's own next window;
+its fingerprint is reported separately, and a norm difference alone cannot isolate weight changes.

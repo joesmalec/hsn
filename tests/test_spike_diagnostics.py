@@ -114,6 +114,57 @@ def test_retained_reference_is_reported_at_its_own_step(saved_case: Any, tmp_pat
     result = run_diagnostic(arm, params, train_ds=data)["diagnostic"]
     assert result["reference"]["step"] == 3 and result["step"] == 2
     assert result["reference"]["report"]["optimizer_updates"] == 0
+    assert result["reference"]["mode"] == "next_window"
+    assert result["reference"]["window_sha256"] != result["window_sha256"]
+
+
+def test_earlier_weights_use_exact_source_window_and_do_not_modify_source(
+    saved_case: Any, tmp_path: Path
+) -> None:
+    cfg, data, path = saved_case
+    reference = path.parent / "healthy_00000001.pt"
+    checksum = sha256(path)
+    params = SpikeDiagnosticParams(
+        name="spike_diagnostic",
+        parent_exp=1,
+        dump=str(path),
+        dump_sha256=checksum,
+        stage="reproduce",
+        reference_checkpoint=str(reference),
+        reference_sha256=sha256(reference),
+        reference_mode="same_window_weights",
+    )
+    directory = tmp_path / "matched"
+    directory.mkdir()
+    arm = ArmRun(cfg, "hsn", "pdg", {}, params, directory, RuleSet(), {})
+    result = run_diagnostic(arm, params, train_ds=data)["diagnostic"]
+    report = result["reference"]["by_mode"]["eager"]["report"]
+    assert result["reference"]["same_windows"]
+    assert report["window_sha256"] == result["window_sha256"]
+    assert report["weights_step"] == 0
+    assert report["stream_checkpoint"] == str(path)
+    assert report["weights_checkpoint"] == str(reference)
+    assert report["optimizer_updates"] == 0 and result["step"] == 2
+    assert all(check["passed"] for check in result["checks"])
+    assert sha256(path) == checksum
+    case = Case(path, cfg, train_ds=data)
+    baseline = case.run(tmp_path / "baseline", compiled=False, deterministic=True)
+    identity = case.run(
+        tmp_path / "identity", compiled=False, deterministic=True, weight_override=path
+    )
+    assert compare(baseline, identity)["passed"]
+
+
+def test_reference_weights_reject_other_configuration(saved_case: Any, tmp_path: Path) -> None:
+    cfg, data, path = saved_case
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["extra"]["config_hash"] = "another-configuration"
+    wrong = tmp_path / "wrong.pt"
+    torch.save(payload, wrong)
+    with pytest.raises(ValueError, match="configuration hash"):
+        Case(path, cfg, train_ds=data).run(
+            tmp_path / "wrong", compiled=False, deterministic=True, weight_override=wrong
+        )
 
 
 def test_multiple_dumps_have_bounded_healthy_references_and_resume(
@@ -206,3 +257,25 @@ def test_compiled_a5_backward_stops_before_update_and_repeats(
     b = case.run(tmp_path / "b", compiled=True, deterministic=True)
     assert compare(a, b)["passed"] and a.trainer.step == 1
     assert a.report["optimizer_updates"] == 0
+    params = SpikeDiagnosticParams(
+        name="spike_diagnostic",
+        parent_exp=1,
+        dump=str(path),
+        dump_sha256=sha256(path),
+        stage="isolate",
+        modes=("compiled",),
+        target_doc=case.docs[0],
+        reference_checkpoint=str(path.parent / "healthy_00000001.pt"),
+        reference_sha256=sha256(path.parent / "healthy_00000001.pt"),
+        reference_mode="same_window_weights",
+    )
+    directory = tmp_path / "compiled_isolation"
+    directory.mkdir()
+    arm = ArmRun(cfg, "hsn", "pdg", {}, params, directory, RuleSet(), {})
+    result = run_diagnostic(arm, params, train_ds=data)["diagnostic"]
+    assert result["completed"] and all(p["compiled"] for p in result["passes"])
+    partition = result["attribution_by_mode"]["compiled"]
+    assert partition["term_partition_relative_error"] <= 0.02
+    assert partition["document_partition_relative_error"] <= 0.02
+    assert result["reference"]["same_windows"]
+    assert all(p["window_sha256"] == result["window_sha256"] for p in result["passes"])

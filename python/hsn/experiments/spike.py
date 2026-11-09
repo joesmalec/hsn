@@ -18,7 +18,7 @@ import os
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
@@ -37,6 +37,18 @@ from hsn.train.loop import StreamLoader
 def sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _window_hash(windows: list[dict[str, Tensor]]) -> str:
+    """Fingerprint ordered inputs, masks and document boundaries independently of weights."""
+    digest = hashlib.sha256()
+    for index, window in enumerate(windows):
+        for key, value in sorted(window.items()):
+            tensor = value.detach().cpu().contiguous()
+            header = json.dumps([index, key, str(tensor.dtype), list(tensor.shape)])
+            digest.update(header.encode() + b"\0")
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 class _BackwardComplete(Exception):
@@ -283,6 +295,7 @@ class Case:
         self.docs = sorted(
             {int(d) for w in self.windows for d in w["doc"].unique().tolist() if d >= 0}
         )
+        self.window_hash = _window_hash(self.windows)
 
     def run(
         self,
@@ -295,6 +308,7 @@ class Case:
         complement: bool = False,
         trace: bool = False,
         cut: str | None = None,
+        weight_override: Path | None = None,
     ) -> Pass:
         if deterministic:
             os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -305,6 +319,16 @@ class Case:
         trainer.divergence_dump = False
         set_deterministic(deterministic)
         trainer.resume(self.path)
+        weight_step = int(self.payload["step"])
+        if weight_override is not None:
+            weights = torch.load(weight_override, map_location="cpu", weights_only=True)
+            expected = self.payload["extra"].get("config_hash")
+            if not expected or weights["extra"].get("config_hash") != expected:
+                raise ValueError("reference weights have a different or missing configuration hash")
+            # Keep the source stream, RNG, recurrent state and previous byte. Replace only model
+            # parameters and buffers (including the EMA target); stop before any optimizer update.
+            model.load_state_dict(weights["model"], strict=True)
+            weight_step = int(weights["step"])
         if trainer.scaler is not None:
             raise ValueError("diagnostic backward requires an unscaled fp32/bf16 recipe")
         gradients: dict[str, Tensor] = {}
@@ -363,6 +387,11 @@ class Case:
             "term": term,
             "document": doc,
             "complement": complement,
+            "stream_checkpoint": str(self.path),
+            "weights_checkpoint": str(weight_override or self.path),
+            "weights_step": weight_step,
+            "window_sha256": self.window_hash,
+            "all_rows_reset_at_window_start": bool(self.windows[0]["reset"][:, 0].all()),
         }
 
         def stop(t: Any) -> None:
@@ -467,6 +496,8 @@ def run_diagnostic(
     actual_hash = sha256(path)
     if actual_hash != params.dump_sha256:
         raise ValueError("diagnostic checkpoint checksum changed")
+    if params.reference_mode == "same_window_weights" and params.reference_checkpoint is None:
+        raise ValueError("same_window_weights requires a reference checkpoint")
     arm.stage = "diagnostic_setup"
     result: dict[str, Any] = {
         "protocol": "spike_diagnostic",
@@ -495,6 +526,7 @@ def run_diagnostic(
         dump_commit=case.info.get("git_rev"),
         step=case.step,
         windows_match=True,
+        window_sha256=case.window_hash,
         original_loss=case.info.get("loss"),
         original_raw_grad_norm=case.info["grad_norm"],
     )
@@ -524,7 +556,7 @@ def run_diagnostic(
             record["passes"].append(report)
             return out
 
-        baselines: dict[str, Pass] = {}
+        baselines: dict[Literal["eager", "compiled"], Pass] = {}
         for mode in params.modes:
             baseline = run(f"{mode}_baseline", mode)
             baselines[mode] = baseline
@@ -537,15 +569,18 @@ def run_diagnostic(
                 del repeated
         if len(baselines) == 2:
             record["execution_mode_comparison"] = compare(baselines["eager"], baselines["compiled"])
-        if params.stage in ("isolate", "trace", "compare"):
-            if "eager" not in baselines:
-                raise ValueError("isolation and tracing need an eager baseline")
-            base = baselines["eager"]
-            if params.stage in ("isolate", "compare"):
+        if params.stage in ("isolate", "compare"):
+            attribution: dict[str, Any] = {}
+            record["attribution_by_mode"] = attribution
+            for mode, base in baselines.items():
+                measurements: dict[str, Any] = {}
+                attribution[mode] = measurements
+                prefix = "" if mode == "eager" else f"{mode}_"
                 pieces = [
-                    run(f"term_{name}", term=name) for name in base.report["objective_parts"][0]
+                    run(f"{prefix}term_{name}", mode, term=name)
+                    for name in base.report["objective_parts"][0]
                 ]
-                record["term_partition_relative_error"] = _partition_error(base, pieces)
+                measurements["term_partition_relative_error"] = _partition_error(base, pieces)
                 for piece in pieces:
                     if not compare(base, piece)["forward_exact"]:
                         raise RuntimeError("term isolation changed forward values")
@@ -553,38 +588,87 @@ def run_diagnostic(
                 if params.target_doc is not None:
                     if params.target_doc not in case.docs:
                         raise ValueError("target document is absent from the saved windows")
-                    selected = run("document_only", doc=params.target_doc)
-                    rest = run("other_documents", doc=params.target_doc, complement=True)
-                    record["document_partition_relative_error"] = _partition_error(
+                    selected = run(f"{prefix}document_only", mode, doc=params.target_doc)
+                    rest = run(
+                        f"{prefix}other_documents", mode, doc=params.target_doc, complement=True
+                    )
+                    measurements["document_partition_relative_error"] = _partition_error(
                         base, [selected, rest]
                     )
                     if not all(compare(base, p)["forward_exact"] for p in (selected, rest)):
                         raise RuntimeError("document isolation changed forward values")
                 tolerance = 0.02 if base.trainer.ctx.autocast_dtype == torch.bfloat16 else 1e-5
+                measurements["tolerance"] = tolerance
+                if mode == "eager":
+                    record.update(measurements)  # preserve the original eager result fields
                 for key in ("term_partition_relative_error", "document_partition_relative_error"):
-                    if key in record and not record[key] <= tolerance:
+                    if key in measurements and not measurements[key] <= tolerance:
                         raise RuntimeError(
-                            f"{key} exceeds the numerical tolerance {tolerance}; "
+                            f"{mode} {key} exceeds the numerical tolerance {tolerance}; "
                             "attribution is inconclusive"
                         )
-            if params.stage in ("trace", "compare"):
-                traced = run("local_trace", trace=True)
-                check = {"kind": "instrumentation", **compare(base, traced)}
-                record["checks"].append(check)
-                if not check["passed"]:
-                    raise RuntimeError("instrumentation changed the baseline; trace is not valid")
-                del traced
-                for branch in ("h", "q"):
-                    cut = run(f"cut_{branch}_at_31", cut=branch)
-                    if not compare(base, cut)["forward_exact"]:
-                        raise RuntimeError("diagnostic gradient cut changed forward values")
-                    del cut
+        if params.stage in ("trace", "compare"):
+            if "eager" not in baselines:
+                raise ValueError("local tracing needs an eager baseline")
+            base = baselines["eager"]
+            traced = run("local_trace", trace=True)
+            check = {"kind": "instrumentation", **compare(base, traced)}
+            record["checks"].append(check)
+            if not check["passed"]:
+                raise RuntimeError("instrumentation changed the baseline; trace is not valid")
+            del traced
+            for branch in ("h", "q"):
+                cut = run(f"cut_{branch}_at_31", cut=branch)
+                if not compare(base, cut)["forward_exact"]:
+                    raise RuntimeError("diagnostic gradient cut changed forward values")
+                del cut
         if params.stage == "update":
             record["shadow_updates"] = {
                 mode: _shadow_update(case, base, params.monitor_docs)
                 for mode, base in baselines.items()
             }
-        if params.reference_checkpoint is not None:
+        if (
+            params.reference_checkpoint is not None
+            and params.reference_mode == "same_window_weights"
+        ):
+            reference_path = Path(params.reference_checkpoint)
+            if sha256(reference_path) != params.reference_sha256:
+                raise ValueError("reference checkpoint checksum changed")
+            reference_results: dict[str, Any] = {}
+            record["reference"] = {
+                "mode": params.reference_mode,
+                "path": str(reference_path),
+                "sha256": params.reference_sha256,
+                "same_windows": True,
+                "window_sha256": case.window_hash,
+                "by_mode": reference_results,
+                "interpretation": (
+                    "Reference model parameters and buffers on the source spike's exact window, "
+                    "RNG, carried state and previous byte. No optimizer update. A weight-only "
+                    "intervention, not a reconstructed earlier training trajectory."
+                ),
+            }
+            for mode, baseline in baselines.items():
+                ref = run(f"reference_{mode}", mode, weight_override=reference_path)
+                reference_results[mode] = {
+                    "report": ref.report,
+                    "source_comparison": compare(baseline, ref),
+                }
+                for repeat in range(1, params.repeats):
+                    repeated = run(
+                        f"reference_{mode}_repeat_{repeat}", mode, weight_override=reference_path
+                    )
+                    check = {
+                        "kind": "reference_repeatability",
+                        "mode": mode,
+                        **compare(ref, repeated),
+                    }
+                    record["checks"].append(check)
+                    if not check["passed"]:
+                        raise RuntimeError("reference weight replay is not repeatable")
+                    del repeated
+                del ref
+        elif params.reference_checkpoint is not None:
             reference_path = Path(params.reference_checkpoint)
             if sha256(reference_path) != params.reference_sha256:
                 raise ValueError("reference checkpoint checksum changed")
@@ -606,9 +690,12 @@ def run_diagnostic(
                 json.dumps(traced_ref.report.pop("trace"), allow_nan=False) + "\n"
             )
             record["reference"] = {
+                "mode": "next_window",
                 "path": str(reference_path),
                 "sha256": params.reference_sha256,
                 "step": reference.step,
+                "same_windows": reference.window_hash == case.window_hash,
+                "window_sha256": reference.window_hash,
                 "trace_path": str(reference_trace),
                 "report": ref.report,
                 "interpretation": (

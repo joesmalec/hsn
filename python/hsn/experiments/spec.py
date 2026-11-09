@@ -258,6 +258,7 @@ class SpikeDiagnosticParams(_TrainParams):
     timeout_s: int = Field(default=300, ge=10, le=1200)
     reference_checkpoint: str | None = None
     reference_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    reference_mode: Literal["next_window", "same_window_weights"] = "next_window"
     requires: tuple[str, ...] = ()  # earlier labels in this sweep; all must have succeeded
 
     @field_validator("modes")
