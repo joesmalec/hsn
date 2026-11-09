@@ -879,6 +879,7 @@ class TBPTTTrainer(Trainer):
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15
                     skipped = self._guard_spike(grad_norm, next_step)
+                self._capture_healthy(next_step, grad_norm, skipped)
                 before = self._adaptive_before_step(skipped)
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
@@ -898,6 +899,7 @@ class TBPTTTrainer(Trainer):
                         applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step(**step_kwargs)
+                self._record_captured_update(applied)
                 if applied:
                     self.hsn.update_target()
                 self._adaptive_after_step(applied, grad_norm, before)

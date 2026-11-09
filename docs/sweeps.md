@@ -57,6 +57,32 @@ the evaluation behind a displayed dev score. Full signal histories remain in eac
 reads warning follow-through and strictly matched ablation comparisons without loading a model or
 writing to SQLite. See [controller reporting and ablations](a5_implementation.md#live-reporting-and-signal-ablations).
 
+For a spike investigation, prepare an ordered diagnostic spec without changing the database:
+
+```bash
+python scripts/prepare_spike_queue.py --db ~/hsn-experiments/experiments.sqlite \
+  --parent 241 --target-doc 15751 --compare 235 --compare 239 --compare 233 --compare 234 \
+  --out ~/hsn-experiments/a5-stability/spike-queue.yaml
+python -m hsn.experiments enqueue ~/hsn-experiments/a5-stability/spike-queue.yaml
+```
+
+Enqueue and resume only in the explicitly owned compute turn. The spec inherits each parent's
+configuration and seed, pins source hashes, marks every job exclusive (`timing: true`), and chains
+prerequisite labels. `spike_diagnostic` runs strictly in insertion order. An exception, failed
+repeatability/instrumentation check, cancellation or timeout pauses the queue; dependent jobs do
+not silently continue. Results are diagnostic records, with no fabricated final dev score.
+
+A worker configured with `--turn-file ~/hsn-handoff/run-turns.json --turn-owner A5` requires an
+active, unreleased claim for that owner. It starts a bounded job only if its full timeout plus
+30 seconds fits the turn. It signals a timed-out diagnostic, then kills its owned process group
+after ten seconds if needed. A turn's last fifteen seconds are reserved for draining. Missing,
+malformed, expired or another owner's claim blocks launches. Replace an idle existing worker to
+enable these options; do not start a second one. Pending jobs may remain paused between turns;
+coordinate them with any external idle guard before handing compute to another session.
+
+See [spike diagnostics](a5_implementation.md#investigating-spikes-before-further-training) for
+capture settings, numerical checks and limits on interpreting these results.
+
 **Database location:** `~/hsn-experiments/experiments.sqlite`, here `/home/joe/hsn-experiments/`. Override it
 with `--db` or `$HSN_EXPERIMENTS_DB`.
 

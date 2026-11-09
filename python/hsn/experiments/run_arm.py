@@ -46,7 +46,7 @@ from hsn.experiments import machine
 from hsn.experiments.db import Database, dumps, loads
 from hsn.experiments.protocols import ArmRun, failure_info, run_protocol
 from hsn.experiments.rules import RuleSet, evaluate_verdicts, parse_rules
-from hsn.experiments.spec import arm_identity, data_hash, protocol_params
+from hsn.experiments.spec import SpikeDiagnosticParams, arm_identity, data_hash, protocol_params
 
 __all__ = ["main", "run_dir_for"]
 
@@ -57,6 +57,10 @@ class Cancelled(BaseException):
 
 def _on_sigterm(signum: int, frame: FrameType | None) -> None:
     raise Cancelled()
+
+
+def _on_timeout(signum: int, frame: FrameType | None) -> None:
+    raise TimeoutError("diagnostic wall-time budget exceeded")
 
 
 @dataclass
@@ -169,6 +173,7 @@ def main(db_path: str, exp_id: int, root: str) -> int:
             f"WARNING: the checkout has modified tracked files {git['dirty']}; diff in dirty.patch"
         )
     signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGALRM, _on_timeout)
     _log(f"experiment {exp_id} ({exp['label']}, arm {exp['arm_id']}) pid {pid} commit {git['sha']}")
     attempt = _Attempt()
     try:
@@ -176,6 +181,9 @@ def main(db_path: str, exp_id: int, root: str) -> int:
             db, exp, arm, sweep, constants, run_dir, pid, git, attempt
         )
     except BaseException as exc:  # noqa: BLE001 - every failure is recorded, then re-raised
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if arm["protocol"] == "spike_diagnostic":
+            db.set_paused(True)  # a failed diagnostic must not silently release dependent jobs
         signal.signal(signal.SIGTERM, signal.SIG_IGN)  # the last write is short: let it finish
         cancelled = isinstance(exc, Cancelled)
         tail = "".join(traceback.format_exception(exc))[-4000:]
@@ -197,6 +205,7 @@ def main(db_path: str, exp_id: int, root: str) -> int:
         if isinstance(exc, KeyboardInterrupt):
             raise
         return 143 if cancelled else 1
+    signal.setitimer(signal.ITIMER_REAL, 0)
     status = "stopped_early" if record.get("stopped") else "done"
     final = record.get("final") or {}
     walls = record.get("walls") or {}
@@ -297,6 +306,32 @@ def _run(
     cfg = RunConfig.model_validate(loads(exp.get("config_json") or arm["config_json"]))
     protocol = loads(exp.get("protocol_json") or arm["protocol_json"])
     params = protocol_params(protocol)
+    if isinstance(params, SpikeDiagnosticParams):
+        for label in params.requires:
+            previous = db.row(
+                "SELECT status FROM experiments WHERE sweep_id = ? AND label = ? "
+                "AND exp_id < ? ORDER BY exp_id DESC LIMIT 1",
+                (exp["sweep_id"], label, exp["exp_id"]),
+            )
+            if previous is None or previous["status"] != "done":
+                raise RuntimeError(f"diagnostic prerequisite {label!r} has not succeeded")
+        parent = db.experiment(params.parent_exp)
+        if parent["status"] not in ("done", "failed", "stopped_early", "cancelled"):
+            raise RuntimeError("diagnostic parent must be a finished experiment")
+        if (
+            not parent.get("run_dir")
+            or Path(params.dump).resolve().parent != Path(parent["run_dir"]).resolve()
+        ):
+            raise ValueError("diagnostic dump must belong to its recorded parent experiment")
+        if (params.reference_checkpoint is None) != (params.reference_sha256 is None):
+            raise ValueError("reference checkpoint and checksum must be supplied together")
+        if (
+            params.reference_checkpoint is not None
+            and Path(params.reference_checkpoint).resolve().parent
+            != Path(parent["run_dir"]).resolve()
+        ):
+            raise ValueError("reference checkpoint must belong to the parent experiment")
+        signal.setitimer(signal.ITIMER_REAL, params.timeout_s)
     variant_params = loads(arm["variant_json"])
     early_stop = loads(arm["early_stop_json"])
     data = data_hash(cfg, REPO_ROOT, required=params.name != "dry_run")
@@ -332,6 +367,8 @@ def _run(
             raise RuntimeError(
                 "the experiment row is no longer running for this process (recovered)"
             )
+        if p.get("diagnostic"):
+            _log("diagnostic " + json.dumps(p, sort_keys=True, allow_nan=False))
         controller = p.get("adaptive_lr")
         if controller is not None and controller["observation_count"] != controller_logged:
             _log("controller " + json.dumps(controller, sort_keys=True, allow_nan=False))

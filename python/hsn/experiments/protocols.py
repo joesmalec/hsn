@@ -95,13 +95,14 @@ from hsn.experiments.spec import (
     DryRunParams,
     OverfitParams,
     ReadsStateParams,
+    SpikeDiagnosticParams,
     TrainEvalParams,
 )
 from hsn.experiments.steptime import StepTimeGuard
 
 __all__ = ["ArmRun", "run_protocol"]
 
-Params = ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams
+Params = ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams
 
 
 @dataclass
@@ -135,6 +136,10 @@ def run_protocol(arm: ArmRun) -> dict[str, Any]:
     try:
         if isinstance(arm.params, DryRunParams):
             record = _dry_run(arm, arm.params)
+        elif isinstance(arm.params, SpikeDiagnosticParams):
+            from hsn.experiments.spike import run_diagnostic
+
+            record = run_diagnostic(arm, arm.params)
         else:
             record = _train(arm, arm.params)
     except BaseException as exc:
@@ -194,6 +199,8 @@ def failure_info(
         kind, reason = "interrupted", "interrupted"
     elif name == "StepTimeExceeded":
         kind, reason = "step_time", first
+    elif isinstance(exc, TimeoutError):
+        kind, reason = "timeout", first
     elif name == "OutOfMemoryError":
         kind, reason = "oom", "out of memory"
     elif isinstance(exc, RuntimeError) and _ROLLBACK_LIMIT in message:  # P1.16
@@ -680,6 +687,7 @@ def _train(
         **_adaptive_record(trainer),
         "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
         "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
+        "divergences": getattr(trainer, "divergences", []),
         "stopped": callback.stop,
         "early_stop_log": callback.log,
         "eval_count": timer.count,
@@ -810,6 +818,7 @@ def _partial_training(
             **_adaptive_record(trainer),
             "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
             "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
+            "divergences": getattr(trainer, "divergences", []),
             "stopped": None,
             "early_stop_log": list(callback.log),
             "eval_count": timer.count,

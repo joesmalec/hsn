@@ -238,3 +238,46 @@ growth at steps 2,253 and 6,036. The 100x sharp guard first flags steps 3,471 an
 so their combined first detections are 2,253 and 5,266. This reuses recorded gradients and cannot
 predict the trajectory after a rollback. Factor 20 also fires during successful control training
 (experiment 222, step 2,850); the fallback starts with factor 100 to reduce early interventions.
+
+## Investigating spikes before further training
+
+Experiment 241 completed with five rollbacks and 2,081 discarded updates. Its first saved spike
+is concentrated in one example, but that observation does not identify the originating operation.
+Raw gradient norms are measured before the existing clipping. A spike alone therefore does not
+establish that its clipped optimizer update would damage learning.
+
+The `spike_diagnostic` protocol runs through the ordinary SQLite worker. It uses saved weights,
+optimizer moments, scheduler, RNG, loader position, recurrent state and previous byte. It verifies
+the checkpoint SHA-256, configuration and regenerated windows before backward. No training
+continuation, final evaluation or training checkpoint is produced. Each attempt records its parent
+experiment, source checksum and commit, seed, data fingerprint, execution mode, intervention,
+progress and results. Diagnostic wall time is not a training step-time measurement.
+
+Run stages in order: `reproduce`, `isolate`, `trace`, `update`, then `compare` on other seeds and
+non-A5 controls. Reproduction compares repeated eager/compiled passes, including routing choices.
+Isolation separates objective terms (answer loss, prediction loss and any enabled variance term)
+and optional document contributions, preserving the forward batch and original normalization.
+For a batch-coupled variance loss, document attribution means its output-gradient contribution,
+not an independent per-document scalar loss. The gradient partitions must reconstruct the baseline
+within 1e-5 relative error in fp32 or 0.02 under bf16; outputs must remain identical.
+
+Tracing clones each module's differentiable input to isolate its local VJP from other consumers.
+It first verifies forward outputs and parameter gradients against an uninstrumented baseline.
+Separate diagnostic cuts of h/q at position 31 preserve forward values; these are investigative
+interventions, never changes to the model's training equations. An earlier retained checkpoint can
+provide a reference window; its health must be assessed from the measurements, not its age.
+
+The update stage takes one clipped optimizer update on a disposable copy, including lazy-AdamW
+active-unit semantics and target EMA. It reports raw/clipped gradients, parameter displacement,
+and loss before/after on a fixed stratified TRAIN monitor. Dev/test scores are not used to select
+the update. One-step behavior cannot establish long-term accuracy or justify weakening guards.
+
+Optional capture settings for subsequent training are `train.divergence_max_dumps=5`,
+`train.divergence_healthy_every=50`, and `train.divergence_healthy_keep=2`. Defaults remain 1/0/2,
+with unchanged legacy hashes and training behavior. Guard-accepted finite windows are saved before
+their update; their JSON sidecars receive actual parameter displacement after the update. At each
+spike, the current healthy references are frozen beside that event. Storage is bounded by the
+event cap and reference count. `divergence` remains the first-event summary; `divergences` records
+all captured events and survives normal checkpoint resume. Per-parameter norms in captures are
+post-clip; reconstructed raw norms are explicitly labelled. Diagnostic backward records measure
+raw parameter gradients directly.

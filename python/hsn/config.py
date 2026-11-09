@@ -388,6 +388,9 @@ class TrainConfig(_StrictModel):
     # write a dump of the pre-step state at the first step a guard skips (non-finite, or a spike
     # with spike_factor set), for a deterministic replay (python/hsn/train/divergence.py)
     divergence_dump: bool = True
+    divergence_max_dumps: int = Field(default=1, ge=1, le=32)
+    divergence_healthy_every: int = Field(default=0, ge=0)
+    divergence_healthy_keep: int = Field(default=2, ge=1, le=8)
     # --- end P1.15 ---
     # --- P1.16: rollback on a guard trigger (python/hsn/train/rollback.py). None: off (today's
     # training). Every rollback_every steps the trainer keeps an in-memory snapshot of the
@@ -1112,6 +1115,9 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.adaptive_lr.gradient_cuts",
     "train.adaptive_lr.update_cuts",
     "train.adaptive_lr.trial_increases",
+    "train.divergence_max_dumps",
+    "train.divergence_healthy_every",
+    "train.divergence_healthy_keep",
 )
 
 

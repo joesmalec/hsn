@@ -83,6 +83,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--idle-gap", type=float, default=60.0)
     p.add_argument("--omp-threads", type=int, default=4)
     p.add_argument("--inductor-cache", default=None, help="compiled-artifact cache of the arms")
+    p.add_argument("--turn-file", default=None, help="require an explicitly claimed compute turn")
+    p.add_argument("--turn-owner", default=None, help="owner name in --turn-file")
 
     p = sub.add_parser("status", help="queue, running and recent results")
     p.add_argument("--sweep", default=None)
@@ -321,6 +323,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
         poll_s=args.poll,
         omp_threads=args.omp_threads,
         inductor_cache=Path(args.inductor_cache) if args.inductor_cache else None,
+        turn_file=Path(args.turn_file) if args.turn_file else None,
+        turn_owner=args.turn_owner,
     )
     return Worker(db, _root(args, db), options).run()
 
@@ -410,7 +414,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 r["pid"],
                 r["worker"],
                 (r["started_at"] or r["claimed_at"] or "")[:19],
-                f"{progress.get('step', '')}/{progress.get('of', '')}",
+                progress.get("stage") or f"{progress.get('step', '')}/{progress.get('of', '')}",
                 progress.get("dev_accuracy", ""),
                 progress.get("dev_step", progress.get("step", ""))
                 if "dev_accuracy" in progress

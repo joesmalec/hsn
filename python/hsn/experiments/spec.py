@@ -240,22 +240,53 @@ class DryRunParams(_TrainParams):
     record: dict[str, Any] = Field(default_factory=dict)  # merged into the synthetic record
 
 
+class SpikeDiagnosticParams(_TrainParams):
+    """Bounded, checkpoint-based investigations; never a training continuation."""
+
+    name: Literal["spike_diagnostic"]
+    steps: Literal[1] = 1
+    checkpoint: Literal["none"] = "none"
+    parent_exp: int = Field(ge=1)
+    dump: str = Field(min_length=1)
+    dump_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stage: Literal["reproduce", "isolate", "trace", "update", "compare"]
+    modes: tuple[Literal["eager", "compiled"], ...] = ("eager",)
+    repeats: int = Field(default=2, ge=2, le=4)
+    deterministic: bool = True
+    target_doc: int | None = Field(default=None, ge=0)
+    monitor_docs: int = Field(default=32, ge=1)
+    timeout_s: int = Field(default=300, ge=10, le=1200)
+    reference_checkpoint: str | None = None
+    reference_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    requires: tuple[str, ...] = ()  # earlier labels in this sweep; all must have succeeded
+
+    @field_validator("modes")
+    @classmethod
+    def _modes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or len(set(value)) != len(value):
+            raise ValueError("modes must be nonempty and unique")
+        return value
+
+
 ProtocolParams = Annotated[
-    ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams, Field(discriminator="name")
+    ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams,
+    Field(discriminator="name"),
 ]
 PROTOCOL_PARAMS: dict[str, type[_TrainParams]] = {
     "reads_state": ReadsStateParams,
     "train_eval": TrainEvalParams,
     "overfit": OverfitParams,
     "dry_run": DryRunParams,
+    "spike_diagnostic": SpikeDiagnosticParams,
 }
-PROTOCOL_VERSION = {"reads_state": 1, "train_eval": 1, "overfit": 1, "dry_run": 1}
+PROTOCOL_VERSION = {name: 1 for name in PROTOCOL_PARAMS}
 #: P1.16: the training protocols also write ``partial`` (a failed arm's re-scored kept checkpoint)
 PROTOCOL_SOURCES: dict[str, tuple[str, ...]] = {
     "reads_state": ("trained", "probe", "final", "partial"),
     "train_eval": ("trained", "final", "partial"),
     "overfit": ("overfit", "final"),
     "dry_run": ("trained", "probe", "probe_v2", "probe_v3", "overfit", "final", "partial"),
+    "spike_diagnostic": (),
 }
 
 
@@ -273,7 +304,7 @@ def protocol_sources(params: Any) -> tuple[str, ...]:
 
 def protocol_params(
     raw: Mapping[str, Any],
-) -> ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams:
+) -> ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams:
     name = raw.get("name")
     if name not in PROTOCOL_PARAMS:
         raise SpecError(f"protocol name must be one of {sorted(PROTOCOL_PARAMS)}, got {name!r}")
@@ -281,7 +312,10 @@ def protocol_params(
         params = PROTOCOL_PARAMS[str(name)].model_validate(dict(raw))
     except ValidationError as exc:
         raise SpecError(f"protocol {name}: {exc}") from exc
-    assert isinstance(params, (ReadsStateParams, TrainEvalParams, OverfitParams, DryRunParams))
+    assert isinstance(
+        params,
+        (ReadsStateParams, TrainEvalParams, OverfitParams, DryRunParams, SpikeDiagnosticParams),
+    )
     return params
 
 
@@ -383,7 +417,9 @@ class Arm:
     config_path: str
     overrides: list[str]
     config: RunConfig
-    protocol: ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams
+    protocol: (
+        ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams
+    )
     timing: bool
     constants: dict[str, Any]
     data_hash: str
@@ -639,6 +675,11 @@ def _expand_one(
     protocol = protocol_params(
         dict(entry.protocol) if other else {**spec.protocol, **entry.protocol}
     )
+    timing = entry.timing if entry.timing is not None else spec.timing
+    if isinstance(protocol, SpikeDiagnosticParams) and (family != "hsn" or not timing):
+        raise SpecError(
+            "spike_diagnostic requires family hsn and timing: true (exclusive execution)"
+        )
     if protocol.name == "reads_state" and family == "hsn" and cfg.model.routing == "random":
         raise SpecError(
             f"arm {entry.name}: routing=random with reads_state: its evaluation draws batch-shaped "
@@ -709,7 +750,7 @@ def _expand_one(
         overrides=overrides,
         config=cfg,
         protocol=protocol,
-        timing=entry.timing if entry.timing is not None else spec.timing,
+        timing=timing,
         constants=constants,
         data_hash=data,
         arm_id=arm_id,

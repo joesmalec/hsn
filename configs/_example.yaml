@@ -99,6 +99,9 @@ train: # Appendix A.3
   slow_burst_factor: null # optional sustained rise of the median; requires spike_factor
   slow_burst_window: 250 # applied steps between median windows; requires slow_burst_factor
   divergence_dump: true # P1.15: dump the pre-step state at the first skipped step (replay it)
+  divergence_max_dumps: 1 # bounded event capture; set 5 for a spike investigation
+  divergence_healthy_every: 0 # optional pre-update healthy reference cadence; 0 disables it
+  divergence_healthy_keep: 2 # rolling references frozen alongside each captured event
   rollback_every: null # P1.16: snapshot cadence of the rollback on a guard trigger (null: off; 50)
   rollback_skip: 0 # P1.16: extra steps' worth of windows discarded after a rollback (10)
   rollback_lr_mult: 1.0 # P1.16: learning-rate factor after a rollback, in (0, 1] (0.5)

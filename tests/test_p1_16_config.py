@@ -62,6 +62,9 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.adaptive_lr.gradient_cuts",
         "train.adaptive_lr.update_cuts",
         "train.adaptive_lr.trial_increases",
+        "train.divergence_max_dumps",
+        "train.divergence_healthy_every",
+        "train.divergence_healthy_keep",
     )
 
 

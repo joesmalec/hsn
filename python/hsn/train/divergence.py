@@ -6,7 +6,7 @@ not reproduce them (exps 90 and 91 diverged, their reruns 168 and 169 did not). 
 starts from (:class:`StepSnapshot`): the loader's position, every random generator's state, a copy
 of the carried recurrent state and of the model's buffers, its own counters, and (by reference) the
 step's CPU windows. The parameters, the optimiser state and the scheduler are left alone: nothing
-changes them before the optimiser step. At the **first** step a guard skips (P1.12's non-finite
+changes them before the optimiser step. At the first step a guard skips (P1.12's non-finite
 norm, or P1.15's gradient spike) :func:`write_dump` writes, before the gradients are zeroed:
 
 * ``<run_dir>/divergence_<step:08d>.pt``: a checkpoint in :mod:`hsn.train.checkpoint`'s format at
@@ -22,6 +22,11 @@ A failure while writing is logged at ERROR and kept in ``trainer.divergence`` (`
 continues (the dump is a diagnostic, not the training). Under an fp16 ``GradScaler`` the guards are
 inactive (the scaler skips steps itself), so there is no dump. ``train.divergence_dump=false`` keeps
 no snapshot at all.
+
+``divergence_max_dumps`` raises the default one-event cap. Optional ``divergence_healthy_every``
+samples finite guard-accepted windows before their update, retaining ``divergence_healthy_keep``
+rolling files and freezing that bounded set at each event. Healthy JSON sidecars also record the
+subsequent actual optimizer displacement. Recording does not change training decisions.
 
 **Replay** (:func:`replay`, ``python -m hsn.experiments replay``): builds the model and trainer from
 the dump's configuration, resumes from the dump and runs that one step again, under deterministic
@@ -55,6 +60,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterator, Mapping
@@ -79,6 +85,7 @@ logger = logging.getLogger("hsn.train")
 #: the dump's file name prefix (not ``step_``: :func:`hsn.train.checkpoint.latest_checkpoint` must
 #: never take a dump for the run's checkpoint)
 DUMP_PREFIX = "divergence_"
+HEALTHY_PREFIX = "healthy_"
 
 
 @dataclass
@@ -163,7 +170,8 @@ def write_dump(
     from hsn.train.checkpoint import capture_rng_state, save_checkpoint
 
     run_dir = Path(trainer.run_dir)
-    path = run_dir / f"{DUMP_PREFIX}{step:08d}.pt"
+    healthy = kind == "healthy"
+    path = run_dir / f"{HEALTHY_PREFIX if healthy else DUMP_PREFIX}{step:08d}.pt"
     cfg = trainer.cfg
     max_norm = float(cfg.train.grad_clip) if cfg.train.grad_clip > 0 else math.inf
     clip_coef = (
@@ -177,10 +185,30 @@ def write_dump(
         "lr": float(trainer.optimizer.param_groups[0]["lr"]),
         "grad_clip": cfg.train.grad_clip,
         "clip_coef": clip_coef,
+        "gradient_stage": "after_clip",
+        "optimizer_update_applied": False,
+        "healthy_references": [],
         "path": str(path),
     }
     try:
         grads = _gradient_summary(trainer.model)
+        clipped = [float(g["norm"]) for g in grads.values() if "norm" in g]
+        summary["clipped_grad_norm"] = _number(math.sqrt(sum(g * g for g in clipped)))
+        for entry in grads.values():
+            if "norm" in entry:
+                entry["raw_norm_reconstructed"] = (
+                    _number(float(entry["norm"]) / clip_coef)
+                    if clip_coef is not None and clip_coef > 0
+                    else None
+                )
+        if not healthy:
+            # Freeze this event's references before the rolling healthy files are replaced.
+            for source in sorted(run_dir.glob(f"{HEALTHY_PREFIX}*.pt")):
+                target = run_dir / f"reference_{step:08d}_{source.name}"
+                shutil.copy2(source, target)
+                if source.with_suffix(".json").exists():
+                    shutil.copy2(source.with_suffix(".json"), target.with_suffix(".json"))
+                summary["healthy_references"].append(str(target))
         model_state = trainer.model.state_dict()
         model_state.update(snapshot.buffers)
         extra = trainer._checkpoint_extra(snapshot.state, snapshot.counters)
@@ -227,7 +255,10 @@ def write_dump(
     except Exception as exc:  # the dump is a diagnostic: never kill the training run for it
         summary["error"] = f"{type(exc).__name__}: {exc}"
         logger.error("step %d: the divergence dump failed: %s", step, summary["error"])
-    trainer.divergence = summary
+    if not healthy:
+        if trainer.divergence is None:  # retain the historical first-event interface
+            trainer.divergence = summary
+        trainer.divergences.append(summary)
     return summary
 
 

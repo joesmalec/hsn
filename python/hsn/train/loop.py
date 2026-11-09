@@ -676,6 +676,8 @@ class Trainer:
         self.divergence_dump: bool = train.divergence_dump
         self._step_snapshot: StepSnapshot | None = None
         self.divergence: dict[str, Any] | None = None
+        self.divergences: list[dict[str, Any]] = []
+        self._diagnostic_update: tuple[Path, list[tuple[str, Tensor, Tensor]]] | None = None
         self.dump_notes: dict[str, Any] = {}
         self.grad_hook: Callable[[Trainer], None] | None = None
         self._loader_state: dict[str, Any] | None = None
@@ -1136,12 +1138,16 @@ class Trainer:
             out["rollback_lr_cut"] = [int(c["lr_cut"][0]), float(c["lr_cut"][1])]
         if self.adaptive_lr is not None:
             out["adaptive_lr"] = c["adaptive_lr"]
+        if c.get("divergences"):
+            out["divergences"] = c["divergences"]
         return out
 
     def _restore_guard(self, extra: Mapping[str, Any], path: str) -> None:
         """The guard's counts from a checkpoint's ``extra``: 0 when written before the guard;
         a malformed count, or more consecutive skips than skips, raises. P1.15: the spike guard's
         count and history (absent: 0 and empty; a malformed history raises)."""
+        self.divergences = [dict(e) for e in extra.get("divergences", [])]
+        self.divergence = self.divergences[0] if self.divergences else None
         if self.adaptive_lr is not None:
             raw = extra.get("adaptive_lr")
             if not isinstance(raw, dict):
@@ -1365,6 +1371,7 @@ class Trainer:
                 skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15
                     skipped = self._guard_spike(grad_norm, self.step + 1)
+                self._capture_healthy(self.step + 1, grad_norm, skipped)
                 before = self._adaptive_before_step(skipped)
                 applied = not skipped
                 if self.scaler is not None:
@@ -1375,6 +1382,7 @@ class Trainer:
                         applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step()
+                self._record_captured_update(applied)
                 self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
             self.step += 1
@@ -1545,6 +1553,7 @@ class Trainer:
             "spike_history": [float(x) for x in self._spike_history],
             "rollbacks": [dict(r) for r in self.rollbacks],  # P1.16
             "lr_cut": (self._lr_cut_until, self._lr_cut_mult),
+            "divergences": [dict(e) for e in self.divergences],
             **(
                 {"adaptive_lr": self.adaptive_lr.state_dict()}
                 if self.adaptive_lr is not None
@@ -1558,8 +1567,12 @@ class Trainer:
 
     def _take_snapshot(self, loader: StreamLoader, state: Any) -> StepSnapshot | None:
         """P1.15: the step snapshot (:mod:`hsn.train.divergence`) while a dump may still be
-        written, else None (the dump off, already written, or an fp16 scaler: no guard)."""
-        if not self.divergence_dump or self.divergence is not None or self.scaler is not None:
+        written, else None (the dump off, event cap reached, or an fp16 scaler: no guard)."""
+        if (
+            not self.divergence_dump
+            or len(self.divergences) >= self.cfg.train.divergence_max_dumps
+            or self.scaler is not None
+        ):
             return None
         return StepSnapshot(
             step=self.step,
@@ -1574,9 +1587,54 @@ class Trainer:
         """P1.15: called by a guard that skips ``step``, before it zeroes the gradients: the
         divergence dump of the first such step (:func:`hsn.train.divergence.write_dump`)."""
         snapshot = self._step_snapshot
-        if snapshot is None or self.divergence is not None:
+        if snapshot is None or len(self.divergences) >= self.cfg.train.divergence_max_dumps:
             return
         write_dump(self, snapshot, step=step, kind=kind, grad_norm=grad_norm)
+
+    def _capture_healthy(self, step: int, grad_norm: float, skipped: bool) -> None:
+        """Optional bounded pre-update references; only finite, guard-accepted windows qualify."""
+        every = self.cfg.train.divergence_healthy_every
+        snapshot = self._step_snapshot
+        if not every or step % every or skipped or snapshot is None or not math.isfinite(grad_norm):
+            return
+        summary = write_dump(self, snapshot, step=step, kind="healthy", grad_norm=grad_norm)
+        if "error" not in summary:
+            self._diagnostic_update = (
+                Path(summary["path"]).with_suffix(".json"),
+                [
+                    (name, p, p.detach().clone())
+                    for name, p in self.model.named_parameters()
+                    if p.requires_grad
+                ],
+            )
+            keep = self.cfg.train.divergence_healthy_keep
+            try:
+                for old in sorted(Path(self.run_dir).glob("healthy_*.pt"))[:-keep]:
+                    old.unlink(missing_ok=True)
+                    old.with_suffix(".json").unlink(missing_ok=True)
+            except OSError as exc:
+                logger.error("healthy reference cleanup failed: %s", exc)
+
+    def _record_captured_update(self, applied: bool) -> None:
+        """Actual optimizer displacement on sampled healthy windows, separate from gradients."""
+        saved, self._diagnostic_update = self._diagnostic_update, None
+        if saved is None:
+            return
+        path, before = saved
+        try:
+            report = json.loads(path.read_text())
+            report["optimizer_update_applied"] = applied
+            report["parameter_updates"] = {
+                name: {
+                    "norm": float((p.detach() - old).float().norm()),
+                    "relative_to_before": float((p.detach() - old).float().norm())
+                    / max(float(old.float().norm()), 1e-12),
+                }
+                for name, p, old in before
+            }
+            path.write_text(json.dumps(report, allow_nan=False, indent=1) + "\n")
+        except (OSError, ValueError) as exc:
+            logger.error("healthy update measurement failed: %s", exc)
 
     def resume(self, path: str | Path) -> int:
         """Load a checkpoint written by :meth:`save` for this configuration; returns its step."""
