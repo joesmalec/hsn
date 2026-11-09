@@ -109,9 +109,18 @@ __all__ = [
 FAMILIES = ("hsn", "gru", "transformer")
 Family = Literal["hsn", "gru", "transformer"]
 # P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
-# computes
+# computes; P1.16: neither do the kept mid-run checkpoints (keep_every, keep_last)
 EXECUTION_ONLY = frozenset(
-    {"eval_batch", "probe_batch", "checkpoint", "sleep_s", "max_step_s", "step_time_approval"}
+    {
+        "eval_batch",
+        "probe_batch",
+        "checkpoint",
+        "sleep_s",
+        "max_step_s",
+        "step_time_approval",
+        "keep_every",
+        "keep_last",
+    }
 )
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -158,6 +167,13 @@ class _TrainParams(_Strict):
     # needs at enqueue; both execution-only
     max_step_s: float = Field(default=STEP_TIME_LIMIT_S, gt=0.0)
     step_time_approval: str = ""
+    # P1.16, kept checkpoints (hsn.experiments.protocols): a mid-run checkpoint every keep_every
+    # steps (0: off; a harness setting of the trainer, never train.ckpt_every, so the configuration
+    # and the training are unchanged), of which the newest keep_last stay on disk beside the final
+    # one; a failed run is re-scored from the newest one before its first guard event (the
+    # record's "partial"). Both execution-only
+    keep_every: int = Field(default=0, ge=0)
+    keep_last: int = Field(default=2, ge=1)
 
 
 Window = tuple[int, int]
@@ -232,11 +248,12 @@ PROTOCOL_PARAMS: dict[str, type[_TrainParams]] = {
     "dry_run": DryRunParams,
 }
 PROTOCOL_VERSION = {"reads_state": 1, "train_eval": 1, "overfit": 1, "dry_run": 1}
+#: P1.16: the training protocols also write ``partial`` (a failed arm's re-scored kept checkpoint)
 PROTOCOL_SOURCES: dict[str, tuple[str, ...]] = {
-    "reads_state": ("trained", "probe", "final"),
-    "train_eval": ("trained", "final"),
+    "reads_state": ("trained", "probe", "final", "partial"),
+    "train_eval": ("trained", "final", "partial"),
     "overfit": ("overfit", "final"),
-    "dry_run": ("trained", "probe", "probe_v2", "probe_v3", "overfit", "final"),
+    "dry_run": ("trained", "probe", "probe_v2", "probe_v3", "overfit", "final", "partial"),
 }
 
 

@@ -1,6 +1,6 @@
 # Experiment sweeps (P1.11)
 
-Status: P1.11, 7 Nov 2026; follow-ups P1.14, 7 Nov 2026, and P1.15, 8 Nov 2026. The harness turns one YAML file into many experiments,
+Status: P1.11, 7 Nov 2026; follow-ups P1.14, 7 Nov 2026, P1.15 and P1.16, 8 Nov 2026. The harness turns one YAML file into many experiments,
 with no code change per experiment. Every experiment, past, present and future, is recorded in one SQLite
 database, which is also the queue. Code: `python/hsn/experiments/`. Command line:
 `python -m hsn.experiments <command>` or `hsn sweep <command>`.
@@ -22,7 +22,23 @@ P1.15 added:
 - [the presets](#rules) `memory_writes`, `reads_state_v3` and `binds_keys`, and `min_vocab` on
   `reads_state_v2`.
 
-Existing specs expand to the same arms with the same ids.
+P1.16 added:
+- [the rollback](#rollback) (`train.rollback_*`): a guard trigger restores an in-memory snapshot instead of
+  skipping, and the run trains on;
+- [kept checkpoints and partial results](#kept-checkpoints-and-partial-results) (protocol `keep_every`,
+  `keep_last`): a failed arm is re-scored from its newest checkpoint before the failure, labelled
+  `failed: … (from step X: …)`, and the `partial:` rule source;
+- [route-check](#route-check-does-routing-follow-the-key), a read-only diagnostic of whether a routed model's
+  routing follows the key;
+- `probe-rerun --weights dump` (a failed run's divergence dump) and `--key-alphabet train` (a diagnostic remap of
+  the dev keys), and `replay --continue-steps` with a remedy;
+- [the HSN recipe file](#recipes) `configs/experiments/hsn_recipe_b095.yaml` (AdamW β2 0.95);
+- [the preset](#rules) `memory_writes_run` (the written gates' 90th percentile and the cell's update ratio, each in
+  some window of the run), calibrated on the stored runs;
+- a first open's switch to WAL retries "database is locked".
+
+Existing specs expand to the same arms with the same ids, and every existing configuration keeps its
+`config_hash` (P1.16's keys are left out of the hash at their defaults).
 
 ## Quick start
 
@@ -42,7 +58,8 @@ with `--db` or `$HSN_EXPERIMENTS_DB`.
 - `result.json`: the full record, with every probe;
 - `run.log`;
 - `config.resolved.yaml`;
-- the final checkpoint;
+- the final checkpoint (P1.16: and, with `keep_every`, the kept mid-run checkpoints until the run finishes);
+- `divergence_<step>.pt` and its `.json` sidecar, when a guard skipped or rolled back a step (P1.15);
 - `dirty.patch`, when the checkout had modified tracked files.
 
 The database is the index; the JSON files are the full copies. A path under `/tmp` is refused, because `/tmp`
@@ -118,11 +135,12 @@ repository root.
 What leaves the id unchanged:
 - YAML spelling, key order and the arm's name;
 - the execution-only parameters `eval_batch`, `probe_batch` and `checkpoint`, which change speed and rounding
-  only, and P1.14's `max_step_s` and `step_time_approval`, which decide whether an arm may run;
+  only, P1.14's `max_step_s` and `step_time_approval`, which decide whether an arm may run, and P1.16's
+  `keep_every` and `keep_last`, which keep checkpoints;
 - verdict rules, which can be re-evaluated from the stored record;
 - a new configuration key with a default;
 - P1.14's `diag_dense_every` and `diag_windows` at their defaults (0 and none), and reads_state's
-  `version: 1`. Version 2 and a dense cadence give new ids, since they change what the arm records.
+  `version: 1`. Versions 2 and 3 and a dense cadence give new ids, since they change what the arm records.
 
 A changed default is a code change. Like every code change, it is tracked by the commit each run records.
 
@@ -261,6 +279,36 @@ Every model reads its later answers from its state (on queries with a single key
 is followed 96 to 97 % of the time by HSN and gru_2m) and none binds keys: swapping two facts' keys changes
 almost no answer. This is the audit's key-blind finding shown by an intervention.
 
+**P1.16, `probe-rerun` options** (read-only database; nothing is written):
+- `--weights dump` probes the parameters of the run's divergence dump (the state before its first guard event)
+  instead of its last checkpoint: a run that failed without a checkpoint still gets its verdicts.
+- A run without stored probes (a failed one) skips the comparison with them (`compared_with_stored: false`).
+- Every rerun adds the dev evaluation with the first/later split (`eval`).
+- `--key-alphabet train` remaps, in memory, the dev documents' key bytes 112 to 127 to the training keys 64 to
+  79 (a bijection: no byte of 64 to 79 occurs in a dev document) before probing. It is a **diagnostic, not a
+  metric** (the output says so; the frozen data and metrics are untouched): it tells "cannot bind keys" from
+  "cannot bind keys never seen in training". After training, unused embedding rows have decayed by
+  exp(−wd·Σlr) (×0.86 over 9k WSD steps at 2e-3), and dev keys keep random directions while trained keys share a
+  learned one (P1.16 measurement, `docs/amendments/A5_key_address.md`).
+
+**`--key-alphabet train` on the stored checkpoints** (8 Nov): no model binds even keys it was trained on. The
+evaluation hardly changes: exp 136 scores 0.790 with the dev keys and with the remapped ones.
+
+| exp | model | dev (remapped) | later | value edit | swap follow / unchanged | swap verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| 136 | HSN d=64 + A4 | 0.790 | 0.604 | reads state (0.78) | 0.007 / 0.991 | does not bind keys |
+| 154 | gru_2m | 0.790 | 0.603 | reads state (0.79) | 0.027 / 0.944 | does not bind keys |
+| 161 | gru_2m, 15k | 0.790 | 0.605 | reads state (0.79) | 0.022 / 0.944 | does not bind keys |
+| 119 | transformer_2m | 0.593 | 0.239 | partial (0.37) | 0.008 / 0.992 | does not bind keys |
+| 194 | HSN, β2 0.95 | 0.787 | 0.598 | reads state (0.78) | 0.006 / 0.988 | does not bind keys |
+| 195 | HSN, β2 0.95 | 0.781 | 0.586 | reads state (0.79) | 0.003 / 0.992 | does not bind keys |
+| 196 | HSN top-K | 0.698 | 0.440 | reads state (0.66) | 0.008 / 0.954 | does not bind keys |
+| 197 | HSN top-K | 0.309 | 0.251 | partial (0.40) | 0.014 / 0.964 | does not bind keys |
+| 198 | HSN top-K | 0.564 | 0.344 | partial (0.39) | 0.008 / 0.974 | does not bind keys |
+
+So the missing binding is not about keys never seen in training: within 9,000 steps the models never learn to bind
+keys at all, and stay at the key-blind policy.
+
 **`train_eval`**: train and evaluate, with optional diagnostics and `trained_state`. No probe.
 
 **`overfit`**: the G1 overfit recipe. The first `n_docs` (64) training documents are both train and dev, and the
@@ -357,6 +405,11 @@ status, it writes:
 P1.15: a run whose skips included gradient spikes stops with the kind `spike` (the same P1.12 rule). The partial
 record keeps `skipped_steps` and `divergence`.
 
+P1.16: a run that keeps diverging after `train.rollback_max` rollbacks stops with the kind `rollback`. With the
+protocol's `keep_every`, a run that fails on a guard (`nonfinite`, `spike`, `rollback`) is re-scored from its
+newest checkpoint before the first guard event: see [kept checkpoints and partial
+results](#kept-checkpoints-and-partial-results).
+
 The status stays `failed` or `cancelled`, so the arm can be queued again. Every verdict that applies reads
 `failed: <reason> @ <step>`, which is never a pass and never a finding. A registered early stop keeps its
 `stopped early: ...` label and its full record, as before.
@@ -438,6 +491,172 @@ at 100 (scratch database, P1.15 evidence).
 
 So at that point the weights made many batches' backward explode, not one outlier batch.
 
+### Rollback
+
+P1.15's guard fails fast: a burst ramps over 5 to 40 steps under clipped updates, so by the trigger the weights
+have already drifted and every later batch spikes too. Exp 189 lost a model at dev 0.755 that way (8 Nov: a
+burst at step 5,214, 25 of 30 steps skipped, P1.12's stop at 5,243, no checkpoint). The rollback (P1.16,
+`python/hsn/train/rollback.py`) is PaLM's remedy (restart about 100 steps before the spike and skip the batches
+around it) in memory.
+
+**The keys** (config, all off by default; the last four are read only with `rollback_every` set):
+
+| key | default | meaning | recommended |
+| --- | --- | --- | --- |
+| `train.rollback_every` | `None` (off) | snapshot cadence in steps | 50 |
+| `train.rollback_skip` | 0 | extra steps' worth of windows discarded after a rollback | 10 |
+| `train.rollback_lr_mult` | 1.0 | learning-rate factor after a rollback, in (0, 1] | 0.5 |
+| `train.rollback_lr_steps` | 0 | steps the factor lasts | 200 |
+| `train.rollback_max` | 5 | the run stops (failure kind `rollback`) at its `rollback_max + 1`-th trigger | 5 |
+
+**What it does.**
+- Every `rollback_every` steps, after an applied optimiser step, the trainer copies every parameter and
+  persistent buffer, the optimiser state (AdamW's and LazyAdamW's moments and step counters) and the spike
+  history into a ring of two snapshots on the device (buffers allocated once; `torch._foreach_copy_`, no
+  synchronisation).
+- A step the guards would skip (non-finite, or a spike with `train.spike_factor` set) instead restores the
+  **older** snapshot in place, so the rollback reaches back between `rollback_every` and twice that many steps;
+  the newer one may sit inside the ramp and is dropped. P1.15's dump is written first, as for a skip.
+- The windows between the snapshot and the trigger are never replayed; `rollback_skip` steps' worth more are
+  discarded; every loader row starts a fresh document (the carried state resets at the next window's reset); the
+  learning rate is cut for `rollback_lr_steps` steps. The step clock, the scheduler and the generators keep
+  running, so records stay monotonic.
+- A trigger before the first snapshot is P1.15's skip.
+
+**The stop rule** (the user's decision Q2 = A, 8 Nov): a rollback is not a skip. It does not count in P1.12's
+rule (10 consecutive, or more than 1 % with at least 10) and resets its run of consecutive skips; its own limit is
+`rollback_max`. Skips without a snapshot count as before.
+
+**Records:** `rollbacks` (step, kind, norm, median, restored step, lost steps, windows skipped), `final.rollbacks`
+(the count; `None` with the rollback off), the trigger step marked `skipped: rollback` on its train entry, the
+TBPTT stats' `rollbacks`. The events and the learning-rate cut are in the checkpoint; the snapshots are not (a
+resumed run re-arms at its next multiple of the cadence).
+
+**P2.8's compiled path:** the parameters and buffers are the CUDA Graphs' static inputs and are restored in
+place, so their addresses stay valid; the optimiser runs eagerly; the trigger reads the norm the step already
+copies to the host. Refused under an fp16 `GradScaler`.
+
+**Cost:** two copies of the parameters and both Adam moments (44 MB for HSN at A.1), and one device copy of about
+22 MB every `rollback_every` steps. Measured on the RTX 3060 (8 Nov; E1's compiled dense recipe, B32, bf16,
+median of steps 11 to 60, one process each, P1.15's method):
+
+| run | s per step | mean |
+| --- | --- | --- |
+| P1.15's defaults (the cited baseline; the training path is unchanged since, `git diff 2a25c35 80b893d`) | 0.2399 / 0.2391 / 0.2386 | 0.2392 |
+| P1.16, defaults | 0.2400 / 0.2408 / 0.2401 | 0.2403 |
+| P1.16, `rollback_every=10` (five snapshots in the 60 steps) | 0.2405 / 0.2402 / 0.2401 | 0.2403 |
+| P1.16, kept checkpoints every 20 steps | 0.2401 | |
+
+- **The defaults** have a mean of 0.2403, against P1.15's 0.2392: +0.46 %, about 1.1 ms. Their maximum is 0.2408,
+  against a prior maximum of 0.2406 (P1.13 to P1.15 measured 0.2386 to 0.2406). At the defaults the step adds
+  only a `None` check, the kept-checkpoint test and the schedule's unused multiplier, so this reads as session
+  noise.
+- **The rollback's snapshots** cost nothing measurable: a mean of 0.2403, +0.0 % against the defaults.
+
+**On a dump.** `replay --dump FILE --continue-steps N --rollback-every 50 [--rollback-skip …] [--spike-factor F]`
+keeps training past a dump with the remedy set on the resumed trainer (the dump's configuration and hash stay
+its own). A dump holds only the state at its trigger's step before, inside the burst: its first snapshot is that
+state, so a continuation shows whether that state recovers, not an N-step rollback.
+
+**The stored dumps** (8 Nov; compiled, deterministic; 300 steps with the rollback, and again with lr × 0.1 for 200
+steps): neither state recovers.
+- **Exp 189** (from step 5,213): 5 of the 6 batches that followed spiked (norms 279 to 61,076, against a median
+  of 1.04), and the continuation stopped at the rollback limit at step 5,220.
+- **Exp 193** (from 818): 5 of 9 spiked (12 to 22, against a median of 0.48).
+- **The learning-rate cut** changed nothing: each rollback restores the same weights.
+- **What it shows:** the weights one step before the trigger are already inside the burst. So the rollback
+  restores the older of two snapshots, between `rollback_every` and twice that many steps back, not the newest.
+  Whether that rescues a live run is the next experiment: HSN at β2 0.999 and lr 2e-3 with the rollback on.
+
+### Kept checkpoints and partial results
+
+With `ckpt_every` 9,000 a run that fails at step 5,243 keeps no model. The protocol fields `keep_every` (0: off)
+and `keep_last` (2), both execution-only:
+- the trainer writes a checkpoint every `keep_every` steps (a harness setting of the trainer: the configuration,
+  its hash and the training are unchanged);
+- after each step the newest `keep_last` of those stay, and so does the newest one before the run's first guard
+  event (a skipped or rolled-back step), which is never pruned;
+- a run that finishes deletes them (its final checkpoint follows `checkpoint`).
+
+When a run fails on a guard (`nonfinite`, `spike`, `rollback`), the newest checkpoint on disk before the first
+guard event (before the failure if there was none) is loaded into the model and evaluated (with the split), its
+state statistics and the protocol version's probes (summaries) are taken, and the record gets `partial`:
+`from_step`, `checkpoint`, `reason`, `final` (the `final` keys of that evaluation), `trained`, `probes` and
+`seconds`. A failure while re-scoring is kept as `partial.error`.
+
+Every verdict of such a record reads `failed: <reason> @ <step> (from step X: <the rule on the kept
+checkpoint>)`: still a failure, never a pass and never a finding. Rules can read the kept checkpoint directly with
+`partial:<final key>` (for example `partial:split/later/accuracy`) and `partial:from_step`. The report's failure
+cell adds `; partial from step X (dev <acc>)`.
+
+For a run stored before P1.16 that left a dump but no checkpoint (exp 189), `probe-rerun --exp N --weights dump`
+gives the dump's parameters their probes and the dev evaluation with the split, as evidence (nothing is written to
+the database).
+- **Exp 189's dump** (step 5,213) scores dev 0.667 (first queries 0.845, later 0.508). It reads state (v1, v2 and
+  v3's value edit, follow 0.72) and does not bind keys (swap follow 0.007). That is below its 0.755 at step 5,000,
+  because the burst had already cost about 0.09 before the trigger. A checkpoint kept at 5,000 would have kept the
+  better model.
+- **Exp 193's dump** (step 818) is at chance (0.025).
+
+### route-check: does routing follow the key?
+
+`python -m hsn.experiments route-check --exp N [--split dev|train] [--n-docs 1000] [--cpu] [--out FILE]`
+(read-only; `python/hsn/experiments/routing.py`). For a routed model's latest checkpoint it runs every delayed
+document from a fresh state in evaluation mode and compares, for every query, the cells selected at the query
+key's position with those selected at the asked fact's key position (`o_key`) and value position (`o_val`),
+against the document's other facts (`o_other_*`). `d_key` and `d_val` are the differences, with 95 % bootstrap
+CIs over documents. The key-swap control uses probe v3's swap documents: routing that follows the key follows it
+to its new position (`d_swap`).
+
+Verdict (thresholds of the diagnostic, not frozen metrics): `follows the key` when a CI's lower bound is at least
+half a cell (0.5 / K) and the swap control agrees; `weakly key-dependent` when a CI excludes 0; else `does not
+follow the key`. `--split train` reads the first training documents instead (keys seen in training, in-sample),
+so that "follows trained keys" and "follows keys never seen" can be told apart. A dense model is refused.
+
+**On the stored top-K runs** (8 Nov; their step-9,000 checkpoints; K = 4, so the threshold is 0.125):
+
+| exp | scorer | split | o_key | o_val | o_other | d_key [95 % CI] | d_val [95 % CI] | d_swap | verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 196 | linear | dev | 0.41 | 0.57 | 0.51 | −0.140 [−0.166, −0.115] | −0.004 [−0.025, +0.017] | −0.081 | does not follow the key |
+| 196 | linear | train | 0.36 | 0.52 | 0.46 | −0.142 [−0.167, −0.117] | −0.022 [−0.044, −0.001] | −0.071 | does not follow the key |
+| 197 | linear | dev | 0.33 | 0.35 | 0.34 | −0.027 [−0.047, −0.006] | −0.013 [−0.037, +0.011] | −0.098 | does not follow the key |
+| 198 | linear | dev | 0.33 | 0.26 | 0.39 | −0.091 [−0.110, −0.072] | −0.002 [−0.026, +0.021] | +0.031 | does not follow the key |
+| 202 | mlp | dev | 0.36 | 0.48 | 0.42 | −0.085 [−0.107, −0.064] | +0.007 [−0.014, +0.028] | −0.075 | does not follow the key |
+| 202 | mlp | train | 0.33 | 0.46 | 0.38 | −0.077 [−0.098, −0.057] | +0.012 [−0.009, +0.033] | −0.079 | does not follow the key |
+| 203 | mlp | dev | 0.09 | 0.06 | 0.10 | −0.015 [−0.027, −0.003] | +0.008 [−0.002, +0.019] | +0.018 | does not follow the key |
+| 203 | mlp | train | 0.08 | 0.05 | 0.10 | −0.011 [−0.024, +0.001] | +0.004 [−0.007, +0.015] | −0.000 | does not follow the key |
+
+- **No run routes by key,** neither on the dev keys nor on the trained keys in-sample, and the mlp scorer does not
+  change that.
+- **The cells follow the query's position, not its key.** `d_key` is negative: a query overlaps less with its
+  fact's key position than with the other facts' positions. The swap control is negative or about 0: when the key
+  moves, the query's cells stay with its old position.
+- **Refresh probes** fill 15 to 28 % of the slots.
+
+### Recipes
+
+New HSN specs start from `configs/experiments/hsn_recipe_b095.yaml` (P1.16, the user's decision of 8 Nov): HSN
+d=64 + A4 (`model.cand_norm=rms`), delayed/in_range, B32, WSD 0.2 over 9,000 steps at lr 2e-3, warm-up 200, clip
+1.0, the spike guard at 1e4 and **AdamW β2 0.95**.
+
+```yaml
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml
+  overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead]
+```
+
+- With these two overrides it resolves to exp 194's configuration exactly, so its arms have exp 194's arm id
+  (arm ids hash the resolved configuration, not the file).
+- β2 0.95 made the lr 2e-3 recipe reliable (exps 194 and 195: reads state, no burst, onset by step 1,000 to
+  1,500; β2 0.999: 2 of 5).
+- **gru_2m's two bars** (the user's decision, 8 Nov):
+  - the final-score bar is gru_2m at 5e-4 with β2 0.999 (0.793, exp 154). At that lr β2 0.95 had no effect
+    (exps 199 to 201: 0.771 / 0.776 / 0.787);
+  - the learning-speed bar is gru_2m at 2e-3 with β2 0.95: dev ≥ 0.6 by step 2,500 to 3,000 in 2 of 3 runs
+    (exps 204 to 206: final 0.786 and 0.776; one stayed at chance, with no burst).
+- `train.betas`' default, `configs/ref_a1.yaml`, `g1_ref_a1.yaml` and the baselines are unchanged. A recipe file
+  is never edited once a spec uses it: a new recipe gets a new file.
+
 ## Rules
 
 Rules are written in the spec before any run, and `enqueue` stores them in the database. They are experiment
@@ -464,7 +683,9 @@ are never changed here.
   - `probe_v3:<key>` (P1.15, reads_state version 3), e.g. `correct_later_n`, `vocab_size`, `value/correct_n`,
     `value/follow_frac`, `value/unchanged_frac`, `swap/correct_n`, `swap/follow_frac`, `swap/unchanged_frac`;
   - `overfit:<key>`;
-  - `final:<key>`;
+  - `final:<key>`; P1.16: `final:rollbacks` (`None` with the rollback off);
+  - `partial:<key>` (P1.16): the same keys of a failed arm's re-scored kept checkpoint, and `partial:from_step`;
+    missing when there is none;
   - `verdict:<rule>`, another rule's label.
 
 **Step selection.** `steps` selects samples: `{at: n}`, or `{from, to, every}` (multiples of `every`). Steps the
@@ -501,9 +722,31 @@ first case that holds gives the label, the default otherwise. Special results:
 | `reads_state_v2` | P1.14: the same thresholds over probe v2's matched documents answered correctly before the edit, after `no matched probes` (0) and `too few matched probes` (< `min_correct`, 20). P1.15: `min_vocab: 20` adds `vocabulary too small` after `no matched probes` (absent: the expansion is P1.14's). Needs reads_state version 2 | every family |
 | `reads_state_v3` | P1.15: probe v3's value edit over the correct later queries: `no correct later queries`, `vocabulary too small` (< `min_vocab`, 20), `too few correct later queries` (< `min_correct`, 20), then v1's thresholds labelled `reads state (later queries)`, `does not read state (later queries)`, `partial (later queries)`. Needs version 3 | every family |
 | `binds_keys` | P1.15: probe v3's key swap: `no swap probes`, `too few swap probes` (< `min_correct`, 20), `binds keys` (follow ≥ 0.5 and unchanged ≤ 0.1), `does not bind keys` (follow < 0.2), `partial`. Needs version 3 | every family |
+| `memory_writes_run` | P1.16: `writes` when some sliding window `[s - window, s + window]` (centres `s` at the multiples of `every`, 500, from `from_step`, 500, to `to_step`, required; `window` 250) has a median `gate_key` (`gate/p90`, the written gates' 90th percentile) ≥ `gate_min` (0.095), **and** some window has a median `update_ratio/cell` ≥ `update_ratio_min` (0.0027), each with `min_samples` (3); else `no writes`. Also `gate_key` (`gate/p90`, `gate/p50`, `gate/mean`, `gate/write_rate`) and `agg`. Reads the late and top-K learners that `memory_writes`' one early window misses. Calibrated below | hsn |
 | `memory_writes` | P1.15: `writes` when, over the diagnostics in `[from_step, to_step]` (1,000 to 1,500), the median `gate/write_rate` ≥ `write_rate_min` (0.025) and the median `update_ratio/cell` ≥ `update_ratio_min` (0.001), each window with `min_samples` (3); else `no writes`. Parameters also `agg`. Provisional (see the caveat below) | hsn |
 | `memory_open` | gate p50 ≥ 0.01 and `grad_share/cell` ≥ 0.01 at every multiple of 500 from step 500 (as registered for queue9). Parameters: `from_step`, `to_step`, `every`, `agg`, `gate_p50_min`, `cell_share_min`, `window` (with `to_step`: the median over ±window at each multiple), `min_samples` (P1.14) | hsn |
 | `cells_apart` | `rank_pr/answer` ≥ 2.0 and `diversity_live/answer` ≥ 0.2 on the trained model | hsn |
+
+**`memory_writes_run` calibration** (8 Nov 2026, the 34 stored HSN reads_state runs with write diagnostics,
+read-only; `evidence/P1.16/calibration/`). A run is a learner when its v1 or v3 verdict reads state (16 runs),
+dead when its final dev accuracy is at most 0.05 and it does not read state (9 runs):
+
+| rule (each median over a sliding window with 3 samples) | learners "writes" | dead "no writes" |
+| --- | --- | --- |
+| P1.16 default: some window `gate/p90` ≥ 0.095, and some window `update_ratio/cell` ≥ 0.0027 | 16 of 16 | 9 of 9 |
+| the same, both in one window | 13 of 16 (misses top-K 198, 202, 203) | 9 of 9 |
+| some window `gate/write_rate` ≥ 0.02 and some window ratio ≥ 0.0027 | 14 of 16 (misses top-K 198, 203) | 9 of 9 |
+| `memory_writes` (median write rate ≥ 0.025 and ratio ≥ 0.001 over 1,000 to 1,500) | misreads 190, 196, 198 | |
+
+- **Why not the write rate.** It cannot separate top-K runs: learner exp 198 peaks at 0.009, while dead exp 192
+  reaches 0.017. The written gates' 90th percentile does: top-K learners reach 0.10 to 0.57 and dead top-K runs at
+  most 0.088.
+- **Why separate windows.** The mlp-scorer learners (exps 202, 203) open their gates early (step 500) and their
+  cell's update ratio grows later (1,500 to 2,000).
+- **Thin margins.** Dead exp 192's p90 is 0.088 against learner exp 198's 0.102. Dead exp 171's update ratio is
+  0.0024 against learner exp 173's 0.0029.
+- Like `memory_writes`'s, the update-ratio threshold is calibrated for lr of about 1e-3 to 3e-3.
+- For a cadence of 500, set `window: 500` so that each window holds three diagnostics.
 
 **`memory_writes` caveat.** Its thresholds come from the 16 stored runs that record the write rate (exps 128 to
 174), and the margins are thin: exp 174, a dead run, writes at 0.0275 against the 0.025 threshold, and the

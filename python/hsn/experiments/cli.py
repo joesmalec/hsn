@@ -15,10 +15,15 @@
              [--imported | --no-imported] [--per-seed] [--format md|csv] [--out FILE]
     import   --audit-dir DIR [--dry-run]
     probe-check --exp N [--batch-rows 64]
-    probe-rerun --exp N [--cpu] [--batch-rows N] [--out FILE]   v1 vs the stored probes, then v2
+    probe-rerun --exp N [--cpu] [--batch-rows N] [--weights checkpoint|dump] [--key-alphabet train]
+             [--out FILE]   v1 vs the stored probes, then v2, v3 and the split (P1.16: read-only)
     split-backfill [--exp N ...] [--recompute] [--cpu] --out FILE   (P1.15; read-only database)
     replay   --dump FILE | --exp N [--eager | --compiled] [--no-deterministic] [--repeats 2]
              [--cpu] [--out FILE]      (P1.15: the divergence dump's step again)
+             [--continue-steps N [--spike-factor F] [--rollback-every N] [--rollback-skip N]
+             [--rollback-lr-mult F] [--rollback-lr-steps N] [--rollback-max N]]   (P1.16)
+    route-check --exp N [--split dev|train] [--n-docs 1000] [--cpu] [--batch-rows 64] [--out FILE]
+             (P1.16: does routing follow the key; read-only)
     run-arm  --db DB --exp N --root ROOT       (the worker's child; not for direct use)
 
 Every command takes ``--db`` (default ``$HSN_EXPERIMENTS_DB`` or
@@ -132,6 +137,26 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--exp", type=int, required=True)
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
     p.add_argument("--batch-rows", type=int, default=None, help="default: the run's probe_batch")
+    p.add_argument(
+        "--weights",
+        choices=("checkpoint", "dump"),
+        default="checkpoint",
+        help="P1.16: the last checkpoint, or the divergence dump (a run that failed without one)",
+    )
+    p.add_argument(
+        "--key-alphabet",
+        choices=("train",),
+        default=None,
+        help="P1.16: dev keys remapped to training keys 64-79 (a diagnostic, not a metric)",
+    )
+    p.add_argument("--out", default=None)
+
+    p = sub.add_parser("route-check", help="does routing follow the key (P1.16; read-only)")
+    p.add_argument("--exp", type=int, required=True)
+    p.add_argument("--split", choices=("dev", "train"), default="dev")
+    p.add_argument("--n-docs", type=int, default=1000)
+    p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
+    p.add_argument("--batch-rows", type=int, default=64)
     p.add_argument("--out", default=None)
 
     p = sub.add_parser("replay", help="replay a divergence dump's step (P1.15)")
@@ -145,6 +170,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32 (approximate)")
     p.add_argument("--out", default=None)
+    # P1.16: keep training past the dumped step, with a remedy set on the resumed trainer
+    p.add_argument("--continue-steps", type=int, default=0)
+    p.add_argument("--spike-factor", type=float, default=None)
+    p.add_argument("--rollback-every", type=int, default=None)
+    p.add_argument("--rollback-skip", type=int, default=0)
+    p.add_argument("--rollback-lr-mult", type=float, default=1.0)
+    p.add_argument("--rollback-lr-steps", type=int, default=0)
+    p.add_argument("--rollback-max", type=int, default=5)
 
     p = sub.add_parser("run-arm", help=argparse.SUPPRESS)
     p.add_argument("--exp", type=int, required=True)
@@ -482,8 +515,15 @@ def cmd_probe_check(args: argparse.Namespace) -> int:
 def cmd_probe_rerun(args: argparse.Namespace) -> int:
     from hsn.experiments.probe_check import probe_rerun
 
-    db = _db(args)
-    out = probe_rerun(db, args.exp, cpu=args.cpu, batch_rows=args.batch_rows)
+    db = Database(Path(args.db) if args.db else default_db_path(), read_only=True)  # P1.16
+    out = probe_rerun(
+        db,
+        args.exp,
+        cpu=args.cpu,
+        batch_rows=args.batch_rows,
+        weights=args.weights,
+        key_alphabet=args.key_alphabet,
+    )
     text = json.dumps(out, indent=1, default=str)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
@@ -528,8 +568,48 @@ def cmd_replay(args: argparse.Namespace) -> int:
             print(f"error: experiment {args.exp} has no divergence dump", file=sys.stderr)
             return 2
         path = found[0]
+    remedy: dict[str, Any] = {}  # P1.16
+    if args.spike_factor is not None:
+        remedy["spike_factor"] = args.spike_factor
+    if args.rollback_every is not None:
+        remedy["rollback"] = {
+            "every": args.rollback_every,
+            "skip": args.rollback_skip,
+            "lr_mult": args.rollback_lr_mult,
+            "lr_steps": args.rollback_lr_steps,
+            "max_rollbacks": args.rollback_max,
+        }
+    if remedy and not args.continue_steps:
+        print("error: a remedy needs --continue-steps", file=sys.stderr)
+        return 2
     out = replay(
-        path, eager=args.eager, deterministic=args.deterministic, repeats=args.repeats, cpu=args.cpu
+        path,
+        eager=args.eager,
+        deterministic=args.deterministic,
+        repeats=args.repeats,
+        cpu=args.cpu,
+        continue_steps=args.continue_steps,
+        remedy=remedy or None,
+    )
+    text = json.dumps(out, indent=1, default=str)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+    print(text)
+    return 0
+
+
+def cmd_route_check(args: argparse.Namespace) -> int:
+    """P1.16: does routing follow the key (hsn.experiments.routing; read-only database)."""
+    from hsn.experiments.routing import route_check
+
+    db = Database(Path(args.db) if args.db else default_db_path(), read_only=True)
+    out = route_check(
+        db,
+        args.exp,
+        split=args.split,
+        n_docs=args.n_docs,
+        cpu=args.cpu,
+        batch_rows=args.batch_rows,
     )
     text = json.dumps(out, indent=1, default=str)
     if args.out:
@@ -559,6 +639,7 @@ COMMANDS = {
     "probe-rerun": cmd_probe_rerun,
     "split-backfill": cmd_split_backfill,
     "replay": cmd_replay,
+    "route-check": cmd_route_check,
     "run-arm": cmd_run_arm,
 }
 

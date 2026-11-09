@@ -34,6 +34,17 @@ regenerated windows against the stored ones (they must be equal), the raw per-pa
 norms (a hook before the clipping) and, eager, the RMS of ``model.cell.cand_norm``'s input (the
 near-zero pre-norm hypothesis of exp 171). ``cpu=True`` replays a CUDA dump on ``profile:cpu`` in
 fp32 (approximate: another device and dtype; the CUDA generators are not restored).
+
+**Continuation (P1.16).** ``continue_steps=N`` keeps training N steps past the dumped one, from the
+same resume, with a ``remedy`` set on the resumed trainer as attributes (so the configuration and
+its hash stay the dump's, which ``resume`` checks): ``spike_factor`` (the guard's factor; its
+history is the dump's) and ``rollback`` (a :class:`hsn.train.rollback.RollbackPolicy`'s fields; the
+first snapshot is the dumped state itself, taken right after the resume, so a rollback there
+restores the dump). It reports every continued step's loss, pre-clip norm and the guard's decision,
+the rollbacks, and the error that stopped the continuation, if any (P1.12's stop rule, P1.16's
+rollback limit). A dump holds only the state at its trigger's step before, inside the burst; whether
+that state recovers is what a continuation shows (a rollback of N steps needs a run's own
+snapshots).
 """
 
 from __future__ import annotations
@@ -261,6 +272,38 @@ def _windows_equal(a: Mapping[str, Tensor], b: Mapping[str, Tensor]) -> bool:
     return set(a) == set(b) and all(torch.equal(a[k], b[k]) for k in a)
 
 
+def _continuation(trainer: Any, step: int, history: Any, stopped: str | None) -> dict[str, Any]:
+    """P1.16: what one continuation from the dumped ``step`` did (module docstring,
+    "Continuation"); ``history`` is the fit's (its steps so far when the fit raised)."""
+    decisions = {int(s["step"]): str(s["reason"]) for s in trainer.skipped_steps}
+    records = [r for r in (history.steps if history is not None else []) if int(r.step) >= step]
+    steps = [
+        {
+            "step": int(r.step),
+            "loss": _number(float(r.loss)),
+            "grad_norm": _number(float(r.grad_norm)),
+            "lr": float(r.lr),
+            "decision": decisions.get(int(r.step), "applied"),
+        }
+        for r in records
+    ]
+    applied = [
+        float(r.grad_norm)
+        for r in records
+        if int(r.step) not in decisions and math.isfinite(float(r.grad_norm))
+    ]
+    tail = applied[-50:]
+    return {
+        "reached_step": int(trainer.step),
+        "stopped": stopped,
+        "rollbacks": [dict(e) for e in getattr(trainer, "rollbacks", [])],
+        "skipped": [dict(s) for s in trainer.skipped_steps if s.get("reason") != "rollback"],
+        "applied_steps": len(applied),
+        "applied_norm_median_last50": float(sorted(tail)[len(tail) // 2]) if tail else None,
+        "steps": steps,
+    }
+
+
 def replay(
     dump: str | Path,
     *,
@@ -269,18 +312,31 @@ def replay(
     repeats: int = 2,
     cpu: bool = False,
     train_ds: Any = None,
+    continue_steps: int = 0,
+    remedy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay the dumped step (module docstring). ``eager`` None runs as the dump's run did
     (compiled when it was); ``train_ds`` defaults to the configuration's training data (truncated
-    to the dump's loader, as the harness's ``n_train`` did)."""
+    to the dump's loader, as the harness's ``n_train`` did). P1.16: ``continue_steps`` and
+    ``remedy`` (module docstring, "Continuation")."""
     from hsn.config import RunConfig, load_hardware_profile
     from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything, set_deterministic
     from hsn.runner import build_model, load_datasets, make_trainer
     from hsn.train.loop import StreamLoader
+    from hsn.train.rollback import RollbackPolicy
 
     if repeats < 1:
         raise ValueError(f"repeats must be >= 1, got {repeats}")
+    if continue_steps < 0:
+        raise ValueError(f"continue_steps must be >= 0, got {continue_steps}")
+    remedy = dict(remedy or {})
+    unknown = set(remedy) - {"spike_factor", "rollback"}
+    if unknown or (remedy and not continue_steps):
+        raise ValueError(
+            f"remedy {sorted(remedy)}: only spike_factor and rollback, with continue_steps > 0"
+        )
+    policy = RollbackPolicy(**remedy["rollback"]) if remedy.get("rollback") else None
     if deterministic:
         # cuBLAS reads its workspace setting when it first runs; set it before anything does (the
         # trainer's set_deterministic(False) then leaves it alone: it removes only its own)
@@ -342,6 +398,11 @@ def replay(
                 if deterministic:
                     set_deterministic(True)
                 trainer.resume(resume_from)
+                if "spike_factor" in remedy:  # P1.16: the remedy, after the resume's hash check
+                    trainer.spike_factor = float(remedy["spike_factor"])
+                if policy is not None:
+                    trainer.rollback = policy
+                    trainer.take_rollback_snapshot()  # the dumped state: the first snapshot
                 raw: dict[str, float | str] = {}
 
                 def grad_hook(t: Any, raw: dict[str, float | str] = raw) -> None:
@@ -349,9 +410,25 @@ def replay(
                         if p.grad is not None:
                             raw[name] = _number(float(torch.linalg.vector_norm(p.grad.float())))
 
-                trainer.grad_hook = grad_hook
                 rms: list[float] = []
                 handle = None
+                if continue_steps:  # P1.16: no per-step hooks (each would read every gradient)
+                    seen: list[Any] = []
+
+                    def keep(t: Any, h: Any, seen: list[Any] = seen) -> bool:
+                        if not seen:
+                            seen.append(h)  # the fit's history, kept if the fit raises
+                        return False
+
+                    stopped: str | None = None
+                    try:
+                        trainer.fit(train_ds, dev, step + continue_steps, callback=keep)
+                    except RuntimeError as exc:  # P1.12's stop rule or the rollback limit
+                        stopped = f"{type(exc).__name__}: {exc}"
+                    runs.append(_continuation(trainer, step, seen[0] if seen else None, stopped))
+                    torch._dynamo.reset()
+                    continue
+                trainer.grad_hook = grad_hook
                 cand = getattr(getattr(model, "cell", None), "cand_norm", None)
                 if (
                     not compiled
@@ -387,8 +464,27 @@ def replay(
             torch._dynamo.reset()
     finally:
         tmp.cleanup()
-    first = runs[0]
     recorded = info["grad_norm"]
+    if continue_steps:
+        return {
+            "dump": str(path),
+            "step": step,
+            "kind": info["kind"],
+            "recorded": {"loss": info.get("loss"), "grad_norm": recorded},
+            "device": str(ctx.device),
+            "compiled": compiled,
+            "deterministic": deterministic,
+            "windows_match": windows_match,
+            "continue_steps": continue_steps,
+            "remedy": {
+                "spike_factor": remedy.get("spike_factor"),
+                "rollback": dataclasses.asdict(policy) if policy is not None else None,
+            },
+            "continuations": runs,
+            "notes": notes,
+            "git_rev_dump": info.get("git_rev"),
+        }
+    first = runs[0]
     return {
         "dump": str(path),
         "step": step,

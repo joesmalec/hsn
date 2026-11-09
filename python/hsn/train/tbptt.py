@@ -141,6 +141,12 @@ window loop::
   the compiled backward, so no device synchronisation and nothing changes in the captured graphs;
   ``stats["skipped_spike"]`` counts them (only with the guard on).
 
+* **Rollback (P1.16).** With ``train.rollback_every`` set, a step the guards would skip rolls back
+  to the older of two in-memory snapshots instead (:mod:`hsn.train.loop`, "Rollback";
+  :mod:`hsn.train.rollback`): restored in place, so the compiled window's CUDA Graphs keep their
+  inputs; the next window starts fresh documents in every row, so the carried state resets there
+  (and P1.10d's cut check holds). ``stats["rollbacks"]`` counts them (only with the rollback on).
+
 * **Non-finite gradients (P1.12).** Without a loss scaler, a step whose global gradient norm is not
   finite is skipped by the generic trainer's guard (:mod:`hsn.train.loop`, "Non-finite gradients"):
   gradients zeroed, no optimiser step (LazyAdamW's per-unit steps included), the scheduler and
@@ -795,6 +801,7 @@ class TBPTTTrainer(Trainer):
                 self.scheduler.step()
                 self.hsn.update_target()
             self.step = next_step
+            self._rollback_after_step(loader, skipped)  # P1.16
             active_ids = None if active is None else active.nonzero().flatten().tolist()
             mean_total = total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
@@ -820,6 +827,8 @@ class TBPTTTrainer(Trainer):
                 "skipped_nonfinite": float(self.skipped_nonfinite),  # P1.12: the count so far
                 # P1.15: the spike guard's count so far (only with train.spike_factor set)
                 **({"skipped_spike": float(self.skipped_spike)} if self.spike_factor else {}),
+                # P1.16: the rollbacks so far (only with train.rollback_every set)
+                **({"rollbacks": float(len(self.rollbacks))} if self.rollback else {}),
                 **{key: value / n_windows for key, value in rate_sums.items()},
                 **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
                 **(probe_counts if self.counterfactual else {}),
@@ -866,7 +875,7 @@ class TBPTTTrainer(Trainer):
                     " ".join(f"{k} {v:.4f}" for k, v in result.items() if isinstance(v, float)),
                 )
             saved = False
-            if self.step % train.ckpt_every == 0 or self.step == steps:
+            if self.step % train.ckpt_every == 0 or self.step == steps or self._kept_step():
                 path = self.save(self.run_dir, loader, state)
                 history.checkpoints.append(str(path))
                 saved = True
@@ -898,6 +907,7 @@ class TBPTTTrainer(Trainer):
             ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
             **self._spike_measured(),  # P1.15
+            **self._rollback_measured(),  # P1.16
         }
         return history
 

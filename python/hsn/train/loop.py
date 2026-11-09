@@ -25,7 +25,9 @@ the end the dev set is evaluated (:func:`hsn.eval.evaluate.evaluate_windows`); e
 ``train.ckpt_every`` steps and at the end a checkpoint is written to ``run_dir``
 (``runs/<run_id>`` unless given). ``fit``
 returns a :class:`History` with one record per step, every evaluation, the model's parameter
-report and the *measured* numbers the run manifest needs (plan §0.5: measured, not assumed).
+report and the *measured* numbers the run manifest needs (plan §0.5: measured, not assumed). P1.16:
+:attr:`Trainer.extra_ckpt_every` (a harness setting, ``None`` by default) writes a checkpoint at its
+multiples too.
 
 **Schedules.** The learning-rate factor of step ``s`` (``LambdaLR``'s count of scheduler steps, so
 optimiser step ``k`` trains at the factor of ``k - 1``) is ``(s + 1) / warmup_steps`` during the
@@ -108,6 +110,24 @@ optimiser and scheduler as they still are, as a checkpoint-format dump in ``run_
 training changes: the snapshot only reads. :attr:`Trainer.grad_hook` (``None``; the replay's) is
 called after a step's backward, before the clipping.
 
+**Rollback (P1.16).** With ``train.rollback_every`` set (``None``, the default, keeps today's
+training) a step the guards above would skip rolls back instead, once a snapshot exists
+(:mod:`hsn.train.rollback`): every ``rollback_every`` steps, after an applied optimiser step, the
+trainer copies the parameters, buffers, optimiser state and spike history into a ring of two
+in-memory snapshots; a trigger (P1.15's dump written first, as for a skip) restores the **older**
+snapshot in place (the CUDA Graphs of P2.8 keep their input addresses), discards
+``train.rollback_skip`` steps' worth of windows, makes every loader row start a fresh document (the
+carried state resets at the next window's ``reset``) and trains at ``lr * train.rollback_lr_mult``
+for ``train.rollback_lr_steps`` steps. The step clock, the scheduler and the generators keep
+running; the trigger step is listed in :attr:`Trainer.skipped_steps` with reason ``rollback`` and
+in :attr:`Trainer.rollbacks` with what was restored. A rollback is not a skip (decision Q2 = A of
+8 Nov 2026): it does not count in P1.12's stop rule and resets its run of consecutive skips; its
+own limit is ``train.rollback_max`` (the run raises a :class:`RuntimeError` naming
+:data:`ROLLBACK_LIMIT` at the ``rollback_max + 1``-th trigger). A trigger before the first snapshot
+is P1.15's skip and counts as one. The count is ``History.measured["rollbacks"]`` and, with the
+learning-rate cut, part of the checkpoint (the snapshots are not: a resumed run re-arms at its next
+multiple of ``rollback_every``). Refused under an fp16 ``GradScaler``.
+
 **Optimiser (P2.6).** ``train.optimizer=adamw`` builds ``torch.optim.AdamW`` with weight decay on
 the tensors of ``ndim >= 2`` and none on the rest; ``train.optimizer=lazy_adamw`` builds the same
 groups as a :class:`~hsn.train.lazy_adam.LazyAdamW` with the unit bank's stacked tensors in unit
@@ -169,11 +189,13 @@ from hsn.train.checkpoint import (
 )
 from hsn.train.divergence import StepSnapshot, persistent_buffers, write_dump
 from hsn.train.lazy_adam import build_lazy_adamw, cell_parameters
+from hsn.train.rollback import RollbackPolicy, SnapshotRing
 
 __all__ = [
     "NONFINITE_MAX_CONSECUTIVE",
     "NONFINITE_MAX_FRACTION",
     "NONFINITE_MIN_SKIPS",
+    "ROLLBACK_LIMIT",
     "SCHEDULES",
     "SPIKE_MIN_HISTORY",
     "SPIKE_WINDOW",
@@ -217,6 +239,9 @@ SPIKE_WINDOW = 100
 #: The guard decides once it has seen min(SPIKE_MIN_HISTORY, window) applied norms (the warm-up's
 #: first steps fall fast: exp 171 went from 4.2 to 0.4 in ten steps).
 SPIKE_MIN_HISTORY = 20
+
+#: P1.16: the rollback limit's message names this (the harness's failure kind ``rollback``).
+ROLLBACK_LIMIT = "P1.16 rollback limit"
 
 
 def spike_decision(
@@ -406,6 +431,12 @@ class StreamLoader:
                     )
             self._rows.append(row)
 
+    def drop_documents(self) -> None:
+        """P1.16: every row drops the rest of its current document, so the next window starts a
+        fresh document in every row at ``t = 0`` (with its ``reset``); the epoch's permutation and
+        cursor are unchanged (the dropped documents' remainders are never emitted)."""
+        self._rows = [_Row() for _ in range(self.batch)]
+
     def __iter__(self) -> Iterator[Batch]:
         return self
 
@@ -561,8 +592,21 @@ class Trainer:
                 type(self.model).__name__,
             )
         self.optimizer = self._make_optimizer()
+        # P1.16: the rollback (train.rollback_*; None: off) and its learning-rate cut, which the
+        # scheduler's factor reads (no cut until a rollback sets one)
+        self.rollback: RollbackPolicy | None = RollbackPolicy.from_config(train)
+        self._lr_cut_until = 0
+        self._lr_cut_mult = 1.0
         self.scheduler = self._make_scheduler()
         self.scaler = make_grad_scaler(ctx)
+        if self.rollback is not None and self.scaler is not None:
+            raise NotImplementedError(
+                f"train.rollback_every={self.rollback.every} under an fp16 GradScaler: the scaler "
+                "skips steps itself and the rollback's guards are not defined there"
+            )
+        self._ring: SnapshotRing | None = None  # P1.16: built at the first snapshot
+        self.rollbacks: list[dict[str, Any]] = []  # P1.16: every rollback, in order
+        self._rollback_windows: int | None = None  # P1.16: windows to discard after a rollback
         self.step = 0
         # P1.12: optimiser steps skipped by the non-finite-gradient guard, and the current run of
         # consecutive ones (the stop rule's)
@@ -596,6 +640,9 @@ class Trainer:
         # P1.15: labels of evaluate()'s loss positions (the reads-state harness's query slots,
         # hsn.experiments.split); a harness setting, not config. None: today's evaluation
         self.eval_position_groups: PositionGroups | None = None
+        # P1.16: an extra checkpoint every this many steps (the harness's protocol keep_every); a
+        # harness setting, not config (train.ckpt_every is unchanged). None: none
+        self.extra_ckpt_every: int | None = None
 
     # construction ----------------------------------------------------------------------------
 
@@ -671,7 +718,13 @@ class Trainer:
                 return 1.0 - progress
             return 1.0
 
-        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, factor)
+        def cut(step: int) -> float:  # P1.16: the rollback's learning-rate cut (none by default)
+            value = factor(step)
+            if step < self._lr_cut_until:
+                value *= self._lr_cut_mult
+            return value
+
+        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, cut)
 
     def _segment(self, name: str, tokens: int = 0) -> AbstractContextManager[object]:
         if self.profiler is None:
@@ -695,6 +748,9 @@ class Trainer:
             return False
         self._on_skip(step, "nonfinite", grad_norm)  # P1.15: the dump, before the zeroing
         self.optimizer.zero_grad(set_to_none=True)
+        if self._can_roll_back():  # P1.16: a rollback, not a skip
+            self._roll_back(step, "nonfinite", grad_norm, None)
+            return True
         self.skipped_nonfinite += 1
         self._skip_streak += 1
         self.skipped_steps.append(
@@ -725,6 +781,9 @@ class Trainer:
             return False
         self._on_skip(step, "spike", grad_norm)  # the dump, before the zeroing
         self.optimizer.zero_grad(set_to_none=True)
+        if self._can_roll_back():  # P1.16: a rollback, not a skip
+            self._roll_back(step, "spike", grad_norm, median)
+            return True
         self.skipped_spike += 1
         self._skip_streak += 1
         self.skipped_steps.append(
@@ -743,6 +802,98 @@ class Trainer:
         )
         self._stop_rule(step)
         return True
+
+    # P1.16: rollback -------------------------------------------------------------------------
+
+    def _can_roll_back(self) -> bool:
+        """A trigger rolls back when the rollback is on and a snapshot exists."""
+        return self.rollback is not None and self._ring is not None and len(self._ring) > 0
+
+    def take_rollback_snapshot(self) -> None:
+        """Copy the current training state into the rollback ring (:mod:`hsn.train.rollback`);
+        the fit loop calls it every ``rollback.every`` applied steps, a replay after a resume."""
+        if self.rollback is None:
+            raise RuntimeError("take_rollback_snapshot without a rollback policy")
+        if self._ring is None:
+            self._ring = SnapshotRing(self.model, self.optimizer)
+        self._ring.take(self.step, self._spike_history)
+
+    def _roll_back(self, step: int, kind: str, grad_norm: float, median: float | None) -> None:
+        """The rollback of ``step`` (module docstring, "Rollback"): raises at the limit, else
+        restores the older snapshot in place, sets the learning-rate cut and the windows the loader
+        discards before the next step, and records the event."""
+        policy = self.rollback
+        assert policy is not None and self._ring is not None
+        what = "non-finite gradient norm" if kind == "nonfinite" else "gradient spike"
+        if len(self.rollbacks) >= policy.max_rollbacks:
+            raise RuntimeError(
+                f"step {step}: a {what} would be rollback {len(self.rollbacks) + 1}, above "
+                f"train.rollback_max={policy.max_rollbacks}. The run keeps diverging after "
+                "rolling back: stopping "
+                f"({ROLLBACK_LIMIT})"
+            )
+        snap = self._ring.restore()
+        self._spike_history = collections.deque(snap.spike_history, maxlen=self.spike_window)
+        self._skip_streak = 0
+        if policy.lr_steps:
+            self._lr_cut_until = step + policy.lr_steps
+            self._lr_cut_mult = policy.lr_mult
+        windows = policy.skip * self.cfg.train.grad_accum
+        self._rollback_windows = windows
+        norm: float | str = float(grad_norm) if math.isfinite(grad_norm) else repr(grad_norm)
+        event = {
+            "step": int(step),
+            "kind": kind,
+            "grad_norm": norm,
+            "median": median,
+            "restored_step": int(snap.step),
+            "lost_steps": int(step - 1 - snap.step),
+            "windows_skipped": int(windows),
+        }
+        self.rollbacks.append(event)
+        self.skipped_steps.append(
+            {
+                "step": int(step),
+                "reason": "rollback",
+                "trigger": kind,
+                "grad_norm": norm,
+                "median": median,
+                "restored_step": int(snap.step),
+            }
+        )
+        logger.warning(
+            "step %d: %s (gradient norm %s); rolled back to the snapshot of step %d (%d steps "
+            "undone), %d windows discarded, fresh documents%s (rollback %d of at most %d)",
+            step,
+            what,
+            grad_norm,
+            snap.step,
+            step - 1 - snap.step,
+            windows,
+            f", lr x {policy.lr_mult:g} for {policy.lr_steps} steps" if policy.lr_steps else "",
+            len(self.rollbacks),
+            policy.max_rollbacks,
+        )
+
+    def _rollback_after_step(self, loader: StreamLoader, skipped: bool) -> None:
+        """P1.16, after every step: a pending rollback's loader work (discard windows, fresh
+        documents), else the snapshot of an applied step at the cadence."""
+        if self.rollback is None:
+            return
+        if self._rollback_windows is not None:
+            for _ in range(self._rollback_windows):
+                next(loader)
+            loader.drop_documents()
+            self._rollback_windows = None
+            return
+        if not skipped and self.step % self.rollback.every == 0:
+            self.take_rollback_snapshot()
+
+    def _rollback_measured(self) -> dict[str, float]:
+        """``rollbacks`` for ``History.measured``, only with the rollback on."""
+        if self.rollback is None:
+            return {}
+        return {"rollbacks": float(len(self.rollbacks))}
 
     def _stop_rule(self, step: int) -> None:
         """P1.12's stop rule over every skipped step (P1.15: non-finite and spike skips together,
@@ -783,6 +934,9 @@ class Trainer:
         if self.spike_factor is not None:
             out["skipped_spike"] = int(c["skipped_spike"])
             out["spike_history"] = [float(x) for x in c["spike_history"]]
+        if self.rollback is not None:  # P1.16: the events and the learning-rate cut
+            out["rollbacks"] = [dict(r) for r in c["rollbacks"]]
+            out["rollback_lr_cut"] = [int(c["lr_cut"][0]), float(c["lr_cut"][1])]
         return out
 
     def _restore_guard(self, extra: Mapping[str, Any], path: str) -> None:
@@ -815,6 +969,21 @@ class Trainer:
         self.skipped_spike = spikes
         self._spike_history = collections.deque(history, maxlen=self.spike_window)
         self._skip_streak = streak
+        if self.rollback is not None:  # P1.16 (absent: written without the rollback)
+            events = extra.get("rollbacks", [])
+            cut = extra.get("rollback_lr_cut", [0, 1.0])
+            if not isinstance(events, list) or not all(isinstance(e, dict) for e in events):
+                raise ValueError(f"{path}: rollbacks must be a list of event dicts")
+            if (
+                not isinstance(cut, list | tuple)
+                or len(cut) != 2
+                or isinstance(cut[0], bool)
+                or not isinstance(cut[0], int)
+                or not isinstance(cut[1], float | int)
+            ):
+                raise ValueError(f"{path}: rollback_lr_cut must be [until_step, mult]")
+            self.rollbacks = [dict(e) for e in events]
+            self._lr_cut_until, self._lr_cut_mult = int(cut[0]), float(cut[1])
 
     def _loader(
         self, ds: ByteDataset, *, shuffle: bool, epochs: int | None, batch: int | None = None
@@ -992,6 +1161,7 @@ class Trainer:
                     self.optimizer.step()
                 self.scheduler.step()
             self.step += 1
+            self._rollback_after_step(loader, skipped)  # P1.16
             mean_loss = float(loss_sum) / n_loss if n_loss else float("nan")
             accuracy = float(correct) / n_loss if n_loss else float("nan")
             if self.scaler is None and n_loss and not math.isfinite(mean_loss) and not skipped:
@@ -1031,7 +1201,7 @@ class Trainer:
                     " ".join(f"{k} {v:.4f}" for k, v in result.items() if isinstance(v, float)),
                 )
             saved = False
-            if self.step % train.ckpt_every == 0 or self.step == steps:
+            if self.step % train.ckpt_every == 0 or self.step == steps or self._kept_step():
                 path = self.save(self.run_dir, loader, state)
                 history.checkpoints.append(str(path))
                 saved = True
@@ -1054,8 +1224,14 @@ class Trainer:
             "compiled_windows": 0.0,  # P2.8: the generic trainer never compiles
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
             **self._spike_measured(),  # P1.15
+            **self._rollback_measured(),  # P1.16
         }
         return history
+
+    def _kept_step(self) -> bool:
+        """P1.16: whether this step writes a kept checkpoint (:attr:`extra_ckpt_every`)."""
+        every = self.extra_ckpt_every
+        return every is not None and every > 0 and self.step % every == 0
 
     def _spike_measured(self) -> dict[str, float]:
         """P1.15: ``skipped_spike_steps`` for ``History.measured``, only with the guard on (a rule
@@ -1148,6 +1324,8 @@ class Trainer:
             "skip_streak": self._skip_streak,
             "skipped_spike": self.skipped_spike,
             "spike_history": [float(x) for x in self._spike_history],
+            "rollbacks": [dict(r) for r in self.rollbacks],  # P1.16
+            "lr_cut": (self._lr_cut_until, self._lr_cut_mult),
         }
 
     def _snapshot_state(self, state: Any) -> Any:
