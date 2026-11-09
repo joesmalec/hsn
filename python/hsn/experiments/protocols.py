@@ -461,6 +461,7 @@ def _train(
 ) -> dict[str, Any]:
     from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything
+    from hsn.experiments.data_selection import PREFIX, STRATIFIED, cap_dataset, dataset_counts
     from hsn.experiments.diagnostics import Diagnostics, trained_state
     from hsn.experiments.probe import (
         edit_probe,
@@ -487,14 +488,35 @@ def _train(
         )
     ctx = resolve(cfg.hardware)  # raises for a compile mode this checkout cannot run
     train_ds, dev_ds = load_datasets(cfg)
+    full_train, full_dev = train_ds, dev_ds
     if isinstance(params, OverfitParams):
         train_ds = ByteDataset(list(train_ds.examples[: params.n_docs]))
         dev_ds = train_ds
+        train_cap = dev_cap = params.n_docs
+        full_dev = full_train  # overfit deliberately evaluates its own training documents
+        data_policy = PREFIX
     else:
-        if params.n_train:
-            train_ds = ByteDataset(list(train_ds.examples[: params.n_train]))
-        if params.n_dev:
-            dev_ds = ByteDataset(list(dev_ds.examples[: params.n_dev]))
+        train_cap, dev_cap = params.n_train, params.n_dev
+        train_ds = cap_dataset(train_ds, train_cap, seed=cfg.seed)
+        dev_ds = cap_dataset(dev_ds, dev_cap, seed=cfg.seed)
+        data_policy = STRATIFIED
+    data_selection = {
+        "policy": data_policy,
+        "seed": cfg.seed,
+        "train": {
+            "cap": train_cap,
+            "source": "train",
+            "full": dataset_counts(full_train),
+            "effective": dataset_counts(train_ds),
+        },
+        "dev": {
+            "cap": dev_cap,
+            "source": "train" if isinstance(params, OverfitParams) else "dev",
+            "full": dataset_counts(full_dev),
+            "effective": dataset_counts(dev_ds),
+        },
+    }
+    arm.record["data_selection"] = data_selection  # retained if setup or training fails
     seed_everything(cfg.seed)
     model = build_model(cfg)
     variant = install_variant(model, arm.variant, cfg.seed, arm.variant_params)  # before compile
@@ -510,6 +532,7 @@ def _train(
         "variant_params": dict(arm.variant_params),
         "run_id": cfg.run_id,
         "protocol": params.name,
+        "data_selection": {"policy": data_policy, "seed": cfg.seed},
     }
     if isinstance(params, ReadsStateParams):  # P1.15: the first/later split of every evaluation
         from hsn.experiments.split import QuerySlots
@@ -591,6 +614,7 @@ def _train(
         )
     full: dict[str, Any] = {
         "protocol": params.name,
+        "data_selection": data_selection,
         "protocol_version": getattr(params, "version", 1),  # P1.14
         "family": arm.family,
         "variant": variant,

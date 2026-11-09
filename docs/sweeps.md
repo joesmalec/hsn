@@ -311,6 +311,14 @@ keys at all, and stay at the key-blind policy.
 
 **`train_eval`**: train and evaluate, with optional diagnostics and `trained_state`. No probe.
 
+For `train_eval` and `reads_state`, optional `n_train` / `n_dev` caps sample deterministically by
+`run.seed`, stratified over task/variant groups. Every group receives at least one document and the
+remaining budget follows group sizes; a cap smaller than the group count raises. Selected documents
+keep their original relative order. Results carry `data_selection` with the full and effective
+document, token and answer counts per group. Capped arms have a new identity for this policy;
+re-scoring historical records preserves their original prefix selection. Zero still means the full
+split. These caps select existing documents and do not change any frozen shard or split.
+
 **`overfit`**: the G1 overfit recipe. The first `n_docs` (64) training documents are both train and dev, and the
 record gives `first_ge_0.90` and `first_ge_0.99`.
 

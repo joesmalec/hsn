@@ -38,9 +38,12 @@ window loop::
   terms named in ``train.aux_enabled`` come from :func:`hsn.losses.auxiliary_terms` (``cost`` from
   the window's expected cost over the router's dense cost, ``balance`` from the stacked unit logits
   and routed slots, ``graph`` from the cell graph) and enter the assembly as ``extras``; the
-  one-at-a-time rule is the configuration's and the assembly's.
-* **Statistics.** Every :class:`TBPTTStepRecord` carries the λ-weighted loss ``parts`` (mean over
-  the step's windows), the model's own statistics from ``info`` (``state_abs_max`` over the step,
+  one-at-a-time rule is the configuration's and the assembly's. With gradient accumulation the
+  task term averages all supervised positions in the step; auxiliary terms retain their mean
+  over windows, including windows without a supervised answer.
+* **Statistics.** Every :class:`TBPTTStepRecord` carries the λ-weighted loss ``parts`` (the task
+  mean over supervised positions and auxiliary means over windows), the model's own statistics
+  from ``info`` (``state_abs_max`` over the step,
   ``eps_mean`` = mean |ε| and ``alpha_entropy``, means over windows and over the positions each
   window computes: a window cut by P1.10d excludes its all-padding tail) and the global gradient
   norm before clipping. Every ``train.stats_every`` steps (and at the last step) the record
@@ -50,7 +53,11 @@ window loop::
   ``model.r_max = 1``, is not reported), and — P2.4 — ``term_grad_norm/<term>``, the gradient norm
   of every objective term on its own (:func:`hsn.losses.grad_norm_report` on the step's first
   window, before its backward, scaled by the fp16 loss scale when there is one; a term without a
-  gradient path reports 0), and one log line prints all of it.
+  gradient path reports 0), and one log line prints all of it. ``active_param_count`` is the
+  token-weighted mean of logical active parameters per non-padding row/position: full shared
+  modules plus each distinct selected unit, excluding the unused single-round halting head.
+  Soft/dense and fallback positions count every unit. Physical compiled execution can run all
+  units before its gather; the parameter count is not a measurement of that compute.
 * **Checkpoints** are the P0.5 files (model, optimiser, scheduler, step, RNG state of Python,
   NumPy, torch, CUDA and MPS, loader position, loss scaler, config hash) plus the carried cell state
   and the resync counters in ``extra`` (:mod:`hsn.train.checkpoint`); :meth:`resume` restores all
@@ -213,6 +220,7 @@ from hsn.train.probes import (
     ProbeResult,
     cell_utility,
     choose_probe_position,
+    dependency_probe_coverage,
     probe_window,
     utility_predictions,
     window_split,
@@ -273,6 +281,7 @@ class _CompiledEval:
     def __init__(self, model: HSN, window: CompiledWindow) -> None:
         self.model = model
         self.window = window
+        self.cfg = model.cfg
 
     @property
     def training(self) -> bool:
@@ -290,16 +299,25 @@ class _CompiledEval:
         return self.model.init_state(B, device)
 
     def __call__(
-        self, tokens: Tensor, ctx: Tensor, state: CellGraphState, reset: Tensor
+        self,
+        tokens: Tensor,
+        ctx: Tensor,
+        state: CellGraphState,
+        reset: Tensor,
+        *,
+        prev_tokens: Tensor | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
+        if self.cfg.key_address:
+            return self.window(tokens, ctx, state, reset, prev_tokens=prev_tokens)
         return self.window(tokens, ctx, state, reset)
 
 
 @dataclass
 class TBPTTStepRecord(StepRecord):
     """A P0.5 :class:`~hsn.train.loop.StepRecord` (``loss`` is the task cross-entropy over the
-    step's loss positions) plus the P1.7 statistics: ``total`` (the assembled objective, mean over
-    the step's windows), ``parts`` (every λ-weighted term, same mean), ``stats`` (the
+    step's loss positions) plus the P1.7 statistics: ``total`` (the sum of the assembled terms),
+    ``parts`` (the task term averaged over all supervised positions in the step, every other
+    λ-weighted term averaged over its windows), ``stats`` (the
     :data:`STAT_KEYS` every step — over the positions the windows computed, which exclude a
     trailing-padding tail cut by P1.10d — ``window_positions``, the mean number of columns
     computed per window, ``skipped_nonfinite``, the steps skipped so far for a non-finite gradient
@@ -350,6 +368,8 @@ class TBPTTTrainer(Trainer):
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0
+        # A5's previous byte belongs to the stream, not CellGraphState's versioned layout.
+        self._prev_tokens: Tensor | None = None
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
         # P1.10d: the trailing-padding cut (exact in math under dense routing only, to rounding in
@@ -436,10 +456,10 @@ class TBPTTTrainer(Trainer):
             return probe_window(
                 self.hsn,
                 state,
-                {**batch, "split": split},
+                {**batch, "split": split, **self._address_kwargs()},
                 t,
                 n_probe=train.n_probe,
-                horizon=train.probe_horizon,
+                horizon=T - t if train.probe_horizon is None else train.probe_horizon,
                 generator=generator,
             )
 
@@ -457,7 +477,8 @@ class TBPTTTrainer(Trainer):
         that term), since a CUDA-Graph backward is replayed once per forward and cannot take the
         eager path's several retained backwards. The CPU generator is restored around the passes
         (the dense-fallback draw of every pass and of the window itself is the same). The norms
-        equal the eager ones to rounding; the keys come in the eager report's order."""
+        equal the eager ones to rounding; the keys come in the eager report's order. Compiled
+        windows require grad_accum=1, so their task weight is identically one."""
         cfg = self.cfg
         graph = self.hsn.cell.graph
         scale = self.scaler.get_scale() if self.scaler is not None else 1.0
@@ -466,7 +487,11 @@ class TBPTTTrainer(Trainer):
         def objective() -> dict[str, Tensor]:
             torch.set_rng_state(rng)
             logits, _, info = self._forward(
-                dict(fwd), state, window=self._compiled, reset_columns=reset_columns
+                dict(fwd),
+                state,
+                window=self._compiled,
+                reset_columns=reset_columns,
+                **self._address_kwargs(),
             )
             extras = auxiliary_terms(info, cfg, graph, reference_cost=reference_cost)
             terms = assemble_terms({"logits": logits, **info}, fwd, cfg, extras)
@@ -525,6 +550,10 @@ class TBPTTTrainer(Trainer):
 
     # window helpers --------------------------------------------------------------------------
 
+    def _address_kwargs(self) -> dict[str, Tensor | None]:
+        """Only A5 forwards receive a previous byte; legacy call signatures stay unchanged."""
+        return {"prev_tokens": self._prev_tokens} if self.cfg.model.key_address else {}
+
     def _window_cut(self, window: Batch) -> int:
         """The columns of the CPU ``window`` this window computes (P1.10d, module docstring):
         :func:`trailing_cut` under dense routing with ``data.align_docs``, ``T`` otherwise. Raises
@@ -570,6 +599,33 @@ class TBPTTTrainer(Trainer):
         return active_units_from_indices(
             info["unit_idx"], info["valid"], n_units, dense_rows=info["dense_fallback"] > 0
         )
+
+    def _window_parameter_sum(
+        self, info: Mapping[str, Tensor], batch: Batch, tokens: int, report: Mapping[str, int]
+    ) -> float:
+        """Logical active parameters summed over non-padding row/positions.
+
+        Shared modules count their parameter tensors in full (the baseline convention). Each
+        selected unit counts once per row/position, even if several cells use it. Dense/soft and
+        fallback positions count every unit; the dormant single-round halting head is excluded.
+        This is logical routing, not physical MACs: the compiled static unit bank can execute all
+        units before gathering the selected outputs. Profiling measures that physical work.
+        """
+        unused = report["halting"] if self.cfg.model.r_max == 1 else 0
+        full = report["total_trainable"] - unused
+        if "unit_idx" not in info or self.hsn.schedule.gate(self.step) == "soft":
+            return float(full * tokens)
+        units = self.cfg.model.n_units
+        indices, valid = info["unit_idx"], info["valid"]
+        counts = torch.zeros(*indices.shape[:2], units, dtype=torch.int32, device=indices.device)
+        counts.scatter_add_(
+            2, indices.masked_fill(~valid, 0).to(torch.int64), valid.to(torch.int32)
+        )
+        distinct = (counts > 0).sum(dim=-1)
+        distinct = torch.where(info["dense_fallback"] > 0, units, distinct)
+        unit_uses = int(distinct.masked_fill(batch["doc"] < 0, 0).sum())
+        shared = full - report["units"]
+        return float(shared * tokens + (report["units"] // units) * unit_uses)
 
     def _grad_groups(self) -> dict[str, list[nn.Parameter]]:
         """Trainable parameters per top-level submodule (plus ``root`` for direct parameters)."""
@@ -678,11 +734,20 @@ class TBPTTTrainer(Trainer):
         reset_peak(device)
         train_seconds = 0.0
         total_tokens = 0
+        parameter_sum = 0.0
+        parameter_tokens = 0
+        dependency_eligible = 0.0
+        dependency_total = 0.0
         compile_seconds = 0.0  # P2.8: the steps during which a window compiled or recorded
         compile_steps = 0
         while self.step < steps:
             started = time.perf_counter()
             snapshot = self._step_snapshot = self._take_snapshot(loader, state)  # P1.15
+            windows = [next(loader) for _ in range(n_windows)]
+            counts = [int(window["loss_mask"].sum()) for window in windows]
+            step_loss_positions = sum(counts)
+            if snapshot is not None:
+                snapshot.windows.extend(windows)
             next_step = self.step + 1
             stats_step = next_step % train.stats_every == 0 or next_step == steps
             # P2.8: every window runs the compiled window when there is one (a statistics step's
@@ -702,13 +767,23 @@ class TBPTTTrainer(Trainer):
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
             tokens_in_step = 0
+            step_parameter_sum = 0.0
             positions_sum = 0  # P1.10d: the columns the step's windows computed
             active: Tensor | None = None  # P2.6: the units the step's windows executed
-            probe_counts = {"probe_windows": 0.0, "probe_pairs": 0.0, "probe_positions": 0.0}
-            for window_index in range(n_windows):
-                window = next(loader)
-                if snapshot is not None:  # P1.15: the dump keeps the step's CPU windows
-                    snapshot.windows.append(window)
+            probe_counts = {
+                "probe_windows": 0.0,
+                "probe_pairs": 0.0,
+                "probe_positions": 0.0,
+                "probe_dependency_eligible": 0.0,
+                "probe_dependency_total": 0.0,
+            }
+            for window_index, (window, count) in enumerate(zip(windows, counts, strict=True)):
+                if self.counterfactual:
+                    eligible, total_answers = dependency_probe_coverage(
+                        window["loss_mask"], window["dep"], train.probe_horizon
+                    )
+                    probe_counts["probe_dependency_eligible"] += eligible
+                    probe_counts["probe_dependency_total"] += total_answers
                 cut = self._window_cut(window)  # P1.10d: from the CPU window, no device sync
                 positions_sum += cut
                 batch = self._to_device(window)
@@ -734,15 +809,20 @@ class TBPTTTrainer(Trainer):
                         fwd, state, reset_columns, probe, reference_cost
                     )  # P2.8: before the window's own forward pass, from the same start state
                 logits, state, info = self._forward(
-                    fwd, state, window=window_fn, reset_columns=reset_columns
+                    fwd,
+                    state,
+                    window=window_fn,
+                    reset_columns=reset_columns,
+                    **self._address_kwargs(),
                 )
+                if self.cfg.model.key_address:
+                    self._prev_tokens = fwd["tokens"][:, -1].detach().clone()
                 window_active = self._window_active_units(info)
                 if window_active is not None:
                     active = window_active if active is None else active | window_active
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
                 loss_mask = fwd["loss_mask"]
-                count = int(loss_mask.sum())
                 terms = self._routing_terms(terms, info, count)
                 if self.counterfactual:  # P2.3: the utility regression
                     terms = {**terms, "utility": self._utility_term(probe)}
@@ -750,15 +830,23 @@ class TBPTTTrainer(Trainer):
                         probe_counts["probe_windows"] += 1.0
                         probe_counts["probe_pairs"] += float(probe.n_pairs)
                         probe_counts["probe_positions"] += float(probe.positions)
+                raw_task = float(terms["task"].detach()) if n_windows > 1 else None
+                if n_windows > 1:
+                    task_weight = (
+                        n_windows * count / step_loss_positions if step_loss_positions else 0
+                    )
+                    terms = {**terms, "task": terms["task"] * task_weight}
                 total, parts = total_and_parts(terms)
                 if stats_step and window_index == 0 and window_fn is None:  # P2.4: one window
                     scale = self.scaler.get_scale() if self.scaler is not None else 1.0
                     term_norms = grad_norm_report(self.model, terms, scale=scale)
-                tokens_in_step += int((window["doc"] >= 0).sum())
+                window_tokens = int((window["doc"] >= 0).sum())
+                tokens_in_step += window_tokens
+                step_parameter_sum += self._window_parameter_sum(info, fwd, window_tokens, report)
                 if count > 0:
                     flat_targets = fwd["targets"][loss_mask]
                     correct += (logits[loss_mask].float().argmax(dim=-1) == flat_targets).sum()
-                    loss_sum += parts["task"] * count
+                    loss_sum += (parts["task"] if raw_task is None else raw_task) * count
                     n_loss += count
                 total_sum += float(total.detach())
                 for name, value in parts.items():
@@ -793,16 +881,32 @@ class TBPTTTrainer(Trainer):
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
+                applied = not skipped
                 if self.scaler is not None:
+                    # A scaler suppresses optimizer.step itself on overflow. Only an EMA target
+                    # needs this check; fixed targets add no extra device synchronisation.
+                    scale_before = (
+                        self.scaler.get_scale() if self.hsn.ema_target is not None else None
+                    )
                     self.scaler.step(self.optimizer, **step_kwargs)
                     self.scaler.update()
+                    if scale_before is not None:
+                        applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step(**step_kwargs)
                 self.scheduler.step()
-                self.hsn.update_target()
+                if applied:
+                    self.hsn.update_target()
             self.step = next_step
+            if self._rollback_windows is not None:
+                # The rollback discards the current documents; the next stream starts at BOS.
+                self._prev_tokens = None
             self._rollback_after_step(loader, skipped)  # P1.16
             active_ids = None if active is None else active.nonzero().flatten().tolist()
+            parameter_sum += step_parameter_sum
+            parameter_tokens += tokens_in_step
+            dependency_eligible += probe_counts["probe_dependency_eligible"]
+            dependency_total += probe_counts["probe_dependency_total"]
             mean_total = total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
             accuracy = float(correct) / n_loss if n_loss else float("nan")
@@ -824,6 +928,9 @@ class TBPTTTrainer(Trainer):
                 "alpha_entropy": entropy_sum / n_windows,
                 "route_cost": cost_sum / n_windows,
                 "window_positions": positions_sum / n_windows,
+                "active_param_count": step_parameter_sum / tokens_in_step
+                if tokens_in_step
+                else 0.0,
                 "skipped_nonfinite": float(self.skipped_nonfinite),  # P1.12: the count so far
                 # P1.15: the spike guard's count so far (only with train.spike_factor set)
                 **({"skipped_spike": float(self.skipped_spike)} if self.spike_factor else {}),
@@ -885,11 +992,22 @@ class TBPTTTrainer(Trainer):
                 logger.info("stopped by callback at step %d of %d", self.step, steps)
                 break
         self._carried_state = state.detach()
+        # A second fit() must continue the same stream as the carried state and optional byte.
+        self._loader_state = loader.state_dict()
         synchronize(device)
         memory = memory_stats(device)
+        if self.counterfactual and dependency_total and dependency_eligible < dependency_total:
+            logger.warning(
+                "counterfactual probe horizons can cover only %.1f%% of training dependencies "
+                "(%d/%d answers); use train.probe_horizon=null for the remainder of each window "
+                "and a sufficient unroll for cross-window dependencies",
+                100.0 * dependency_eligible / dependency_total,
+                dependency_eligible,
+                dependency_total,
+            )
         history.measured = {
             "param_count": float(report["total_trainable"]),
-            "active_param_count": float(report["total_trainable"]),  # dense: every parameter runs
+            "active_param_count": parameter_sum / parameter_tokens if parameter_tokens else 0.0,
             "peak_bytes": float(memory["peak"]),
             "reserved_bytes": float(memory["reserved"]),
             "tokens_per_s": total_tokens / train_seconds if train_seconds > 0 else 0.0,
@@ -908,6 +1026,17 @@ class TBPTTTrainer(Trainer):
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
             **self._spike_measured(),  # P1.15
             **self._rollback_measured(),  # P1.16
+            **(
+                {
+                    "probe_dependency_eligible": dependency_eligible,
+                    "probe_dependency_total": dependency_total,
+                    "probe_dependency_fraction": (
+                        dependency_eligible / dependency_total if dependency_total else 0.0
+                    ),
+                }
+                if self.counterfactual
+                else {}
+            ),
         }
         return history
 
@@ -949,6 +1078,17 @@ class TBPTTTrainer(Trainer):
             "q_resync": q_resync_counter(c["windows"], c["windows_since_resync"], c["resyncs"]),
             "reinforce_baseline": c["reinforce_baseline"],  # P2.2 (None unless reinforce ran)
             "cut_pending": c["cut_pending"],  # P1.10d: the next window must reset every row
+            **(
+                {
+                    "prev_tokens": (
+                        None
+                        if c["prev_tokens"] is None
+                        else c["prev_tokens"].detach().to(device="cpu", copy=True)
+                    )
+                }
+                if self.cfg.model.key_address
+                else {}
+            ),
             **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
         }
 
@@ -962,6 +1102,15 @@ class TBPTTTrainer(Trainer):
             "resyncs": self.resyncs,
             "cut_pending": self._cut_pending,
             "reinforce_baseline": self.reinforce_baseline,
+            **(
+                {
+                    "prev_tokens": (
+                        None if self._prev_tokens is None else self._prev_tokens.detach().clone()
+                    )
+                }
+                if self.cfg.model.key_address
+                else {}
+            ),
         }
 
     def _snapshot_state(self, state: Any) -> Any:
@@ -999,6 +1148,20 @@ class TBPTTTrainer(Trainer):
         if extra.get("carried_state") is None:
             raise ValueError(f"{path} has no carried cell state (not a TBPTT checkpoint)")
         self._carried_state = unpack_cell_state(extra["carried_state"], self.ctx.device)
+        if self.cfg.model.key_address:
+            if "prev_tokens" not in extra:
+                raise ValueError(f"{path}: an A5 checkpoint must hold prev_tokens")
+            previous = extra["prev_tokens"]
+            if previous is not None:
+                if (
+                    not isinstance(previous, Tensor)
+                    or previous.dtype not in (torch.int32, torch.int64)
+                    or tuple(previous.shape) != (self.cfg.train.batch,)
+                    or not bool(((previous >= 0) & (previous < self.cfg.model.vocab_size)).all())
+                ):
+                    raise ValueError(f"{path}: prev_tokens must be integer bytes [train.batch]")
+                previous = previous.to(self.ctx.device).clone()
+            self._prev_tokens = previous
         if "q_resync" not in extra:
             raise ValueError(f"{path} has no q_resync counters (not a TBPTT checkpoint)")
         counters = check_q_resync(extra["q_resync"], str(path))

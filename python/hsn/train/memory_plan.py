@@ -91,7 +91,7 @@ def _mlp(d_in: int, hidden: int, d_out: int) -> int:
 
 def _scorer_params(m: ModelConfig) -> int:
     """Parameters of one scorer application: ``(3d + 8) -> M``, or via ``scorer_hidden`` for mlp."""
-    d_in = 3 * m.d + SCORER_SCALAR_FEATURES
+    d_in = 3 * m.d + SCORER_SCALAR_FEATURES + (2 if m.key_address else 0)
     if m.scorer == "linear":
         return d_in * m.n_units + m.n_units
     return _mlp(d_in, m.scorer_hidden, m.n_units)
@@ -126,7 +126,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "cand_norm": d if m.cand_norm == "rms" else 0,  # P1.13 (amendment A4)
         "scorer": _scorer_params(m),
         "halting": 2 * d + 1,
-        "decoder": _mlp(2 * d, h, v),
+        "decoder": _mlp((3 if m.selected_readout else 2) * d, h, v),
     }
     rows["total"] = sum(rows.values())
     return rows
@@ -147,7 +147,8 @@ def macs_per_token(m: ModelConfig) -> dict[str, int]:
     unit = params["units"] // m.n_units
     shared = params["encoder"] + params["predictor"] + params["shared"] + params["decoder"]
     per_cell = unit + params["w_out"] + m.in_degree * params["v_msg"] + params["gate"]
-    scorer = m.n_cells * params["scorer"]
+    # A5's fixed code/address dot products are scorer work (global rule 5).
+    scorer = m.n_cells * params["scorer"] + (2 * m.n_cells * m.d if m.key_address else 0)
     return {
         "shared": shared,
         "per_cell": per_cell,
@@ -167,7 +168,7 @@ def activations_per_token(m: ModelConfig) -> dict[str, int]:
     """
     _check_supported(m)
     return {
-        "shared": 4 * m.d + 4 * m.hidden + m.vocab_size,
+        "shared": (5 if m.selected_readout else 4) * m.d + 4 * m.hidden + m.vocab_size,
         "per_cell": 4 * m.d + m.hidden + 3 * m.d,
     }
 

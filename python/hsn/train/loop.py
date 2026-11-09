@@ -18,7 +18,8 @@ resumes at the same window (:func:`hsn.train.checkpoint`).
 **One step** is ``train.grad_accum`` windows: the recurrent state is detached at every window
 start (truncated BPTT), the model applies the ``reset`` flags itself (a document never sees the
 state of the one before it), the loss is next-symbol cross-entropy over the positions where
-``loss_mask`` is True, gradients are clipped to ``train.grad_clip`` (global norm), AMP follows the
+``loss_mask`` is True (every supervised position in the accumulated step has equal weight),
+gradients are clipped to ``train.grad_clip`` (global norm), AMP follows the
 device context (:mod:`hsn.train.amp`), the learning rate follows ``train.schedule`` with
 ``train.warmup_steps`` over the horizon ``train.steps``. Every ``train.eval_every`` steps and at
 the end the dev set is evaluated (:func:`hsn.eval.evaluate.evaluate_windows`); every
@@ -27,7 +28,9 @@ the end the dev set is evaluated (:func:`hsn.eval.evaluate.evaluate_windows`); e
 returns a :class:`History` with one record per step, every evaluation, the model's parameter
 report and the *measured* numbers the run manifest needs (plan §0.5: measured, not assumed). P1.16:
 :attr:`Trainer.extra_ckpt_every` (a harness setting, ``None`` by default) writes a checkpoint at its
-multiples too.
+multiples too. P1.17: repeated calls to ``fit`` retain the loader cursor and carried state, just
+like checkpoint resume. Loader checkpoints fingerprint the ordered dataset; legacy checkpoints
+without the fingerprint remain readable.
 
 **Schedules.** The learning-rate factor of step ``s`` (``LambdaLR``'s count of scheduler steps, so
 optimiser step ``k`` trains at the factor of ``k - 1``) is ``(s + 1) / warmup_steps`` during the
@@ -404,6 +407,7 @@ class StreamLoader:
             "windows": self.windows,
             "windows_total": self.windows_total,
             "n_docs": self.n_docs,
+            "dataset_fingerprint": self.dataset.fingerprint,
             "rows": [[row.doc, row.offset] for row in self._rows],
         }
 
@@ -411,6 +415,11 @@ class StreamLoader:
         if int(state["n_docs"]) != self.n_docs:
             raise ValueError(
                 f"loader state is for {state['n_docs']} documents, dataset has {self.n_docs}"
+            )
+        fingerprint = state.get("dataset_fingerprint")
+        if fingerprint is not None and fingerprint != self.dataset.fingerprint:
+            raise ValueError(
+                "loader dataset fingerprint differs: document contents or order changed"
             )
         rows = list(state["rows"])
         if len(rows) != self.batch:
@@ -1112,21 +1121,22 @@ class Trainer:
         while self.step < steps:
             started = time.perf_counter()
             snapshot = self._step_snapshot = self._take_snapshot(loader, state)  # P1.15
+            windows = [next(loader) for _ in range(train.grad_accum)]
+            counts = [int(window["loss_mask"].sum()) for window in windows]
+            step_loss_positions = sum(counts)
+            if snapshot is not None:
+                snapshot.windows.extend(windows)
             self.optimizer.zero_grad(set_to_none=True)
             # host-side float64 accumulator: MPS has no float64 (P0.8 fix for profile:m_series)
             loss_sum = torch.zeros((), dtype=torch.float64)
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
             tokens_in_step = 0
-            for _ in range(train.grad_accum):
-                window = next(loader)
-                if snapshot is not None:
-                    snapshot.windows.append(window)
+            for window, count in zip(windows, counts, strict=True):
                 batch = self._to_device(window)
                 state = detach_state(state)
                 logits, state, _info = self._forward(batch, state)
                 loss_mask = batch["loss_mask"]
-                count = int(loss_mask.sum())
                 tokens_in_step += int((window["doc"] >= 0).sum())
                 if count > 0:
                     flat_logits = logits[loss_mask].float()
@@ -1137,7 +1147,11 @@ class Trainer:
                     n_loss += count
                 else:  # no loss positions in this window (padding only): zero gradient
                     loss = logits.float().sum() * 0.0
-                scaled = loss / train.grad_accum
+                scaled = (
+                    loss / train.grad_accum
+                    if train.grad_accum == 1
+                    else loss * (count / step_loss_positions if step_loss_positions else 0.0)
+                )
                 with self._segment("backward", tokens=tokens_in_step):
                     if self.scaler is not None:
                         scaled = self.scaler.scale(scaled)
@@ -1210,6 +1224,8 @@ class Trainer:
                     history.checkpoints.append(str(self.save(self.run_dir, loader, state)))
                 logger.info("stopped by callback at step %d of %d", self.step, steps)
                 break
+        self._loader_state = loader.state_dict()
+        self._carried_state = detach_state(state)
         synchronize(device)
         stats = memory_stats(device)
         history.measured = {

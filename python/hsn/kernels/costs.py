@@ -105,6 +105,21 @@ UNIFORM_SOURCE = "uniform placeholder (not profiled)"
 
 _BLOCK_INT_KEYS = ("n_cells", "n_units", "d", "hidden", "batch", "positions")
 _BLOCK_STR_KEYS = ("producer", "profile", "device", "dtype")
+_MODEL_OPTION_KEYS = ("key_address", "selected_readout")
+# Old profiles recorded d/H but omitted these cost-sensitive settings. Their reference defaults
+# are the only supported inference; a nondefault configuration must be measured again.
+_MODEL_COST_DEFAULTS: dict[str, str | int] = {
+    "vocab_size": 256,
+    "n_context": 16,
+    "in_degree": 4,
+    "random_edges": 0,
+    "edge_norm": "softmax",
+    "activation": "gelu",
+    "cell_norm": "rms",
+    "cand_norm": "none",
+    "scorer": "linear",
+    "scorer_hidden": 128,
+}
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -231,13 +246,18 @@ class CostTable:
         )
 
     @classmethod
-    def from_profile(cls, path: Path | str, n_units: int) -> CostTable:
+    def from_profile(
+        cls, path: Path | str, n_units: int, *, cfg: ModelConfig | None = None
+    ) -> CostTable:
         """Read a cost profile (module docstring) and derive the table for ``n_units`` units.
 
         Raises ``ValueError`` (naming the file) for anything that is not a complete, consistent
         cost profile: no provenance block, a missing segment, ``tokens == 0``, ``device_ms <= 0``,
         a non-finite value, segments with different ``tokens``, a block whose shapes disagree with
         the report, or ``n_units`` different from the profiled ``M`` (regenerate the profile).
+        With ``cfg``, dimensions and cost-sensitive model settings must match. Missing legacy
+        settings imply only their original reference defaults (A5 off, context_dim = d); an
+        unrecorded nondefault setting requires a fresh measurement.
         """
         if isinstance(n_units, bool) or not isinstance(n_units, int) or n_units < 1:
             raise ValueError(f"n_units must be an int >= 1, got {n_units!r}")
@@ -250,6 +270,28 @@ class CostTable:
         if not isinstance(data, dict):
             raise ValueError(f"{file}: a cost profile is a JSON object, got {type(data).__name__}")
         block = _check_block(file, data)
+        if cfg is not None:
+            expected = {
+                **{name: False for name in _MODEL_OPTION_KEYS},
+                **_MODEL_COST_DEFAULTS,
+                "context_dim": block["d"],
+                "d": block["d"],
+                "hidden": block["hidden"],
+            }
+            for name, legacy in expected.items():
+                # Linear scoring never executes the unused MLP hidden layer.
+                if (
+                    name == "scorer_hidden"
+                    and cfg.scorer == block.get("scorer", "linear") == "linear"
+                ):
+                    continue
+                measured = block.get(name, legacy)
+                if measured != getattr(cfg, name):
+                    provenance = " (unrecorded; legacy default)" if name not in block else ""
+                    raise ValueError(
+                        f"{file}: cost profile {name}={measured}{provenance} differs from "
+                        f"model.{name}={getattr(cfg, name)}; regenerate the cost profile"
+                    )
         n_cells, profiled_units = block["n_cells"], block["n_units"]
         if profiled_units != n_units:
             raise ValueError(
@@ -314,6 +356,22 @@ def _check_block(file: Path, data: dict[str, Any]) -> dict[str, Any]:
                 f"{file}: {COST_PROFILE_KEY}.{key} must be a non-empty string, got "
                 f"{block.get(key)!r}"
             )
+    for key in _MODEL_OPTION_KEYS:
+        if key in block and not isinstance(block[key], bool):
+            raise ValueError(f"{file}: {COST_PROFILE_KEY}.{key} must be a bool")
+    for key, default in {**_MODEL_COST_DEFAULTS, "context_dim": 64}.items():
+        if key not in block:
+            continue
+        value = block[key]
+        if (
+            type(value) is not type(default)
+            or (
+                isinstance(value, int)
+                and value < (0 if key in ("in_degree", "random_edges") else 1)
+            )
+            or (isinstance(value, str) and not value)
+        ):
+            raise ValueError(f"{file}: invalid {COST_PROFILE_KEY}.{key}={value!r}")
     return block
 
 
@@ -372,7 +430,7 @@ def cost_table_from_config(cfg: ModelConfig) -> CostTable:
     if cfg.cost_profile is None:
         return CostTable.uniform(cfg.n_units, cfg.n_cells)
     path = cfg.cost_profile if cfg.cost_profile.is_absolute() else REPO_ROOT / cfg.cost_profile
-    table = CostTable.from_profile(path, cfg.n_units)
+    table = CostTable.from_profile(path, cfg.n_units, cfg=cfg)
     if table.n_cells != cfg.n_cells:
         raise ValueError(
             f"{path}: the cost profile was taken with N = {table.n_cells} cells, model.n_cells = "
@@ -442,7 +500,13 @@ def profile_dense_costs(
         with torch.no_grad():
             for t in range(warmup):
                 with profiler.segment("startup"):
-                    state = model.step(tokens[:, t], contexts[:, t], state, mode="dense").state
+                    state = model.step(
+                        tokens[:, t],
+                        contexts[:, t],
+                        state,
+                        mode="dense",
+                        prev_tokens=tokens[:, t - 1] if t else None,
+                    ).state
             for t in range(warmup, total):
                 x_t, ctx_t = tokens[:, t], contexts[:, t]
                 with profiler.segment("shared_path", tokens=batch):
@@ -452,8 +516,23 @@ def profile_dense_costs(
                     eps = z - z_hat
                     u = model.shared(torch.cat([z, q_prev, model.ctx_emb(ctx_t)], dim=-1))
                 with profiler.segment("scorer", tokens=batch):
+                    address_inputs = {}
+                    if cfg.key_address:
+                        address_inputs = {
+                            "tokens": x_t,
+                            "prev_tokens": model._reset_previous(
+                                tokens[:, t - 1] if t else None, state.pos == 0, x_t
+                            ),
+                        }
                     feats = model.scorer.features(
-                        u, eps, state, ctx_t, budget_frac=cfg.budget, round_idx=0, ema=None
+                        u,
+                        eps,
+                        state,
+                        ctx_t,
+                        budget_frac=cfg.budget,
+                        round_idx=0,
+                        ema=None,
+                        **address_inputs,
                     )
                     alpha = torch.softmax(model.scorer(feats), dim=-1)
                 with profiler.segment("messages", tokens=batch):
@@ -476,8 +555,13 @@ def profile_dense_costs(
                         h_new = torch.where(cell.disabled[None, :, None], h_prev, h_new)
                     new_state = state.with_dense(h_new)
                 with profiler.segment("decode", tokens=batch):
-                    logits = model.decoder(torch.cat([new_state.q, u], dim=-1))
-                out = model.step(x_t, ctx_t, state, mode="dense")  # the reference, unsegmented
+                    parts = [new_state.q, u]
+                    if cfg.selected_readout:
+                        parts.append(new_state.q)  # this profiler executes every cell
+                    logits = model.decoder(torch.cat(parts, dim=-1))
+                out = model.step(
+                    x_t, ctx_t, state, mode="dense", prev_tokens=tokens[:, t - 1] if t else None
+                )  # the reference, unsegmented
                 if not torch.allclose(
                     logits.float(), out.logits.float(), rtol=1e-4, atol=1e-5
                 ) or not torch.allclose(
@@ -499,6 +583,10 @@ def profile_dense_costs(
         "n_units": cfg.n_units,
         "d": cfg.d,
         "hidden": cfg.hidden,
+        "key_address": cfg.key_address,
+        "selected_readout": cfg.selected_readout,
+        **{name: getattr(cfg, name) for name in _MODEL_COST_DEFAULTS},
+        "context_dim": cfg.context_dim,
         "batch": batch,
         "positions": positions,
         "profile": ctx.profile,
