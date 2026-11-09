@@ -84,7 +84,9 @@ uv pip install --index-url https://download.pytorch.org/whl/cu132 torch==2.15.0 
 uv pip install --index-url https://download.pytorch.org/whl/cpu torch==2.15.0     # CPU-only Linux
 ```
 
-Optional extras: `uv sync --extra cuda` (pynvml, for the energy meter) and `--extra viz` (matplotlib).
+Optional extras: `uv sync --extra cuda` (nvidia-ml-py, for the energy meter) and `--extra viz`
+(matplotlib). NVIDIA's bindings retain the `pynvml` import name; the deprecated `pynvml`
+distribution is not required.
 
 ## Continuous integration
 

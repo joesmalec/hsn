@@ -20,7 +20,8 @@ carries a ``method`` string that matches the plan's §3.8 table:
 Every reading also carries ``components`` (joules by component, for example ``gpu_j`` and
 ``cpu_j``) so GPU-only and whole-package energy can be reported separately (plan §3.8).
 
-``pynvml`` is an optional dependency (the ``cuda`` extra) and is imported lazily; the base install
+``nvidia-ml-py`` is an optional dependency (the ``cuda`` extra), imported lazily as ``pynvml``;
+the base install
 stays free of GPU-only packages. Nothing here estimates energy from a TDP. The meters resolve
 100–200 ms at best, so an energy segment should span seconds (plan P0.6 pitfall: 5 s or more on
 GA106 without the counter); the profiler meters only outermost segments for that reason.
@@ -138,7 +139,8 @@ def _load_pynvml() -> Any:
         return importlib.import_module("pynvml")
     except ImportError as exc:
         raise ImportError(
-            "NvmlEnergyMeter needs pynvml, an optional dependency of the cuda extra: install it "
+            "NvmlEnergyMeter needs nvidia-ml-py (import name pynvml), an optional dependency "
+            "of the cuda extra: install it "
             "with `uv sync --extra cuda` (hsn[cuda]); the base install stays free of GPU-only "
             "packages"
         ) from exc

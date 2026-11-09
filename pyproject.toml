@@ -28,7 +28,7 @@ dev = [
     "types-PyYAML",
     "pytest-xdist>=3.8.0",
 ]
-cuda = ["pynvml"]
+cuda = ["nvidia-ml-py"]
 viz = ["matplotlib"]
 
 [build-system]
