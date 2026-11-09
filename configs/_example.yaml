@@ -73,6 +73,22 @@ train: # Appendix A.3
   cell_lr_mult: 1.0 # P1.13: the HSN cell's parameter group trains at lr * cell_lr_mult
   router_lr_mult: 1.0 # A5 stability: HSN.router rate (learned routing only)
   readout_lr_mult: 1.0 # A5 stability: whole HSN.decoder rate, including shared columns
+  adaptive_lr: # opt-in training-only feedback; scales multiply the chosen schedule
+    enabled: false
+    interval: 100 # accepted updates per fixed training-monitor measurement
+    monitor_docs: 32 # increased automatically to cover every task/variant
+    patience: 2
+    cooldown: 2 # monitor windows after a rate change
+    threshold: 0.01 # relative monitor-loss change
+    reduce_factor: 0.5
+    increase_factor: 1.1 # bounded plateau trial; only kept if loss improves
+    min_scale: 0.03125
+    max_scale: 1.0 # default trials can recover cuts but cannot exceed the initial rate
+    grad_growth: 3.0
+    max_update_ratio: 0.01 # sampled ||weight change|| / ||weight after update||
+    router_max_update_ratio: 0.005
+    readout_max_update_ratio: 0.005
+    trial_windows: 2
   cell_weight_decay: null # P1.13: weight decay of the cell's tensors with ndim >= 2; null = weight_decay
   spike_factor: null # P1.15: skip a step whose grad norm > factor x the running median (null: off; 1e3-1e4)
   spike_window: 100 # P1.15: applied steps in that median (read only with spike_factor set)

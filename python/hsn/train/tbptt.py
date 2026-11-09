@@ -683,6 +683,7 @@ class TBPTTTrainer(Trainer):
             raise ValueError(f"steps={steps} is before the current step {self.step}")
         self._refuse_test(train_ds, False)
         self._refuse_test(dev_ds, False)
+        self._prepare_adaptive_monitor(train_ds)
         report = self.hsn.param_report()
         if "total_trainable" not in report:
             raise KeyError(f"param_report() lacks 'total_trainable': {sorted(report)}")
@@ -878,15 +879,18 @@ class TBPTTTrainer(Trainer):
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15
                     skipped = self._guard_spike(grad_norm, next_step)
+                before = self._adaptive_before_step(skipped)
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
                 applied = not skipped
                 if self.scaler is not None:
                     # A scaler suppresses optimizer.step itself on overflow. Only an EMA target
-                    # needs this check; fixed targets add no extra device synchronisation.
+                    # or adaptive controller needs this check; defaults add no synchronisation.
                     scale_before = (
-                        self.scaler.get_scale() if self.hsn.ema_target is not None else None
+                        self.scaler.get_scale()
+                        if self.hsn.ema_target is not None or self.adaptive_lr is not None
+                        else None
                     )
                     self.scaler.step(self.optimizer, **step_kwargs)
                     self.scaler.update()
@@ -894,9 +898,10 @@ class TBPTTTrainer(Trainer):
                         applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step(**step_kwargs)
-                self.scheduler.step()
                 if applied:
                     self.hsn.update_target()
+                self._adaptive_after_step(applied, grad_norm, before)
+                self.scheduler.step()
             self.step = next_step
             if self._rollback_windows is not None:
                 # The rollback discards the current documents; the next stream starts at BOS.

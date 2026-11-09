@@ -3,6 +3,59 @@
 This implements the mechanism requested in the 8 November hand-off. It does not establish that
 the model binds keys or beats gru_2m. The architecture amendment remains experimental.
 
+## Adaptive learning rates (9 November follow-up)
+
+`train.adaptive_lr.enabled=true` enables training-only feedback in both trainers. Defaults are
+documented in `configs/_example.yaml`; disabled configurations retain their historical hashes,
+optimizer groups and scheduler behavior. The new thresholds are hypotheses, not a validated
+accuracy improvement. `configs/sweeps/p1_17_a5_adaptive.yaml` supplies matched seeds 0/1 and fixed
+recovery controls. It preserves the existing WSD schedule, data, objectives and quality gates.
+
+Every 100 **applied** updates, the controller evaluates the same seeded, stratified sample of
+32 training documents (expanded if necessary to cover every task/variant). It uses fresh recurrent
+state and an isolated fixed RNG seed, then restores training RNG state. It never reads dev/test
+scores. The sample fingerprint is checked on
+resume. Monitoring and parameter snapshots count toward training time; the existing step-time
+guard remains in force.
+
+The measurements are fixed-sample task loss, the median accepted raw gradient norm, and the actual
+sampled parameter-change ratio `||after - before|| / ||after||`, with separate router and decoder
+budgets. Sustained loss regression halves rates; regression with gradient growth relative to the
+last healthy reference can react earlier. Sustained excess parameter changes reduce the affected
+component. Guard skips/rollbacks also halve rates, cumulatively down to the floor. Controller state
+is deliberately outside the in-memory rollback ring, so restoring model weights cannot undo a
+cut. Use `rollback_lr_mult=1` and `rollback_lr_steps=0` to avoid a competing temporary recovery cut.
+
+After cooldown, a healthy plateau can trial a 10% increase within configured bounds. The default
+ceiling is the original rate, so a trial can recover part of a previous cut. A trial is retained
+only after meaningful monitor-loss improvement with healthy update/gradient measurements. Rejection
+restores rates, **not weights already updated during the trial**. Failed trials remain blocked until
+new healthy improvement or a reduction. The selected schedule multiplies these scales; constant
+schedule can be tested separately, while WSD still decays at its existing late-run boundary.
+
+Checkpoints contain the full controller state, pending trial, partial gradient window and monitor
+identity. Normal and failed experiment `record_json` entries in SQLite include `adaptive_lr`, with
+every observation, decision and before/after scale. Standard logs also emit each decision. Runtime
+rollback snapshots remain ephemeral as before; full checkpoint resume restores controller state.
+
+A plateau alone cannot distinguish a small rate from a missing or poor learning signal. Existing
+counterfactual write probes compare matched examples, state and RNG with a write added or removed;
+a positive loss difference means that intervention helped prediction. Key-swap and route-check
+probes test key use. Report the number of eligible examples and the distribution of paired loss
+differences: zero effect can mean redundancy or a horizon that cannot reach the answer. These are
+separate measurements from gradient size and are not dev/test feedback to this controller.
+
+For a controller input, distinguish predictive value from intervention value. Its logged warning
+should precede deterioration with useful lead time and few false alarms; a matched-seed ablation
+then tests whether acting on it improves final quality and cost. Correlation alone cannot establish
+that the warning or the resulting rate change helped. Loss, gradient and update observations are
+stored separately to support this analysis without adjusting frozen quality thresholds.
+
+Implementation validation: 956 CPU tests passed; two focused compiled CUDA tests passed, including
+monitoring across rollback and checkpoint resume. Lint and strict typing passed (79 source files).
+CPU continuation tests cover partial monitoring windows, an active upward trial and preserved
+training trajectories when no rate changes are made. This validates mechanics, not final accuracy.
+
 ## Controls and compatibility
 
 `model.key_address` and `model.selected_readout` are independent booleans, both false by default.

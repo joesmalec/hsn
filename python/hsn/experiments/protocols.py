@@ -443,6 +443,7 @@ class _StepCallback:
         if step not in self.at_steps:
             return False
         record = {
+            **_adaptive_record(trainer),
             "evals": [_eval_entry(e, audit_keys=False) for e in history.evals],
             "diagnostics": list(self.diag.records) if self.diag is not None else [],
             "train": [_train_entry(s) for s in history.steps],
@@ -455,6 +456,12 @@ class _StepCallback:
             self.stop = {**stop, "elapsed_s": round(time.perf_counter() - self.started, 1)}
             return True
         return False
+
+
+def _adaptive_record(trainer: Any) -> dict[str, Any]:
+    """Kept in successful and partial SQLite record_json, including guard/trial decisions."""
+    controller = getattr(trainer, "adaptive_lr", None)
+    return {} if controller is None else {"adaptive_lr": controller.state_dict()}
 
 
 def _compile_info(trainer: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
@@ -661,6 +668,7 @@ def _train(
             "rollbacks": measured.get("rollbacks"),  # P1.16: None with the rollback off
         },
         "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+        **_adaptive_record(trainer),
         "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
         "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
         "stopped": callback.stop,
@@ -790,6 +798,7 @@ def _partial_training(
                 "rollbacks": rollbacks,  # P1.16
             },
             "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+            **_adaptive_record(trainer),
             "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
             "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
             "stopped": None,

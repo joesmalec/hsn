@@ -57,6 +57,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.readout_lr_mult",
         "train.slow_burst_factor",
         "train.slow_burst_window",
+        "train.adaptive_lr",
     )
 
 

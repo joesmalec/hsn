@@ -182,6 +182,7 @@ from hsn.device import (
     synchronize,
 )
 from hsn.eval.evaluate import DEFAULT_METRICS, Metric, PositionGroups, evaluate_windows
+from hsn.train.adaptive import AdaptiveLR
 from hsn.train.amp import autocast_ctx, autocast_name, make_grad_scaler
 from hsn.train.checkpoint import (
     capture_rng_state,
@@ -626,6 +627,14 @@ class Trainer:
         self.rollback: RollbackPolicy | None = RollbackPolicy.from_config(train)
         self._lr_cut_until = 0
         self._lr_cut_mult = 1.0
+        self.adaptive_lr = (
+            AdaptiveLR(
+                train.adaptive_lr, {g["adaptive_group"] for g in self.optimizer.param_groups}
+            )
+            if train.adaptive_lr.enabled
+            else None
+        )
+        self._adaptive_monitor: ByteDataset | None = None
         self.scheduler = self._make_scheduler()
         self.scaler = make_grad_scaler(ctx)
         if self.rollback is not None and self.scaler is not None:
@@ -685,17 +694,19 @@ class Trainer:
     def _make_optimizer(self) -> torch.optim.Optimizer:
         optimizer = self._make_base_optimizer()
         train = self.cfg.train
-        if train.router_lr_mult == train.readout_lr_mult == 1.0:
+        if train.router_lr_mult == train.readout_lr_mult == 1.0 and not train.adaptive_lr.enabled:
             return optimizer
         # Split the existing groups before any state or scheduler exists. This preserves the
         # cell's overrides, lazy unit metadata and ndim-based decay rules for both optimisers.
         by_id: dict[int, str] = {}
         multipliers = {"router": train.router_lr_mult, "decoder": train.readout_lr_mult}
         for name, mult in multipliers.items():
-            if mult != 1.0:
+            if mult != 1.0 or train.adaptive_lr.enabled:
                 module = getattr(self.model, name, None)
                 if not isinstance(module, nn.Module):
-                    raise ValueError(f"learning-rate multiplier requires HSN.{name}")
+                    if mult != 1.0:
+                        raise ValueError(f"learning-rate multiplier requires HSN.{name}")
+                    continue
                 by_id.update((id(p), name) for p in module.parameters())
         grouped: dict[str, list[dict[str, Any]]] = {"shared": [], "router": [], "decoder": []}
         for group in optimizer.param_groups:
@@ -704,7 +715,12 @@ class Trainer:
                 buckets.setdefault(by_id.get(id(p), "shared"), []).append(p)
             for name, params in buckets.items():
                 grouped[name].append(
-                    {**group, "params": params, "lr": group["lr"] * multipliers.get(name, 1.0)}
+                    {
+                        **group,
+                        "params": params,
+                        "lr": group["lr"] * multipliers.get(name, 1.0),
+                        **({"adaptive_group": name} if train.adaptive_lr.enabled else {}),
+                    }
                 )
         optimizer.param_groups.clear()
         for groups in grouped.values():
@@ -790,7 +806,99 @@ class Trainer:
                 value *= self._lr_cut_mult
             return value
 
-        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, cut)
+        if self.adaptive_lr is None:
+            return torch.optim.lr_scheduler.LambdaLR(self.optimizer, cut)
+
+        def adaptive_factor(group: str) -> Callable[[int], float]:
+            def rate(step: int) -> float:
+                assert self.adaptive_lr is not None
+                return cut(step) * self.adaptive_lr.scale(group)
+
+            return rate
+
+        return torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            [adaptive_factor(g["adaptive_group"]) for g in self.optimizer.param_groups],
+        )
+
+    def _prepare_adaptive_monitor(self, train_ds: ByteDataset) -> None:
+        if self.adaptive_lr is None:
+            return
+        # A dev monitor would make the controller itself a validation-trained component.
+        if not len(train_ds) or any(e.meta.get("split") != "train" for e in train_ds.examples):
+            raise ValueError("adaptive_lr requires a nonempty, explicitly TRAIN-labelled dataset")
+        from hsn.experiments.data_selection import cap_dataset
+
+        groups = {(e.meta["task"], e.meta["variant"]) for e in train_ds.examples}
+        monitor = cap_dataset(
+            train_ds, max(len(groups), self.cfg.train.adaptive_lr.monitor_docs), seed=self.cfg.seed
+        )
+        if not any(e.loss_mask.any() for e in monitor.examples):
+            raise ValueError("adaptive_lr training monitor has no supervised positions")
+        self.adaptive_lr.bind_monitor(monitor.fingerprint)
+        self._adaptive_monitor = monitor
+
+    def _adaptive_monitor_loss(self) -> float:
+        assert self._adaptive_monitor is not None
+        # Fresh loader/state and restored RNG: monitoring must not change the training stream,
+        # carried state, previous byte, target encoder or subsequent stochastic updates.
+        rng = capture_rng_state()
+        try:
+            seed_everything((self.cfg.seed ^ 0xA5AD) % (2**32))
+            result = evaluate_windows(
+                self._eval_model(),
+                self._loader(self._adaptive_monitor, shuffle=False, epochs=1),
+                DEFAULT_METRICS,
+                device=self.ctx.device,
+                autocast=autocast_ctx(self.ctx),
+            )
+            return float(result["loss"])
+        finally:
+            restore_rng_state(rng)
+
+    def _adaptive_before_step(self, skipped: bool) -> list[tuple[Tensor, Tensor, str]]:
+        if self.adaptive_lr is None or skipped or not self.adaptive_lr.due:
+            return []
+        return [
+            (p, p.detach().clone(), group["adaptive_group"])
+            for group in self.optimizer.param_groups
+            for p in group["params"]
+        ]
+
+    def _adaptive_after_step(
+        self, applied: bool, grad_norm: float, before: list[tuple[Tensor, Tensor, str]]
+    ) -> None:
+        controller = self.adaptive_lr
+        if controller is None:
+            return
+        step = self.step + 1
+        if not applied:
+            controller.guard(step, "optimizer_step_skipped")
+            logger.info("adaptive_lr %s", json.dumps(controller.state.observations[-1]))
+            return
+        if not controller.accepted(grad_norm):
+            return
+        delta: dict[str, list[Tensor]] = {}
+        weight: dict[str, list[Tensor]] = {}
+        with torch.no_grad():
+            for p, previous, group in before:
+                delta.setdefault(group, []).append(
+                    (p.detach().float() - previous.float()).square().sum()
+                )
+                weight.setdefault(group, []).append(p.detach().float().square().sum())
+            updates = {
+                group: float(
+                    (
+                        torch.stack(delta[group]).sum()
+                        / torch.stack(weight[group]).sum().clamp_min(1e-24)
+                    ).sqrt()
+                )
+                for group in delta
+            }
+        observation = controller.observe(
+            step, self._adaptive_monitor_loss(), updates, warmup=step <= self.cfg.train.warmup_steps
+        )
+        logger.info("adaptive_lr %s", json.dumps(observation))
 
     def _segment(self, name: str, tokens: int = 0) -> AbstractContextManager[object]:
         if self.profiler is None:
@@ -1026,12 +1134,19 @@ class Trainer:
         if self.rollback is not None:  # P1.16: the events and the learning-rate cut
             out["rollbacks"] = [dict(r) for r in c["rollbacks"]]
             out["rollback_lr_cut"] = [int(c["lr_cut"][0]), float(c["lr_cut"][1])]
+        if self.adaptive_lr is not None:
+            out["adaptive_lr"] = c["adaptive_lr"]
         return out
 
     def _restore_guard(self, extra: Mapping[str, Any], path: str) -> None:
         """The guard's counts from a checkpoint's ``extra``: 0 when written before the guard;
         a malformed count, or more consecutive skips than skips, raises. P1.15: the spike guard's
         count and history (absent: 0 and empty; a malformed history raises)."""
+        if self.adaptive_lr is not None:
+            raw = extra.get("adaptive_lr")
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}: adaptive_lr checkpoint state is missing")
+            self.adaptive_lr.load_state_dict(raw)
         skipped = _skipped_counter(extra, "skipped_nonfinite", path)
         streak = _skipped_counter(extra, "skipped_nonfinite_streak", path)
         spikes = 0
@@ -1165,6 +1280,7 @@ class Trainer:
             raise ValueError(f"steps={steps} is before the current step {self.step}")
         self._refuse_test(train_ds, False)
         self._refuse_test(dev_ds, False)
+        self._prepare_adaptive_monitor(train_ds)
         report = self.model.param_report()
         for key in ("active", "stored", "trainable"):
             if key not in report:
@@ -1249,11 +1365,17 @@ class Trainer:
                 skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15
                     skipped = self._guard_spike(grad_norm, self.step + 1)
+                before = self._adaptive_before_step(skipped)
+                applied = not skipped
                 if self.scaler is not None:
+                    scale_before = self.scaler.get_scale() if self.adaptive_lr is not None else None
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    if scale_before is not None:
+                        applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step()
+                self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
             self.step += 1
             self._rollback_after_step(loader, skipped)  # P1.16
@@ -1423,6 +1545,11 @@ class Trainer:
             "spike_history": [float(x) for x in self._spike_history],
             "rollbacks": [dict(r) for r in self.rollbacks],  # P1.16
             "lr_cut": (self._lr_cut_until, self._lr_cut_mult),
+            **(
+                {"adaptive_lr": self.adaptive_lr.state_dict()}
+                if self.adaptive_lr is not None
+                else {}
+            ),
         }
 
     def _snapshot_state(self, state: Any) -> Any:

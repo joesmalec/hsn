@@ -320,6 +320,26 @@ class DataConfig(_StrictModel):
 # --------------------------------------------------------------------------------------------------
 
 
+class AdaptiveLRConfig(_StrictModel):
+    """Training-only feedback controller; disabled preserves existing training and hashes."""
+
+    enabled: bool = False
+    interval: int = Field(default=100, ge=1)
+    monitor_docs: int = Field(default=32, ge=1)
+    patience: int = Field(default=2, ge=1)
+    cooldown: int = Field(default=2, ge=0)
+    threshold: float = Field(default=0.01, gt=0.0, lt=1.0, allow_inf_nan=False)
+    reduce_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
+    increase_factor: float = Field(default=1.1, gt=1.0, allow_inf_nan=False)
+    min_scale: float = Field(default=0.03125, gt=0.0, le=1.0, allow_inf_nan=False)
+    max_scale: float = Field(default=1.0, ge=1.0, allow_inf_nan=False)
+    grad_growth: float = Field(default=3.0, gt=1.0, allow_inf_nan=False)
+    max_update_ratio: float = Field(default=0.01, gt=0.0, allow_inf_nan=False)
+    router_max_update_ratio: float = Field(default=0.005, gt=0.0, allow_inf_nan=False)
+    readout_max_update_ratio: float = Field(default=0.005, gt=0.0, allow_inf_nan=False)
+    trial_windows: int = Field(default=2, ge=1)
+
+
 class TrainConfig(_StrictModel):
     """Appendix A.3 ``train.*`` including loss weights and the one-at-a-time auxiliary rule."""
 
@@ -343,6 +363,7 @@ class TrainConfig(_StrictModel):
     # Defaults preserve the existing optimiser groups and checkpoint layout.
     router_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     readout_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    adaptive_lr: AdaptiveLRConfig = AdaptiveLRConfig()
     # --- end P1.13 ---
     # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
     # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
@@ -445,6 +466,15 @@ class TrainConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        if (
+            self.adaptive_lr.enabled
+            and self.rollback_every is not None
+            and (self.rollback_lr_steps != 0 or self.rollback_lr_mult != 1.0)
+        ):
+            raise ValueError(
+                "adaptive_lr owns persistent recovery cuts: use rollback_lr_steps=0 and "
+                "rollback_lr_mult=1 with adaptive_lr.enabled"
+            )
         # --- P2.2: a schedule whose end value can never be reached is refused, not ignored ---
         for what in ("temperature", "epsilon"):
             start, end = getattr(self, f"{what}_start"), getattr(self, f"{what}_end")
@@ -1072,6 +1102,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.readout_lr_mult",
     "train.slow_burst_factor",
     "train.slow_burst_window",
+    "train.adaptive_lr",
 )
 
 
@@ -1084,6 +1115,8 @@ def _hash_view(cfg: RunConfig) -> dict[str, Any]:
         schema = RunConfig.model_fields[section].annotation
         assert isinstance(schema, type) and issubclass(schema, BaseModel)
         default = schema.model_fields[key].default
+        if isinstance(default, BaseModel):
+            default = default.model_dump(mode="json")
         if dump[section][key] == default:
             del dump[section][key]
     return dump
