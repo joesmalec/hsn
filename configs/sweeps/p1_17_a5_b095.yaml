@@ -2,6 +2,7 @@
 # Expand does not register or enqueue runs. The original A5 sweep remains reproducible.
 name: p1_17_a5_b095
 description: matched control and A5 at beta2 0.95, with pre-collapse checkpoints retained
+timing: true # one arm at a time; use the existing worker's idle-card/CPU checks
 base:
   config: configs/experiments/hsn_recipe_b095.yaml
   overrides:

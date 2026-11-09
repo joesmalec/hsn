@@ -2,6 +2,7 @@
 # No loss, data, architecture or binding-threshold change. These settings are hypotheses.
 name: p1_17_a5_recovery
 description: A5 recovery from sharp and sustained bursts, then separate router/readout LR ablations
+timing: true # serialize on the shared experiment worker
 base:
   config: configs/experiments/hsn_recipe_b095.yaml
   overrides:

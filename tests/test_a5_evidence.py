@@ -116,6 +116,7 @@ def test_beta2_stage_is_matched_and_retention_does_not_change_arm_ids() -> None:
     new = expand(proposed)
     assert len(new) == 4
     for arm in new:
+        assert arm.timing
         reference = old[arm.label]
         expected = reference.config.model_dump(exclude={"run_id"})
         expected["train"]["betas"] = (0.9, 0.95)
@@ -131,6 +132,7 @@ def test_recovery_stage_has_independent_learning_rate_ablations() -> None:
     arms = expand(spec)
     assert len(arms) == 8
     for arm in arms:
+        assert arm.timing
         cfg = arm.config
         assert cfg.train.slow_burst_factor == 10 and cfg.train.rollback_every == 50
         assert cfg.train.spike_factor == 100 and cfg.train.betas == (0.9, 0.95)

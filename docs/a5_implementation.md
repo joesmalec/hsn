@@ -109,6 +109,8 @@ before: a resumed run starts filling a new ring. Failed candidates never enter g
 The first comparison is `configs/sweeps/p1_17_a5_b095.yaml`: control and full A5, seeds 0 and 1,
 9,000 steps, changing only beta2 from 0.999 to 0.95. It saves every 500 steps with `keep_last: 18`
 and `checkpoint: retained`. Do this before adding other stability settings.
+Both specs set `timing: true`, so the existing SQLite worker runs one arm at a time after its
+idle GPU/CPU checks; no second worker or change to its concurrency setting is needed.
 
 If that comparison still collapses, `configs/sweeps/p1_17_a5_recovery.yaml` provides a matched
 control, A5, router-rate 0.3 and decoder-rate 0.3, each on two seeds. All arms share spike factor
