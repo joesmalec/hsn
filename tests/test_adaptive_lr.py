@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 from cards import CUDA_PROFILE
-from hsn.config import AdaptiveLRConfig, config_hash
+from hsn.config import AdaptiveLRConfig, RunConfig, config_hash
+from hsn.experiments.controller import controller_progress
 from hsn.experiments.protocols import _adaptive_record
+from hsn.experiments.spec import arm_identity
 from hsn.train.adaptive import AdaptiveLR
 from hsn.train.checkpoint import capture_rng_state
 from p1_11_support import restore_determinism  # noqa: F401
@@ -92,6 +95,77 @@ def test_update_budget_cuts_only_offending_group() -> None:
     observe(c, 0.9, router=0.02)
     assert observe(c, 0.8, router=0.02) == "update_cut"
     assert c.state.scales == {"shared": 1, "router": 0.5, "decoder": 1}
+
+
+@pytest.mark.parametrize("flag", ["loss_cuts", "gradient_cuts", "update_cuts", "trial_increases"])
+def test_independent_signal_ablations_and_emergency_cuts(flag: str) -> None:
+    def trigger(c: AdaptiveLR) -> str:
+        if flag == "trial_increases":
+            c.guard(0, "earlier cut")
+        observe(c, 1)
+        if flag == "gradient_cuts":
+            return observe(c, 1.02, 4)
+        if flag == "update_cuts":
+            observe(c, 0.9, router=0.02)
+            return observe(c, 0.8, router=0.02)
+        loss = 1.1 if flag == "loss_cuts" else 1
+        observe(c, loss)
+        return observe(c, loss)
+
+    full, ablated = controller(), controller(**{flag: False})
+    decision = trigger(full)
+    assert decision in {"loss_cut", "loss_and_gradient_cut", "update_cut", "trial_started"}
+    assert trigger(ablated) not in {
+        "loss_cut",
+        "loss_and_gradient_cut",
+        "update_cut",
+        "trial_started",
+    }
+    before = dict(ablated.state.scales)
+    ablated.guard(100, "overflow")
+    assert ablated.state.scales == {key: value * 0.5 for key, value in before.items()}
+    # Raw measurements are still recorded for the ablated signal.
+    assert ablated.state.observations[-2]["loss"] > 0
+
+
+def test_experiment_240_config_identity_and_legacy_controller_resume() -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures/adaptive_exp240.json").read_text())
+    cfg = RunConfig.model_validate(fixture["config"])
+    assert config_hash(cfg) == fixture["config_hash"]
+    arm, _ = arm_identity(
+        cfg,
+        family="hsn",
+        variant=fixture["variant_name"],
+        variant_params=fixture["variant"],
+        protocol=fixture["protocol"],
+        early_stop=fixture["early_stop"],
+        data=fixture["data_hash"],
+    )
+    assert arm == fixture["arm_id"]
+    c = AdaptiveLR(cfg.train.adaptive_lr, {"shared", "router", "decoder"})
+    c.load_state_dict(fixture["controller"])
+    assert c.state.accepted_steps == 1000
+    assert c.state.scales == {"shared": 1, "router": 0.5, "decoder": 1}
+    assert c.state.observations == fixture["controller"]["observations"]
+    changed_raw = cfg.model_dump()
+    changed_raw["train"]["adaptive_lr"]["update_cuts"] = False
+    changed = RunConfig.model_validate(changed_raw)
+    assert config_hash(changed) != fixture["config_hash"]
+    with pytest.raises(ValueError, match="configuration differs"):
+        AdaptiveLR(changed.train.adaptive_lr, set(c.state.scales)).load_state_dict(
+            fixture["controller"]
+        )
+
+
+@pytest.mark.parametrize("flag", ["gradient_cuts", "update_cuts"])
+def test_disabled_signal_does_not_veto_plateau_trial(flag: str) -> None:
+    c = controller(**{flag: False})
+    c.guard(0, "make room for trial")
+    observe(c, 1)
+    stress = {"grad": 4.0} if flag == "gradient_cuts" else {"router": 0.02}
+    observe(c, 1, **stress)
+    assert observe(c, 1, **stress) == "trial_started"
+    assert observe(c, 0.95, **stress) == "trial_accepted"
 
 
 @pytest.mark.parametrize("improves", [False, True])
@@ -189,6 +263,14 @@ def test_control_changes_real_group_lrs_and_preserves_multipliers(
     t.fit(*datasets(), 8)
     assert [g["lr"] for g in t.optimizer.param_groups] == [lr * 0.5 for lr in initial]
     assert t.adaptive_lr.state.observations[2]["decision"] == "loss_cut"
+    # Reporting reads the optimizer, preserving both component and cell multipliers.
+    live = controller_progress(t)["adaptive_lr"]
+    assert live["last_adjustment"]["step"] == 6
+    expected: dict[str, set[float]] = {}
+    for group, initial_lr in zip(t.optimizer.param_groups, initial, strict=True):
+        expected.setdefault(group["adaptive_group"], set()).add(initial_lr * 0.5)
+    assert live["next_update_lrs"] == {key: sorted(values) for key, values in expected.items()}
+    assert len(live["next_update_lrs"]["shared"]) == 2
 
 
 def test_monitor_is_train_only_and_restores_rng_and_state(tmp_path: Path) -> None:
@@ -278,6 +360,10 @@ def test_live_trial_and_repeated_fit_match_checkpoint_continuation(
     monkeypatch.setattr(t, "_adaptive_monitor_loss", lambda: 1.0 if t.step < 3 else 0.9)
     t.fit(*datasets(), 3)
     assert t.adaptive_lr.state.trial is not None
+    live = controller_progress(t)["adaptive_lr"]
+    assert live["trial"]["remaining"] == cfg.train.adaptive_lr.trial_windows
+    assert live["latest_observation"]["decision"] == "trial_started"
+    assert live["scales"] == {"shared": 0.55}
     resumed = gru_trainer(cfg, tmp_path / "resumed")
     resumed.resume(tmp_path / "full" / "step_00000003.pt")
     monkeypatch.setattr(resumed, "_adaptive_monitor_loss", lambda: 0.9)

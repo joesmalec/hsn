@@ -24,6 +24,7 @@
              [--rollback-lr-mult F] [--rollback-lr-steps N] [--rollback-max N]]   (P1.16)
     route-check --exp N [--split dev|train] [--n-docs 1000] [--cpu] [--batch-rows 64] [--out FILE]
              (P1.16: does routing follow the key; read-only)
+    controller-report --exp N [--exp M ...] [--out FILE]  (read-only signals and matched ablations)
     run-arm  --db DB --exp N --root ROOT       (the worker's child; not for direct use)
 
 Every command takes ``--db`` (default ``$HSN_EXPERIMENTS_DB`` or
@@ -86,6 +87,12 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="queue, running and recent results")
     p.add_argument("--sweep", default=None)
     p.add_argument("--recent", type=int, default=10)
+
+    p = sub.add_parser(
+        "controller-report", help="controller signals and matched ablations (read-only)"
+    )
+    p.add_argument("--exp", type=int, action="append", required=True)
+    p.add_argument("--out", default=None)
 
     for name in ("cancel", "requeue"):
         p = sub.add_parser(name)
@@ -369,8 +376,33 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     print(f"\nrunning ({len(running)}):")
     rows = []
+    controller_rows = []
     for r in running:
         progress = loads(r["progress_json"]) or {}
+        controller = progress.get("adaptive_lr")
+        if controller is not None:
+            from hsn.experiments.controller import format_rates
+
+            latest = controller.get("latest_observation") or {}
+            change = controller.get("last_adjustment") or {}
+            rates = controller.get("next_update_lrs") or {}
+            controller_rows.append(
+                (
+                    r["exp_id"],
+                    latest.get("step", ""),
+                    latest.get("decision", "initializing"),
+                    f"{change['decision']} @ {change['step']}" if change else "none",
+                    latest.get("loss", ""),
+                    latest.get("grad_median", ""),
+                    format_rates(rates.get("shared", [])),
+                    format_rates(rates.get("router", [])),
+                    format_rates(rates.get("decoder", [])),
+                    controller.get("cooldown_windows", ""),
+                    "pending"
+                    if controller.get("trial")
+                    else ("blocked" if controller.get("trial_blocked") else "none"),
+                )
+            )
         rows.append(
             (
                 r["exp_id"],
@@ -380,9 +412,34 @@ def cmd_status(args: argparse.Namespace) -> int:
                 (r["started_at"] or r["claimed_at"] or "")[:19],
                 f"{progress.get('step', '')}/{progress.get('of', '')}",
                 progress.get("dev_accuracy", ""),
+                progress.get("dev_step", progress.get("step", ""))
+                if "dev_accuracy" in progress
+                else "",
             )
         )
-    print(_table(rows, ["exp", "label", "pid", "worker", "started", "step", "dev acc"]))
+    print(
+        _table(rows, ["exp", "label", "pid", "worker", "started", "step", "dev acc", "dev @ step"])
+    )
+    if controller_rows:
+        print("\ncontroller (training monitor; learning rates are for the next update):")
+        print(
+            _table(
+                controller_rows,
+                [
+                    "exp",
+                    "observed step",
+                    "decision",
+                    "last rate change",
+                    "train monitor loss",
+                    "grad median",
+                    "shared lr",
+                    "router lr",
+                    "readout lr",
+                    "cooldown",
+                    "trial",
+                ],
+            )
+        )
     print(f"\nrecent ({len(recent)}):")
     recent_rows: list[tuple[Any, ...]] = []
     for r in recent:
@@ -626,6 +683,18 @@ def cmd_route_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_controller_report(args: argparse.Namespace) -> int:
+    from hsn.experiments.controller import controller_report
+
+    db = Database(Path(args.db) if args.db else default_db_path(), read_only=True)
+    report = controller_report(db, args.exp)
+    body = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    if args.out:
+        Path(args.out).write_text(body, encoding="utf-8")
+    print(body, end="")
+    return 0
+
+
 def cmd_run_arm(args: argparse.Namespace) -> int:
     from hsn.experiments.run_arm import main as run_arm
 
@@ -639,6 +708,7 @@ COMMANDS = {
     "enqueue": cmd_enqueue,
     "worker": cmd_worker,
     "status": cmd_status,
+    "controller-report": cmd_controller_report,
     "cancel": cmd_cancel,
     "requeue": cmd_requeue,
     "report": cmd_report,

@@ -51,10 +51,55 @@ then tests whether acting on it improves final quality and cost. Correlation alo
 that the warning or the resulting rate change helped. Loss, gradient and update observations are
 stored separately to support this analysis without adjusting frozen quality thresholds.
 
-Implementation validation: 956 CPU tests passed; two focused compiled CUDA tests passed, including
-monitoring across rollback and checkpoint resume. Lint and strict typing passed (79 source files).
+### Live reporting and signal ablations
+
+`python -m hsn.experiments status` shows controller state while an adaptive run is active.
+The child writes compact SQLite progress after every controller observation or guard decision,
+including observations between dev evaluations. It shows the latest decision, last actual rate
+change, training-monitor loss, gradient median, cooldown, pending/blocked trial, and effective
+shared/router/readout learning rates for the **next** update. The dev score retains its evaluation
+step. The JSON snapshot also retains update ratios, scales, enabled signals and monitor identity;
+it does not copy the growing observation history. Each new controller event is flushed to the
+run log. The final/failed result retains the complete history as before.
+
+Read existing results without running a model or modifying the database:
+
+```bash
+python -m hsn.experiments controller-report --exp 240 --out /tmp/controller-240.json
+python -m hsn.experiments controller-report --exp FULL_ID --exp ABLATED_ID
+```
+
+The JSON report counts raw warnings followed by a monitor-loss increase greater than the configured
+threshold at the next observation. It excludes intervals starting with warmup, baseline, cooldown,
+trials or rate changes, and pairs interrupted by a guard. It lists the next loss change after rate
+changes separately. Missing evidence is not counted as a successful warning; a signal with no
+alerts has no follow-through fraction. These adjacent, correlated measurements are exploratory
+training evidence, not causal usefulness or an independent quality score.
+
+Four default-on switches under `train.adaptive_lr` support controlled experiments: `loss_cuts`,
+`gradient_cuts`, `update_cuts`, and `trial_increases`. They gate sustained-loss cuts, the combined
+loss/gradient cut, component update-budget cuts, and upward trials, respectively. Disabling a
+gradient/update signal also removes its veto on healthy plateaus and trials. Raw measurements
+continue to be collected. Loss remains the trial reward, and emergency guard/rollback cuts remain
+active. Existing enabled-controller configuration hashes, arm identities and checkpoints remain
+compatible when all switches retain their defaults.
+
+`configs/sweeps/p1_17_a5_adaptive_ablations.yaml` defines full-controller and one-switch-off arms
+for seeds 0/1, preserving the 9000-step recipe and quality gates. Its full-controller arms reuse
+the original adaptive sweep's identities. The report pairs only completed, clean attempts with
+matching source commit, seed, data, monitor identity, protocol and configuration apart from one
+switch, with a final evaluation at the full training horizon. Accuracy deltas use fractions
+(0.01 is one percentage point). Repeat across seeds and inspect cost and guard failures as well
+as quality; an unpaired or failed run is still reported but does not produce a matched delta.
+
+Implementation validation: 968 CPU tests passed in 71 seconds with eight workers; two focused
+compiled CUDA tests passed, including monitoring across rollback and checkpoint resume.
+Lint, pre-commit and strict typing passed (80 source files).
 CPU continuation tests cover partial monitoring windows, an active upward trial and preserved
-training trajectories when no rate changes are made. This validates mechanics, not final accuracy.
+training trajectories when no rate changes are made. Reporting tests inspect SQLite while training
+is still running, check old dev-score timestamps, guard events, full/failed histories and matching
+rules. Experiment 240's saved configuration hash, arm identity and controller state remain compatible.
+This validates mechanics, not final accuracy.
 
 ## Controls and compatibility
 

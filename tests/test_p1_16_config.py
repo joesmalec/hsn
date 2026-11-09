@@ -58,6 +58,10 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.slow_burst_factor",
         "train.slow_burst_window",
         "train.adaptive_lr",
+        "train.adaptive_lr.loss_cuts",
+        "train.adaptive_lr.gradient_cuts",
+        "train.adaptive_lr.update_cuts",
+        "train.adaptive_lr.trial_increases",
     )
 
 

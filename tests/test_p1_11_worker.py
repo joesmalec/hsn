@@ -243,6 +243,7 @@ def test_p1_11_queue_side_imports_no_torch() -> None:
         "import sys\n"
         "import hsn.experiments.cli, hsn.experiments.db, hsn.experiments.spec\n"
         "import hsn.experiments.rules\n"
+        "import hsn.experiments.controller\n"
         "import hsn.experiments.scheduler, hsn.experiments.machine, hsn.experiments.worker\n"
         "import hsn.experiments.report, hsn.experiments.importer, hsn.experiments.run_arm\n"
         "loaded = sorted(m for m in sys.modules if m.startswith('torch'))\n"

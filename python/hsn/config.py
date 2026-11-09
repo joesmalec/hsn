@@ -338,6 +338,11 @@ class AdaptiveLRConfig(_StrictModel):
     router_max_update_ratio: float = Field(default=0.005, gt=0.0, allow_inf_nan=False)
     readout_max_update_ratio: float = Field(default=0.005, gt=0.0, allow_inf_nan=False)
     trial_windows: int = Field(default=2, ge=1)
+    # Independent controller ablations; emergency guard/rollback cuts remain active.
+    loss_cuts: bool = True
+    gradient_cuts: bool = True
+    update_cuts: bool = True
+    trial_increases: bool = True
 
 
 class TrainConfig(_StrictModel):
@@ -1103,6 +1108,10 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.slow_burst_factor",
     "train.slow_burst_window",
     "train.adaptive_lr",
+    "train.adaptive_lr.loss_cuts",
+    "train.adaptive_lr.gradient_cuts",
+    "train.adaptive_lr.update_cuts",
+    "train.adaptive_lr.trial_increases",
 )
 
 
@@ -1111,14 +1120,23 @@ def _hash_view(cfg: RunConfig) -> dict[str, Any]:
     the :data:`HASH_OMIT_AT_DEFAULT` keys that hold their default."""
     dump = cfg.model_dump(mode="json")
     for dotted in HASH_OMIT_AT_DEFAULT:
-        section, key = dotted.split(".")
-        schema = RunConfig.model_fields[section].annotation
-        assert isinstance(schema, type) and issubclass(schema, BaseModel)
-        default = schema.model_fields[key].default
-        if isinstance(default, BaseModel):
-            default = default.model_dump(mode="json")
-        if dump[section][key] == default:
-            del dump[section][key]
+        parts = dotted.split(".")
+        node = dump
+        schema: type[BaseModel] = RunConfig
+        for part in parts[:-1]:
+            if part not in node:  # an enclosing default object was already omitted
+                break
+            node = node[part]
+            nested = schema.model_fields[part].annotation
+            assert isinstance(nested, type) and issubclass(nested, BaseModel)
+            schema = nested
+        else:
+            key = parts[-1]
+            default = schema.model_fields[key].default
+            if isinstance(default, BaseModel):
+                default = default.model_dump(mode="json")
+            if node[key] == default:
+                del node[key]
     return dump
 
 

@@ -1,0 +1,554 @@
+{
+  "config": {
+    "baseline": {
+      "gru": {
+        "d_model": 384,
+        "dropout": 0.0,
+        "n_layers": 2
+      },
+      "transformer": {
+        "d_model": 192,
+        "dropout": 0.0,
+        "ffn_hidden": 768,
+        "n_heads": 4,
+        "n_layers": 4
+      }
+    },
+    "data": {
+      "align_docs": true,
+      "context_symbols": "configs/data/context_symbols.yaml",
+      "dataset": "synthetic_v1",
+      "manifest": "data/synthetic_v1/manifest.json",
+      "split": "train",
+      "tasks": [
+        "delayed"
+      ],
+      "tokenizer": "bytes",
+      "variants": [
+        "in_range"
+      ]
+    },
+    "fast": {
+      "eta": 0.01,
+      "rank": 8,
+      "retention_max_loss_pp": 1.0,
+      "rho": 1.0,
+      "steps_max": 10
+    },
+    "growth": {
+      "budget_per_stage": {},
+      "cap": 0.25,
+      "quality_tolerance_pp": 1.0,
+      "starting_params": null,
+      "threshold_per_task": {},
+      "windows": 3
+    },
+    "hardware": {
+      "autocast_dtype": "bf16",
+      "compile_mode": "reduce-overhead",
+      "device": "cuda",
+      "master_dtype": "fp32",
+      "name": "rtx3060",
+      "nvcc_arch": [
+        "sm_86"
+      ],
+      "pinned_memory": true,
+      "power_meter": "nvml",
+      "recipe": {
+        "activation_checkpoint": "none",
+        "batch": 4,
+        "micro_batch": 4,
+        "unroll": 256
+      },
+      "stream": {},
+      "unified_memory": false,
+      "vram_bytes": 12884901888,
+      "vram_cap_fraction": 1.0
+    },
+    "model": {
+      "ablate_shared_u": false,
+      "activation": "gelu",
+      "age_max": 64,
+      "budget": 1.0,
+      "cand_norm": "none",
+      "cell_norm": "rms",
+      "context_dim": 64,
+      "cost_profile": null,
+      "d": 64,
+      "deadline_ms": null,
+      "disabled_cells": [],
+      "edge_norm": "softmax",
+      "fixed_route": [],
+      "gate_bias_init": -3.0,
+      "halt_threshold": 0.5,
+      "hidden": 512,
+      "in_degree": 4,
+      "init": "trunc_normal_0.02",
+      "k_min": 1,
+      "k_select": 4,
+      "key_address": true,
+      "lambda_cost": 0.0,
+      "n_cells": 32,
+      "n_context": 16,
+      "n_units": 8,
+      "predictor_target": "fixed_embedding",
+      "r_max": 1,
+      "random_edges": 0,
+      "routing": "topk",
+      "scorer": "linear",
+      "scorer_features": {
+        "exclude": []
+      },
+      "scorer_hidden": 128,
+      "selected_readout": true,
+      "state_init": "fan_in",
+      "state_schema_version": 1,
+      "static_k": true,
+      "vocab_size": 256
+    },
+    "model_name": "hsn",
+    "notes": "The standard HSN recipe of P1.16: d=64 + A4, WSD 0.2 over 9k at lr 2e-3, B32, AdamW beta2 0.95 (exp 194).",
+    "profile": "rtx3060",
+    "replay": {
+      "capacity": 100000,
+      "expiry_days": null,
+      "near_dup_threshold": 0.9,
+      "path": null,
+      "quotas": {}
+    },
+    "run_id": "a5_adaptive-s0-d17abb622717",
+    "san": {
+      "k_random": 4,
+      "max_edges": 128,
+      "quality_tolerance_pp": 1.0,
+      "update_every_windows": 16,
+      "validation_windows": 4
+    },
+    "seed": 0,
+    "serve": {
+      "capture_policy": "disabled",
+      "encryption": "none",
+      "limits": {
+        "max_budget": 1.0,
+        "max_deadline_ms": 1000.0,
+        "max_input_bytes": 65536,
+        "max_tokens": 4096,
+        "rps_per_tenant": 10.0
+      },
+      "persistence_enabled": false,
+      "state_ttl_s": 3600
+    },
+    "stream": {
+      "device_budget_bytes": 0,
+      "enabled": false,
+      "host_budget_bytes": 0,
+      "hot_windows": 4,
+      "policy": "utility_lru",
+      "prefetch_top": "2K"
+    },
+    "train": {
+      "activation_checkpoint": "none",
+      "adaptive_lr": {
+        "cooldown": 2,
+        "enabled": true,
+        "grad_growth": 3.0,
+        "increase_factor": 1.1,
+        "interval": 100,
+        "max_scale": 1.0,
+        "max_update_ratio": 0.01,
+        "min_scale": 0.03125,
+        "monitor_docs": 32,
+        "patience": 2,
+        "readout_max_update_ratio": 0.005,
+        "reduce_factor": 0.5,
+        "router_max_update_ratio": 0.005,
+        "threshold": 0.01,
+        "trial_windows": 2
+      },
+      "allow_multiple_aux": "",
+      "aux_enabled": [],
+      "batch": 32,
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "cell_lr_mult": 1.0,
+      "cell_weight_decay": null,
+      "ckpt_every": 9000,
+      "decay_fraction": 0.2,
+      "deterministic": false,
+      "distill_temperature": 2.0,
+      "divergence_dump": true,
+      "ema_decay": 0.99,
+      "ema_tau": 0.99,
+      "epsilon_end": 0.0,
+      "epsilon_start": 0.0,
+      "epsilon_steps": 0,
+      "eval_every": 500,
+      "ewc_batches": 64,
+      "ewc_cap": 1.0,
+      "ewc_groups": {},
+      "gate_mode": "ste",
+      "grad_accum": 1,
+      "grad_clip": 1.0,
+      "interference_window": 32,
+      "lambda_b": 0.0,
+      "lambda_c": 0.0,
+      "lambda_d": 0.0,
+      "lambda_e": 0.0,
+      "lambda_g": 0.0,
+      "lambda_p": 1.0,
+      "lambda_ponder": 0.0,
+      "lambda_r": 0.0,
+      "lambda_u": 0.0,
+      "lr": 0.0025,
+      "micro_batch": 32,
+      "n_probe": 4,
+      "obsolete_label_versions": [],
+      "optimizer": "lazy_adamw",
+      "p_dense": 0.0,
+      "pcgrad": false,
+      "pcgrad_eps": 1e-08,
+      "precision": "bf16",
+      "probe_fraction": 0.05,
+      "probe_horizon": null,
+      "q_resync_every": 64,
+      "readout_lr_mult": 1.0,
+      "reinforce_baseline_decay": 0.9,
+      "replay_fraction": 0.25,
+      "rollback_every": 50,
+      "rollback_lr_mult": 1.0,
+      "rollback_lr_steps": 0,
+      "rollback_max": 5,
+      "rollback_skip": 10,
+      "router_lr_mult": 1.0,
+      "schedule": "wsd",
+      "search_trials": 4,
+      "shared_lr_scale_on_conflict": 0.5,
+      "slow_burst_factor": 10.0,
+      "slow_burst_window": 250,
+      "soft_until_step": 0,
+      "spike_factor": 100.0,
+      "spike_window": 100,
+      "stats_every": 100,
+      "steps": 9000,
+      "temperature_end": 1.0,
+      "temperature_start": 1.0,
+      "temperature_steps": 0,
+      "unroll": 256,
+      "variance_floor_gamma": 1.0,
+      "warmup_steps": 200,
+      "weight_decay": 0.01
+    }
+  },
+  "config_hash": "bf8bd4f1e38b83db8e221678eba9839d7ed2c29dfa4b10972166b9793df6a41f",
+  "arm_id": "d17abb622717aae5",
+  "protocol": {
+    "checkpoint": "retained",
+    "diag_dense_every": 0,
+    "diag_docs": 32,
+    "diag_every": 250,
+    "diag_window_docs": 4,
+    "diag_windows": [],
+    "eval_batch": 128,
+    "keep_every": 500,
+    "keep_last": 2,
+    "max_step_s": 0.5,
+    "n_dev": 0,
+    "n_train": 0,
+    "name": "train_eval",
+    "step_time_approval": "",
+    "steps": 1000
+  },
+  "variant": {},
+  "early_stop": [],
+  "data_hash": "56ec31bac68dac64",
+  "source": {
+    "exp_id": 240,
+    "commit": "e67fdaa8e551b40b70b7a3c95be1cce17f9d2ecb"
+  },
+  "controller": {
+    "accepted_steps": 1000,
+    "anchor_loss": 3.5181539759916416,
+    "bad_windows": 0,
+    "best_loss": 3.4641848574666416,
+    "config": {
+      "cooldown": 2,
+      "enabled": true,
+      "grad_growth": 3.0,
+      "increase_factor": 1.1,
+      "interval": 100,
+      "max_scale": 1.0,
+      "max_update_ratio": 0.01,
+      "min_scale": 0.03125,
+      "monitor_docs": 32,
+      "patience": 2,
+      "readout_max_update_ratio": 0.005,
+      "reduce_factor": 0.5,
+      "router_max_update_ratio": 0.005,
+      "threshold": 0.01,
+      "trial_windows": 2
+    },
+    "cooldown": 0,
+    "healthy_grad": 0.6650837659835815,
+    "hot_windows": {
+      "decoder": 0,
+      "router": 0,
+      "shared": 0
+    },
+    "monitor_fingerprint": "b86d7208a532251a6f7a2297844c322f312eb0283faeca91899d955c97b25581",
+    "norms": [],
+    "observations": [
+      {
+        "accepted_steps": 100,
+        "anchor_loss": null,
+        "before": {
+          "decoder": 1.0,
+          "router": 1.0,
+          "shared": 1.0
+        },
+        "decision": "warmup",
+        "grad_median": 1.9020792245864868,
+        "healthy_grad": null,
+        "loss": 3.9369913549984203,
+        "scales": {
+          "decoder": 1.0,
+          "router": 1.0,
+          "shared": 1.0
+        },
+        "step": 100,
+        "update_ratios": {
+          "decoder": 0.011845625005662441,
+          "router": 0.0191111471503973,
+          "shared": 0.004085768014192581
+        }
+      },
+      {
+        "accepted_steps": 200,
+        "anchor_loss": 3.9369913549984203,
+        "before": {
+          "decoder": 1.0,
+          "router": 1.0,
+          "shared": 1.0
+        },
+        "decision": "warmup",
+        "grad_median": 0.7155216336250305,
+        "healthy_grad": 1.9020792245864868,
+        "loss": 3.9146942320991966,
+        "scales": {
+          "decoder": 1.0,
+          "router": 1.0,
+          "shared": 1.0
+        },
+        "step": 200,
+        "update_ratios": {
+          "decoder": 0.011365302838385105,
+          "router": 0.007753492332994938,
+          "shared": 0.005074384622275829
+        }
+      },
+      {
+        "accepted_steps": 300,
+        "anchor_loss": 3.9146942320991966,
+        "before": {
+          "decoder": 1.0,
+          "router": 1.0,
+          "shared": 1.0
+        },
+        "decision": "improving",
+        "grad_median": 0.386861115694046,
+        "healthy_grad": 0.7155216336250305,
+        "loss": 3.824192993781146,
+        "scales": {
+          "decoder": 1.0,
+          "router": 1.0,
+          "shared": 1.0
+        },
+        "step": 300,
+        "update_ratios": {
+          "decoder": 0.0058282604441046715,
+          "router": 0.011434841901063919,
+          "shared": 0.005575357470661402
+        }
+      },
+      {
+        "accepted_steps": 400,
+        "anchor_loss": 3.9146942320991966,
+        "before": {
+          "decoder": 1.0,
+          "router": 1.0,
+          "shared": 1.0
+        },
+        "decision": "update_cut",
+        "grad_median": 0.37150992453098297,
+        "healthy_grad": 0.7155216336250305,
+        "loss": 3.725201980156057,
+        "scales": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "step": 400,
+        "update_ratios": {
+          "decoder": 0.003675140207633376,
+          "router": 0.007969890721142292,
+          "shared": 0.005634643137454987
+        }
+      },
+      {
+        "accepted_steps": 500,
+        "anchor_loss": 3.725201980156057,
+        "before": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "decision": "cooldown",
+        "grad_median": 0.41888658702373505,
+        "healthy_grad": 0.37150992453098297,
+        "loss": 3.704620491055881,
+        "scales": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "step": 500,
+        "update_ratios": {
+          "decoder": 0.0046995338052511215,
+          "router": 0.005563231185078621,
+          "shared": 0.006998436525464058
+        }
+      },
+      {
+        "accepted_steps": 600,
+        "anchor_loss": 3.725201980156057,
+        "before": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "decision": "cooldown",
+        "grad_median": 0.5245318114757538,
+        "healthy_grad": 0.37150992453098297,
+        "loss": 3.692139224094503,
+        "scales": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "step": 600,
+        "update_ratios": {
+          "decoder": 0.0017302994383499026,
+          "router": 0.006799354683607817,
+          "shared": 0.005495115648955107
+        }
+      },
+      {
+        "accepted_steps": 700,
+        "anchor_loss": 3.725201980156057,
+        "before": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "decision": "improving",
+        "grad_median": 0.5575023889541626,
+        "healthy_grad": 0.37150992453098297,
+        "loss": 3.641564550645211,
+        "scales": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "step": 700,
+        "update_ratios": {
+          "decoder": 0.001655396306887269,
+          "router": 0.003191299270838499,
+          "shared": 0.005497193895280361
+        }
+      },
+      {
+        "accepted_steps": 800,
+        "anchor_loss": 3.641564550645211,
+        "before": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "decision": "improving",
+        "grad_median": 0.6005901992321014,
+        "healthy_grad": 0.5575023889541626,
+        "loss": 3.4641848574666416,
+        "scales": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "step": 800,
+        "update_ratios": {
+          "decoder": 0.0024418930988758802,
+          "router": 0.0050873239524662495,
+          "shared": 0.00507173128426075
+        }
+      },
+      {
+        "accepted_steps": 900,
+        "anchor_loss": 3.641564550645211,
+        "before": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "decision": "improving",
+        "grad_median": 0.6650837659835815,
+        "healthy_grad": 0.5575023889541626,
+        "loss": 3.5181539759916416,
+        "scales": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "step": 900,
+        "update_ratios": {
+          "decoder": 0.0012186005478724837,
+          "router": 0.0029263212345540524,
+          "shared": 0.004316505044698715
+        }
+      },
+      {
+        "accepted_steps": 1000,
+        "anchor_loss": 3.5181539759916416,
+        "before": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "decision": "hold",
+        "grad_median": 0.698712170124054,
+        "healthy_grad": 0.6650837659835815,
+        "loss": 3.521257656462052,
+        "scales": {
+          "decoder": 1.0,
+          "router": 0.5,
+          "shared": 1.0
+        },
+        "step": 1000,
+        "update_ratios": {
+          "decoder": 0.0015367977321147919,
+          "router": 0.003644858254119754,
+          "shared": 0.004822912160307169
+        }
+      }
+    ],
+    "plateau_windows": 1,
+    "scales": {
+      "decoder": 1.0,
+      "router": 0.5,
+      "shared": 1.0
+    },
+    "trial": null,
+    "trial_blocked": false,
+    "version": 1
+  },
+  "variant_name": "pdg"
+}

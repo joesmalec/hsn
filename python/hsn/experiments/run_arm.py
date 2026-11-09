@@ -10,7 +10,7 @@ It owns its experiment row while that row is ``running`` with its PID (guarded w
 2. re-validates the stored resolved configuration with its own code and recomputes the arm id
    (configuration, data manifest, family, variant, protocol, early-stop rules); a mismatch or a key
    this checkout does not know fails the run (the database is shared between worktrees);
-3. runs the protocol (:mod:`hsn.experiments.protocols`) with progress at every evaluation;
+3. runs the protocol with progress at every evaluation and adaptive-controller observation;
 4. evaluates the sweep's verdict rules on the record, writes the full JSON (every probe included)
    to ``<run dir>/result.json`` and, in one transaction, the results row and the final status
    (``done`` or ``stopped_early``).
@@ -324,11 +324,18 @@ def _run(
     dump_resolved(cfg, run_dir / "config.resolved.yaml")
     start_card = _snapshot()
 
+    controller_logged = -1
+
     def progress(p: dict[str, Any]) -> None:
+        nonlocal controller_logged
         if not dbm.child_progress(db, exp["exp_id"], pid, p):
             raise RuntimeError(
                 "the experiment row is no longer running for this process (recovered)"
             )
+        controller = p.get("adaptive_lr")
+        if controller is not None and controller["observation_count"] != controller_logged:
+            _log("controller " + json.dumps(controller, sort_keys=True, allow_nan=False))
+            controller_logged = controller["observation_count"]
 
     attempt.arm_run = ArmRun(
         cfg=cfg,

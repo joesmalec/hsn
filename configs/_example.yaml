@@ -89,6 +89,10 @@ train: # Appendix A.3
     router_max_update_ratio: 0.005
     readout_max_update_ratio: 0.005
     trial_windows: 2
+    loss_cuts: true # false ablates cuts from sustained loss regression alone
+    gradient_cuts: true # false ablates the joint loss/gradient warning and its trial veto
+    update_cuts: true # false ablates per-component update cuts and their trial veto
+    trial_increases: true # false disables upward trials; emergency guard cuts are always active
   cell_weight_decay: null # P1.13: weight decay of the cell's tensors with ndim >= 2; null = weight_decay
   spike_factor: null # P1.15: skip a step whose grad norm > factor x the running median (null: off; 1e3-1e4)
   spike_window: 100 # P1.15: applied steps in that median (read only with spike_factor set)

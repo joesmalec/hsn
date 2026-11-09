@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from hsn.config import AdaptiveLRConfig
 
+ABLATION_KEYS = ("loss_cuts", "gradient_cuts", "update_cuts", "trial_increases")
+
 
 class _Trial(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -148,7 +150,7 @@ class AdaptiveLR:
                 s.hot_windows[key] = s.hot_windows.get(key, 0) + 1 if key in hot else 0
             s.bad_windows = s.bad_windows + 1 if worse else 0
             # A plateau is eligible only while both gradient and update measurements are healthy.
-            healthy = not hot and not growing
+            healthy = (not hot or not c.update_cuts) and (not growing or not c.gradient_cuts)
             s.plateau_windows = (
                 s.plateau_windows + 1 if healthy and not improved and not worse else 0
             )
@@ -177,11 +179,13 @@ class AdaptiveLR:
                 s.hot_windows.clear()
                 if improved and healthy:
                     s.anchor_loss, s.healthy_grad = loss, grad
-            elif s.bad_windows >= c.patience or (worse and growing):
+            elif (c.loss_cuts and s.bad_windows >= c.patience) or (
+                c.gradient_cuts and worse and growing
+            ):
                 self._cut(set(s.scales))
                 s.anchor_loss, s.healthy_grad = loss, grad
-                decision = "loss_and_gradient_cut" if growing else "loss_cut"
-            elif overheated:
+                decision = "loss_and_gradient_cut" if c.gradient_cuts and growing else "loss_cut"
+            elif c.update_cuts and overheated:
                 self._cut(overheated)
                 s.anchor_loss, s.healthy_grad = loss, grad
                 decision = "update_cut"
@@ -191,7 +195,7 @@ class AdaptiveLR:
                     s.anchor_loss, s.healthy_grad = loss, grad
                     s.trial_blocked = False
                 s.plateau_windows = 0
-            elif s.plateau_windows >= c.patience and not s.trial_blocked:
+            elif c.trial_increases and s.plateau_windows >= c.patience and not s.trial_blocked:
                 raised = {
                     key: min(c.max_scale, value * c.increase_factor)
                     for key, value in s.scales.items()
@@ -214,7 +218,12 @@ class AdaptiveLR:
 
     def load_state_dict(self, raw: dict[str, Any]) -> None:
         raw = copy.deepcopy(raw)
-        if raw.pop("config", None) != self.cfg.model_dump(mode="json"):
+        config = raw.pop("config", None)
+        if isinstance(config, dict):
+            # Version-1 checkpoints predate the ablation switches; every switch was on.
+            for key in ABLATION_KEYS:
+                config.setdefault(key, True)
+        if config != self.cfg.model_dump(mode="json"):
             raise ValueError("adaptive_lr checkpoint configuration differs or is missing")
         state = _State.model_validate(raw)
         scales = [state.scales] + ([] if state.trial is None else [state.trial.scales])

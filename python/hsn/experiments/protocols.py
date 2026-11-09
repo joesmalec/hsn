@@ -392,8 +392,7 @@ def _first_guard_event(trainer: Any) -> int | None:
 
 
 class _StepCallback:
-    """Progress at every evaluation; the step-time guard (P1.14) at every step; the early-stop rules
-    at their steps."""
+    """Progress at evaluations and controller observations; guard/stop rules at their cadence."""
 
     def __init__(
         self,
@@ -408,6 +407,7 @@ class _StepCallback:
         self.audit_keys = audit_keys
         self.guard = guard
         self._compile_seen = 0.0
+        self._controller_reported = -1
         self.at_steps = {s for r in arm.rules.early_stop for s in r.at_steps}
         self.stop: dict[str, Any] | None = None
         self.log: list[dict[str, Any]] = []
@@ -429,17 +429,12 @@ class _StepCallback:
             self.guard.observe(
                 step, float(history.steps[-1].seconds), compiled=compiled, evaluated=evaluated
             )  # raises StepTimeExceeded above the arm's max_step_s
-        if evaluated:
-            last = history.evals[-1]
-            self.arm.on_progress(
-                {
-                    "step": step,
-                    "of": self.arm.steps,
-                    "dev_accuracy": float(last["accuracy"]),
-                    "dev_loss": float(last["loss"]),
-                    "elapsed_s": round(time.perf_counter() - self.started, 1),
-                }
-            )
+        controller = getattr(trainer, "adaptive_lr", None)
+        changed = controller is not None and (
+            len(controller.state.observations) != self._controller_reported
+        )
+        if evaluated or changed:
+            self.publish_progress(trainer, history)
         if step not in self.at_steps:
             return False
         record = {
@@ -456,6 +451,27 @@ class _StepCallback:
             self.stop = {**stop, "elapsed_s": round(time.perf_counter() - self.started, 1)}
             return True
         return False
+
+    def publish_progress(self, trainer: Any, history: Any, *, phase: str | None = None) -> None:
+        from hsn.experiments.controller import controller_progress
+
+        progress: dict[str, Any] = {
+            "step": int(trainer.step),
+            "of": self.arm.steps,
+            "elapsed_s": round(time.perf_counter() - self.started, 1),
+            **controller_progress(trainer),
+        }
+        if history.evals:
+            last = history.evals[-1]
+            progress.update(dev_accuracy=float(last["accuracy"]), dev_loss=float(last["loss"]))
+            if "adaptive_lr" in progress:
+                # A monitoring update must not present an older dev score as a fresh evaluation.
+                progress["dev_step"] = int(last["step"])
+        if phase is not None:
+            progress["phase"] = phase
+        self.arm.on_progress(progress)
+        if "adaptive_lr" in progress:
+            self._controller_reported = int(progress["adaptive_lr"]["observation_count"])
 
 
 def _adaptive_record(trainer: Any) -> dict[str, Any]:
@@ -633,16 +649,9 @@ def _train(
 
     evals = [_eval_entry(e, audit_keys=audit_keys) for e in history.evals]
     train = _mark_skipped([_train_entry(s) for s in history.steps], trainer)
-    if evals:  # the trainer does not call back at its last step: report it, and the phase after
-        arm.on_progress(
-            {
-                "step": int(history.steps[-1].step),
-                "of": arm.steps,
-                "dev_accuracy": evals[-1]["accuracy"],
-                "dev_loss": evals[-1]["loss"],
-                "phase": "stopped, probing" if callback.stop else "trained, probing",
-                "elapsed_s": round(time.perf_counter() - t1, 1),
-            }
+    if evals:
+        callback.publish_progress(
+            trainer, history, phase="stopped, probing" if callback.stop else "trained, probing"
         )
     full: dict[str, Any] = {
         "protocol": params.name,

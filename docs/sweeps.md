@@ -50,6 +50,13 @@ python -m hsn.experiments status                                            # qu
 python -m hsn.experiments report --sweep example_reads_state                # one row per seed group
 ```
 
+Adaptive runs publish controller observations to `status` between dev evaluations, with effective
+rates for the next update, the latest decision and the last actual rate change. `dev @ step` identifies
+the evaluation behind a displayed dev score. Full signal histories remain in each result's
+`adaptive_lr` block. `python -m hsn.experiments controller-report --exp N [--exp M ...] [--out FILE]`
+reads warning follow-through and strictly matched ablation comparisons without loading a model or
+writing to SQLite. See [controller reporting and ablations](a5_implementation.md#live-reporting-and-signal-ablations).
+
 **Database location:** `~/hsn-experiments/experiments.sqlite`, here `/home/joe/hsn-experiments/`. Override it
 with `--db` or `$HSN_EXPERIMENTS_DB`.
 
