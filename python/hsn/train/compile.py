@@ -32,6 +32,13 @@ static (plan P2.8, "static shapes are required for graph capture"):
   once per window, so the edge-softmax backward stays the eager one (the dense cells' exact zero
   edge gradient, plan finding 1 of the efficiency audit).
 
+Dense-fallback row IDs are compacted before the window and padded to a power-of-two batch
+(capped at B). Only that subset runs the dense cell pass; distinct padding rows keep their sparse
+result. Each bucket has its own compiled function and compile-time accounting, so changing row
+IDs within a bucket never changes the graph. At B32 there are six nonempty buckets. The sparse
+pass still runs on all rows. State maxima are reduced within each position; only ``capture=True``
+on the eager path materializes the full state history.
+
 The compiled window matches eager ``HSN.forward`` to rounding (fused kernels round differently),
 not bit for bit; ``hardware.compile_mode = none`` leaves every path eager and unchanged.
 ``profile:rtx3060`` compiles by default (``reduce-overhead``, the user's decision of 7 Nov 2026);
@@ -273,6 +280,7 @@ def _block(
     r_b: Tensor,
     dense_in: tuple[Tensor, Tensor] | None,
     dense_rows: Tensor | None,
+    dense_indices: Tensor | None,
     consts: WindowConsts,
     mode: StepMode,
     controls: _Controls,
@@ -290,9 +298,10 @@ def _block(
     epss: list[Tensor] = []
     us: list[Tensor] = []
     qs: list[Tensor] = []
-    hs: list[Tensor] = []
+    state_maxima: list[Tensor] = []
     logit_steps: list[Tensor] = []
     records: list[dict[str, Tensor]] = []
+    readouts: list[Tensor] = []
     zero_age = torch.zeros_like(age) if dense_in is not None else None
     for i in range(n):
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
@@ -313,13 +322,16 @@ def _block(
             counters,
             static=True,
             consts=consts,
+            dense_indices=dense_indices,
         )
         state = result.state
+        if model.cfg.selected_readout:
+            readouts.append(model._selected_readout(state, result.selection, controls.gate, mode))
         z_hats.append(result.z_hat)
         epss.append(result.eps)
         us.append(result.u)
         qs.append(state.q)
-        hs.append(state.h.detach())
+        state_maxima.append(state.h.detach().abs().amax())
         logit_steps.append(result.unit_logits.detach())
         if result.selection is not None:
             records.append(model._selection_record(result.selection))
@@ -332,12 +344,14 @@ def _block(
         "eps": torch.stack(epss, dim=1),
         "u": torch.stack(us, dim=1),
         "qs": torch.stack(qs, dim=1),
-        "hs": torch.stack(hs, dim=1),
+        "state_abs_max": torch.stack(state_maxima),
         "unit_logits_d": torch.stack(logit_steps, dim=1),
     }
     if records:
         for key in SELECTION_RECORD_KEYS:
             out["sel_" + key] = _stack_record([r[key] for r in records])
+    if readouts:
+        out["readouts"] = torch.stack(readouts, dim=1)
     return out
 
 
@@ -361,13 +375,14 @@ class CompiledWindow:
         self.backend = backend
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
         self._block = _compiler(mode, backend, ctx.device.type)(_block)
+        self._bucket_blocks: dict[int, Any] = {0: self._block}
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
 
-    def variant(self, B: int, T: int, dense_rows: bool) -> tuple[object, ...]:
+    def variant(self, B: int, T: int, dense_bucket: int) -> tuple[object, ...]:
         """What selects a compiled graph: batch, block, grad mode, training mode, gate, autocast
-        and whether dense-fallback rows are present."""
+        and the padded dense-fallback batch size."""
         model = self.model
         return (
             B,
@@ -376,12 +391,12 @@ class CompiledWindow:
             model.training,
             model._controls().gate,
             torch.is_autocast_enabled(self.ctx.device.type),
-            dense_rows,
+            dense_bucket,
         )
 
-    def is_new_variant(self, B: int, T: int, dense_rows: bool) -> bool:
+    def is_new_variant(self, B: int, T: int, dense_bucket: int) -> bool:
         """True when the next call with these properties compiles (or records) a graph."""
-        key = self.variant(B, T, dense_rows)
+        key = self.variant(B, T, dense_bucket)
         warm = (*key, "warm")
         if self.cuda_graphs:  # CUDA Graph trees warm up once, then record on the second call
             return key not in self._variants or warm not in self._variants
@@ -396,6 +411,7 @@ class CompiledWindow:
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
+        prev_tokens: Tensor | None = None,
     ) -> WindowOut:
         model = self.model
         if capture:
@@ -408,11 +424,15 @@ class CompiledWindow:
             model._reset_columns(reset, reset_columns)  # validated; every block resets anyway
         mode = model._window_mode()
         dense_rows = model._draw_dense_rows(B, state)
+        dense_indices = model._dense_indices(dense_rows, bucket=True)
+        dense_bucket = 0 if dense_indices is None else int(dense_indices.numel())
         controls = model._controls()
-        key = self.variant(B, T, dense_rows is not None)
-        new = self.is_new_variant(B, T, dense_rows is not None)
+        key = self.variant(B, T, dense_bucket)
+        new = self.is_new_variant(B, T, dense_bucket)
         started = time.perf_counter()
-        out = self._run(tokens, ctx, state, reset, mode, controls, dense_rows)
+        out = self._run(
+            tokens, ctx, state, reset, mode, controls, dense_rows, prev_tokens, dense_indices
+        )
         self.calls += 1
         if new:
             if self.cuda_graphs:
@@ -430,11 +450,15 @@ class CompiledWindow:
         mode: StepMode,
         controls: _Controls,
         dense_rows: Tensor | None,
+        prev_tokens: Tensor | None = None,
+        dense_indices: Tensor | None = None,
     ) -> WindowOut:
         model = self.model
         T = int(tokens.shape[1])
         blk = block_size(T)
-        pro = model._window_prologue(tokens, ctx, state, reset, mode, reset_first=True)
+        pro = model._window_prologue(
+            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
+        )
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age, pos = state.h, state.q, state.age, state.pos
@@ -447,6 +471,14 @@ class CompiledWindow:
             h = h.detach().requires_grad_(True)
             q = q.detach().requires_grad_(True)
         blocks: list[dict[str, Tensor]] = []
+        bucket = 0 if dense_indices is None else int(dense_indices.numel())
+        if bucket not in self._bucket_blocks:
+            # Each shape bucket has its own Dynamo code object/recompile budget. A B32 window
+            # needs at most six fallback shapes, independent of which row IDs were drawn.
+            self._bucket_blocks[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(
+                _block
+            )
+        block = self._bucket_blocks[bucket]
         with model.cell.window():
             consts = model.cell.window_consts()
             for start in range(0, T, blk):
@@ -455,7 +487,7 @@ class CompiledWindow:
                 if pro.counters is not None:
                     _, _, positions, positions_after = pro.counters
                     dense_in = (positions[:, cols], positions_after[:, cols])
-                out = self._block(
+                out = block(
                     model,
                     h,
                     q,
@@ -467,6 +499,7 @@ class CompiledWindow:
                     reset[:, cols],
                     dense_in,
                     dense_rows,
+                    dense_indices,
                     consts,
                     mode,
                     controls,
@@ -492,11 +525,13 @@ class CompiledWindow:
             epss=joined("eps"),
             us=joined("u"),
             qs=joined("qs"),
-            hs=joined("hs"),
+            hs=None,
+            state_abs_max=torch.cat([b["state_abs_max"] for b in blocks]),
             unit_logits=joined("unit_logits_d"),
             routed=routed,
             gates=None,
             written=None,
+            readouts=joined("readouts") if model.cfg.selected_readout else None,
         )
 
 
@@ -509,9 +544,16 @@ def _eager_window(model: HSN) -> Callable[..., WindowOut]:
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
+        prev_tokens: Tensor | None = None,
     ) -> WindowOut:
         result: WindowOut = model(
-            tokens, ctx, state, reset, capture=capture, reset_columns=reset_columns
+            tokens,
+            ctx,
+            state,
+            reset,
+            capture=capture,
+            reset_columns=reset_columns,
+            prev_tokens=prev_tokens,
         )
         return result
 
@@ -565,11 +607,14 @@ def _serve(
     pos: Tensor,
     mode: StepMode,
     static: bool,
+    prev_tokens: Tensor | None = None,
 ) -> Tensor:
     """One serving position: :meth:`HSN._step_impl` on the state ``(h, q, age, pos)``, written
     back into those tensors in place; returns the logits ``[B, V]``."""
     state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
-    out = model._step_impl(x_t, ctx_t, state, mode, None, None, static=static)
+    out = model._step_impl(
+        x_t, ctx_t, state, mode, None, None, static=static, prev_tokens=prev_tokens
+    )
     h.copy_(out.state.h)
     q.copy_(out.state.q)
     age.copy_(out.state.age)
@@ -599,11 +644,20 @@ class ServingStep:
         self._marked: set[int] = set()
         self._seen: dict[tuple[object, ...], int] = {}
 
-    def __call__(self, x_t: Tensor, ctx_t: Tensor, state: CellGraphState) -> Tensor:
+    def __call__(
+        self,
+        x_t: Tensor,
+        ctx_t: Tensor,
+        state: CellGraphState,
+        *,
+        prev_tokens: Tensor | None = None,
+    ) -> Tensor:
         model = self.model
         if model.training:
             raise RuntimeError("the serving step runs in evaluation mode: call model.eval() first")
         model._check_step_inputs(x_t, ctx_t, state)
+        if model.cfg.key_address:
+            prev_tokens = model._previous_tokens(x_t, prev_tokens)
         for t in (state.h, state.q, state.age, state.pos):
             if t.requires_grad:
                 raise RuntimeError("the serving state must not require grad (detach it)")
@@ -628,6 +682,7 @@ class ServingStep:
                 state.pos,
                 model._window_mode(),
                 self.static,
+                prev_tokens,
             )
         self.calls += 1
         self._seen[key] = seen + 1
@@ -640,7 +695,7 @@ class ServingStep:
 
 def compile_step(
     model: HSN, ctx: DeviceContext, mode: CompileMode, *, backend: Backend = "inductor"
-) -> Callable[[Tensor, Tensor, CellGraphState], Tensor]:
+) -> Callable[..., Tensor]:
     """The serving step of ``model`` at compile level ``mode`` (:class:`ServingStep`; module
     docstring): ``none`` is the eager in-place step (L0); otherwise the position is compiled and,
     on CUDA, captured as a CUDA Graph on the state's preallocated buffers. The compiled scope

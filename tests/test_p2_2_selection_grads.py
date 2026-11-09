@@ -1086,14 +1086,15 @@ def test_p2_2_sparse_round_takes_the_gradient() -> None:
     grad = model.router.scorer.net.weight.grad
     assert grad is not None and bool(torch.isfinite(grad).all()) and float(grad.norm()) > 1e-8
     assert sparse.selection.alpha.requires_grad  # the gradient entry of the sparse round
-    # dense-fallback rows: the dense step bit for bit, the other rows the sparse round
+    # Dense fallback compacts its rows: the changed GEMM batch shape may round differently.
+    # Other rows still execute exactly the sparse round.
     rows = torch.tensor([True, False, True, False])
     mixed = model.step(x, c, state, "sparse", dense_rows=rows)
     dense = model.step(x, c, state, "dense")
     plain = model.step(x, c, state, "sparse")
     assert mixed.selection is not None and torch.equal(mixed.selection.dense_fallback, rows)
-    assert torch.equal(mixed.logits[rows], dense.logits[rows])
-    assert torch.equal(mixed.state.h[rows], dense.state.h[rows])
+    torch.testing.assert_close(mixed.logits[rows], dense.logits[rows], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(mixed.state.h[rows], dense.state.h[rows], atol=1e-6, rtol=1e-5)
     assert torch.equal(mixed.state.age[rows], dense.state.age[rows])
     assert torch.equal(mixed.logits[~rows], plain.logits[~rows])
     assert torch.equal(mixed.state.h[~rows], plain.state.h[~rows])

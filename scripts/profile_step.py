@@ -1203,16 +1203,19 @@ def serving(
     times: list[float] = []
     with autocast:
         for t in range(8):  # warm-up: compile, record
-            step(xs[t], cs[t], state)
+            kwargs = {"prev_tokens": None if t == 0 else xs[t - 1]} if cfg.model.key_address else {}
+            step(xs[t], cs[t], state, **kwargs)
         synchronize(ctx.device)
         for t in range(8, 8 + tokens):
+            kwargs = {"prev_tokens": xs[t - 1]} if cfg.model.key_address else {}
             started = time.perf_counter()
-            logits = step(xs[t], cs[t], state)
+            logits = step(xs[t], cs[t], state, **kwargs)
             float(logits[0, 0])  # the token is read: a synchronising latency
             times.append(time.perf_counter() - started)
         if ctx.device.type == "cuda":
             with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-                step(xs[0], cs[0], state)
+                kwargs = {"prev_tokens": xs[-1]} if cfg.model.key_address else {}
+                step(xs[0], cs[0], state, **kwargs)
                 synchronize(ctx.device)
     host = -1  # MPS: no host launch calls exist to count, and the serving step is not traced
     if ctx.device.type == "cuda":

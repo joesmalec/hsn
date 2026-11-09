@@ -67,7 +67,7 @@ import math
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import torch
@@ -75,6 +75,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from hsn.data.dataset import ByteDataset
+from hsn.data.synthetic import BOS
 from hsn.model.hsn import HSN
 from hsn.model.router import (
     CANDIDATE_ADD,
@@ -166,6 +167,7 @@ class _Window:
     context: Tensor
     loss_mask: Tensor
     reset: Tensor
+    prev_tokens: Tensor | None = None
 
     @property
     def B(self) -> int:  # noqa: N802 - the plan's shape symbol
@@ -208,7 +210,8 @@ def run_probe(
     either an unselected cell (any unit) or a valid, scorer-chosen slot ``(cell, unit)`` of the
     policy's selection at ``t``; anything else raises. ``t + horizon <= T``. The model must be
     routed and, in training mode, past the soft warm-up (a soft gate has no hard counterfactual).
-    Runs under ``no_grad`` and restores every RNG on exit."""
+    Runs under ``no_grad`` and restores every RNG on exit. For A5, the optional
+    ``batch_window['prev_tokens']`` is the byte before the window (None means BOS)."""
     _require_split(batch_window, (PROBE_SPLIT,), "run_probe")
     window = _prepare(model, state, batch_window, t, horizon)
     cand = _check_candidates(candidates, window.B, model)
@@ -265,6 +268,31 @@ def choose_probe_position(
             return None
     pick = int(torch.randint(int(positions.numel()), (1,), generator=generator))
     return int(positions[pick])
+
+
+def dependency_probe_coverage(
+    loss_mask: Tensor, dependencies: Tensor, horizon: int | None
+) -> tuple[int, int]:
+    """Count answer dependencies whose source can be probed in this window, and all answers.
+
+    This is eligibility, not the number actually sampled. Both tensors are the loader's CPU
+    [B,T] fields. A source before this TBPTT window cannot receive a counterfactual here. For a
+    fixed horizon the source must also be a legal start and reach its own answer; merely having
+    another row's answer nearby is insufficient. None removes the short-horizon exclusion while
+    respecting the window boundary. Metadata diagnoses coverage and never enters the router.
+    """
+    if loss_mask.ndim != 2 or loss_mask.dtype != torch.bool:
+        raise ValueError("loss_mask must be bool [B,T]")
+    if dependencies.shape != loss_mask.shape:
+        raise ValueError("dependencies must match loss_mask")
+    T = int(loss_mask.shape[1])
+    position = torch.arange(T, device=dependencies.device)[None, :]
+    source = position - dependencies
+    eligible = (source >= 0) & (dependencies >= 0)
+    if horizon is not None:
+        _check_horizon(horizon, T)
+        eligible = eligible & (dependencies < horizon) & (source + horizon <= T)
+    return int((eligible & loss_mask).sum()), int(loss_mask.sum())
 
 
 def sample_candidates(selection: Selection, n_probe: int, generator: torch.Generator) -> Tensor:
@@ -467,6 +495,7 @@ def measure_utility_correlation(
     per_window: list[tuple[np.ndarray[Any, Any], ...]] = []
     n_windows = 0
     state: CellGraphState | None = None
+    prev_tokens: Tensor | None = None
     with torch.no_grad():
         for batch_window in windows:
             split = _require_split(
@@ -475,7 +504,9 @@ def measure_utility_correlation(
             del split
             if state is None:
                 state = model.init_state(int(batch_window["tokens"].shape[0]))
-            window = _prepare(model, state, batch_window, 0, 1)
+            window = _prepare(
+                model, state, {**batch_window, **_address_kwargs(model, prev_tokens)}, 0, 1
+            )
             n_windows += 1
             t = choose_probe_position(window.loss_mask, horizon, generator)
             if t is not None:
@@ -498,8 +529,14 @@ def measure_utility_correlation(
                         )
                     )
             _, state, _ = model.forward(
-                window.tokens, window.context, state, window.reset
+                window.tokens,
+                window.context,
+                state,
+                window.reset,
+                **_address_kwargs(model, prev_tokens),
             )  # carry the state into the next window
+            if model.cfg.key_address:
+                prev_tokens = window.tokens[:, -1].detach().clone()
     return _summarise(per_window, n_windows, horizon, n_probe, seed, n_bootstrap)
 
 
@@ -593,7 +630,11 @@ def _prefix(model: HSN, state: CellGraphState, window: _Window, t: int) -> CellG
     if t == 0:
         return state
     _, before_t, _ = model.forward(
-        window.tokens[:, :t], window.context[:, :t], state, window.reset[:, :t]
+        window.tokens[:, :t],
+        window.context[:, :t],
+        state,
+        window.reset[:, :t],
+        **_address_kwargs(model, window.prev_tokens),
     )
     return before_t
 
@@ -609,7 +650,17 @@ def _rollout(
     """Position ``t`` with the (edited) selection, then ``[t+1, t+H)`` under the normal policy:
     ``(summed horizon cross-entropy [B], the executed selection at t, the features at t)``."""
     with model.router.intercept(edit) as tap:
-        out = model.step(window.tokens[:, t], window.context[:, t], state_t)
+        previous = window.tokens[:, t - 1] if t > 0 else window.prev_tokens
+        if model.cfg.key_address:
+            if previous is None:
+                previous = torch.full_like(window.tokens[:, t], BOS)
+            previous = previous.masked_fill(window.reset[:, t], BOS)
+        out = model.step(
+            window.tokens[:, t],
+            window.context[:, t],
+            state_t,
+            **_address_kwargs(model, previous),
+        )
     if len(tap.selections) != 1 or len(tap.features) != 1:
         raise NotImplementedError(
             f"a probe edits the single routed round of a position; position {t} ran "
@@ -621,7 +672,11 @@ def _rollout(
     if horizon > 1:
         rest = slice(t + 1, t + horizon)
         logits, _, _ = model.forward(
-            window.tokens[:, rest], window.context[:, rest], out.state, window.reset[:, rest]
+            window.tokens[:, rest],
+            window.context[:, rest],
+            out.state,
+            window.reset[:, rest],
+            **_address_kwargs(model, window.tokens[:, t]),
         )
         loss = loss + _ce_sum(logits, window.targets[:, rest], window.loss_mask[:, rest])
     return loss, tap.selections[0], tap.features[0]
@@ -697,6 +752,15 @@ def _ce_sum(logits: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
 # --------------------------------------------------------------------------------------------------
 
 
+class _AddressKwargs(TypedDict, total=False):
+    prev_tokens: Tensor | None
+
+
+def _address_kwargs(model: HSN, previous: Tensor | None) -> _AddressKwargs:
+    """A5's optional stream byte, without changing legacy forward/step calls."""
+    return {"prev_tokens": previous} if model.cfg.key_address else {}
+
+
 def _require_split(batch_window: Mapping[str, Any], allowed: tuple[str, ...], what: str) -> str:
     if not isinstance(batch_window, Mapping):
         raise TypeError(
@@ -767,12 +831,24 @@ def _prepare(
             f"t = {t!r} must be an int with 0 <= t and t + horizon <= T (t + {horizon} <= "
             f"{shape[1]})"
         )
+    previous = batch_window.get("prev_tokens") if model.cfg.key_address else None
+    if previous is not None and (
+        not isinstance(previous, Tensor)
+        or previous.dtype not in _INDEX_DTYPES
+        or tuple(previous.shape) != (shape[0],)
+        or previous.device != model.device
+        or not bool(((previous >= 0) & (previous < model.cfg.vocab_size)).all())
+    ):
+        raise ValueError(
+            "batch_window['prev_tokens'] must be integer bytes [B] on the model device"
+        )
     return _Window(
         tokens=tensors["tokens"],
         targets=tensors["targets"].to(torch.int64),
         context=tensors["context"],
         loss_mask=tensors["loss_mask"],
         reset=tensors["reset"],
+        prev_tokens=previous,
     )
 
 

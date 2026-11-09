@@ -1,10 +1,12 @@
-# Amendment A5: key-address features and a readout of the selected cells (draft)
+# Amendment A5: key-address features and a readout of the selected cells (experimental)
 
-Status: **draft of 8 Nov 2026 (P1.16), not adopted.**
-- Nothing in the code implements it.
-- Every configuration, result and gate runs without it.
-- The user approved this design for a follow-up chunk, P1.17 ("a router that learns" plus A5). That
-  chunk's plan proposes the configuration keys and the user approves them there.
+Status: **implemented as an opt-in experiment on 8 Nov 2026; not adopted as a default.**
+- The user requested implementation of A5 alongside the training review, with the P1.17 hand-off.
+- `model.key_address: true` enables the fixed-code address features; `model.selected_readout: true`
+  enables the selected-cell decoder input. Both default to false and are refused for dense routing
+  and baselines. Existing configurations, hashes, state-dict keys and benchmark gates remain unchanged.
+- Implementation correctness is tested separately from learned binding and measured speed. No A5
+  training result, passing gate or improvement over gru_2m is claimed by this change.
 - It amends plan §2.2 step 4 (the router's features), §2.4 (the decoder's input) and the scorer and
   decoder rows of Appendix C. It changes no metric, threshold, task, data split or key alphabet.
 
@@ -143,7 +145,7 @@ codes and addresses are buffers.
 B32, compiled) with both parts of A5, seeds 0 and 1. It uses the scorer that P1.17's router work
 and P1.16's `route-check` recommend.
 
-**Binding is shown** when either seed has both:
+**Binding is shown** when either seed has both, first with the trained-key remap and then on dev keys:
 - probe v3's swap verdict "binds keys" (follow ≥ 0.5, unchanged ≤ 0.1);
 - `route-check` on dev reading "follows the key".
 

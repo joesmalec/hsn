@@ -221,6 +221,9 @@ class ModelConfig(_StrictModel):
     scorer_hidden: int = Field(default=128, ge=1)  # hidden width when scorer = mlp
     scorer_features: ScorerFeaturesConfig = ScorerFeaturesConfig()
     routing: Routing = "dense"  # selection mode
+    # Amendment A5: independently ablatable, routed HSN only; fixed codes have width d.
+    key_address: bool = False
+    selected_readout: bool = False
     fixed_route: list[int] = []  # cells for routing = fixed
     budget: float = Field(default=1.0, ge=0.0)  # B_t as a fraction of the dense step cost
     lambda_cost: float = Field(default=0.0, ge=0.0)  # lambda_cost in score = U - lambda * c
@@ -242,6 +245,11 @@ class ModelConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        if self.routing == "dense" and (self.key_address or self.selected_readout):
+            raise ValueError(
+                "model.key_address and model.selected_readout require routed HSN; "
+                "model.routing=dense makes both A5 features void"
+            )
         if self.state_init != "fan_in" and not self.state_init.startswith("trunc_normal_"):
             raise ValueError(
                 f"model.state_init={self.state_init!r} must be 'fan_in' or 'trunc_normal_<std>'"
@@ -395,7 +403,9 @@ class TrainConfig(_StrictModel):
     p_dense: float = Field(default=0.0, ge=0.0, le=1.0)
     probe_fraction: float = Field(default=0.05, ge=0.0, le=1.0)  # P2.3
     n_probe: int = Field(default=4, ge=0)
-    probe_horizon: int = Field(default=16, ge=1)
+    # None probes to the current window's end, allowing delayed writes to receive utility
+    # supervision. Integers preserve the original fixed-horizon experiment protocol.
+    probe_horizon: int | None = Field(default=16, ge=1)
     ema_decay: float = Field(default=0.99, ge=0.0, le=1.0)
     replay_fraction: float = Field(default=0.25, ge=0.0, le=1.0)  # rows per window from replay
     distill_temperature: float = Field(default=2.0, gt=0.0)  # P3.2
@@ -764,6 +774,10 @@ class RunConfig(_StrictModel):
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
+            if self.model.key_address or self.model.selected_readout:
+                raise ValueError(
+                    "model.key_address and model.selected_readout are HSN-only A5 features"
+                )
             if self.train.cell_lr_mult != 1.0:
                 ignored.append(f"train.cell_lr_mult={self.train.cell_lr_mult}")
             if self.train.cell_weight_decay is not None:
@@ -834,7 +848,7 @@ class RunConfig(_StrictModel):
                     "train.lambda_u > 0 but train.probe_fraction = 0: no window would be "
                     "probed and the utility term would silently stay zero"
                 )
-            if train.probe_horizon > train.unroll:
+            if train.probe_horizon is not None and train.probe_horizon > train.unroll:
                 raise ValueError(
                     f"train.probe_horizon={train.probe_horizon} exceeds the window "
                     f"train.unroll={train.unroll}; a probe's horizon lies inside its window"
@@ -1032,7 +1046,11 @@ def load_config(path: str | Path, overrides: Sequence[str] = ()) -> RunConfig:
 #: divergence dumps written before them still resume and replay (``Trainer.resume`` compares
 #: hashes). A configuration that sets one of them to another value hashes it as usual. Dotted paths
 #: into the dump; append only (removing a key changes the hash of every configuration that sets it).
-HASH_OMIT_AT_DEFAULT: tuple[str, ...] = tuple(f"train.{key}" for key in ROLLBACK_KEYS)
+HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
+    *tuple(f"train.{key}" for key in ROLLBACK_KEYS),
+    "model.key_address",
+    "model.selected_readout",
+)
 
 
 def _hash_view(cfg: RunConfig) -> dict[str, Any]:

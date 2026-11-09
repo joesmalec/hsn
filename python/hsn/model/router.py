@@ -152,13 +152,14 @@ from torch import Tensor, nn
 
 from hsn.config import GateMode, ModelConfig, Routing
 from hsn.kernels.costs import CostTable, cost_table_from_config
-from hsn.model.embeddings import init_weight_
+from hsn.model.embeddings import init_weight_, parse_init
 from hsn.model.encoder import MLP2
 from hsn.model.state import CellGraphState
 from hsn.profiler import Profiler
 from hsn.train.memory_plan import SCORER_SCALAR_FEATURES
 
 __all__ = [
+    "ADDRESS_FEATURE_NAMES",
     "BUDGET_SLACK",
     "CANDIDATE_ADD",
     "CANDIDATE_NONE",
@@ -212,6 +213,8 @@ _INDEX_DTYPES = (torch.int64, torch.int32)
 #: The candidate kinds of :meth:`Router.with_candidate` (P2.3), one per row.
 CANDIDATE_NONE, CANDIDATE_ADD, CANDIDATE_REMOVE = 0, 1, 2
 _EMA_BUFFERS = ("ema_utility", "ema_selected")
+ADDRESS_FEATURE_NAMES: tuple[str, str] = ("a_cur", "a_prev")
+_KEY_ADDRESS_TAG = 0x48534E4135
 
 
 def _check_decay(decay: float) -> float:
@@ -317,6 +320,11 @@ class Scorer(nn.Module):
     P2.3: the persistent buffers ``ema_utility`` and ``ema_selected`` (``[N]``, zeros at
     initialisation) are the running averages :meth:`features` reads when no :class:`EMAFeatures`
     is given; :attr:`ema` views them and :meth:`load_ema` writes them (module docstring).
+
+    A5: ``key_address`` appends ``a_cur`` and ``a_prev`` after ``one``, giving ``3d+10``
+    features. ``seed`` is required then and seeds fixed byte codes and cell addresses without
+    changing the global RNG or the existing scorer columns. The code buffers travel with the
+    checkpoint; the previous byte comes from the caller and is never stored in the scorer.
     """
 
     #: State-dict version (``nn.Module`` convention): 2 since P2.3 added the EMA buffers.
@@ -325,8 +333,10 @@ class Scorer(nn.Module):
     _excluded: Tensor  # bool [3d+8]: True at zeroed feature slots (non-persistent)
     ema_utility: Tensor  # [N] P2.3 running average of the counterfactual utility (persistent)
     ema_selected: Tensor  # [N] P2.3 running average of the selection indicator (persistent)
+    byte_codes: Tensor  # [V, d], A5 only: fixed code for each byte
+    cell_addresses: Tensor  # [N, d], A5 only: fixed address for each cell
 
-    def __init__(self, cfg: ModelConfig, *, unroll: int) -> None:
+    def __init__(self, cfg: ModelConfig, *, unroll: int, seed: int | None = None) -> None:
         super().__init__()
         if isinstance(unroll, bool) or not isinstance(unroll, int) or unroll < 1:
             raise ValueError(f"Scorer: unroll (train.unroll) must be an int >= 1, got {unroll!r}")
@@ -338,19 +348,22 @@ class Scorer(nn.Module):
         self.n_context = cfg.n_context
         self.unroll = unroll
         self.kind = cfg.scorer
-        self.in_features = 3 * cfg.d + SCORER_SCALAR_FEATURES
+        self.key_address = cfg.key_address
+        base_features = 3 * cfg.d + SCORER_SCALAR_FEATURES
+        self.in_features = base_features + (2 if cfg.key_address else 0)
+        feature_names = SCORER_FEATURE_NAMES + (ADDRESS_FEATURE_NAMES if cfg.key_address else ())
 
-        unknown = [name for name in cfg.scorer_features.exclude if name not in SCORER_FEATURE_NAMES]
+        unknown = [name for name in cfg.scorer_features.exclude if name not in feature_names]
         if unknown:
             raise ValueError(
                 f"model.scorer_features.exclude names unknown features {unknown}; known: "
-                f"{list(SCORER_FEATURE_NAMES)}"
+                f"{list(feature_names)}"
             )
         self.exclude: tuple[str, ...] = tuple(dict.fromkeys(cfg.scorer_features.exclude))
 
         self.feature_slices: dict[str, slice] = {}
         start = 0
-        for name in SCORER_FEATURE_NAMES:
+        for name in feature_names:
             width = cfg.d if name in _VECTOR_FEATURES else 1
             self.feature_slices[name] = slice(start, start + width)
             start += width
@@ -358,15 +371,38 @@ class Scorer(nn.Module):
 
         self.net: nn.Linear | MLP2
         if cfg.scorer == "linear":
-            self.net = nn.Linear(self.in_features, cfg.n_units)
+            self.net = nn.Linear(base_features, cfg.n_units)
             init_weight_(self.net.weight, cfg.init)
             nn.init.zeros_(self.net.bias)
         elif cfg.scorer == "mlp":
             self.net = MLP2(
-                self.in_features, cfg.scorer_hidden, cfg.n_units, cfg.activation, init=cfg.init
+                base_features, cfg.scorer_hidden, cfg.n_units, cfg.activation, init=cfg.init
             )
         else:  # pragma: no cover - ModelConfig.scorer is a Literal
             raise ValueError(f"model.scorer={cfg.scorer!r} is not supported (linear | mlp)")
+
+        if cfg.key_address:
+            if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                raise ValueError("model.key_address requires run.seed as a non-negative int")
+            # Independent RNG: adding codes must not perturb any existing parameter's init.
+            generator = torch.Generator(device="cpu").manual_seed(
+                (seed ^ _KEY_ADDRESS_TAG) % (2**63)
+            )
+            scale = math.sqrt(cfg.d)
+            self.register_buffer(
+                "byte_codes", torch.randn(cfg.vocab_size, cfg.d, generator=generator) / scale
+            )
+            self.register_buffer(
+                "cell_addresses", torch.randn(cfg.n_cells, cfg.d, generator=generator) / scale
+            )
+            first = self.net if isinstance(self.net, nn.Linear) else self.net.fc1
+            extra = first.weight.new_empty(first.out_features, 2)
+            std = 1 / math.sqrt(self.in_features) if cfg.init == "fan_in" else parse_init(cfg.init)
+            nn.init.trunc_normal_(extra, std=std, a=-2 * std, b=2 * std, generator=generator)
+            first.weight = nn.Parameter(torch.cat([first.weight.detach(), extra], dim=1))
+            first.in_features = self.in_features
+            if isinstance(self.net, MLP2):
+                self.net.in_dim = self.in_features
 
         excluded = torch.zeros(self.in_features, dtype=torch.bool)
         for name in self.exclude:
@@ -439,6 +475,9 @@ class Scorer(nn.Module):
         budget_frac: float,
         round_idx: int,
         ema: EMAFeatures | None = None,
+        *,
+        tokens: Tensor | None = None,
+        prev_tokens: Tensor | None = None,
     ) -> Tensor:
         """The ``[B, N, 3d+8]`` feature tensor in the module's layout, in ``u``'s dtype.
 
@@ -446,6 +485,7 @@ class Scorer(nn.Module):
         ``[B]`` (int64/int32); ``budget_frac`` a finite number >= 0; ``round_idx`` an int in
         ``[0, r_max)``; ``ema`` explicit averages, or ``None`` for the scorer's own buffers
         (:attr:`ema`; zeros until P2.3 updates them). Shape, dtype and device mismatches raise.
+        With A5, ``tokens`` and ``prev_tokens`` are ``[B]`` and the result has width ``3d+10``.
         """
         B, N, d = state.batch_size, state.n_cells, state.width
         if N != self.n_cells or d != self.d:
@@ -467,6 +507,11 @@ class Scorer(nn.Module):
         scalars = self._scalars(
             ctx[:, None], state.pos[:, None], budget_frac, round_idx, ema, u.dtype, u.device
         )[:, 0]
+        if self.key_address:
+            addresses = self.address_features(tokens, prev_tokens)
+            if addresses.shape != (B, N, 2):
+                raise ValueError("key-address step tokens and prev_tokens must have shape [B]")
+            scalars = torch.cat([scalars, addresses.to(u.dtype)], dim=-1)
         return self._assemble(u, eps, state.h, state.age, scalars)
 
     def window_scalars(
@@ -478,12 +523,16 @@ class Scorer(nn.Module):
         round_idx: int,
         dtype: torch.dtype,
         ema: EMAFeatures | None = None,
+        tokens: Tensor | None = None,
+        prev_tokens: Tensor | None = None,
     ) -> Tensor:
         """The features of a window that do not depend on the step (P1.10a): ``[B, T, N, 7]`` in
         ``dtype``, the scalars after ``age`` in layout order (budget, round, context, the two P2.3
         averages, pos, one) for every position of the window. ``ctx`` are the window's context ids
         and ``pos`` the session position before each step (int64), both ``[B, T]`` on one device.
-        :meth:`features` builds the same values from the same elementwise ops for one position."""
+        :meth:`features` builds the same values from the same elementwise ops for one position.
+        A5 requires current and previous ``tokens [B,T]`` and appends the two address features,
+        so this tail has width 9 instead of 7."""
         if not isinstance(ctx, Tensor) or not isinstance(pos, Tensor):
             raise TypeError("ctx and pos must be torch.Tensors [B, T]")
         if ctx.dtype not in _INDEX_DTYPES:
@@ -500,7 +549,37 @@ class Scorer(nn.Module):
             raise TypeError(f"dtype must be a floating torch.dtype, got {dtype!r}")
         self._check_budget_frac(budget_frac)
         self._check_round(round_idx)
-        return self._scalars(ctx, pos, budget_frac, round_idx, ema, dtype, ctx.device)
+        scalars = self._scalars(ctx, pos, budget_frac, round_idx, ema, dtype, ctx.device)
+        if self.key_address:
+            addresses = self.address_features(tokens, prev_tokens)
+            if addresses.shape != (*ctx.shape, self.n_cells, 2):
+                raise ValueError("key-address window tokens and prev_tokens must have shape [B, T]")
+            scalars = torch.cat([scalars, addresses.to(dtype)], dim=-1)
+        return scalars
+
+    def address_features(self, tokens: Tensor | None, prev_tokens: Tensor | None) -> Tensor:
+        """A5's fixed similarities ``[..., N, 2]`` in ``a_cur, a_prev`` order.
+
+        Both token tensors have the same shape and contain only current/past bytes. The caller
+        supplies BOS for ``prev_tokens`` at document resets. Fixed codes are persistent buffers,
+        not trainable parameters; the two matmuls run outside autocast so addresses agree at a
+        fact's value and its query even when training uses mixed precision.
+        """
+        if not self.key_address:
+            raise ValueError("address_features requires model.key_address=true")
+        for name, value in (("tokens", tokens), ("prev_tokens", prev_tokens)):
+            if not isinstance(value, Tensor) or value.dtype not in _INDEX_DTYPES:
+                raise TypeError(f"{name} must be an int64 or int32 token tensor for key_address")
+            if value.device != self.byte_codes.device:
+                raise ValueError(f"{name} must live on {self.byte_codes.device}")
+        assert isinstance(tokens, Tensor) and isinstance(prev_tokens, Tensor)
+        if tokens.shape != prev_tokens.shape:
+            raise ValueError("key-address tokens and prev_tokens must have the same shape")
+        with torch.autocast(device_type=tokens.device.type, enabled=False):
+            addresses = self.cell_addresses.transpose(0, 1)
+            current = F.embedding(tokens, self.byte_codes) @ addresses
+            previous = F.embedding(prev_tokens, self.byte_codes) @ addresses
+            return torch.stack([current, previous], dim=-1) * math.sqrt(self.d)
 
     def _scalars(
         self,
@@ -883,7 +962,9 @@ class Router(nn.Module):
         self._tap: RouterTap | None = None  # P2.3: armed by intercept()
 
     @classmethod
-    def from_config(cls, cfg: ModelConfig, *, unroll: int, scorer: Scorer | None = None) -> Self:
+    def from_config(
+        cls, cfg: ModelConfig, *, unroll: int, scorer: Scorer | None = None, seed: int | None = None
+    ) -> Self:
         """A router for ``cfg``: the scorer (built here unless given), the table of
         ``model.cost_profile`` (the uniform placeholder when ``null``) and ``model.lambda_cost``;
         ``unroll`` is ``train.unroll``. A sparse ``model.routing`` whose ``model.budget`` cannot
@@ -898,7 +979,7 @@ class Router(nn.Module):
                 "is what graph capture and torch.compile need; set model.static_k=true"
             )
         if scorer is None:
-            scorer = Scorer(cfg, unroll=unroll)
+            scorer = Scorer(cfg, unroll=unroll, seed=seed)
         router = cls(scorer, cost_table_from_config(cfg), lambda_cost=cfg.lambda_cost)
         if cfg.routing == "fixed":
             router.require_affordable(cfg.budget, len(cfg.fixed_route), "model.fixed_route")

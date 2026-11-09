@@ -316,12 +316,15 @@ def replay(
     remedy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay the dumped step (module docstring). ``eager`` None runs as the dump's run did
-    (compiled when it was); ``train_ds`` defaults to the configuration's training data (truncated
-    to the dump's loader, as the harness's ``n_train`` did). P1.16: ``continue_steps`` and
+    (compiled when it was); ``train_ds`` defaults to the configuration's training data, selected
+    to the dump's loader count using its recorded cap policy and seed. Historical dumps without
+    policy metadata retain prefix selection. An explicitly supplied dataset already matching
+    the loader's size is used unchanged. P1.16: ``continue_steps`` and
     ``remedy`` (module docstring, "Continuation")."""
     from hsn.config import RunConfig, load_hardware_profile
     from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything, set_deterministic
+    from hsn.experiments.data_selection import cap_dataset, recorded_policy
     from hsn.runner import build_model, load_datasets, make_trainer
     from hsn.train.loop import StreamLoader
     from hsn.train.rollback import RollbackPolicy
@@ -359,8 +362,14 @@ def replay(
     n_docs = int(loader_state["n_docs"])
     if len(train_ds) < n_docs:
         raise ValueError(f"the dump's loader has {n_docs} documents, the data {len(train_ds)}")
-    if len(train_ds) > n_docs:  # the harness's n_train: the first n_docs documents
-        train_ds = ByteDataset(list(train_ds.examples[:n_docs]))
+    if len(train_ds) > n_docs:
+        selection = notes.get("data_selection") or {}
+        train_ds = cap_dataset(
+            train_ds,
+            n_docs,
+            seed=selection.get("seed", cfg.seed),
+            policy=recorded_policy(notes),
+        )
     # the windows the loader gives from the dumped position must be the stored ones
     loader = StreamLoader(
         train_ds,

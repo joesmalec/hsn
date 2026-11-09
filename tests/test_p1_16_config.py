@@ -49,7 +49,11 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
     assert train.rollback_every is None
     assert (train.rollback_skip, train.rollback_lr_mult, train.rollback_lr_steps) == (0, 1.0, 0)
     assert train.rollback_max == 5
-    assert HASH_OMIT_AT_DEFAULT == tuple(f"train.{k}" for k in ROLLBACK_KEYS)
+    assert HASH_OMIT_AT_DEFAULT == (
+        *tuple(f"train.{k}" for k in ROLLBACK_KEYS),
+        "model.key_address",
+        "model.selected_readout",
+    )
 
 
 def test_p1_16_rollback_key_set_changes_hash() -> None:

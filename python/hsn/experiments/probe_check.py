@@ -45,10 +45,18 @@ DEV_KEYS = range(112, 128)
 TRAIN_KEYS_REMAP = range(64, 80)
 
 
+def _data_policy(db: Database, exp_id: int) -> str:
+    """Reconstruct the recorded subset; historical records retain their prefix semantics."""
+    from hsn.experiments.data_selection import recorded_policy
+
+    result = db.row("SELECT record_json FROM results WHERE exp_id = ?", (exp_id,))
+    return recorded_policy(loads(result["record_json"]) if result else {})
+
+
 def probe_check(db: Database, exp_id: int, *, batch_rows: int = 64) -> dict[str, Any]:
     from hsn.config import RunConfig
-    from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything
+    from hsn.experiments.data_selection import cap_dataset
     from hsn.experiments.probe import edit_probe, edit_probe_reference, summarize
     from hsn.experiments.spec import protocol_params
     from hsn.experiments.variants import install_variant
@@ -68,9 +76,7 @@ def probe_check(db: Database, exp_id: int, *, batch_rows: int = 64) -> dict[str,
         raise FileNotFoundError(f"no checkpoint in {exp['run_dir']}")
     ctx = resolve(cfg.hardware)
     _train, dev = load_datasets(cfg)
-    n_dev = getattr(params, "n_dev", 0)
-    if n_dev:
-        dev = ByteDataset(list(dev.examples[:n_dev]))
+    dev = cap_dataset(dev, params.n_dev, seed=cfg.seed, policy=_data_policy(db, exp_id))
     seed_everything(cfg.seed)
     model = build_model(cfg)
     install_variant(model, arm["variant"], cfg.seed, loads(arm["variant_json"]))
@@ -164,8 +170,8 @@ def _restored(
     installed the same way), on the run's hardware or (``cpu``) on ``profile:cpu`` in fp32.
     P1.16: ``weights="dump"`` loads the newest divergence dump instead (checkpoint format)."""
     from hsn.config import RunConfig, load_hardware_profile
-    from hsn.data.dataset import ByteDataset
     from hsn.device import resolve, seed_everything
+    from hsn.experiments.data_selection import cap_dataset
     from hsn.experiments.spec import protocol_params
     from hsn.experiments.variants import install_variant
     from hsn.runner import build_model, load_datasets
@@ -191,8 +197,7 @@ def _restored(
             raise FileNotFoundError(f"no checkpoint in {run_dir}")
     ctx = resolve(load_hardware_profile("cpu") if cpu else cfg.hardware)
     _train, dev = load_datasets(cfg)
-    if params.n_dev:
-        dev = ByteDataset(list(dev.examples[: params.n_dev]))
+    dev = cap_dataset(dev, params.n_dev, seed=cfg.seed, policy=_data_policy(db, exp_id))
     seed_everything(cfg.seed)
     model = build_model(cfg)
     install_variant(model, arm["variant"], cfg.seed, loads(arm["variant_json"]))
