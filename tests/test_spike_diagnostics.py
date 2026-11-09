@@ -175,11 +175,15 @@ def test_turn_claim_must_be_explicit_and_unexpired(tmp_path: Path) -> None:
 
 
 @pytest.mark.cuda
-@pytest.mark.usefixtures("small_blocks")
-def test_compiled_a5_backward_stops_before_update_and_repeats(tmp_path: Path) -> None:
+def test_compiled_a5_backward_stops_before_update_and_repeats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
     from cards import CUDA_PROFILE
+    from hsn.train import compile as compile_mod
+
+    monkeypatch.setattr(compile_mod, "MAX_BLOCK", 4)
 
     cfg = hsn_config(
         4,
