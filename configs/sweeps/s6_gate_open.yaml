@@ -1,0 +1,105 @@
+# Approved by the user (8 Nov 2026 about 19:35 via the coordinator joe-c1: "yes" to one gate-opening arm after B-rescue; the
+# coordinator proposes two doses of the same test, the user is told and may drop one). Drafted by the coordinator; checked,
+# registered and enqueued by the audit. Rules and predictions registered in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run.
+# Exp 207's configuration (s4h_hsn_beta95_lr1e3: exp 194's recipe at lr 1e-3, seed 0) with only model.gate_bias_init changed
+# (default -3.0, sigmoid(-3) = 0.047, amendment A1). Init-only: no equation change (architecture identity kept).
+#   (1) s6g_hsn_lr1e3_gb2: gate_bias_init -2.0 (sigmoid 0.119; at init a cell keeps 88 % per position, half-life about 5.5)
+#   (2) s6g_hsn_lr1e3_gb1: gate_bias_init -1.0 (sigmoid 0.269; keeps 73 %, half-life about 2.2)
+# Question: is HSN's onset gated by the write gate having to open? With beta2 0.95, steps to dev >= 0.6 x lr is about 4 at
+# 2e-3 / 1e-3 / 5e-4 (exps 194, 207, 208: 2,000 / 4,000 / 7,500), and the write rate (gate >= 0.5) leaves 0 at about 750 /
+# 1,250 / 2,000; gru_2m does not scale like this.
+# Reference (exp 207, gate_bias_init -3): write rate >= 0.025 by about 1,500 (memory_writes "no writes" over 1,000-1,500);
+# dev >= 0.6 at 4,000; final 0.778, later split 0.583.
+# Decision rule (fixed before the runs, read by hand from the evals and diagnostics against exp 207):
+#   - gate-limited onset (supported): an arm reaches dev >= 0.6 by step 3,000 (>= 2 evals earlier than 207) AND its write rate
+#     reaches 0.025 earlier than 207's;
+#   - not the gate: writes start earlier but both arms reach 0.6 at 3,500 to 4,500 -> the limiter is elsewhere;
+#   - retention cost: an arm's later split < 0.533 or final < 0.728 (0.05 under 207) -> a more open gate trades away retention;
+#   - seed 0 only: a "supported" is a lead; seeds 1 and 2 are a user decision.
+# Prior evidence against: E5b (gate_bias_init -1 on the overfit task, lr 1e-3, pre-A4, 5 Nov) was 0.95x at the 0.99 mark (no
+# gain). Coordinator's predictions: (1) supported 40 %; (2) supported 35 %, retention cost 40 %.
+# Timing arms, about 0.241 s per step, about 38 min each (about 80 min for both).
+
+name: s6_gate_open
+description: "HSN d=64 + cand_norm, beta2 0.95, lr 1e-3 (exp 207's recipe), WSD 9k, guard 1e4: write gate started more open (gate_bias_init -2 and -1)"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.002
+    - train.steps=9000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.cand_norm=rms
+    - train.betas=[0.9,0.95]
+    - train.spike_factor=10000
+protocol: {name: reads_state, version: 3, steps: 9000, diag_every: 250, diag_docs: 32, eval_batch: 128, probe_batch: 64}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20}
+    reads_state_v3: {preset: reads_state_v3} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys} # the key swap: does the read follow the key
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    guard_fired:
+      cases:
+        - label: spikes skipped
+          when: {metric: "final:skipped_spike_steps", op: ">", value: 0}
+      default: no spike skipped
+    # "reliable" (the user's rule via the coordinator): reads state (v3) AND final dev >= 0.70 AND no burst (no pre-clip
+    # norm above 1e3 after step 500) AND no stop and no skipped step; counts as a finding when both seeds share it
+    reliable:
+      group: {min_agree: 2}
+      cases:
+        - label: reliable
+          when:
+            all:
+              - {metric: "verdict:reads_state_v3", op: "==", value: "reads state (later queries)"}
+              - {metric: "final:delayed/in_range/accuracy", op: ">=", value: 0.70}
+              - {metric: "train:grad_norm", steps: {from: 501, to: 9000, every: 1}, agg: max, op: "<", value: 1000, min_samples: 8000}
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+              - {metric: "final:skipped_spike_steps", op: "==", value: 0}
+      default: not reliable
+    memory_writes: {preset: memory_writes} # write rate >= 0.025 and cell update ratio >= 0.001, 1,000 to 1,500
+    cells_apart: {preset: cells_apart}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s6g_hsn_lr1e3_gb2
+    family: hsn
+    overrides: [train.lr=0.001, model.gate_bias_init=-2.0]
+  - name: s6g_hsn_lr1e3_gb1
+    family: hsn
+    overrides: [train.lr=0.001, model.gate_bias_init=-1.0]
