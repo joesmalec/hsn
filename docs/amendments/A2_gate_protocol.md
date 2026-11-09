@@ -77,14 +77,20 @@ search therefore could not tell a method that does not learn from a recipe that 
     steps can see it learn.
   - The warmup-stable-decay schedule (P1.13's `train.schedule=wsd`) holds the peak learning rate
     until the last 20 %.
-- **β2 is a recipe key, and it matters for HSN only.**
+- **β2 is a recipe key whose effect depends on the method and its learning rate.**
   - With AdamW β2 0.95 (large-model practice), HSN's 2e-3 recipe is reliable: exps 194 and 195
     read state with no burst and an onset by step 1,000 to 1,500. With β2 0.999 the same recipe met
     the same criteria in 2 of 5 runs (exps 170, 171, 172, 189 and 190).
-  - gru_2m with β2 0.95 at its optimum shows no effect: exps 199 to 201 reach 0.771 / 0.776 /
+  - gru_2m with β2 0.95 at its lr 5e-4 shows no effect: exps 199 to 201 reach 0.771 / 0.776 /
     0.787, against 0.793 and 0.784.
+  - At lr 2e-3, gru_2m with β2 0.95 learns faster: 2 of 3 runs are reliable (exps 204 to 206:
+    0.786 and 0.776, dev 0.6 by step 2,500 to 3,000), and 1 stays at chance.
+  - **The user's two gru_2m bars (8 Nov):**
+    - the final score: gru_2m at 5e-4 with β2 0.999 (0.793, exp 154);
+    - the learning speed: gru_2m at 2e-3 with β2 0.95 (dev ≥ 0.6 by step 2,500 to 3,000).
   - So each method's own configuration sets β2: HSN's recipe file
-    (`configs/experiments/hsn_recipe_b095.yaml`) uses 0.95, and gru_2m keeps 0.999.
+    (`configs/experiments/hsn_recipe_b095.yaml`) uses 0.95. The grid's 2e-3 point covers gru_2m's
+    fast-learning recipe.
 - **Compiled HSN costs 0.240 s per step** (P2.8, `profile:rtx3060`, d = 64, B32), not the eager
   rate of the 4–5 Nov search; gru_2m costs 0.0167 s (eager cuDNN).
 

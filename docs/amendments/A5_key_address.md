@@ -37,6 +37,16 @@ Status: **draft of 8 Nov 2026 (P1.16), not adopted.**
   - identity from a code whose distribution is the same for every byte;
   - a similarity without learned weights.
 
+**No model binds even the keys it was trained on** (P1.16, `probe-rerun --key-alphabet train`, a diagnostic
+that remaps the dev keys 112 to 127 to the trained keys 64 to 79 in memory, 8 Nov).
+- Across 9 stored runs (dense and top-K HSN, gru_2m, the Transformer), the swap follow is 0.003 to 0.027, and the
+  dev score is unchanged by the remap.
+- `route-check` on the five top-K runs finds the selected cells following the query's position, not its key, on
+  the dev keys and on the trained keys alike.
+- So the first obstacle is learning to bind at all; unseen keys are the second. A5's codes address the second.
+  Its smallest test must therefore also show binding on trained keys (the remapped probe) before it is read as a
+  failure of generalisation.
+
 **The router cannot route by key as built** (`python/hsn/model/router.py`).
 - The default scorer is linear over each cell's `[u_t ; ε_t ; h_i ; 8 scalars]`, and `u_t` and
   `ε_t` are shared by every cell. So the current byte shifts every cell's score for a unit equally,

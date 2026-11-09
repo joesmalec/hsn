@@ -5,7 +5,8 @@
 # burst and an onset by step 1,000 to 1,500, where beta2 0.999 met the same criteria in 2 of 5 runs (exps 170,
 # 171, 172, 189, 190). With `profile=rtx3060` (which compiles by default, P2.8) it resolves to exp 194's
 # configuration exactly, so its arms share exp 194's arm id (tests/test_p1_16_recipe.py). The defaults of
-# configs/ref_a1.yaml and train.betas are unchanged; gru_2m keeps beta2 0.999 (exps 199-201: no effect).
+# configs/ref_a1.yaml and train.betas are unchanged. gru_2m's bars (8 Nov): final score at 5e-4 with beta2 0.999
+# (exp 154; beta2 0.95 there had no effect, exps 199-201), learning speed at 2e-3 with beta2 0.95 (exps 204-206).
 # Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
 #
 #   base: {config: configs/experiments/hsn_recipe_b095.yaml,
