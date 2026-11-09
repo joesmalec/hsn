@@ -1,0 +1,95 @@
+# Approved by the user (P1.16's plan, approved 8 Nov 2026 15:39, "all recommended"; relayed by the coordinator after PR #44 merged
+# at 0a69f31, 17:32): B-rescue, the post-merge arm of P1.16's plan §3. Rules, predictions and the plan's decision rule registered
+# in /home/joe/hsn-eff/evidence/EFF/AUDIT.md before any run; enqueued after exp 213 once the worker runs 0a69f31.
+# HSN d=64 + A4 at beta2 0.999 and lr 2e-3, WSD 0.2 over 9,000 (the unreliable recipe of exps 170 to 172, 189, 190: take-off in
+# 3 of 5, "reliable" in 2 of 5) with the spike guard at factor 1e3 and P1.16's rollback (rollback_every 50, rollback_skip 10,
+# rollback_lr_mult 0.5, rollback_lr_steps 200, rollback_max 5: the plan's recommended values), seeds 0 to 4. Question: does
+# rollback rescue the unreliable recipe? protocol keep_every 1000 (P1.16, execution-only, no arm id change) keeps mid-run
+# checkpoints so that a stopped seed still gets a partial record. Architecture note: recipe-only (+ A4) and P1.16's training
+# safety keys. Timing arms, about 0.240 s per step (+ < 0.5 %), about 37 min each.
+
+name: s5_brescue_hsn
+description: "B-rescue: HSN d=64 + A4, WSD 9k at 2e-3, beta2 0.999, spike guard 1e3 + rollback 50/10/0.5/200/5, seeds 0-4"
+base:
+  config: configs/experiments/g1_ref_a1.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - train.batch=32
+    - train.micro_batch=32
+    - train.lr=0.002
+    - train.steps=9000
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - train.eval_every=500
+    - train.ckpt_every=9000
+    - train.stats_every=100
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+    - model.cand_norm=rms
+    - train.spike_factor=1000
+    - train.rollback_every=50
+    - train.rollback_skip=10
+    - train.rollback_lr_mult=0.5
+    - train.rollback_lr_steps=200
+    - train.rollback_max=5
+protocol: {name: reads_state, version: 3, steps: 9000, diag_every: 250, diag_docs: 32, eval_batch: 128, probe_batch: 64, keep_every: 1000}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0, 1, 2, 3, 4]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    reads_state_v2: {preset: reads_state_v2, min_vocab: 20}
+    reads_state_v3: {preset: reads_state_v3} # the value edit at later queries (read from state, not binding)
+    binds_keys: {preset: binds_keys} # the key swap: does the read follow the key
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    finished:
+      cases:
+        - label: finished 9,000
+          when: {metric: "final:steps", op: "==", value: 9000}
+      default: did not finish
+    final_ge_070:
+      cases:
+        - label: final >= 0.70
+          when: {metric: "final:delayed/in_range/accuracy", op: ">=", value: 0.70}
+      default: final < 0.70
+    rolled_back:
+      cases:
+        - label: rolled back
+          when: {metric: "final:rollbacks", op: ">", value: 0}
+      default: no rollback
+    beats_bar:
+      cases:
+        - label: above 0.7930
+          when:
+            all:
+              - {metric: "eval:delayed/in_range/accuracy", steps: {at: 9000}, op: ">", value: 0.7930}
+      default: not above 0.7930
+    memory_writes: {preset: memory_writes}
+    cells_identical:
+      applies_to: {family: [hsn]}
+      cases:
+        - label: identical
+          when:
+            all:
+              - {metric: "trained:rank_pr/answer", op: "<=", value: 1.000001}
+              - {metric: "trained:cell_spread/answer", op: "==", value: 0}
+              - {metric: "trained:edge_logit/absmax", op: "==", value: 0}
+      default: not identical
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: s5b_hsn_lr2e3_b999_rollback
+    family: hsn
