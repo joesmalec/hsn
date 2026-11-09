@@ -463,6 +463,12 @@ def arm_identity(
         and k != "version"
         and not (k in IDENTITY_DEFAULTS and _plain(v) == IDENTITY_DEFAULTS[k])
     }
+    # Prefix caps used to silently omit later task shards. Capped arms using the corrected
+    # stratified selection are different experiments; uncapped and explicit overfit ids stay.
+    if name in ("reads_state", "train_eval") and (
+        protocol.get("n_train", 0) or protocol.get("n_dev", 0)
+    ):
+        science["data_subset"] = "stratified_v1"
     version = int(protocol.get("version", PROTOCOL_VERSION[name]))  # P1.14: reads_state v2
     payload: dict[str, Any] = {
         "config": config_view(cfg),
@@ -614,6 +620,11 @@ def _expand_one(
             "hardware.compile_mode=none"
         )
     variant, vparams = _variant(entry, family)
+    if (cfg.model.key_address or cfg.model.selected_readout) and variant != "pdg":
+        raise SpecError(
+            f"arm {entry.name}: A5 requires variant pdg; variant {variant} may replace its "
+            "scorer, cell, or readout. Ablate A5 with key_address / selected_readout flags"
+        )
     if cfg.hardware.compile_mode != "none" and variant not in ("pdg", "none"):
         raise SpecError(
             f"arm {entry.name}: variant {variant} with hardware.compile_mode="

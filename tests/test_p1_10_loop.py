@@ -399,7 +399,12 @@ def _expected_capture(
                 rows = sel.dense_fallback
                 assert bool(rows.any())
                 dense_gate = dense_info["b"].detach().masked_fill(~enabled[None, :, None], math.nan)
-                gate[rows] = dense_gate[rows]
+                # P1.17 compacts eager fallback rows in their original batch order.
+                if dense_gate.shape[0] == B:
+                    gate[rows] = dense_gate[rows]
+                else:
+                    assert dense_gate.shape[0] == int(rows.sum())
+                    gate[rows] = dense_gate
                 mask[rows] = enabled
         gates.append(gate)
         written.append(mask)

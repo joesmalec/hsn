@@ -211,6 +211,9 @@ def evaluate_windows(
     n_windows = 0
     n_tokens = 0
     state: Any = None
+    prev_tokens: Tensor | None = None
+    underlying = getattr(model, "model", model)
+    key_address = bool(getattr(getattr(underlying, "cfg", None), "key_address", False))
     batch_size: int | None = None
     ctx = autocast if autocast is not None else nullcontext()
     try:
@@ -228,7 +231,10 @@ def evaluate_windows(
                 loss_mask = window["loss_mask"].to(device)
                 targets = window["targets"].to(device)
                 with ctx:
-                    logits, state, _info = model(tokens, context, state, reset)
+                    kwargs = {"prev_tokens": prev_tokens} if key_address else {}
+                    logits, state, _info = model(tokens, context, state, reset, **kwargs)
+                if key_address:
+                    prev_tokens = tokens[:, -1].clone()
                 group_ids: Tensor | None = None
                 if groups is not None:
                     doc = window["doc"].to(device)

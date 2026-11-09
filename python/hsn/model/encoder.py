@@ -10,7 +10,8 @@ Plan §2.1 / §2.2 and Appendix C.1:
   (:class:`SharedTransform`). The chunk writes the input width as ``3d``, which is the A.1 value
   (``context_dim = d``); using ``2d + context_dim`` keeps the module equal to the P1.1 closed form
   ``shared`` for every configuration.
-* ``D``: ``logits_t = D([q_t; u_t])``, ``2d -> H -> V`` (:class:`Decoder`).
+* ``D``: ``logits_t = D([q_t; u_t])``, ``2d -> H -> V`` (:class:`Decoder`); A5's optional
+  selected-cell readout appends ``r_t`` and expands the input to ``3d``.
 
 The activation is ``model.activation`` (``gelu`` in A.1, taken as the exact erf form; the P2.9
 kernels must compute the same function) and the weights follow ``model.init`` through
@@ -146,10 +147,26 @@ class SharedTransform(MLP2):
 
 
 class Decoder(MLP2):
-    """``D``: next-symbol logits ``D([q_t; u_t])``, ``2d -> H -> V`` (C.1 row ``decoder``)."""
+    """``D``: ``D([q_t; u_t])``, ``2d -> H -> V`` (C.1 row ``decoder``), or ``3d`` with A5."""
 
-    def __init__(self, cfg: ModelConfig) -> None:
+    def __init__(self, cfg: ModelConfig, *, seed: int = 0) -> None:
         super().__init__(2 * cfg.d, cfg.hidden, cfg.vocab_size, cfg.activation, init=cfg.init)
+        if cfg.selected_readout:
+            # Build the original network first: A5 must not change any existing parameter's
+            # initialisation or consume the global random stream for its additional columns.
+            original = self.fc1
+            with torch.random.fork_rng(devices=[]):
+                generator = torch.Generator(device="cpu").manual_seed(
+                    (seed + 0xA5DEC0DE) % (2**63 - 1)
+                )
+                torch.set_rng_state(generator.get_state())
+                expanded = nn.Linear(3 * cfg.d, cfg.hidden)
+                init_weight_(expanded.weight, cfg.init)
+            with torch.no_grad():
+                expanded.weight[:, : 2 * cfg.d].copy_(original.weight)
+                expanded.bias.copy_(original.bias)
+            self.fc1 = expanded
+            self.in_dim = 3 * cfg.d
 
 
 class EMATarget(nn.Module):

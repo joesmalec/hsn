@@ -109,6 +109,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import GateMode, ModelConfig, RunConfig
+from hsn.data.synthetic import BOS
 from hsn.model.cell import PDGCell, WindowConsts, profiler_segment
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
@@ -330,9 +331,9 @@ class HSN(nn.Module):
         self.shared = SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
-        self.router = Router.from_config(cfg, unroll=unroll)
+        self.router = Router.from_config(cfg, unroll=unroll, seed=seed)
         self.halting = HaltingHead(cfg)
-        self.decoder = Decoder(cfg)
+        self.decoder = Decoder(cfg, seed=seed)
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
         self._fixed_route: Tensor | None = (
             torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
@@ -398,6 +399,7 @@ class HSN(nn.Module):
         *,
         profiler: Profiler | None = None,
         dense_rows: Tensor | None = None,
+        prev_tokens: Tensor | None = None,
     ) -> StepOutput:
         """One input position in the §2.2 order (see the module docstring); returns a
         :class:`StepOutput` whose ``state`` is the functional update of ``state`` (autograd intact).
@@ -427,7 +429,11 @@ class HSN(nn.Module):
             raise TypeError(f"profiler must be a hsn.profiler.Profiler or None, got {profiler!r}")
         self._check_step_inputs(x_t, ctx_t, state)
         dense_rows = self._check_dense_rows(dense_rows, mode, state)
-        return self._step_impl(x_t, ctx_t, state, mode, profiler, dense_rows)
+        if self.cfg.key_address:
+            prev_tokens = self._previous_tokens(x_t, prev_tokens)
+        return self._step_impl(
+            x_t, ctx_t, state, mode, profiler, dense_rows, prev_tokens=prev_tokens
+        )
 
     def _step_impl(
         self,
@@ -439,6 +445,7 @@ class HSN(nn.Module):
         dense_rows: Tensor | None,
         *,
         static: bool = False,
+        prev_tokens: Tensor | None = None,
     ) -> StepOutput:
         """:meth:`step` after its checks (``mode`` resolved). ``static`` (P2.8: the captured
         serving step of :func:`hsn.train.compile.compile_step`) runs the capturable sparse
@@ -457,7 +464,21 @@ class HSN(nn.Module):
         with self.cell.graph.step():
             with profiler_segment(profiler, "scorer", B):
                 feats = self.scorer.features(
-                    u_s, eps_s, state, ctx_t, budget_frac=cfg.budget, round_idx=0, ema=None
+                    u_s,
+                    eps_s,
+                    state,
+                    ctx_t,
+                    budget_frac=cfg.budget,
+                    round_idx=0,
+                    ema=None,
+                    **(
+                        {
+                            "tokens": x_t,
+                            "prev_tokens": self._reset_previous(prev_tokens, state.pos == 0, x_t),
+                        }
+                        if cfg.key_address
+                        else {}
+                    ),
                 )
                 unit_logits, alpha, selection = self._score(
                     feats, state, mode, dense_rows, controls=controls
@@ -474,6 +495,7 @@ class HSN(nn.Module):
                 dense_rows,
                 controls=controls,
                 static=static,
+                dense_indices=self._dense_indices(dense_rows, bucket=static),
             ).state
         if selection is None:
             cost = torch.ones((), dtype=state.dtype, device=state.device)
@@ -481,7 +503,12 @@ class HSN(nn.Module):
             cost = selection.cost.detach().mean().to(state.dtype)
 
         with profiler_segment(profiler, "decode", B):
-            logits = self.decoder(torch.cat([new_state.q, u], dim=-1))  # the updated q_t
+            decoder_inputs = [new_state.q, u]
+            if cfg.selected_readout:
+                decoder_inputs.append(
+                    self._selected_readout(new_state, selection, controls.gate, mode)
+                )
+            logits = self.decoder(torch.cat(decoder_inputs, dim=-1))
 
         with torch.no_grad():
             probs = alpha if alpha is not None else torch.softmax(unit_logits, dim=-1)
@@ -597,6 +624,7 @@ class HSN(nn.Module):
         controls: _Controls | None = None,
         static: bool = False,
         consts: WindowConsts | None = None,
+        dense_indices: Tensor | None = None,
     ) -> _RoundResult:
         """The round of one position on ``state``: the dense reference, the masked round (mode
         ``masked`` or the soft warm-up) or the sparse round, shared by :meth:`step` and
@@ -639,6 +667,7 @@ class HSN(nn.Module):
             capture,
             static=static,
             consts=consts,
+            dense_indices=dense_indices,
         )
 
     def _cell_dense(
@@ -676,6 +705,7 @@ class HSN(nn.Module):
         *,
         static: bool = False,
         consts: WindowConsts | None = None,
+        dense_indices: Tensor | None = None,
     ) -> _RoundResult:
         """The sparse round (P2.5): :meth:`PDGCell.step_sparse` on ``selection`` and the tick of
         the unselected cells. The rows of ``dense_rows`` (P2.2's dense fallback) run the P1.5 dense
@@ -701,24 +731,52 @@ class HSN(nn.Module):
             b, valid = info["b"], info["valid"]
             assert isinstance(b, Tensor) and isinstance(valid, Tensor)
             gate = _gate_of_slots(b, executed.cell_idx, valid, state.n_cells)
-        if dense_rows is not None:
-            h_dense, dense_info = self._cell_dense(
-                u_s, eps_s, state, torch.softmax(unit_logits, dim=-1), consts
+        if dense_rows is not None and dense_indices is not None:
+            # The row IDs were compacted once before the window. Compiled windows pad to a
+            # power-of-two bucket with distinct non-fallback rows; only real fallback rows write.
+            rows = dense_indices
+            full = rows.numel() == state.h.shape[0]
+            # The full bucket already has the original static batch shape; avoid gathering and
+            # scattering a permutation of all rows (including a fully dense warm-up).
+            subset = (
+                state
+                if full
+                else CellGraphState._make(
+                    h=state.h.index_select(0, rows),
+                    q=state.q.index_select(0, rows),
+                    age=state.age.index_select(0, rows),
+                    pos=state.pos.index_select(0, rows),
+                )
             )
-            dense_state = self._write_dense(state, h_dense)
-            rows = dense_rows
+            h_dense, dense_info = self._cell_dense(
+                u_s if full else u_s.index_select(0, rows),
+                eps_s if full else eps_s.index_select(0, rows),
+                subset,
+                torch.softmax(unit_logits if full else unit_logits.index_select(0, rows), dim=-1),
+                consts,
+            )
+            dense_state = self._write_dense(subset, h_dense)
+            valid_rows = dense_rows if full else dense_rows.index_select(0, rows)
+
+            def merged(original: Tensor, dense: Tensor) -> Tensor:
+                mask = valid_rows.reshape((-1,) + (1,) * (original.ndim - 1))
+                if full:
+                    return torch.where(mask, dense, original)
+                values = torch.where(mask, dense, original.index_select(0, rows))
+                return original.index_copy(0, rows, values)
+
             new_state = CellGraphState._make(
-                h=torch.where(rows[:, None, None], dense_state.h, new_state.h),
-                q=torch.where(rows[:, None], dense_state.q, new_state.q),
-                age=torch.where(rows[:, None], dense_state.age, new_state.age),
+                h=merged(new_state.h, dense_state.h),
+                q=merged(new_state.q, dense_state.q),
+                age=merged(new_state.age, dense_state.age),
                 pos=new_state.pos,  # both paths advanced it once
             )
             if capture:
                 assert gate is not None
-                enabled = self._enabled_cells(state)
+                enabled = self._enabled_cells(subset)
                 dense_gate = _gate_of_written(dense_info["b"], enabled)
-                gate = torch.where(rows[:, None, None], dense_gate, gate)
-                selected = torch.where(rows[:, None], enabled, selected)
+                gate = merged(gate, dense_gate)
+                selected = merged(selected, enabled)
         if not capture:
             return _RoundResult(new_state)
         return _RoundResult(new_state, gate, selected)
@@ -794,6 +852,7 @@ class HSN(nn.Module):
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
+        prev_tokens: Tensor | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """Run positions ``0 .. T−1`` of ``tokens [B, T]`` / ``ctx [B, T]`` from ``state``.
 
@@ -870,17 +929,22 @@ class HSN(nn.Module):
             resets_at[column] = True
         mode = self._window_mode()
         dense_rows = self._draw_dense_rows(B, state)
+        dense_indices = self._dense_indices(dense_rows)
         controls = self._controls()
-        pro = self._window_prologue(tokens, ctx, state, reset, mode, reset_first=resets_at[0])
+        pro = self._window_prologue(
+            tokens, ctx, state, reset, mode, reset_first=resets_at[0], prev_tokens=prev_tokens
+        )
         z_hats: list[Tensor] = []
         epss: list[Tensor] = []
         us: list[Tensor] = []
         qs: list[Tensor] = []
         hs: list[Tensor] = []
+        state_maxima: list[Tensor] = []
         unit_logits_steps: list[Tensor] = []
         gates: list[Tensor] = []
         written: list[Tensor] = []
         records: list[dict[str, Tensor]] = []
+        readouts: list[Tensor] = []
         # P1.10e: the bound method of the loop, looked up once per call (never at construction:
         # experiments replace modules, and functional_call swaps parameters)
         position = self._position
@@ -897,13 +961,20 @@ class HSN(nn.Module):
                     dense_rows,
                     capture,
                     pro.dense_counters(t),
+                    dense_indices=dense_indices,
                 )
                 state = result.state
+                if self.cfg.selected_readout:
+                    readouts.append(
+                        self._selected_readout(state, result.selection, controls.gate, mode)
+                    )
                 z_hats.append(result.z_hat)
                 epss.append(result.eps)
                 us.append(result.u)
                 qs.append(state.q)
-                hs.append(state.h.detach())
+                state_maxima.append(state.h.detach().abs().amax())
+                if capture:
+                    hs.append(state.h.detach())
                 unit_logits_steps.append(result.unit_logits.detach())
                 if result.selection is not None:
                     records.append(self._selection_record(result.selection))
@@ -928,11 +999,13 @@ class HSN(nn.Module):
             epss=torch.stack(epss, dim=1),
             us=torch.stack(us, dim=1),
             qs=torch.stack(qs, dim=1),
-            hs=torch.stack(hs, dim=1),
+            hs=torch.stack(hs, dim=1) if capture else None,
+            state_abs_max=torch.stack(state_maxima),
             unit_logits=torch.stack(unit_logits_steps, dim=1),
             routed=routed,
             gates=torch.stack(gates, dim=1) if capture else None,
             written=torch.stack(written, dim=1) if capture else None,
+            readouts=torch.stack(readouts, dim=1) if readouts else None,
         )
 
     # -- the pieces of a window (P2.8: shared by forward and the compiled window) ----------------
@@ -955,6 +1028,24 @@ class HSN(nn.Module):
             return None
         return drawn.to(state.device)
 
+    @staticmethod
+    def _dense_indices(dense_rows: Tensor | None, *, bucket: bool = False) -> Tensor | None:
+        """Compact fallback row IDs once per window, before graph capture.
+
+        Compiled execution uses power-of-two buckets, padded with distinct non-fallback rows.
+        No duplicate index writes or data-dependent output shapes occur inside compiled blocks.
+        A caller-supplied device mask costs one host read per window, never per position.
+        """
+        if dense_rows is None:
+            return None
+        cpu = dense_rows.detach().to("cpu")
+        count = int(cpu.sum())
+        if count == 0:
+            return None
+        size = min(cpu.numel(), 1 << (count - 1).bit_length()) if bucket else count
+        order = torch.argsort(cpu.to(torch.int8), descending=True, stable=True)
+        return order[:size].to(dense_rows.device)
+
     def _window_prologue(
         self,
         tokens: Tensor,
@@ -964,6 +1055,7 @@ class HSN(nn.Module):
         mode: StepMode,
         *,
         reset_first: bool,
+        prev_tokens: Tensor | None = None,
     ) -> _Prologue:
         """The window-invariant work of :meth:`forward` (P1.10a): the embeddings, ``E`` and the
         prediction target over ``[B, T]``, the context embeddings, the position-independent scorer
@@ -977,9 +1069,20 @@ class HSN(nn.Module):
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         context = self.ctx_emb(ctx)  # [B, T, context_dim]
         positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
+        previous_window: Tensor | None = None
+        if cfg.key_address:
+            previous = self._previous_tokens(tokens[:, 0], prev_tokens)
+            shifted = torch.cat([previous[:, None], tokens[:, :-1]], dim=1)
+            previous_window = shifted.masked_fill(reset, BOS)
         scalars = self.scorer.window_scalars(
-            ctx, positions, budget_frac=cfg.budget, round_idx=0, dtype=state.dtype
-        )  # [B, T, N, 7]
+            ctx,
+            positions,
+            budget_frac=cfg.budget,
+            round_idx=0,
+            dtype=state.dtype,
+            tokens=tokens if cfg.key_address else None,
+            prev_tokens=previous_window,
+        )  # [B, T, N, 7] (9 with A5)
         # P1.10b: the dense round writes every cell, so its counters are known for the window
         dense_window = mode == "dense" and not self.cell.disabled_cells
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
@@ -1016,6 +1119,7 @@ class HSN(nn.Module):
         *,
         static: bool = False,
         consts: WindowConsts | None = None,
+        dense_indices: Tensor | None = None,
     ) -> _PositionResult:
         """One position of a window (the body of :meth:`forward`'s loop): the reset (``reset_t``,
         bool ``[B]``, or ``None`` for a column without one), ``ẑ_t = P(q_{t−1})``, ``ε_t``,
@@ -1055,6 +1159,7 @@ class HSN(nn.Module):
             controls=controls,
             static=static,
             consts=consts,
+            dense_indices=dense_indices,
         )
         return _PositionResult(
             result.state, z_hat, eps, u, unit_logits, selection, result.gate, result.written
@@ -1088,23 +1193,31 @@ class HSN(nn.Module):
         epss: Tensor,
         us: Tensor,
         qs: Tensor,
-        hs: Tensor,
+        hs: Tensor | None,
+        state_abs_max: Tensor,
         unit_logits: Tensor,
         routed: dict[str, Tensor] | None,
         gates: Tensor | None,
         written: Tensor | None,
+        readouts: Tensor | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """The work after the loop (P1.10a): the decoder over the stacked ``[q_t ; u_t]``, the
         statistics from the stacks and ``info`` (:meth:`forward`). Every argument is stacked over
         the window's positions (``[B, T, …]``; ``routed`` the stacked
-        :meth:`_selection_record`)."""
+        :meth:`_selection_record`). ``state_abs_max`` is already reduced to ``[T]``;
+        ``hs`` is materialized only for an explicit diagnostic capture."""
         T = int(z_hats.shape[1])
         if pro.counters is not None:
             positions_after = pro.counters[3]
             state = CellGraphState._make(
                 h=state.h, q=state.q, age=state.age, pos=positions_after[:, -1].contiguous()
             )
-        logits = self.decoder(torch.cat([qs, us], dim=-1))  # the updated q_t
+        decoder_inputs = [qs, us]
+        if self.cfg.selected_readout:
+            if readouts is None:
+                raise ValueError("A5 selected_readout needs the per-position readouts")
+            decoder_inputs.append(readouts)
+        logits = self.decoder(torch.cat(decoder_inputs, dim=-1))
         info: dict[str, Tensor] = {
             "z": pro.z,
             "z_hat": z_hats,
@@ -1115,7 +1228,7 @@ class HSN(nn.Module):
         with torch.no_grad():
             probs = torch.softmax(unit_logits, dim=-1)
             log_probs = F.log_softmax(unit_logits, dim=-1)
-            info["state_abs_max"] = hs.abs().amax(dim=(0, 2, 3))
+            info["state_abs_max"] = state_abs_max
             info["eps_abs_mean"] = epss.abs().mean(dim=(0, 2))
             info["alpha_entropy"] = -(probs * log_probs).sum(dim=-1).mean(dim=(0, 2))
         if routed is not None:
@@ -1136,10 +1249,57 @@ class HSN(nn.Module):
             info["refreshed"] = routed["refreshed"]
             info["dense_fallback"] = routed["dense_fallback"]
         if gates is not None and written is not None:
+            assert hs is not None
             info["cell_states"] = hs
             info["cell_gates"] = gates
             info["cell_written"] = written
         return logits, state, info
+
+    def _previous_tokens(self, tokens: Tensor, previous: Tensor | None) -> Tensor:
+        """A5's external previous byte; it never changes CellGraphState's schema."""
+        if previous is None:
+            return torch.full_like(tokens, BOS)
+        self._check_ids("prev_tokens", previous, tuple(tokens.shape), tokens.device)
+        return previous
+
+    @staticmethod
+    def _reset_previous(previous: Tensor | None, reset: Tensor, tokens: Tensor) -> Tensor:
+        if previous is None:
+            return torch.full_like(tokens, BOS)
+        return previous.masked_fill(reset, BOS)
+
+    def _selected_readout(
+        self,
+        state: CellGraphState,
+        selection: Selection | None,
+        gate: GateMode | None = None,
+        mode: StepMode | None = None,
+    ) -> Tensor:
+        """A5: mean updated selected cells, with the existing gate's gradient estimator.
+
+        STE keeps the exact hard mean and routes its gradient through the selected mask. Soft
+        warm-up uses the normalised soft mask over all cells; fallback rows read all cells.
+        No sequence attention, additional persistent state, or computation-path weight writes.
+        """
+        if selection is None:
+            return state.q
+        if mode == "masked" or (gate == "soft" and self.cfg.routing in SCORED_MODES):
+            weights = selection.cell_mask.to(state.dtype)
+            readout = (state.h * weights[..., None]).sum(1) / weights.sum(
+                1, keepdim=True
+            ).clamp_min(1e-6)
+        else:
+            # Padded indices are unspecified, just as in the sparse cell kernels.
+            safe_idx = selection.cell_idx.masked_fill(~selection.valid, 0)
+            indices = safe_idx[..., None].expand(-1, -1, state.width)
+            chosen = state.h.gather(1, indices)
+            weights = selection.valid.to(state.dtype)
+            if gate == "ste":
+                mask = selection.cell_mask.gather(1, safe_idx).to(state.dtype)
+                weights = weights * (1.0 + mask - mask.detach())
+            readout = (chosen * weights[..., None]).sum(1)
+            readout = readout / selection.valid.sum(1, keepdim=True).clamp_min(1).to(state.dtype)
+        return torch.where(selection.dense_fallback[:, None], state.q, readout)
 
     # -- accounting -------------------------------------------------------------------------------
 

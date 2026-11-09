@@ -13,7 +13,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -100,3 +100,42 @@ def test_p2_8_real_frames_are_package_frames(ps: ModuleType) -> None:
     assert ps.classify_frames(frames) == "shared_path"
     label = ps.innermost_label(frames)
     assert label.startswith("encoder.py:") and label.endswith(" forward")
+
+
+@pytest.mark.parametrize("key_address", [False, True])
+def test_p1_17_serving_profile_carries_previous_byte(
+    ps: ModuleType, monkeypatch: pytest.MonkeyPatch, key_address: bool
+) -> None:
+    """The measured stream continues the warm-up's last byte; legacy calls stay unchanged."""
+    calls: list[tuple[torch.Tensor, dict[str, torch.Tensor | None]]] = []
+
+    class Replica:
+        def eval(self) -> Replica:
+            return self
+
+        def init_state(self, batch: int) -> None:
+            assert batch == 2
+
+    def step(
+        tokens: torch.Tensor, context: torch.Tensor, state: None, **kwargs: torch.Tensor | None
+    ) -> torch.Tensor:
+        calls.append((tokens.clone(), kwargs))
+        return torch.zeros(2, 256)
+
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(key_address=key_address, vocab_size=256, n_context=8)
+    )
+    ctx = SimpleNamespace(device=torch.device("cpu"), autocast_dtype=None)
+    monkeypatch.setattr(ps.compile_mod, "compile_step", lambda *args: step)
+    measured = ps.serving(cfg, ctx, Replica(), "L0", 2, 3)
+    assert measured["tokens"] == 3
+    assert len(calls) == 11  # eight warm-up calls, then three measured calls
+    for i, (_tokens, kwargs) in enumerate(calls):
+        if not key_address:
+            assert kwargs == {}
+        elif i == 0:
+            assert kwargs == {"prev_tokens": None}
+        else:
+            previous = kwargs["prev_tokens"]
+            assert isinstance(previous, torch.Tensor)
+            assert torch.equal(previous, calls[i - 1][0])

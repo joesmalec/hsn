@@ -22,7 +22,10 @@ input list (``-1`` on padding) so per-document metadata can be joined for evalua
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator, Mapping, Sequence
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Self
 
@@ -58,7 +61,12 @@ def example_tensors(example: Example) -> Batch:
 
 
 class ByteDataset(Dataset[Batch]):
-    """Documents as tensors; see the module docstring for the item layout."""
+    """Documents as tensors; see the module docstring for the item layout.
+
+    Treat examples, including their metadata, as immutable after construction. To alter a
+    document or its order, construct a new dataset. The ordered-content fingerprint is computed
+    lazily and cached for checkpoint identity; it does not re-hash the corpus at every step.
+    """
 
     def __init__(self, examples: Sequence[Example]) -> None:
         self._examples: tuple[Example, ...] = tuple(examples)
@@ -125,6 +133,42 @@ class ByteDataset(Dataset[Batch]):
 
     def __len__(self) -> int:
         return len(self._examples)
+
+    @cached_property
+    def fingerprint(self) -> str:
+        """Ordered model inputs, supervision and document/dependency identity (blake2b-256).
+
+        This identifies the actual selected data, not just a manifest path or document count.
+        Length prefixes delimit every field and document, so moving a boundary changes the hash.
+        """
+        digest = hashlib.blake2b(digest_size=32)
+
+        def field(payload: bytes) -> None:
+            digest.update(len(payload).to_bytes(8, "little"))
+            digest.update(payload)
+
+        field(b"hsn-byte-dataset/v1")
+        field(str(len(self)).encode())
+        for example in self._examples:
+            field(str(example.length).encode())
+            for name in ("tokens", "targets", "loss_mask", "context"):
+                array = getattr(example, name)
+                field(name.encode())
+                field(array.dtype.str.encode())
+                field(np.ascontiguousarray(array).tobytes())
+            meta = example.meta
+            identity = {
+                **{
+                    name: str(meta[name])
+                    for name in ("task", "variant", "family", "split", "doc_id")
+                },
+                "index": int(meta["index"]),
+                "dep_len": int(meta["dep_len"]),
+                "in_range": bool(meta["in_range"]),
+                "deps": [int(dep) for dep in meta["deps"]],
+            }
+            field(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode())
+        return digest.hexdigest()
 
     def __getitem__(self, index: int) -> Batch:
         return example_tensors(self._examples[index])

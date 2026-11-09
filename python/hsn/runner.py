@@ -274,6 +274,7 @@ def _profile_probe(
     state: Any,
     profiler: Profiler,
     index: int,
+    prev_tokens: Tensor | None = None,
 ) -> None:
     """Time one P2.3 probe of ``window`` from ``state`` (timing only; nothing is kept), at the
     first step whose gate is hard, from a generator seeded by ``(run.seed, index)``."""
@@ -291,10 +292,16 @@ def _profile_probe(
             probe_window(
                 model,
                 state,
-                {**window, "split": split},
+                {
+                    **window,
+                    "split": split,
+                    **({"prev_tokens": prev_tokens} if cfg.model.key_address else {}),
+                },
                 t,
                 n_probe=train.n_probe,
-                horizon=train.probe_horizon,
+                horizon=(int(window["tokens"].shape[1]) - t)
+                if train.probe_horizon is None
+                else train.probe_horizon,
                 generator=generator,
             )
     finally:
@@ -372,14 +379,22 @@ def profile_run(
         warm_windows = 2  # compile, then (CUDA Graphs) record
     first = "compile" if warm_windows > 1 else "startup"
     state: Any = api.init_state(batch_size, device)
+    prev_tokens: Tensor | None = None
+    key_address = isinstance(replica, HSN) and cfg.model.key_address
     for _ in range(warm_windows):
         window = _to_device(next(loader), device)
         state = _detach(state)
         with train_prof.segment(first, tokens=_n_tokens(window)):
             with autocast_ctx(ctx):
                 logits, state, _ = forward(
-                    window["tokens"], window["context"], state, window["reset"]
+                    window["tokens"],
+                    window["context"],
+                    state,
+                    window["reset"],
+                    **({"prev_tokens": prev_tokens} if key_address else {}),
                 )
+            if key_address:
+                prev_tokens = window["tokens"][:, -1].clone()
             _window_loss(logits, window).backward()  # type: ignore[no-untyped-call]
         optimizer.zero_grad(set_to_none=True)
     counterfactual = isinstance(replica, HSN) and cfg.train.lambda_u > 0.0
@@ -389,9 +404,19 @@ def profile_run(
         tokens = _n_tokens(window)
         if counterfactual:
             assert isinstance(replica, HSN)
-            _profile_probe(replica, cfg, ctx, train_ds, window, state, train_prof, index)
+            _profile_probe(
+                replica, cfg, ctx, train_ds, window, state, train_prof, index, prev_tokens
+            )
         with train_prof.segment("shared_path", tokens=tokens), autocast_ctx(ctx):
-            logits, state, _ = forward(window["tokens"], window["context"], state, window["reset"])
+            logits, state, _ = forward(
+                window["tokens"],
+                window["context"],
+                state,
+                window["reset"],
+                **({"prev_tokens": prev_tokens} if key_address else {}),
+            )
+            if key_address:
+                prev_tokens = window["tokens"][:, -1].clone()
             loss = _window_loss(logits, window)
         with train_prof.segment("backward", tokens=tokens):
             loss.backward()  # type: ignore[no-untyped-call]
@@ -414,6 +439,7 @@ def profile_run(
         )
     )
     state = api.init_state(batch_size, device)
+    prev_tokens = None
     with torch.no_grad():
         for index in range(steps + warm_windows):
             try:
@@ -422,7 +448,15 @@ def profile_run(
                 break
             name = first if index < warm_windows else "shared_path"
             with serve_prof.segment(name, tokens=_n_tokens(window)), autocast_ctx(ctx):
-                _, state, _ = forward(window["tokens"], window["context"], state, window["reset"])
+                _, state, _ = forward(
+                    window["tokens"],
+                    window["context"],
+                    state,
+                    window["reset"],
+                    **({"prev_tokens": prev_tokens} if key_address else {}),
+                )
+                if key_address:
+                    prev_tokens = window["tokens"][:, -1].clone()
     synchronize(device)
     return train_prof.report(), serve_prof.report()
 

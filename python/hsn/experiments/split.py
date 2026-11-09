@@ -276,6 +276,7 @@ def backfill_split(
     from pathlib import Path
 
     from hsn.config import RunConfig
+    from hsn.experiments.data_selection import cap_dataset, recorded_policy
     from hsn.experiments.db import loads
     from hsn.experiments.probe_check import _restored
     from hsn.experiments.spec import protocol_params
@@ -317,13 +318,13 @@ def backfill_split(
         cfg = RunConfig.model_validate(loads(exp.get("config_json") or arm["config_json"]))
         proto = protocol_params(loads(exp.get("protocol_json") or arm["protocol_json"]))
         n_dev = int(getattr(proto, "n_dev", 0) or 0)
-        key = f"{cfg.data.manifest}|{cfg.data.tasks}|{cfg.data.variants}|{n_dev}"
+        policy = recorded_policy(record)
+        key = (
+            f"{cfg.data.manifest}|{cfg.data.tasks}|{cfg.data.variants}|{n_dev}|{cfg.seed}|{policy}"
+        )
         if key not in dev_cache:
-            from hsn.data.dataset import ByteDataset
-
             _train, dev = load_datasets(cfg)
-            if n_dev:
-                dev = ByteDataset(list(dev.examples[:n_dev]))
+            dev = cap_dataset(dev, n_dev, seed=cfg.seed, policy=policy)
             try:
                 dev_cache[key] = (dev, split_counts(dev))
             except ValueError as exc:

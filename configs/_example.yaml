@@ -37,6 +37,8 @@ model: # Appendix A.1
   scorer_features:
     exclude: [] # feature names to zero (ablation; e.g. [eps])
   routing: dense # dense | topk | greedy_budget | random | fixed
+  key_address: false # A5 fixed byte/cell address features; routed HSN only
+  selected_readout: false # A5 selected-cell mean appended to decoder input; routed HSN only
   fixed_route: [] # cells for routing = fixed
   budget: 1.0 # B_t as a fraction of the dense step cost
   lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
@@ -112,7 +114,7 @@ train: # Appendix A.3
   reinforce_baseline_decay: 0.9 # P2.2: EMA rate of the REINFORCE reward baseline (gate_mode = reinforce)
   probe_fraction: 0.05 # P2.3
   n_probe: 4
-  probe_horizon: 16
+  probe_horizon: 16 # null probes to the window end; integers preserve fixed-horizon behavior
   ema_decay: 0.99
   replay_fraction: 0.25 # rows per window from replay
   distill_temperature: 2.0 # P3.2

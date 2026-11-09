@@ -356,8 +356,10 @@ def test_p2_8_no_recompiles_after_warmup() -> None:
     with_rows = [s for s in range(SEED_SEARCH) if draws_rows(s)][:3]
     without_rows = [s for s in range(SEED_SEARCH) if not draws_rows(s)][:3]
     assert len(with_rows) == 3 and len(without_rows) == 3
-    # warm: training with and without fallback rows, then evaluation
-    run(0, 0, True, with_rows[0])
+    # Each power-of-two fallback batch is a static shape; warm every bucket used below.
+    # Subsequent calls may choose different row IDs without compiling another graph.
+    for dense_seed in with_rows:
+        run(0, 0, True, dense_seed)
     run(0, 0, True, without_rows[0])
     run(0, 0, False, 0)
     graphs = counters["stats"]["unique_graphs"]
