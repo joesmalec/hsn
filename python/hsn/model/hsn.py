@@ -104,6 +104,13 @@ selection gradient trains the scorer's weights only. With all four the state's b
 is the gated carry ``(1 − b) ⊙ h`` and the linear summary update, whose Jacobian has no singular
 value above 1: a gradient cannot grow on its way back through a window.
 
+A6, the other half (``train.state_grad_clip``; opt-in): at the entry of every position the
+gradient that the position passes back into the state is limited per batch row
+(:func:`hsn.model.gradclip.clip_row_grad`: ``dL/dq`` to the limit, ``dL/dh`` to ``limit /
+sqrt(N)``). The forward values are unchanged and a row under the limit keeps its gradient unscaled,
+so a healthy window is full backpropagation through time (to the rounding of autograd's sums);
+the paths stay, their blow-ups do not.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
@@ -123,6 +130,7 @@ from hsn.data.synthetic import BOS
 from hsn.model.cell import PDGCell, WindowConsts, profiler_segment
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
+from hsn.model.gradclip import clip_row_grad
 from hsn.model.halting import HaltingHead
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
@@ -300,7 +308,8 @@ class HSN(nn.Module):
     ``None`` otherwise). ``schedule`` is the P2.2 :class:`~hsn.train.schedules.SelectionSchedule`
     (``train.gate_mode`` and the ramps; the config defaults when ``None``: soft gates, τ = 1, no
     exploration, no dense fallback). ``feedback_detach`` is A6's ``train.feedback_detach`` (module
-    docstring; empty: full backpropagation through time)."""
+    docstring; empty: full backpropagation through time) and ``state_grad_clip`` its
+    ``train.state_grad_clip`` (``None``: off)."""
 
     def __init__(
         self,
@@ -311,8 +320,24 @@ class HSN(nn.Module):
         ema_tau: float | None = None,
         schedule: SelectionSchedule | None = None,
         feedback_detach: Collection[str] = (),
+        state_grad_clip: float | None = None,
     ) -> None:
         super().__init__()
+        if state_grad_clip is not None and (
+            isinstance(state_grad_clip, bool)
+            or not isinstance(state_grad_clip, int | float)
+            or not 0.0 < state_grad_clip < float("inf")
+        ):
+            raise ValueError(
+                f"state_grad_clip must be None or a finite number > 0, got {state_grad_clip!r}"
+            )
+        #: A6: the per-row limit on dL/dq at every position (dL/dh: this / sqrt(N)); None: off.
+        self.state_grad_clip: float | None = (
+            None if state_grad_clip is None else float(state_grad_clip)
+        )
+        self._clip_h = (
+            None if state_grad_clip is None else float(state_grad_clip) / cfg.n_cells**0.5
+        )
         if isinstance(feedback_detach, str) or not isinstance(feedback_detach, Collection):
             raise TypeError(
                 f"feedback_detach must be a collection of path names, got {feedback_detach!r}"
@@ -377,7 +402,7 @@ class HSN(nn.Module):
     def from_config(cls, run: RunConfig) -> Self:
         """``HSN(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau,
         schedule=SelectionSchedule.from_config(run.train),
-        feedback_detach=run.train.feedback_detach)``."""
+        feedback_detach=run.train.feedback_detach, state_grad_clip=run.train.state_grad_clip)``."""
         if not isinstance(run, RunConfig):
             raise TypeError(f"from_config needs a RunConfig, got {type(run).__name__}")
         return cls(
@@ -387,6 +412,7 @@ class HSN(nn.Module):
             ema_tau=run.train.ema_tau,
             schedule=SelectionSchedule.from_config(run.train),
             feedback_detach=run.train.feedback_detach,
+            state_grad_clip=run.train.state_grad_clip,
         )
 
     def set_train_step(self, step: int) -> None:
@@ -484,6 +510,7 @@ class HSN(nn.Module):
         cfg = self.cfg
         B = state.batch_size
         controls = self._controls()
+        state = self._clip_state_grad(state)  # A6: what this position passes back is limited
 
         with profiler_segment(profiler, "shared_path", B):
             z_hat, z, z_target, eps, u = self._shared_path(x_t, ctx_t, state)
@@ -587,6 +614,20 @@ class HSN(nn.Module):
         """The error the cell and the scorer read: ``z − ẑ.detach()`` with ``eps`` (the same
         value; ``z`` keeps its gradient, the prediction does not), else ``eps`` itself."""
         return z - z_hat.detach() if self._cut_eps else eps
+
+    def _clip_state_grad(self, state: CellGraphState) -> CellGraphState:
+        """``state`` with the gradient into ``h`` and ``q`` limited per row
+        (``train.state_grad_clip``); ``state`` itself when the limit is off or nothing is
+        recorded (evaluation, serving)."""
+        if self._clip_h is None or not torch.is_grad_enabled():
+            return state
+        assert self.state_grad_clip is not None
+        return CellGraphState._make(
+            h=clip_row_grad(state.h, self._clip_h),
+            q=clip_row_grad(state.q, self.state_grad_clip),
+            age=state.age,
+            pos=state.pos,
+        )
 
     def _router_state(self, state: CellGraphState) -> CellGraphState:
         """The state whose ``h`` the scorer's features read (detached with ``router``)."""
@@ -1182,6 +1223,7 @@ class HSN(nn.Module):
             state = CellGraphState._make(h=h, q=q, age=dense_counters[0], pos=dense_counters[1])
         elif reset_t is not None:
             state = state.reset(reset_t)
+        state = self._clip_state_grad(state)  # A6: what this position passes back is limited
         q_prev = state.q
         z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
         eps = z_t - z_hat
@@ -1410,6 +1452,8 @@ class HSN(nn.Module):
             text += f", ema_tau={self.ema_tau}"
         if self.feedback_detach:
             text += f", feedback_detach={list(self.feedback_detach)}"
+        if self.state_grad_clip is not None:
+            text += f", state_grad_clip={self.state_grad_clip}"
         return text
 
     # -- validation -------------------------------------------------------------------------------

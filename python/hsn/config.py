@@ -489,6 +489,14 @@ class TrainConfig(_StrictModel):
     # scorer's features (u, eps, h). With all four the backward recurrence is the gated carry
     # (1 - b) alone, which cannot amplify a gradient. Empty (default): full BPTT, as before.
     feedback_detach: list[FeedbackPath] = []
+    # A6 (same amendment; opt-in): the per-row limit on the gradient a position passes back into
+    # the recurrent state. At every position each row's dL/dq is scaled to at most this norm and
+    # its dL/dh to at most state_grad_clip / sqrt(n_cells) (the share a summary gradient gives the
+    # cells). A row under the limit keeps its gradient unscaled, so a healthy window is plain
+    # backpropagation through time; a row whose gradient blows up at a write no longer replaces
+    # the batch's. None (default): off. Calibrated at B32 on the delayed task: healthy rows stay
+    # below 0.12 in h (0.7 in q) from step 1,500 to 8,500 of exp 346.
+    state_grad_clip: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     steps: int = Field(default=1000, ge=1)  # schedule
     eval_every: int = Field(default=100, ge=1)
     ckpt_every: int = Field(default=500, ge=1)
@@ -923,6 +931,8 @@ class RunConfig(_StrictModel):
                 )
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
+            if self.train.state_grad_clip is not None:
+                raise ValueError("train.state_grad_clip (A6) is HSN-only")
             if self.train.cell_lr_mult != 1.0:
                 ignored.append(f"train.cell_lr_mult={self.train.cell_lr_mult}")
             if self.train.cell_weight_decay is not None:
@@ -1218,6 +1228,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.gradient_growth",
     "train.grad_norm_precision",
     "train.feedback_detach",
+    "train.state_grad_clip",
 )
 
 

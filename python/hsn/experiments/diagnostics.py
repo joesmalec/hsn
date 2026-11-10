@@ -152,6 +152,10 @@ class Diagnostics:
         self._capture_window: Callable[..., Any] | None = None
         #: Wall seconds :meth:`attach` spent compiling that variant (0.0: eager, nothing compiled).
         self.warm_seconds = 0.0
+        #: ``[step, unix start, seconds]`` of every sample (hook time: the harness's ``phases``).
+        self.intervals: list[list[float]] = []
+        self._sample_wall = 0.0
+        self._sample_seconds = 0.0
         from hsn.experiments.stability import StabilityObserver
 
         self.stability = (
@@ -228,6 +232,7 @@ class Diagnostics:
                 g_total = _norm([g for gs in grads.values() for g in gs])
                 g_group = {n: _norm(gs) for n, gs in grads.items()}
             self._pending = {"step": step, "before": before, "g_total": g_total, "g": g_group}
+            self._sample_wall, self._sample_seconds = time.time(), time.perf_counter() - started
         self.seconds += time.perf_counter() - started
 
     def _post(self, optimizer: torch.optim.Optimizer, args: Any, kwargs: Any) -> None:
@@ -252,6 +257,9 @@ class Diagnostics:
         else:
             self._stability_stats(record)
         self.seconds += time.perf_counter() - started
+        self._sample_seconds += time.perf_counter() - started
+        if not self._observe_applied:
+            self.intervals.append([record["step"], self._sample_wall, self._sample_seconds])
 
     @torch.no_grad()
     def _applied(self, trainer: Any) -> None:
@@ -287,6 +295,8 @@ class Diagnostics:
             restore_rng_state(rng)
         self._stability_stats(record)
         self.seconds += time.perf_counter() - started
+        self._sample_seconds += time.perf_counter() - started
+        self.intervals.append([record["step"], self._sample_wall, self._sample_seconds])
 
     def _stability_stats(self, record: dict[str, Any]) -> None:
         if self.stability is not None and isinstance(self.model, HSN) and self.window is not None:

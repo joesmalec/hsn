@@ -338,3 +338,153 @@ def test_training_runs_and_resumes_with_the_cut(tmp_path: Path) -> None:
     other = hsn_trainer(hsn_config(8, *A5, "train.ckpt_every=4"), tmp_path / "other")
     with pytest.raises(ValueError, match="configuration"):
         other.resume(tmp_path / "full" / "step_00000004.pt")
+
+
+# --------------------------------------------------------------------------------------------------
+# train.state_grad_clip: the per-row limit on the gradient a position passes back into the state
+# --------------------------------------------------------------------------------------------------
+
+
+def test_row_clip_function_is_exact_under_the_limit_and_safe_above_it() -> None:
+    from hsn.model.gradclip import clip_row_grad, row_norm
+
+    x = torch.tensor(
+        [[3.0, 4.0, 0.0], [0.3, 0.4, 0.0], [0.0, 0.0, 0.0], [3e30, 4e30, 0.0]],
+        requires_grad=True,
+    )
+    y = clip_row_grad(x, 1.0)
+    assert torch.equal(y, x) and y is not x
+    weights = torch.tensor([[3.0, 4.0, 0.0], [0.3, 0.4, 0.0], [0.0, 0.0, 0.0], [3e30, 4e30, 0.0]])
+    (y * weights).sum().backward()
+    assert torch.equal(x.grad[1], weights[1]), "a row under the limit is returned bit for bit"
+    assert torch.equal(x.grad[2], weights[2])
+    torch.testing.assert_close(x.grad[0], torch.tensor([0.6, 0.8, 0.0]))
+    # 5e30 squared overflows fp32; the norm does not, and the direction is kept
+    torch.testing.assert_close(row_norm(weights)[3], torch.tensor([5e30]))
+    torch.testing.assert_close(x.grad[3], torch.tensor([0.6, 0.8, 0.0]))
+    bad = torch.tensor([[1.0, float("inf")], [float("nan"), 1.0], [0.1, 0.2]], requires_grad=True)
+    (clip_row_grad(bad, 1.0) * bad.detach()).sum().backward()
+    assert torch.equal(bad.grad[:2], torch.zeros(2, 2)), "a non-finite row is dropped"
+    assert torch.equal(bad.grad[2], torch.tensor([0.1, 0.2]))
+    for limit in (0.0, -1.0, float("nan"), True):
+        with pytest.raises(ValueError):
+            clip_row_grad(x, limit)  # type: ignore[arg-type]
+
+
+def test_state_grad_clip_config() -> None:
+    base = _cfg()
+    assert base.train.state_grad_clip is None and "state_grad_clip" not in canonical_json(base)
+    on = _cfg("train.state_grad_clip=4.0")
+    assert config_hash(on) != config_hash(base)
+    model = HSN.from_config(on)
+    assert model.state_grad_clip == 4.0
+    assert model._clip_h == pytest.approx(4.0 / on.model.n_cells**0.5)
+    for bad in ("0", "-1", "inf", "nan"):
+        with pytest.raises(ValueError):
+            _cfg(f"train.state_grad_clip={bad}")
+    with pytest.raises(ValueError, match="HSN-only"):
+        load_config(REPO / "configs" / "baselines" / "gru_2m.yaml", ["train.state_grad_clip=4"])
+    with pytest.raises(ValueError, match="state_grad_clip"):
+        HSN(on.model, seed=0, unroll=8, state_grad_clip=0.0)
+
+
+def test_trainer_refuses_a_model_built_with_another_limit(tmp_path: Path) -> None:
+    cfg = _cfg("train.state_grad_clip=4.0")
+    model = HSN(cfg.model, seed=cfg.seed, unroll=cfg.train.unroll)
+    with pytest.raises(ValueError, match="state_grad_clip"):
+        TBPTTTrainer(model, cfg, resolve(cfg.hardware), run_dir=tmp_path)
+
+
+@pytest.mark.parametrize("routing", [(), ROUTED, A5])
+def test_state_grad_clip_changes_no_value_and_no_healthy_gradient(routing: tuple[str, ...]) -> None:
+    """Forward values are the same, and with every row under the limit so is every gradient (to
+    the rounding of autograd's sums, whose order the extra node changes; nothing is scaled)."""
+    cfg = _cfg(*routing)
+    full = _model(cfg)
+    loose = _model(_cfg(*routing, "train.state_grad_clip=1e30"))
+    loose.load_state_dict(full.state_dict())
+    tokens, ctx, reset = _window(cfg)
+    outs = []
+    for model in (full, loose):
+        model.zero_grad(set_to_none=True)
+        logits, state, _ = model(tokens, ctx, _start(model, tokens.shape[0]), reset)
+        logits.square().sum().backward()
+        outs.append((logits.detach(), state, {n: p.grad for n, p in model.named_parameters()}))
+    assert torch.equal(outs[0][0], outs[1][0])
+    assert torch.equal(outs[0][1].h, outs[1][1].h) and torch.equal(outs[0][1].q, outs[1][1].q)
+    for name, grad in outs[0][2].items():
+        other = outs[1][2][name]
+        assert (grad is None) == (other is None), name
+        if grad is not None:
+            torch.testing.assert_close(grad, other, rtol=1e-11, atol=1e-13, msg=name)
+    # evaluation records nothing: the clip is not in the graph at all
+    with torch.no_grad():
+        e_full = full.eval()(tokens, ctx, _start(full, tokens.shape[0]), reset)[0]
+        e_loose = loose.eval()(tokens, ctx, _start(loose, tokens.shape[0]), reset)[0]
+    assert torch.equal(e_full, e_loose)
+
+
+@pytest.mark.parametrize("routing", [ROUTED, A5])
+def test_state_grad_clip_bounds_every_row(routing: tuple[str, ...]) -> None:
+    """A high-gain model's exploding rows are limited where the full gradient is not, per row."""
+    limit = 0.5
+    grads = {}
+    for name, override in (("full", ()), ("clip", (f"train.state_grad_clip={limit}",))):
+        cfg = _cfg(*routing, *override)
+        model = _model(cfg)
+        with torch.no_grad():
+            for key, p in model.named_parameters():
+                if key.startswith(("cell.units", "cell.gate.weight", "shared", "predictor")):
+                    p.mul_(6.0)
+        g_h, g_q, _ = _state_grad(model, cfg)
+        grads[name] = (g_h, g_q)
+    N = _cfg().model.n_cells
+    full_h = grads["full"][0].flatten(1).norm(dim=1)
+    clip_h = grads["clip"][0].flatten(1).norm(dim=1)
+    clip_q = grads["clip"][1].norm(dim=1)
+    assert float(full_h.max()) > 20.0 * limit, "the fixture explodes without the limit"
+    assert float(clip_q.max()) <= limit * (1 + 1e-9)
+    assert float(clip_h.max()) <= limit / N**0.5 * (1 + 1e-9)
+
+
+def test_state_grad_clip_compiled_window_matches_eager() -> None:
+    cfg = _cfg(*A5, "train.state_grad_clip=0.05", "train.unroll=8")
+    ctx = resolve(cfg.hardware)
+    eager = _model(cfg, torch.float32)
+    compiled = _model(cfg, torch.float32)
+    compiled.load_state_dict(eager.state_dict())
+    window = compile_window(compiled, ctx, "reduce-overhead", backend="aot_eager")
+    tokens, ctxs, reset = _window(cfg)
+    outs = []
+    for model, fn in ((eager, eager), (compiled, window)):
+        model.zero_grad(set_to_none=True)
+        logits, _, _ = fn(tokens, ctxs, model.init_state(tokens.shape[0]), reset)
+        logits.square().mean().backward()
+        outs.append((logits.detach(), {n: p.grad for n, p in model.named_parameters()}))
+    torch.testing.assert_close(outs[0][0], outs[1][0], rtol=1e-4, atol=1e-5)
+    reference = _model(_cfg(*A5, "train.unroll=8"), torch.float32)
+    reference.load_state_dict(eager.state_dict())
+    logits, _, _ = reference(tokens, ctxs, reference.init_state(tokens.shape[0]), reset)
+    logits.square().mean().backward()
+    changed = False
+    for name, grad in outs[0][1].items():
+        other = outs[1][1][name]
+        if grad is None:
+            assert other is None or not bool(other.abs().sum() > 0)
+            continue
+        torch.testing.assert_close(grad, other, rtol=2e-3, atol=1e-5)
+        ref = dict(reference.named_parameters())[name].grad
+        changed = changed or not torch.allclose(grad, ref, rtol=1e-3, atol=1e-6)
+    assert changed, "the limit was active in this window (it is a test of the clipped path)"
+
+
+def test_training_runs_and_resumes_with_the_state_grad_clip(tmp_path: Path) -> None:
+    from p1_15_support import datasets, hsn_config, hsn_trainer
+
+    cfg = hsn_config(8, *A5, "train.state_grad_clip=0.01", "train.ckpt_every=4")
+    full = hsn_trainer(cfg, tmp_path / "full")
+    expected = full.fit(*datasets(), 8)
+    resumed = hsn_trainer(cfg, tmp_path / "resumed")
+    assert resumed.resume(tmp_path / "full" / "step_00000004.pt") == 4
+    actual = resumed.fit(*datasets(), 8)
+    assert [s.loss for s in actual.steps] == [s.loss for s in expected.steps[4:]]

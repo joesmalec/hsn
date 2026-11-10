@@ -241,18 +241,52 @@ class _EvalTimer:
     def __init__(self) -> None:
         self.seconds = 0.0
         self.count = 0
+        #: ``[unix start, seconds]`` of every evaluation (the record's ``phases``).
+        self.intervals: list[list[float]] = []
 
     @contextlib.contextmanager
     def segment(self, name: str, tokens: int = 0) -> Iterator[None]:
         if name != "evaluate":
             yield
             return
-        started = time.perf_counter()
+        started, wall = time.perf_counter(), time.time()
         try:
             yield
         finally:
             self.seconds += time.perf_counter() - started
             self.count += 1
+            self.intervals.append([wall, time.perf_counter() - started])
+
+
+def _timed_saves(trainer: Any) -> list[list[float]]:
+    """Wrap ``trainer.save`` so that every checkpoint write is logged as ``[unix start,
+    seconds]`` (the record's ``phases``); the checkpoint itself is unchanged."""
+    intervals: list[list[float]] = []
+    save = trainer.save
+
+    def timed(*args: Any, **kwargs: Any) -> Any:
+        started, wall = time.perf_counter(), time.time()
+        try:
+            return save(*args, **kwargs)
+        finally:
+            intervals.append([wall, time.perf_counter() - started])
+
+    trainer.save = timed
+    return intervals
+
+
+def _phases(
+    timer: _EvalTimer, diag: Any, saves: list[list[float]], stages: dict[str, list[float]]
+) -> dict[str, Any]:
+    """When the run was not training (wall-clock intervals, for the card's time series): the
+    evaluations, the diagnostic samples, the checkpoint writes and the run's stages."""
+    return {
+        "evaluate": timer.intervals,
+        "diagnostics": [list(x) for x in getattr(diag, "intervals", [])],
+        "diagnostics_warm_s": float(getattr(diag, "warm_seconds", 0.0)),
+        "checkpoint": saves,
+        "stages": stages,
+    }
 
 
 def _eval_entry(e: Mapping[str, Any], *, audit_keys: bool) -> dict[str, Any]:
@@ -617,6 +651,8 @@ def _train(
     arm.record["variant"] = variant
     timer = _EvalTimer()
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
+    saves = _timed_saves(trainer)
+    stages: dict[str, list[float]] = {"setup": [time.time()]}
     trainer.eval_batch = params.eval_batch
     if params.keep_every:  # P1.16: kept checkpoints (a harness setting, not the configuration)
         trainer.extra_ckpt_every = params.keep_every
@@ -668,16 +704,20 @@ def _train(
             keep_best=params.checkpoint == "retained",
         )
     arm.walls["setup_s"] = time.perf_counter() - t0
+    stages["setup"].append(time.time())
 
     arm.stage = "train"
     t1 = time.perf_counter()
+    stages["fit"] = [time.time()]
     try:
         history = trainer.fit(train_ds, dev_ds, arm.steps, callback=callback)
     except BaseException as exc:
         # P1.14: what the fit produced before it raised (the P1.12 stop, OOM, SIGTERM, ...)
         arm.walls["fit_s"] = time.perf_counter() - t1
+        stages["fit"].append(time.time())
         diag.detach()
         _partial_training(arm, params, trainer, callback, diag, timer, audit_keys)
+        arm.record["phases"] = _phases(timer, diag, saves, stages)
         spike_on = getattr(trainer, "spike_factor", None) is not None
         arm.record["failure"] = failure_info(
             exc,
@@ -704,6 +744,7 @@ def _train(
             )
         raise
     arm.walls["fit_s"] = time.perf_counter() - t1
+    stages["fit"].append(time.time())
     diag.detach()
     measured = dict(history.measured)
     arm.walls["train_s"] = float(measured.get("train_seconds", 0.0)) - diag.seconds
@@ -753,6 +794,7 @@ def _train(
         "eval_count": timer.count,
         "checkpoints": history.checkpoints,
         "step_time": guard.summary(),  # P1.14
+        "phases": _phases(timer, diag, saves, stages),
     }
     record = arm.record  # P1.14: filled in place, so that a later stage's failure keeps it
     record.clear()
@@ -762,6 +804,7 @@ def _train(
     if isinstance(params, (ReadsStateParams, TrainEvalParams)):
         arm.stage = "trained_state"
         t2 = time.perf_counter()
+        stages["probing"] = [time.time()]
         state = trained_state(model, cfg, ctx, dev_ds, params.diag_docs)
         arm.walls["trained_s"] = time.perf_counter() - t2
         probes: list[dict[str, Any]] | None = None
@@ -791,6 +834,7 @@ def _train(
                 v2["probes_v3"] = probes_v3
                 v2["probes_v3_originals"] = originals_v3
                 arm.walls["probe_v3_s"] = time.perf_counter() - t5
+        stages["probing"].append(time.time())
         if callback.stop is not None:
             record["at_stop"] = {
                 "step": callback.stop["step"],
