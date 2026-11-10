@@ -55,3 +55,10 @@ arms:
     overrides:
       - model.address_init=1.0
       - model.decoder_shortcut_dropout=0.5
+  # the address start on the full feedback cut (no clip: the cut backward cannot amplify)
+  - name: carry_addr1
+    family: hsn
+    overrides:
+      - model.address_init=1.0
+      - train.state_grad_clip=null
+      - train.feedback_detach=[summary,eps,state,router]
