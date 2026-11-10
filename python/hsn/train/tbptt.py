@@ -186,7 +186,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from hsn.config import RunConfig
+from hsn.config import GradNormPrecision, RunConfig
 from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, memory_stats, reset_peak, synchronize
 from hsn.eval.evaluate import Metric
@@ -214,6 +214,7 @@ from hsn.train.checkpoint import (
     unpack_cell_state,
 )
 from hsn.train.compile import CompiledWindow, compile_window
+from hsn.train.grad_norm import clip_grad_norm_, norm_float64
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
 from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
 from hsn.train.probes import (
@@ -505,13 +506,24 @@ class TBPTTTrainer(Trainer):
         live = [name for name in order if terms[name].requires_grad]
         # the terms without a gradient path report 0.0 and need no pass
         report = grad_norm_report(
-            self.model, {name: terms[name] for name in order if name not in live}, scale=scale
+            self.model,
+            {name: terms[name] for name in order if name not in live},
+            scale=scale,
+            precision=cfg.train.grad_norm_precision,
         )
         for index, name in enumerate(live):
             if index > 0:
                 terms = objective()
             single = {name: terms[name]}
-            report.update(grad_norm_report(self.model, single, scale=scale, retain_graph=False))
+            report.update(
+                grad_norm_report(
+                    self.model,
+                    single,
+                    scale=scale,
+                    retain_graph=False,
+                    precision=cfg.train.grad_norm_precision,
+                )
+            )
         torch.set_rng_state(rng)
         prefix = TERM_GRAD_NORM_PREFIX
         return {f"{prefix}{name}": report[f"{prefix}{name}"] for name in order}
@@ -640,11 +652,18 @@ class TBPTTTrainer(Trainer):
         return groups
 
     @staticmethod
-    def _group_grad_norms(groups: Mapping[str, Sequence[nn.Parameter]]) -> dict[str, float]:
+    def _group_grad_norms(
+        groups: Mapping[str, Sequence[nn.Parameter]], *, precision: GradNormPrecision = "native"
+    ) -> dict[str, float]:
         """``grad_norm/<group>``: the L2 norm of the group's gradients (after unscaling, before
         clipping); groups whose parameters carry no gradient are left out."""
         norms: dict[str, float] = {}
         for name, params in groups.items():
+            if precision == "float64":
+                present = [p.grad for p in params if p.grad is not None]
+                if present:
+                    norms[f"grad_norm/{name}"] = float(norm_float64(present))
+                continue
             grads = [p.grad.detach().float() for p in params if p.grad is not None]
             if not grads:
                 continue
@@ -840,7 +859,9 @@ class TBPTTTrainer(Trainer):
                 total, parts = total_and_parts(terms)
                 if stats_step and window_index == 0 and window_fn is None:  # P2.4: one window
                     scale = self.scaler.get_scale() if self.scaler is not None else 1.0
-                    term_norms = grad_norm_report(self.model, terms, scale=scale)
+                    term_norms = grad_norm_report(
+                        self.model, terms, scale=scale, precision=train.grad_norm_precision
+                    )
                 window_tokens = int((window["doc"] >= 0).sum())
                 tokens_in_step += window_tokens
                 step_parameter_sum += self._window_parameter_sum(info, fwd, window_tokens, report)
@@ -871,11 +892,17 @@ class TBPTTTrainer(Trainer):
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
-                group_norms = self._group_grad_norms(groups) if stats_step else {}
+                group_norms = (
+                    self._group_grad_norms(groups, precision=train.grad_norm_precision)
+                    if stats_step
+                    else {}
+                )
                 if self.grad_hook is not None:  # P1.15: the replay's raw gradients
                     self.grad_hook(self)
                 growth_norms = self._growth_raw_norms()
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
+                grad_norm = float(
+                    clip_grad_norm_(params, max_norm, precision=train.grad_norm_precision)
+                )
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15

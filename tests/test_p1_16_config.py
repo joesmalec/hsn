@@ -69,6 +69,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.update_limit",
         "model.decoder_shortcut_dropout",
         "train.gradient_growth",
+        "train.grad_norm_precision",
     )
 
 

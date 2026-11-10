@@ -192,6 +192,7 @@ from hsn.train.checkpoint import (
     save_checkpoint,
 )
 from hsn.train.divergence import StepSnapshot, persistent_buffers, write_dump
+from hsn.train.grad_norm import clip_grad_norm_
 from hsn.train.lazy_adam import build_lazy_adamw, cell_parameters
 from hsn.train.rollback import RollbackPolicy, SnapshotRing
 
@@ -891,7 +892,11 @@ class Trainer:
                 )
 
     def _growth_raw_norms(self) -> Tensor | None:
-        return self.gradient_growth.raw_norms() if self.gradient_growth is not None else None
+        return (
+            self.gradient_growth.raw_norms(precision=self.cfg.train.grad_norm_precision)
+            if self.gradient_growth is not None
+            else None
+        )
 
     def _growth_before_step(self, skipped: bool, norm: float, groups: Tensor | None) -> None:
         controller = self.gradient_growth
@@ -1440,7 +1445,9 @@ class Trainer:
                 if self.grad_hook is not None:  # P1.15: the replay's raw gradients
                     self.grad_hook(self)
                 growth_norms = self._growth_raw_norms()
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
+                grad_norm = float(
+                    clip_grad_norm_(params, max_norm, precision=train.grad_norm_precision)
+                )
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15

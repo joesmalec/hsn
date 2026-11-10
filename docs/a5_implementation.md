@@ -3,6 +3,15 @@
 This implements the mechanism requested in the 8 November hand-off. It does not establish that
 the model binds keys or beats gru_2m. The architecture amendment remains experimental.
 
+## Gradient norm precision
+
+`train.grad_norm_precision=float64` is an optional numerical control for finite gradients whose
+native L2 reduction overflows. It widens both the reduction and multiplication before copying
+clipped gradients back in place. The default `native` retains historical clipping and hashes.
+Actual nonfinite guards remain active. Details and validation requirements are in
+[the numerical amendment](amendments/A5_gradient_norm_precision.md). This is not evidence that
+the weight drift or key-binding deficit is fixed; learned performance and cost remain unvalidated.
+
 ## Adaptive learning rates (9 November follow-up)
 
 `train.adaptive_lr.enabled=true` enables training-only feedback in both trainers. Defaults are

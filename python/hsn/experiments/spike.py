@@ -31,6 +31,7 @@ from hsn.experiments.spec import SpikeDiagnosticParams, config_view
 from hsn.runner import build_model, load_datasets, make_trainer
 from hsn.train import tbptt
 from hsn.train.divergence import _deterministic_compile, _number, _windows_equal, load_dump
+from hsn.train.grad_norm import clip_grad_norm_, norm_float64
 from hsn.train.lazy_adam import LazyAdamW
 from hsn.train.loop import StreamLoader
 
@@ -417,11 +418,18 @@ class Case:
 
         def stop(t: Any) -> None:
             present = [p.grad for p in t.model.parameters() if p.grad is not None]
-            norm = torch.linalg.vector_norm(torch.stack([g.norm() for g in present]))
+            norm = (
+                norm_float64(present)
+                if self.cfg.train.grad_norm_precision == "float64"
+                else torch.linalg.vector_norm(torch.stack([g.norm() for g in present]))
+            )
             report["raw_grad_norm"] = _number(float(norm))
             for name, p in t.model.named_parameters():
                 if p.grad is not None:
-                    gradients[name] = p.grad.detach().float().cpu().clone()
+                    value = p.grad.detach()
+                    if self.cfg.train.grad_norm_precision == "native":
+                        value = value.float()
+                    gradients[name] = value.cpu().clone()
             raise _BackwardComplete()
 
         if compiled and (trace or cut):
@@ -444,7 +452,17 @@ class Case:
             trainer._forward = original_forward
             trainer.grad_hook = None
         report["objective_parts"] = parts
-        report["parameter_grad_norms"] = {k: _number(float(v.norm())) for k, v in gradients.items()}
+        report["parameter_grad_norms"] = {
+            k: _number(
+                float(
+                    norm_float64([v])
+                    if self.cfg.train.grad_norm_precision == "float64"
+                    else v.norm()
+                )
+            )
+            for k, v in gradients.items()
+        }
+        report["grad_norm_precision"] = self.cfg.train.grad_norm_precision
         report["optimizer_updates"] = 0
         report["active_units"] = (
             None if active is None else active.nonzero().flatten().cpu().tolist()
@@ -474,7 +492,13 @@ def _shadow_update(case: Case, baseline: Pass, monitor_docs: int) -> dict[str, A
     before_loss = trainer._adaptive_monitor_loss()
     before = {name: p.detach().clone() for name, p in trainer.model.named_parameters()}
     parameters = [p for p in trainer.model.parameters() if p.requires_grad]
-    raw = float(torch.nn.utils.clip_grad_norm_(parameters, case.cfg.train.grad_clip or math.inf))
+    raw = float(
+        clip_grad_norm_(
+            parameters,
+            case.cfg.train.grad_clip or math.inf,
+            precision=case.cfg.train.grad_norm_precision,
+        )
+    )
     clipped = float(torch.stack([p.grad.norm() for p in parameters if p.grad is not None]).norm())
     kwargs = (
         {"active_units": trainer._diagnostic_active}

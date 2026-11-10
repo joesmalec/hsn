@@ -19,7 +19,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from hsn.config import GradientGrowthConfig
+from hsn.config import GradientGrowthConfig, GradNormPrecision
+from hsn.train.grad_norm import norm_float64
 
 
 class GradientGrowth:
@@ -54,10 +55,14 @@ class GradientGrowth:
         self.pending: dict[str, Any] | None = None
 
     @torch.no_grad()
-    def raw_norms(self) -> Tensor:
+    def raw_norms(self, *, precision: GradNormPrecision = "native") -> Tensor:
         """Call after unscaling and before global clipping; one deferred host copy."""
         norms = []
         for entries in self.groups.values():
+            if precision == "float64":
+                gradients = [p.grad for _, p, _ in entries if p.grad is not None]
+                norms.append(norm_float64(gradients or [entries[0][1].new_zeros(())]))
+                continue
             values = [p.grad.norm() for _, p, _ in entries if p.grad is not None]
             norms.append(torch.stack(values).norm() if values else entries[0][1].new_zeros(()))
         return torch.stack(norms)

@@ -112,6 +112,7 @@ Split = Literal["train", "dev", "test"]
 Variant = Literal["in_range", "out_of_range"]  # P0.4 dependency-length variants
 Optimizer = Literal["adamw", "lazy_adamw"]
 Precision = Literal["bf16", "fp16", "fp32", "fp64"]
+GradNormPrecision = Literal["native", "float64"]
 GateMode = Literal["soft", "ste", "reinforce"]
 ActivationCheckpoint = Literal["none", "per_round", "per_window"]
 StreamPolicy = Literal["lru", "utility_lru", "pinned"]
@@ -466,6 +467,9 @@ class TrainConfig(_StrictModel):
     grad_accum: int = Field(default=1, ge=1)
     precision: Precision = "bf16"  # autocast dtype (fp64 only for gradcheck)
     grad_clip: float = Field(default=1.0, ge=0.0)  # global norm clip
+    # Opt-in wide norm reduction AND scaling; native preserves historical clipping bitwise.
+    # MPS uses CPU float64. True NaN/Inf gradients still reach the existing nonfinite guard.
+    grad_norm_precision: GradNormPrecision = "native"
     steps: int = Field(default=1000, ge=1)  # schedule
     eval_every: int = Field(default=100, ge=1)
     ckpt_every: int = Field(default=500, ge=1)
@@ -1185,6 +1189,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.update_limit",
     "model.decoder_shortcut_dropout",
     "train.gradient_growth",
+    "train.grad_norm_precision",
 )
 
 
