@@ -1,12 +1,24 @@
 # Baseline run notes
 
-All figures below come from canonical SQLite `/home/joe/hsn-experiments/experiments.sqlite` and run records on commit `d4bd65bcbd2f0436ffcebbf2efa4174a7808308b`.
+All figures below come from canonical SQLite `/home/joe/hsn-experiments/experiments.sqlite`.
+Historical runs 331–343 use commit `d4bd65bcbd2f0436ffcebbf2efa4174a7808308b`;
+logging-validation runs 344–347 use `6fe8e0b4ec62241970952ca175b789ae1cc104ea`.
 
 **Comparison correction (10 November):** GRU and Transformer overall dev scores below combine
 five tasks; HSN and A5 are delayed-only. The 27k delayed-task scores are **78.69% GRU** and
 **70.23% Transformer**, rather than their 92% overall scores. See the
 [training findings report](p1_17_training_findings_2026_11_10.md) for every task-specific score,
 the three-seed cap comparison, and the remaining accuracy drops.
+
+**Latest completed queue (14:09 MST, 10 November):** the 200-step logging check and
+all three 9k runs finished and were saved to SQLite. Current-norm A5 seed 2 (345)
+ended at **2.16% dev / 2.22% later**; anchored-router A5 seed 2 (346) ended at
+**77.47% / 62.52%**, but suffered a **36.92 pp** cumulative decline before recovery.
+Delayed-only GRU seed 0 (347) ended at **77.85% / 58.35%**, with a **1.27 pp**
+worst decline. All three failed key binding. This new anchored repeat supersedes
+any suggestion that its temporary declines are limited to the earlier 12 pp.
+The task selection and data fingerprint now match across these runs; seeds and
+other recipe settings still differ. See the report for diagnostic curves and limits.
 
 ## HSN and GRU 9k resource comparison
 
@@ -26,11 +38,11 @@ The baseline queue completed for the listed GRU and Transformer runs, followed b
 
 ## Memory growth over a run
 
-The user observed that GRU memory use increases gradually as training proceeds, while HSN reserves most of its GPU memory near startup. This is recorded as an operator observation; the current experiment records provide start/end/peak memory snapshots rather than a full time series, so they do not independently establish the shape of the memory curve. Per-run peak memory above is still available in SQLite.
+The user observed that GRU memory use increases gradually as training proceeds, while HSN reserves most of its GPU memory near startup. This is recorded as an operator observation; the historical baseline records provide start/end/peak memory snapshots rather than a full time series, so they do not independently establish the shape of the memory curve. Runs 344–347 now add process and device VRAM time series, but do not measure host RAM or allocator-reserved memory. Per-run peak memory above is still available in SQLite.
 
 ## GPU utilization pattern
 
-The user also observed that HSN has frequent, deeper dips in GPU utilization, while GRU and Transformer runs appear to have fewer and smaller dips. The current sweep records utilization at coarse worker snapshots, not a sufficiently dense time series to quantify dip frequency or depth. Treat this as an operator observation pending sampled utilization traces.
+The user also observed that HSN has frequent, deeper dips in GPU utilization, while GRU and Transformer runs appear to have fewer and smaller dips. Historical baseline snapshots were too sparse to quantify this. New runs 345–347 sample utilization about once per second: after reported step 200 and before 9,000, about 10.2% of A5 samples fell below 50% utilization, compared with none of the GRU samples. These samples include diagnostics, evaluation, and checkpoint activity; phase profiling is still needed to attribute the dips. No new Transformer trace was collected.
 
 ## Remaining baseline results
 
