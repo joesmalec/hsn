@@ -74,3 +74,26 @@ arms:
   # control: no caps, full backpropagation (the recipe of the historical collapses)
   - name: full_nocap
     family: hsn
+  # Which cut does the work, and which costs the learning speed (exp 349 reaches 0.6 at step
+  # 4,500, exp 346 at 2,500)? Each on exp 346's anchored caps, as carry_anchored.
+  - name: summary_eps_anchored
+    family: hsn
+    overrides:
+      - train.feedback_detach=[summary,eps]
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+  - name: state_anchored
+    family: hsn
+    overrides:
+      - train.feedback_detach=[state]
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+  - name: no_router_cut_anchored
+    family: hsn
+    overrides:
+      - train.feedback_detach=[summary,eps,state]
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'
