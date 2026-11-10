@@ -381,8 +381,27 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"\nrunning ({len(running)}):")
     rows = []
     controller_rows = []
+    growth_rows = []
     for r in running:
         progress = loads(r["progress_json"]) or {}
+        growth = progress.get("gradient_growth")
+        if growth is not None:
+            observation = growth.get("latest") or {}
+            for name, scale in growth["scales"].items():
+                group = observation.get("groups", {}).get(name, {})
+                growth_rows.append(
+                    (
+                        r["exp_id"],
+                        observation.get("step", ""),
+                        name,
+                        group.get("action", "warming up"),
+                        group.get("recent_median", ""),
+                        group.get("share", ""),
+                        group.get("growth", ""),
+                        scale,
+                        growth["damped_steps"].get(name, 0),
+                    )
+                )
         controller = progress.get("adaptive_lr")
         if controller is not None:
             from hsn.experiments.controller import format_rates
@@ -441,6 +460,24 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "readout lr",
                     "cooldown",
                     "trial",
+                ],
+            )
+        )
+    if growth_rows:
+        print("\ngradient growth (pre-clip training norms; update scales for selected groups):")
+        print(
+            _table(
+                growth_rows,
+                [
+                    "exp",
+                    "observed step",
+                    "group",
+                    "action",
+                    "grad median",
+                    "norm share",
+                    "growth",
+                    "update scale",
+                    "damped steps",
                 ],
             )
         )

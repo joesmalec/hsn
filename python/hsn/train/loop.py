@@ -627,6 +627,11 @@ class Trainer:
         self.update_limiter = (
             UpdateLimiter(model, train.update_limit) if train.update_limit.groups else None
         )
+        from hsn.train.gradient_growth import GradientGrowth
+
+        self.gradient_growth = (
+            GradientGrowth(model, train.gradient_growth) if train.gradient_growth.enabled else None
+        )
         # P1.16: the rollback (train.rollback_*; None: off) and its learning-rate cut, which the
         # scheduler's factor reads (no cut until a rollback sets one)
         self.rollback: RollbackPolicy | None = RollbackPolicy.from_config(train)
@@ -884,6 +889,22 @@ class Trainer:
                 logger.info(
                     "update_limit step %d %s", step, json.dumps(self.update_limiter.state_dict())
                 )
+
+    def _growth_raw_norms(self) -> Tensor | None:
+        return self.gradient_growth.raw_norms() if self.gradient_growth is not None else None
+
+    def _growth_before_step(self, skipped: bool, norm: float, groups: Tensor | None) -> None:
+        controller = self.gradient_growth
+        if controller is not None and not skipped and math.isfinite(norm):
+            assert groups is not None
+            controller.observe(self.step + 1, norm, groups.detach().cpu().tolist())
+            controller.capture()
+
+    def _growth_after_step(self, applied: bool) -> None:
+        if self.gradient_growth is not None and applied:
+            observation = self.gradient_growth.apply()
+            if observation is not None:
+                logger.info("gradient_growth %s", json.dumps(observation))
 
     def _adaptive_after_step(
         self, applied: bool, grad_norm: float, before: list[tuple[Tensor, Tensor, str]]
@@ -1178,6 +1199,8 @@ class Trainer:
             out["adaptive_lr"] = c["adaptive_lr"]
         if self.update_limiter is not None:
             out["update_limit"] = c["update_limit"]
+        if self.gradient_growth is not None:
+            out["gradient_growth"] = c["gradient_growth"]
         if c.get("divergences"):
             out["divergences"] = c["divergences"]
         return out
@@ -1198,6 +1221,11 @@ class Trainer:
             if not isinstance(raw, dict):
                 raise ValueError(f"{path}: update_limit checkpoint state is missing")
             self.update_limiter.load_checkpoint_state(raw)
+        if self.gradient_growth is not None:
+            raw = extra.get("gradient_growth")
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}: gradient_growth checkpoint state is missing")
+            self.gradient_growth.load_state_dict(raw)
         skipped = _skipped_counter(extra, "skipped_nonfinite", path)
         streak = _skipped_counter(extra, "skipped_nonfinite_streak", path)
         spikes = 0
@@ -1411,6 +1439,7 @@ class Trainer:
                     self.scaler.unscale_(self.optimizer)
                 if self.grad_hook is not None:  # P1.15: the replay's raw gradients
                     self.grad_hook(self)
+                growth_norms = self._growth_raw_norms()
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
@@ -1419,11 +1448,14 @@ class Trainer:
                 self._capture_healthy(self.step + 1, grad_norm, skipped)
                 before = self._adaptive_before_step(skipped)
                 self._limit_before_step(skipped)
+                self._growth_before_step(skipped, grad_norm, growth_norms)
                 applied = not skipped
                 if self.scaler is not None:
                     scale_before = (
                         self.scaler.get_scale()
-                        if self.adaptive_lr is not None or self.update_limiter is not None
+                        if self.adaptive_lr is not None
+                        or self.update_limiter is not None
+                        or self.gradient_growth is not None
                         else None
                     )
                     self.scaler.step(self.optimizer)
@@ -1433,6 +1465,7 @@ class Trainer:
                 elif not skipped:
                     self.optimizer.step()
                 self._limit_after_step(applied)
+                self._growth_after_step(applied)
                 self._record_captured_update(applied)
                 self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
@@ -1613,6 +1646,11 @@ class Trainer:
             **(
                 {"update_limit": self.update_limiter.checkpoint_state()}
                 if self.update_limiter is not None
+                else {}
+            ),
+            **(
+                {"gradient_growth": self.gradient_growth.state_dict()}
+                if self.gradient_growth is not None
                 else {}
             ),
         }

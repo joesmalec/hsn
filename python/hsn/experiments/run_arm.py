@@ -360,9 +360,10 @@ def _run(
     start_card = _snapshot()
 
     controller_logged = -1
+    growth_logged = -1
 
     def progress(p: dict[str, Any]) -> None:
-        nonlocal controller_logged
+        nonlocal controller_logged, growth_logged
         if not dbm.child_progress(db, exp["exp_id"], pid, p):
             raise RuntimeError(
                 "the experiment row is no longer running for this process (recovered)"
@@ -373,6 +374,10 @@ def _run(
         if controller is not None and controller["observation_count"] != controller_logged:
             _log("controller " + json.dumps(controller, sort_keys=True, allow_nan=False))
             controller_logged = controller["observation_count"]
+        growth = p.get("gradient_growth")
+        if growth is not None and growth["observation_count"] != growth_logged:
+            _log("gradient_growth " + json.dumps(growth, sort_keys=True, allow_nan=False))
+            growth_logged = growth["observation_count"]
 
     attempt.arm_run = ArmRun(
         cfg=cfg,

@@ -417,6 +417,7 @@ class _StepCallback:
         self.guard = guard
         self._compile_seen = 0.0
         self._controller_reported = -1
+        self._growth_reported = -1
         self.at_steps = {s for r in arm.rules.early_stop for s in r.at_steps}
         self.stop: dict[str, Any] | None = None
         self.log: list[dict[str, Any]] = []
@@ -442,7 +443,9 @@ class _StepCallback:
         changed = controller is not None and (
             len(controller.state.observations) != self._controller_reported
         )
-        if evaluated or changed:
+        growth = getattr(trainer, "gradient_growth", None)
+        growth_changed = growth is not None and len(growth.observations) != self._growth_reported
+        if evaluated or changed or growth_changed:
             self.publish_progress(trainer, history)
         elif (
             getattr(trainer, "update_limiter", None) is not None
@@ -478,10 +481,13 @@ class _StepCallback:
         limiter = getattr(trainer, "update_limiter", None)
         if limiter is not None:
             progress["update_limit"] = limiter.state_dict()
+        growth = getattr(trainer, "gradient_growth", None)
+        if growth is not None:
+            progress["gradient_growth"] = growth.progress()
         if history.evals:
             last = history.evals[-1]
             progress.update(dev_accuracy=float(last["accuracy"]), dev_loss=float(last["loss"]))
-            if "adaptive_lr" in progress or "update_limit" in progress:
+            if any(k in progress for k in ("adaptive_lr", "update_limit", "gradient_growth")):
                 # A monitoring update must not present an older dev score as a fresh evaluation.
                 progress["dev_step"] = int(last["step"])
         if phase is not None:
@@ -489,6 +495,8 @@ class _StepCallback:
         self.arm.on_progress(progress)
         if "adaptive_lr" in progress:
             self._controller_reported = int(progress["adaptive_lr"]["observation_count"])
+        if "gradient_growth" in progress:
+            self._growth_reported = int(progress["gradient_growth"]["observation_count"])
 
 
 def _adaptive_record(trainer: Any) -> dict[str, Any]:
@@ -498,6 +506,9 @@ def _adaptive_record(trainer: Any) -> dict[str, Any]:
     limiter = getattr(trainer, "update_limiter", None)
     if limiter is not None:
         out["update_limit"] = limiter.state_dict()
+    growth = getattr(trainer, "gradient_growth", None)
+    if growth is not None:
+        out["gradient_growth"] = growth.state_dict()
     return out
 
 

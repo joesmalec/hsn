@@ -125,4 +125,8 @@ class UpdateLimiter:
             if raw["groups"][name] != [n for n, _, _ in entries]:
                 raise ValueError(f"update_limit checkpoint parameters differ for {name}")
         for name in ("counts", "max_proposed", "max_applied", "last"):
-            getattr(self, name).copy_(raw[name])
+            # Mapping order is not part of the config hash. Match saved tensor rows by name
+            # when an equivalent config lists its groups in a different order at resume.
+            order = list(raw["groups"])
+            for index, group in enumerate(self.groups):
+                getattr(self, name)[index].copy_(raw[name][order.index(group)])

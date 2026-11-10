@@ -364,6 +364,35 @@ class UpdateLimitConfig(_StrictModel):
     norm_floor: float = Field(default=1e-12, gt=0.0, allow_inf_nan=False)
 
 
+class GradientGrowthConfig(_StrictModel):
+    """Selective, reversible update damping from sustained pre-clip gradient growth."""
+
+    enabled: bool = False
+    groups: dict[str, list[str]] = {}  # disjoint parameter-name globs, chosen by the experiment
+    window: int = Field(default=100, ge=1)
+    reference_lag: int = Field(default=500, ge=1)
+    interval: int = Field(default=100, ge=1)  # observations per accepted finite samples
+    growth_threshold: float = Field(default=1.5, gt=1.0, allow_inf_nan=False)
+    global_growth_threshold: float = Field(default=1.25, gt=1.0, allow_inf_nan=False)
+    min_share: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+    share_power: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    response_power: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    recovery_threshold: float = Field(default=1.1, ge=1.0, allow_inf_nan=False)
+    recovery_rate: float = Field(default=0.1, gt=0.0, le=1.0, allow_inf_nan=False)
+    min_scale: float = Field(default=0.25, gt=0.0, le=1.0, allow_inf_nan=False)
+    norm_floor: float = Field(default=1e-12, gt=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _check_growth(self) -> Self:
+        if self.reference_lag < self.window:
+            raise ValueError("gradient_growth.reference_lag must be >= window")
+        if self.recovery_threshold >= self.growth_threshold:
+            raise ValueError("gradient_growth.recovery_threshold must be below growth_threshold")
+        if self.enabled and (not self.groups or any(not v for v in self.groups.values())):
+            raise ValueError("gradient_growth.enabled requires nonempty parameter selectors")
+        return self
+
+
 class TrainConfig(_StrictModel):
     """Appendix A.3 ``train.*`` including loss weights and the one-at-a-time auxiliary rule."""
 
@@ -389,6 +418,7 @@ class TrainConfig(_StrictModel):
     readout_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     adaptive_lr: AdaptiveLRConfig = AdaptiveLRConfig()
     update_limit: UpdateLimitConfig = UpdateLimitConfig()
+    gradient_growth: GradientGrowthConfig = GradientGrowthConfig()
     # --- end P1.13 ---
     # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
     # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
@@ -497,6 +527,14 @@ class TrainConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        if self.gradient_growth.enabled and (
+            self.adaptive_lr.enabled
+            or self.rollback_every is not None
+            or self.spike_factor is not None
+        ):
+            raise ValueError(
+                "gradient_growth requires adaptive_lr, rollback and finite spike skipping off"
+            )
         if (
             self.adaptive_lr.enabled
             and self.rollback_every is not None
@@ -1146,6 +1184,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.rollback_selection",
     "train.update_limit",
     "model.decoder_shortcut_dropout",
+    "train.gradient_growth",
 )
 
 

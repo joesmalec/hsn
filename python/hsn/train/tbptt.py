@@ -874,6 +874,7 @@ class TBPTTTrainer(Trainer):
                 group_norms = self._group_grad_norms(groups) if stats_step else {}
                 if self.grad_hook is not None:  # P1.15: the replay's raw gradients
                     self.grad_hook(self)
+                growth_norms = self._growth_raw_norms()
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
@@ -882,6 +883,7 @@ class TBPTTTrainer(Trainer):
                 self._capture_healthy(next_step, grad_norm, skipped)
                 before = self._adaptive_before_step(skipped)
                 self._limit_before_step(skipped)
+                self._growth_before_step(skipped, grad_norm, growth_norms)
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
@@ -894,6 +896,7 @@ class TBPTTTrainer(Trainer):
                         if self.hsn.ema_target is not None
                         or self.adaptive_lr is not None
                         or self.update_limiter is not None
+                        or self.gradient_growth is not None
                         else None
                     )
                     self.scaler.step(self.optimizer, **step_kwargs)
@@ -903,6 +906,7 @@ class TBPTTTrainer(Trainer):
                 elif not skipped:
                     self.optimizer.step(**step_kwargs)
                 self._limit_after_step(applied)
+                self._growth_after_step(applied)
                 self._record_captured_update(applied)
                 if applied:
                     self.hsn.update_target()

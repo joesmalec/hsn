@@ -174,6 +174,25 @@ def test_new_settings_validate_and_preserve_default_hashes() -> None:
         hsn_config(4, "model.decoder_shortcut_dropout=0.2")
 
 
+def test_limiter_checkpoint_follows_group_names_when_mapping_order_changes() -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1))
+    groups = {
+        "first": {"selectors": ["0.*"], "max_ratio": 0.001},
+        "second": {"selectors": ["1.*"], "max_ratio": 1.0},
+    }
+    source = UpdateLimiter(model, UpdateLimitConfig.model_validate({"groups": groups}))
+    source.capture()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(0.01)
+    source.apply()
+    restored = UpdateLimiter(
+        model, UpdateLimitConfig.model_validate({"groups": dict(reversed(groups.items()))})
+    )
+    restored.load_checkpoint_state(source.checkpoint_state())
+    assert restored.state_dict() == source.state_dict()
+
+
 def test_guard_horizon_selects_by_trigger_and_advances_anchor(tmp_path: Path) -> None:
     trainer = hsn_trainer(
         hsn_config(

@@ -77,6 +77,21 @@ train: # Appendix A.3
   update_limit: # project excessive optimizer displacements; no finite batch is discarded
     groups: {} # name -> {selectors: [parameter-name globs], max_ratio: relative L2 cap}
     norm_floor: 1.0e-12 # denominator floor for groups with zero/small weight norm
+  gradient_growth: # reversible damping of selected groups when raw gradient medians rise
+    enabled: false # requires groups; adaptive_lr, rollback and spike skipping must be off
+    groups: {} # arbitrary group name -> list of parameter-name globs
+    window: 100 # recent/reference median widths in finite accepted samples
+    reference_lag: 500 # distance between windows; at least window
+    interval: 100 # sample cadence of decisions
+    growth_threshold: 1.5 # minimum group norm growth before damping
+    global_growth_threshold: 1.25 # global norm growth required to call a group hot
+    min_share: 0.25 # minimum group share of the pre-clip gradient norm
+    share_power: 1.0 # rising share strengthens the response (zero ignores share growth)
+    response_power: 1.0 # exponent of the inverse excess-growth response
+    recovery_threshold: 1.1 # group growth at/below this permits recovery toward scale 1
+    recovery_rate: 0.1 # maximum scale increase at one observation
+    min_scale: 0.25 # floor for each selected group; other parameters are unchanged
+    norm_floor: 1.0e-12 # protects ratios with zero/near-zero reference norms
   adaptive_lr: # opt-in training-only feedback; scales multiply the chosen schedule
     enabled: false
     interval: 100 # accepted updates per fixed training-monitor measurement
