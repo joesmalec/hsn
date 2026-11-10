@@ -48,10 +48,15 @@ steps: it cannot act there, and exp 354 (`c = 4`, no update caps) fell to chance
 (and its `dL/dh`) is at most `k` times the batch's *typical live row* there, the 90th percentile
 of the rows that carry a gradient at that position (a document that ended earlier carries none and
 is not counted; with fewer than ten live rows the typical row is their largest, so nothing is
-limited). In healthy windows the largest row is 1.2 to 2.1 times that percentile at steps 500,
-1,000, 2,000, 3,000 and 8,500, so `k = 3` leaves them alone throughout. Up to three rows of a
-B32 batch can blow up without moving the percentile. Both keys may be set; the smaller limit
-applies.
+limited). Measured on exp 346's checkpoints (total loss, 4 windows each, per position,
+`/home/joe/hsn-experiments/a5-fix/probe/probe_ratio.py`): the largest row of a window is usually
+1.3 to 3.5 times that percentile, and `k = 3` would act on 0 % (step 500), 0.9 % (1,000), 0.2 %
+(3,000) and 0.7 % (8,500) of the live row-positions in `q`, at most one document per window: the
+isolated documents at 9 and 21 times the percentile that these otherwise healthy checkpoints
+already contain. In the burst checkpoint (6,000) the same document-level outliers reach 24 times
+in `q` and 11 times in `h`. So the relative limit acts on the same kind of row at every stage of
+a run, which no absolute number does. Up to three rows of a B32 batch can blow up without moving
+the percentile. Both keys may be set; the smaller limit applies.
 
 ## The feedback cut
 

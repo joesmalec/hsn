@@ -20,8 +20,9 @@ whole run. Healthy per-row gradients grow about twentyfold over a run of the A5 
 ``dL/dq`` row of a window: 0.13 at step 500, 0.35 at 1,000, 1.2 at 2,000, 2.9 from 3,000 on), so a
 number that never touches a healthy row late is far above an exploding row early. The **relative**
 limit needs no scale: a row may be at most ``ratio`` times the batch's typical live row at the same
-position (:func:`typical_row`: the 90th percentile of the rows that carry a gradient there). In
-healthy windows the largest row is 1.2 to 2.1 times that percentile, at every stage measured.
+position (:func:`typical_row`: the 90th percentile of the rows that carry a gradient there). On
+exp 346's checkpoints a ratio of 3 acts on 0 % to 0.9 % of the live row-positions from step 500
+to 8,500: at most one document per window, the isolated ones at 9 to 21 times the percentile.
 
 The norm is computed as ``peak * ||g / peak||`` (``peak`` the row's largest magnitude), which
 cannot overflow for finite entries (exp 316's finite gradient had an fp32 norm of infinity). A row
