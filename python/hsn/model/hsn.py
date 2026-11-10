@@ -94,13 +94,23 @@ the statistics, ``info``) — which the compiled window reuses: it compiles bloc
 the unit bank's static pass) and the window's constants passed as tensors
 (:class:`~hsn.model.cell.WindowConsts`). The eager path is unchanged, bit for bit.
 
+A6 (``train.feedback_detach``, ``docs/amendments/A6_feedback_gradient.md``; opt-in): the feedback
+reads of the recurrent state can be constants in the backward pass, with every forward value
+unchanged. ``summary``: ``S`` reads ``q_{t−1}.detach()``; ``eps``: the cell and the scorer read
+``z_t − ẑ_t.detach()`` (``StepOutput.eps`` and the prediction loss keep ``ẑ_t``'s gradient into
+``P`` and ``q``); ``state``: the cell's units, gate and messages read ``h.detach()``
+(:attr:`PDGCell.detach_state_read`); ``router``: the scorer's features are detached, so a
+selection gradient trains the scorer's weights only. With all four the state's backward recurrence
+is the gated carry ``(1 − b) ⊙ h`` and the linear summary update, whose Jacobian has no singular
+value above 1: a gradient cannot grow on its way back through a window.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple, Self
 
@@ -108,7 +118,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from hsn.config import GateMode, ModelConfig, RunConfig
+from hsn.config import FEEDBACK_PATHS, GateMode, ModelConfig, RunConfig
 from hsn.data.synthetic import BOS
 from hsn.model.cell import PDGCell, WindowConsts, profiler_segment
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
@@ -289,7 +299,8 @@ class HSN(nn.Module):
     (``train.ema_tau``) for the :class:`~hsn.model.encoder.EMATarget` copy of ``E`` (``ema_target``;
     ``None`` otherwise). ``schedule`` is the P2.2 :class:`~hsn.train.schedules.SelectionSchedule`
     (``train.gate_mode`` and the ramps; the config defaults when ``None``: soft gates, τ = 1, no
-    exploration, no dense fallback)."""
+    exploration, no dense fallback). ``feedback_detach`` is A6's ``train.feedback_detach`` (module
+    docstring; empty: full backpropagation through time)."""
 
     def __init__(
         self,
@@ -299,8 +310,25 @@ class HSN(nn.Module):
         unroll: int,
         ema_tau: float | None = None,
         schedule: SelectionSchedule | None = None,
+        feedback_detach: Collection[str] = (),
     ) -> None:
         super().__init__()
+        if isinstance(feedback_detach, str) or not isinstance(feedback_detach, Collection):
+            raise TypeError(
+                f"feedback_detach must be a collection of path names, got {feedback_detach!r}"
+            )
+        unknown = sorted(set(feedback_detach) - set(FEEDBACK_PATHS))
+        if unknown:
+            raise ValueError(
+                f"feedback_detach names unknown paths {unknown}; known: {list(FEEDBACK_PATHS)}"
+            )
+        #: A6: the feedback reads that are constants in the backward pass, in FEEDBACK_PATHS order.
+        self.feedback_detach: tuple[str, ...] = tuple(
+            name for name in FEEDBACK_PATHS if name in feedback_detach
+        )
+        self._cut_summary = "summary" in self.feedback_detach
+        self._cut_eps = "eps" in self.feedback_detach
+        self._cut_router = "router" in self.feedback_detach
         if schedule is not None and not isinstance(schedule, SelectionSchedule):
             raise TypeError(
                 f"schedule must be a SelectionSchedule or None, got {type(schedule).__name__}"
@@ -330,6 +358,7 @@ class HSN(nn.Module):
         self.predictor = Predictor(cfg)
         self.shared = SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
+        self.cell.detach_state_read = "state" in self.feedback_detach  # A6
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
         self.router = Router.from_config(cfg, unroll=unroll, seed=seed)
         self.halting = HaltingHead(cfg)
@@ -347,7 +376,8 @@ class HSN(nn.Module):
     @classmethod
     def from_config(cls, run: RunConfig) -> Self:
         """``HSN(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau,
-        schedule=SelectionSchedule.from_config(run.train))``."""
+        schedule=SelectionSchedule.from_config(run.train),
+        feedback_detach=run.train.feedback_detach)``."""
         if not isinstance(run, RunConfig):
             raise TypeError(f"from_config needs a RunConfig, got {type(run).__name__}")
         return cls(
@@ -356,6 +386,7 @@ class HSN(nn.Module):
             unroll=run.train.unroll,
             ema_tau=run.train.ema_tau,
             schedule=SelectionSchedule.from_config(run.train),
+            feedback_detach=run.train.feedback_detach,
         )
 
     def set_train_step(self, step: int) -> None:
@@ -459,14 +490,14 @@ class HSN(nn.Module):
         # P1.7: under autocast E, P and S emit the autocast dtype (bf16 / fp16); the state path
         # (scorer features, the softmax over units, the cell update and q) runs in the state's
         # dtype, the fp32 master precision of §3.7. Without autocast these casts are no-ops.
-        u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)
+        u_s, eps_s = u.to(state.dtype), self._eps_read(z, z_hat, eps).to(state.dtype)
 
         with self.cell.graph.step():
             with profiler_segment(profiler, "scorer", B):
                 feats = self.scorer.features(
-                    u_s,
-                    eps_s,
-                    state,
+                    u_s.detach() if self._cut_router else u_s,
+                    eps_s.detach() if self._cut_router else eps_s,
+                    self._router_state(state),
                     ctx_t,
                     budget_frac=cfg.budget,
                     round_idx=0,
@@ -543,8 +574,25 @@ class HSN(nn.Module):
         z = self.encoder(emb)
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         eps = z - z_hat
-        u = self.shared(torch.cat([z, q_prev, self.ctx_emb(ctx_t)], dim=-1))
+        u = self.shared(torch.cat([z, self._summary_read(q_prev), self.ctx_emb(ctx_t)], dim=-1))
         return z_hat, z, z_target, eps, u
+
+    # -- A6: the feedback reads (values unchanged; see the module docstring) ----------------------
+
+    def _summary_read(self, q_prev: Tensor) -> Tensor:
+        """What ``S`` reads of the carried summary: a constant in the backward with ``summary``."""
+        return q_prev.detach() if self._cut_summary else q_prev
+
+    def _eps_read(self, z: Tensor, z_hat: Tensor, eps: Tensor) -> Tensor:
+        """The error the cell and the scorer read: ``z − ẑ.detach()`` with ``eps`` (the same
+        value; ``z`` keeps its gradient, the prediction does not), else ``eps`` itself."""
+        return z - z_hat.detach() if self._cut_eps else eps
+
+    def _router_state(self, state: CellGraphState) -> CellGraphState:
+        """The state whose ``h`` the scorer's features read (detached with ``router``)."""
+        if not self._cut_router:
+            return state
+        return CellGraphState._make(h=state.h.detach(), q=state.q, age=state.age, pos=state.pos)
 
     def _gate(self) -> GateMode | None:
         """The gate of this step: the schedule's in training, ``None`` (hard, no gradient path) in
@@ -1137,10 +1185,16 @@ class HSN(nn.Module):
         q_prev = state.q
         z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
         eps = z_t - z_hat
-        u = self.shared(torch.cat([z_t, q_prev, ctx_t], dim=-1))
-        u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)  # P1.7: see step
+        u = self.shared(torch.cat([z_t, self._summary_read(q_prev), ctx_t], dim=-1))
+        # P1.7: see step. A6: the reads of the cell and the scorer (the same values)
+        u_s, eps_s = u.to(state.dtype), self._eps_read(z_t, z_hat, eps).to(state.dtype)
         age = None if dense_counters is not None else state.age  # dense: a column of the scalars
-        feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalars_t)
+        if self._cut_router:
+            feats = self.scorer._assemble(
+                u_s.detach(), eps_s.detach(), state.h.detach(), age, scalars_t
+            )
+        else:
+            feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalars_t)
         unit_logits, alpha, selection = self._score(
             feats, state, mode, dense_rows, controls=controls
         )
@@ -1354,6 +1408,8 @@ class HSN(nn.Module):
         text = f"seed={self.seed}, unroll={self.unroll}, routing={self.cfg.routing!r}"
         if self.ema_target is not None:
             text += f", ema_tau={self.ema_tau}"
+        if self.feedback_detach:
+            text += f", feedback_detach={list(self.feedback_detach)}"
         return text
 
     # -- validation -------------------------------------------------------------------------------

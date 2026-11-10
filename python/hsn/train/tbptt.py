@@ -366,6 +366,13 @@ class TBPTTTrainer(Trainer):
                 f"the model's selection schedule {model.schedule} is not the configuration's "
                 f"{expected}; build the model with HSN.from_config(cfg)"
             )
+        detach = tuple(sorted(cfg.train.feedback_detach))
+        if tuple(sorted(model.feedback_detach)) != detach:  # A6: one source of truth
+            raise ValueError(
+                f"the model's feedback_detach {list(model.feedback_detach)} is not the "
+                f"configuration's train.feedback_detach {list(cfg.train.feedback_detach)}; build "
+                "the model with HSN.from_config(cfg)"
+            )
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0

@@ -113,6 +113,9 @@ Variant = Literal["in_range", "out_of_range"]  # P0.4 dependency-length variants
 Optimizer = Literal["adamw", "lazy_adamw"]
 Precision = Literal["bf16", "fp16", "fp32", "fp64"]
 GradNormPrecision = Literal["native", "float64"]
+#: A6: the state's feedback reads a backward pass can leave out (``train.feedback_detach``).
+FeedbackPath = Literal["summary", "eps", "state", "router"]
+FEEDBACK_PATHS: tuple[str, ...] = ("summary", "eps", "state", "router")
 GateMode = Literal["soft", "ste", "reinforce"]
 ActivationCheckpoint = Literal["none", "per_round", "per_window"]
 StreamPolicy = Literal["lru", "utility_lru", "pinned"]
@@ -479,6 +482,13 @@ class TrainConfig(_StrictModel):
     # Opt-in wide norm reduction AND scaling; native preserves historical clipping bitwise.
     # MPS uses CPU float64. True NaN/Inf gradients still reach the existing nonfinite guard.
     grad_norm_precision: GradNormPrecision = "native"
+    # A6 (docs/amendments/A6_feedback_gradient.md; opt-in, forward values unchanged): the feedback
+    # reads of the recurrent state that are constants in the backward pass. "summary": S reads
+    # q[t-1]; "eps": the cell and the scorer read eps = z - P(q[t-1]) (L_pred keeps its gradient
+    # into P and q); "state": a cell reads its own h and its neighbours' messages; "router": the
+    # scorer's features (u, eps, h). With all four the backward recurrence is the gated carry
+    # (1 - b) alone, which cannot amplify a gradient. Empty (default): full BPTT, as before.
+    feedback_detach: list[FeedbackPath] = []
     steps: int = Field(default=1000, ge=1)  # schedule
     eval_every: int = Field(default=100, ge=1)
     ckpt_every: int = Field(default=500, ge=1)
@@ -634,6 +644,11 @@ class TrainConfig(_StrictModel):
                     "train.rollback_every is not set; drop them or set the cadence"
                 )
         # --- end P1.16 ---
+        if len(set(self.feedback_detach)) != len(self.feedback_detach):
+            raise ValueError(
+                f"train.feedback_detach={self.feedback_detach} names a path twice; known: "
+                f"{list(FEEDBACK_PATHS)}"
+            )
         return self
 
 
@@ -906,6 +921,8 @@ class RunConfig(_StrictModel):
                 raise ValueError(
                     "model.key_address and model.selected_readout are HSN-only A5 features"
                 )
+            if self.train.feedback_detach:
+                raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.cell_lr_mult != 1.0:
                 ignored.append(f"train.cell_lr_mult={self.train.cell_lr_mult}")
             if self.train.cell_weight_decay is not None:
@@ -1200,6 +1217,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.decoder_shortcut_dropout",
     "train.gradient_growth",
     "train.grad_norm_precision",
+    "train.feedback_detach",
 )
 
 

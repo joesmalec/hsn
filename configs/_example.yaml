@@ -135,6 +135,7 @@ train: # Appendix A.3
   precision: bf16 # bf16 | fp16 | fp32 | fp64 (fp64 only for gradcheck)
   grad_clip: 1.0 # global norm clip
   grad_norm_precision: native # native | float64; wide global reduction and clipping, opt-in
+  feedback_detach: [] # A6, opt-in: summary | eps | state | router; feedback reads held constant in the backward
   steps: 1000
   eval_every: 100
   ckpt_every: 500

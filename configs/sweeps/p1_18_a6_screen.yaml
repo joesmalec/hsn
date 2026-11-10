@@ -1,0 +1,76 @@
+# A6 screening (10 Nov 2026): does cutting the state's feedback reads out of the backward pass
+# (train.feedback_detach) remove the mid-run accuracy drops of the A5 recipe, with and without the
+# update caps, and how does it compare with the candidate norm (A4) on the same recipe?
+# Seed 2 first: the seed whose anchored repeat (exp 346) lost 36.9 points and whose
+# current-norm run (exp 345) collapsed. Arms are not timing arms: they share the card.
+name: p1_18_a6_screen
+description: "A6 feedback-gradient cut on the A5 recipe: seed-2 screen against exps 345/346"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - model.routing=topk
+    - model.cand_norm=none
+    - model.key_address=true
+    - model.selected_readout=true
+    - train.optimizer=lazy_adamw
+    - train.gate_mode=ste
+    - train.lr=2.5e-3
+    - train.betas=[0.9,0.95]
+    - train.probe_horizon=null
+    - train.spike_factor=null
+    - train.rollback_every=null
+    - train.grad_norm_precision=float64
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [2]
+arms:
+  # every feedback read cut: the backward recurrence is the gated carry alone; no update caps
+  - name: carry
+    family: hsn
+    overrides:
+      - train.feedback_detach=[summary,eps,state,router]
+  # the same cut on exp 346's anchored-cap recipe (isolates the cut from the caps)
+  - name: carry_anchored
+    family: hsn
+    overrides:
+      - train.feedback_detach=[summary,eps,state,router]
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+  # A4 on the A5 recipe, full backpropagation, no caps (never registered before)
+  - name: a4_full
+    family: hsn
+    overrides:
+      - model.cand_norm=rms
+  - name: a4_carry
+    family: hsn
+    overrides:
+      - model.cand_norm=rms
+      - train.feedback_detach=[summary,eps,state,router]
+  # only the summary's two readers cut (P and S), the cell still reads its state with gradient
+  - name: summary_eps
+    family: hsn
+    overrides:
+      - train.feedback_detach=[summary,eps]
+  # control: no caps, full backpropagation (the recipe of the historical collapses)
+  - name: full_nocap
+    family: hsn

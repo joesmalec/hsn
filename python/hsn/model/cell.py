@@ -179,6 +179,11 @@ class PDGCell(nn.Module):
         if self.disabled_cells:
             disabled[list(self.disabled_cells)] = True
         self.register_buffer("disabled", disabled, persistent=False)
+        #: A6 (``train.feedback_detach`` holds ``state``; set by :class:`~hsn.model.hsn.HSN`): the
+        #: units, the gate and the messages read a detached copy of the pre-round ``h``, so the
+        #: only gradient a round passes back into ``h`` is the carry ``(1 - b) * h``. The values
+        #: are unchanged.
+        self.detach_state_read = False
         #: P1.10e: True inside :meth:`window`, whose caller (``HSN.forward``) validated the window
         #: once: the rounds then skip their per-call shape / dtype / device checks.
         self._in_window = False
@@ -246,9 +251,11 @@ class PDGCell(nn.Module):
         w1_flat = None if consts is None else consts.w1_flat
         with self.graph.step():
             h_prev = state.h
-            m = self.graph.messages_dense(h_prev, self.V, weights=weights)  # [B, N, d]
+            # A6: what the round reads of the state (the carry below keeps the state itself)
+            h_read = h_prev.detach() if self.detach_state_read else h_prev
+            m = self.graph.messages_dense(h_read, self.V, weights=weights)  # [B, N, d]
             v_raw = torch.cat(
-                [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_prev, m], dim=-1
+                [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_read, m], dim=-1
             )  # [B, N, 4d]
             v = self.norm(v_raw)  # P1.5a: what the units and the gate read
             unit_out = self.units.forward_all(v, w1_flat=w1_flat)  # [B, N, M, d] ([M, B·N, d])
@@ -336,13 +343,15 @@ class PDGCell(nn.Module):
         with self.graph.step():
             with profiler_segment(profiler, "messages", B):
                 h_prev = state.h
+                # A6: what the round reads of the state (the update below keeps the state itself)
+                h_read = h_prev.detach() if self.detach_state_read else h_prev
                 if static or weights is not None:  # P2.8: no range check, window weights
                     m = native.csr_messages(
-                        h_prev, self.graph, self.V, cells, weights=weights, validate=not static
+                        h_read, self.graph, self.V, cells, weights=weights, validate=not static
                     )
                 else:
-                    m = native.csr_messages(h_prev, self.graph, self.V, cells)  # [B, K, d]
-                v_raw = native.gather_concat(u, eps, h_prev, m, cells)  # [B, K, 4d]
+                    m = native.csr_messages(h_read, self.graph, self.V, cells)  # [B, K, d]
+                v_raw = native.gather_concat(u, eps, h_read, m, cells)  # [B, K, 4d]
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
@@ -373,6 +382,8 @@ class PDGCell(nn.Module):
                     state, cells, c, b, valid, validate=not static
                 )
         h_old = v_raw[..., 2 * d : 3 * d]  # the gathered h[cell] slice of the raw v
+        if self.detach_state_read:  # A6: the returned slots keep the carry's gradient
+            h_old = h_prev.gather(1, cells.unsqueeze(-1).expand(B, K, d))
         h_new = torch.where(valid.unsqueeze(-1), (1 - b) * h_old + b * c, h_old).to(state.dtype)
         info: dict[str, Tensor | CellGraphState] = {
             "m": m,
