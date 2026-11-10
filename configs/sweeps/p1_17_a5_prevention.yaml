@@ -1,5 +1,5 @@
 # A5 prevention hypotheses, frozen before the first run on this code version.
-# 2 x 2 ablation, controlled existing seeds 0 and 1; no discarded finite batches.
+# 2 x 2 ablation plus slower-router control, existing seeds 0 and 1; no discarded finite batches.
 # Caps are experimental settings based on exp235's reported module update ratios;
 # no implementation threshold or step number was fitted to a spike.
 name: p1_17_a5_prevention
@@ -57,3 +57,6 @@ arms:
       - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
       - train.update_limit.norm_floor=1e-12
       - model.decoder_shortcut_dropout=0.5
+  - name: a5_router_slow
+    family: hsn
+    overrides: [train.router_lr_mult=0.3]
