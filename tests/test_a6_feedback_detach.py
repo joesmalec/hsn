@@ -488,3 +488,140 @@ def test_training_runs_and_resumes_with_the_state_grad_clip(tmp_path: Path) -> N
     assert resumed.resume(tmp_path / "full" / "step_00000004.pt") == 4
     actual = resumed.fit(*datasets(), 8)
     assert [s.loss for s in actual.steps] == [s.loss for s in expected.steps[4:]]
+
+
+# --------------------------------------------------------------------------------------------------
+# train.state_grad_ratio: the same limit as a multiple of the batch's typical live row
+# --------------------------------------------------------------------------------------------------
+
+
+def test_typical_row_is_the_90th_percentile_of_the_live_rows() -> None:
+    from hsn.model.gradclip import typical_row
+
+    rows = torch.arange(1, 33, dtype=torch.float32)[:, None]  # 32 live rows: 1 .. 32
+    assert float(typical_row(rows)) == 29.0  # ceil(0.9 * 32) = 29th smallest
+    with_dead = torch.cat([rows, torch.zeros(20, 1), torch.full((3, 1), float("nan"))])
+    assert float(typical_row(with_dead)) == 29.0, "rows without a gradient say nothing"
+    few = torch.tensor([[0.0], [2.0], [0.0], [7.0], [0.5]])
+    assert float(typical_row(few)) == 7.0, "under ten live rows: their largest"
+    assert float(typical_row(torch.zeros(4, 1))) == float("inf")
+
+
+def test_relative_row_clip_limits_only_the_outliers() -> None:
+    from hsn.model.gradclip import clip_row_grad
+
+    g = torch.Generator().manual_seed(0)
+    direction = torch.randn(32, 6, generator=g)
+    direction = direction / direction.norm(dim=1, keepdim=True)
+    sizes = torch.linspace(0.5, 2.0, 32)  # healthy: the largest row is 4x the smallest
+    sizes[5], sizes[17] = 400.0, 1e30  # two rows blow up
+    x = torch.zeros(32, 6, requires_grad=True)
+    (clip_row_grad(x, ratio=3.0) * (direction * sizes[:, None])).sum().backward()
+    norms = x.grad.norm(dim=1)
+    healthy = torch.ones(32, dtype=torch.bool)
+    healthy[[5, 17]] = False
+    assert torch.equal(x.grad[healthy], (direction * sizes[:, None])[healthy])
+    typical = sizes.sort().values[28]  # the 29th smallest of the 32
+    torch.testing.assert_close(norms[[5, 17]], (3.0 * typical).expand(2), rtol=1e-5, atol=0)
+    cosine = (x.grad[[5, 17]] * direction[[5, 17]]).sum(dim=1) / norms[[5, 17]]
+    torch.testing.assert_close(cosine, torch.ones(2), rtol=1e-5, atol=0)
+    # the smaller of the two limits applies
+    y = torch.zeros(32, 6, requires_grad=True)
+    (clip_row_grad(y, 1.0, ratio=3.0) * (direction * sizes[:, None])).sum().backward()
+    assert float(y.grad.norm(dim=1).max()) <= 1.0 + 1e-6
+    # a few live rows cannot be judged against each other: none is limited
+    z = torch.zeros(4, 6, requires_grad=True)
+    w = torch.zeros(4, 6)
+    w[1], w[3] = 1e6 * direction[1], direction[3]
+    (clip_row_grad(z, ratio=3.0) * w).sum().backward()
+    assert torch.equal(z.grad, w)
+    with pytest.raises(ValueError):
+        clip_row_grad(x)
+    with pytest.raises(ValueError):
+        clip_row_grad(x, ratio=0.0)
+
+
+def test_state_grad_ratio_config_and_training(tmp_path: Path) -> None:
+    from p1_15_support import datasets, hsn_config, hsn_trainer
+
+    base = _cfg()
+    assert base.train.state_grad_ratio is None and "state_grad_ratio" not in canonical_json(base)
+    on = _cfg("train.state_grad_ratio=3.0")
+    assert config_hash(on) != config_hash(base)
+    assert HSN.from_config(on).state_grad_ratio == 3.0
+    for bad in ("1.0", "0.5", "inf"):
+        with pytest.raises(ValueError):
+            _cfg(f"train.state_grad_ratio={bad}")
+    with pytest.raises(ValueError, match="HSN-only"):
+        load_config(REPO / "configs" / "baselines" / "gru_2m.yaml", ["train.state_grad_ratio=3"])
+    with pytest.raises(ValueError, match="state_grad_ratio"):
+        TBPTTTrainer(
+            HSN(on.model, seed=on.seed, unroll=on.train.unroll),
+            on,
+            resolve(on.hardware),
+            run_dir=tmp_path,
+        )
+    cfg = hsn_config(8, *A5, "train.state_grad_ratio=3.0", "train.ckpt_every=4")
+    full = hsn_trainer(cfg, tmp_path / "full")
+    expected = full.fit(*datasets(), 8)
+    resumed = hsn_trainer(cfg, tmp_path / "resumed")
+    assert resumed.resume(tmp_path / "full" / "step_00000004.pt") == 4
+    actual = resumed.fit(*datasets(), 8)
+    assert [s.loss for s in actual.steps] == [s.loss for s in expected.steps[4:]]
+
+
+@pytest.mark.parametrize("routing", [ROUTED, A5])
+def test_state_grad_ratio_bounds_the_outlier_row(routing: tuple[str, ...]) -> None:
+    """One document made to explode is held at the multiple of the batch's typical row."""
+    grads = {}
+    for name, override in (("full", ()), ("ratio", ("train.state_grad_ratio=3.0",))):
+        cfg = _cfg(*routing, *override, "train.batch=16", "train.micro_batch=16")
+        model = _model(cfg)
+        with torch.no_grad():
+            for key, p in model.named_parameters():
+                if key.startswith(("cell.units", "cell.gate.weight", "shared", "predictor")):
+                    p.mul_(6.0)
+        g_h, g_q, _ = _state_grad(model, cfg)
+        grads[name] = g_q.norm(dim=1)
+    full, ratio = grads["full"], grads["ratio"]
+    assert float(full.max() / full.median()) > 30.0, "the fixture has outlier rows"
+    assert float(ratio.max() / ratio.median()) < float(full.max() / full.median())
+    assert float(ratio.max()) < float(full.max())
+
+
+def test_state_grad_ratio_compiled_window_matches_eager() -> None:
+    cfg = _cfg(
+        *A5,
+        "train.state_grad_ratio=1.5",
+        "train.unroll=8",
+        "train.batch=12",
+        "train.micro_batch=12",
+    )
+    ctx = resolve(cfg.hardware)
+    eager = _model(cfg, torch.float32)
+    compiled = _model(cfg, torch.float32)
+    compiled.load_state_dict(eager.state_dict())
+    window = compile_window(compiled, ctx, "reduce-overhead", backend="aot_eager")
+    tokens, ctxs, reset = _window(cfg)
+    outs = []
+    for model, fn in ((eager, eager), (compiled, window)):
+        model.zero_grad(set_to_none=True)
+        logits, _, _ = fn(tokens, ctxs, model.init_state(tokens.shape[0]), reset)
+        logits.square().mean().backward()
+        outs.append({n: p.grad for n, p in model.named_parameters()})
+    reference = _model(
+        _cfg(*A5, "train.unroll=8", "train.batch=12", "train.micro_batch=12"), torch.float32
+    )
+    reference.load_state_dict(eager.state_dict())
+    logits, _, _ = reference(tokens, ctxs, reference.init_state(tokens.shape[0]), reset)
+    logits.square().mean().backward()
+    changed = False
+    for name, grad in outs[0].items():
+        other = outs[1][name]
+        if grad is None:
+            assert other is None or not bool(other.abs().sum() > 0)
+            continue
+        torch.testing.assert_close(grad, other, rtol=2e-3, atol=1e-5)
+        ref = dict(reference.named_parameters())[name].grad
+        changed = changed or not torch.allclose(grad, ref, rtol=1e-3, atol=1e-6)
+    assert changed, "the relative limit was active in this window"

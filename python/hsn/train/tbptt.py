@@ -373,11 +373,15 @@ class TBPTTTrainer(Trainer):
                 f"configuration's train.feedback_detach {list(cfg.train.feedback_detach)}; build "
                 "the model with HSN.from_config(cfg)"
             )
-        if model.state_grad_clip != cfg.train.state_grad_clip:  # A6
+        if (model.state_grad_clip, model.state_grad_ratio) != (
+            cfg.train.state_grad_clip,
+            cfg.train.state_grad_ratio,
+        ):  # A6
             raise ValueError(
-                f"the model's state_grad_clip {model.state_grad_clip} is not the configuration's "
-                f"train.state_grad_clip {cfg.train.state_grad_clip}; build the model with "
-                "HSN.from_config(cfg)"
+                f"the model's state_grad_clip {model.state_grad_clip} / state_grad_ratio "
+                f"{model.state_grad_ratio} are not the configuration's "
+                f"{cfg.train.state_grad_clip} / {cfg.train.state_grad_ratio}; build the model "
+                "with HSN.from_config(cfg)"
             )
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0

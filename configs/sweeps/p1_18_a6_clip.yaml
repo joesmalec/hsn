@@ -62,3 +62,15 @@ arms:
       - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
       - train.update_limit.norm_floor=1e-12
       - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+  # the scale-free limit: a row at most 3x the batch's typical live row at each position
+  - name: ratio3
+    family: hsn
+    overrides:
+      - train.state_grad_ratio=3.0
+  - name: ratio3_anchored
+    family: hsn
+    overrides:
+      - train.state_grad_ratio=3.0
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'

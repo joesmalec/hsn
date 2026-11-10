@@ -107,9 +107,10 @@ value above 1: a gradient cannot grow on its way back through a window.
 A6, the other half (``train.state_grad_clip``; opt-in): at the entry of every position the
 gradient that the position passes back into the state is limited per batch row
 (:func:`hsn.model.gradclip.clip_row_grad`: ``dL/dq`` to the limit, ``dL/dh`` to ``limit /
-sqrt(N)``). The forward values are unchanged and a row under the limit keeps its gradient unscaled,
-so a healthy window is full backpropagation through time (to the rounding of autograd's sums);
-the paths stay, their blow-ups do not.
+sqrt(N)``; ``train.state_grad_ratio``: both to that multiple of the batch's typical live row at
+the position, a limit without a scale). The forward values are unchanged and a row under the
+limit keeps its gradient unscaled, so a healthy window is full backpropagation through time (to
+the rounding of autograd's sums); the paths stay, their blow-ups do not.
 
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
@@ -321,6 +322,7 @@ class HSN(nn.Module):
         schedule: SelectionSchedule | None = None,
         feedback_detach: Collection[str] = (),
         state_grad_clip: float | None = None,
+        state_grad_ratio: float | None = None,
     ) -> None:
         super().__init__()
         if state_grad_clip is not None and (
@@ -331,6 +333,18 @@ class HSN(nn.Module):
             raise ValueError(
                 f"state_grad_clip must be None or a finite number > 0, got {state_grad_clip!r}"
             )
+        if state_grad_ratio is not None and (
+            isinstance(state_grad_ratio, bool)
+            or not isinstance(state_grad_ratio, int | float)
+            or not 1.0 < state_grad_ratio < float("inf")
+        ):
+            raise ValueError(
+                f"state_grad_ratio must be None or a finite number > 1, got {state_grad_ratio!r}"
+            )
+        #: A6: the relative per-row limit (a multiple of the batch's typical live row); None: off.
+        self.state_grad_ratio: float | None = (
+            None if state_grad_ratio is None else float(state_grad_ratio)
+        )
         #: A6: the per-row limit on dL/dq at every position (dL/dh: this / sqrt(N)); None: off.
         self.state_grad_clip: float | None = (
             None if state_grad_clip is None else float(state_grad_clip)
@@ -402,7 +416,8 @@ class HSN(nn.Module):
     def from_config(cls, run: RunConfig) -> Self:
         """``HSN(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau,
         schedule=SelectionSchedule.from_config(run.train),
-        feedback_detach=run.train.feedback_detach, state_grad_clip=run.train.state_grad_clip)``."""
+        feedback_detach=run.train.feedback_detach, state_grad_clip=run.train.state_grad_clip,
+        state_grad_ratio=run.train.state_grad_ratio)``."""
         if not isinstance(run, RunConfig):
             raise TypeError(f"from_config needs a RunConfig, got {type(run).__name__}")
         return cls(
@@ -413,6 +428,7 @@ class HSN(nn.Module):
             schedule=SelectionSchedule.from_config(run.train),
             feedback_detach=run.train.feedback_detach,
             state_grad_clip=run.train.state_grad_clip,
+            state_grad_ratio=run.train.state_grad_ratio,
         )
 
     def set_train_step(self, step: int) -> None:
@@ -617,14 +633,13 @@ class HSN(nn.Module):
 
     def _clip_state_grad(self, state: CellGraphState) -> CellGraphState:
         """``state`` with the gradient into ``h`` and ``q`` limited per row
-        (``train.state_grad_clip``); ``state`` itself when the limit is off or nothing is
-        recorded (evaluation, serving)."""
-        if self._clip_h is None or not torch.is_grad_enabled():
+        (``train.state_grad_clip``, ``train.state_grad_ratio``); ``state`` itself when both are
+        off or nothing is recorded (evaluation, serving)."""
+        if (self._clip_h is None and self.state_grad_ratio is None) or not torch.is_grad_enabled():
             return state
-        assert self.state_grad_clip is not None
         return CellGraphState._make(
-            h=clip_row_grad(state.h, self._clip_h),
-            q=clip_row_grad(state.q, self.state_grad_clip),
+            h=clip_row_grad(state.h, self._clip_h, ratio=self.state_grad_ratio),
+            q=clip_row_grad(state.q, self.state_grad_clip, ratio=self.state_grad_ratio),
             age=state.age,
             pos=state.pos,
         )
@@ -1454,6 +1469,8 @@ class HSN(nn.Module):
             text += f", feedback_detach={list(self.feedback_detach)}"
         if self.state_grad_clip is not None:
             text += f", state_grad_clip={self.state_grad_clip}"
+        if self.state_grad_ratio is not None:
+            text += f", state_grad_ratio={self.state_grad_ratio}"
         return text
 
     # -- validation -------------------------------------------------------------------------------

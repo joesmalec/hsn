@@ -138,6 +138,7 @@ train: # Appendix A.3
   grad_norm_precision: native # native | float64; wide global reduction and clipping, opt-in
   feedback_detach: [] # A6, opt-in: summary | eps | state | router; feedback reads held constant in the backward
   state_grad_clip: null # A6, opt-in: per-row limit on the gradient a position passes back into the state (q; h gets / sqrt(N))
+  state_grad_ratio: null # A6, opt-in: the same limit as a multiple of the batch's typical live row (scale-free)
   steps: 1000
   eval_every: 100
   ckpt_every: 500
