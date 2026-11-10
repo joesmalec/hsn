@@ -58,7 +58,7 @@ from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 from pathlib import Path
-from typing import Any, Literal, Self, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -363,6 +363,15 @@ class UpdateLimitConfig(_StrictModel):
 
     groups: dict[str, UpdateLimitGroup] = {}
     norm_floor: float = Field(default=1e-12, gt=0.0, allow_inf_nan=False)
+    # For these groups, cap the radius's reference norm at this multiple of its initial norm.
+    # Empty preserves the original current-weight-relative projection and checkpoint format.
+    norm_growth_limits: dict[str, Annotated[float, Field(ge=1.0, allow_inf_nan=False)]] = {}
+
+    @model_validator(mode="after")
+    def _check_norm_growth_limits(self) -> Self:
+        if set(self.norm_growth_limits) - set(self.groups):
+            raise ValueError("update_limit.norm_growth_limits must name configured groups")
+        return self
 
 
 class GradientGrowthConfig(_StrictModel):
@@ -1187,6 +1196,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.divergence_healthy_keep",
     "train.rollback_selection",
     "train.update_limit",
+    "train.update_limit.norm_growth_limits",
     "model.decoder_shortcut_dropout",
     "train.gradient_growth",
     "train.grad_norm_precision",

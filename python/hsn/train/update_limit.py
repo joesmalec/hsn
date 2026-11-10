@@ -4,6 +4,9 @@ Each group has a radius ``max_ratio * max(||old weights||, norm_floor)``. Adam m
 advance normally once; only excessive parameter displacement is projected. No example,
 gradient, or document is removed. Unconstrained proposals are left bitwise untouched.
 This limits update size, not cumulative drift or the recurrent network's Jacobian.
+An optional norm-growth ceiling anchors selected groups' radii to their initial weight norms;
+growing weights then cannot increase their allowed absolute update without bound. It does not
+project the weights themselves or constrain their distance from initialization.
 """
 
 from __future__ import annotations
@@ -47,6 +50,12 @@ class UpdateLimiter:
         self.max_applied = torch.zeros_like(self.max_proposed)
         self.last = torch.zeros(len(self.groups), 3, device=first.device, dtype=first.dtype)
         self.applied_steps = 0
+        self.initial_norms = {
+            name: torch.stack([p.detach().square().sum() for _, p, _ in self.groups[name]])
+            .sum()
+            .sqrt()
+            for name in config.norm_growth_limits
+        }
 
     @torch.no_grad()
     def capture(self) -> None:
@@ -60,7 +69,11 @@ class UpdateLimiter:
             denom = old_norm.clamp_min(self.config.norm_floor)
             deltas = [p - old for _, p, old in entries]
             norm = torch.stack([delta.square().sum() for delta in deltas]).sum().sqrt()
-            radius = denom * self.config.groups[group].max_ratio
+            reference = denom
+            if group in self.initial_norms:
+                ceiling = self.initial_norms[group] * self.config.norm_growth_limits[group]
+                reference = torch.minimum(denom, ceiling.clamp_min(self.config.norm_floor))
+            radius = reference * self.config.groups[group].max_ratio
             scale = radius / norm.clamp_min(radius)
             clipped = norm > radius
             for (_, p, old), delta in zip(entries, deltas, strict=True):
@@ -101,6 +114,18 @@ class UpdateLimiter:
                     "proposed_ratio": v[3],
                     "applied_ratio": v[4],
                     "scale": v[5],
+                    **(
+                        {
+                            "initial_norm": float(self.initial_norms[name]),
+                            "reference_norm_ceiling": max(
+                                float(self.initial_norms[name])
+                                * self.config.norm_growth_limits[name],
+                                self.config.norm_floor,
+                            ),
+                        }
+                        if name in self.initial_norms
+                        else {}
+                    ),
                 }
                 for (name, entries), v in zip(self.groups.items(), values, strict=True)
             },
@@ -115,11 +140,24 @@ class UpdateLimiter:
             "max_proposed": self.max_proposed.clone(),
             "max_applied": self.max_applied.clone(),
             "last": self.last.clone(),
+            **(
+                {
+                    "initial_norms": {
+                        name: value.clone() for name, value in self.initial_norms.items()
+                    }
+                }
+                if self.initial_norms
+                else {}
+            ),
         }
 
     def load_checkpoint_state(self, raw: dict[str, Any]) -> None:
         if set(raw["groups"]) != set(self.groups):
             raise ValueError("update_limit checkpoint groups differ")
+        if set(raw.get("initial_norms", {})) != set(self.initial_norms):
+            raise ValueError("update_limit checkpoint initial norm groups differ")
+        for name, value in self.initial_norms.items():
+            value.copy_(raw["initial_norms"][name])
         self.applied_steps = int(raw["applied_steps"])
         for name, entries in self.groups.items():
             if raw["groups"][name] != [n for n, _, _ in entries]:

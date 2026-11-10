@@ -75,6 +75,7 @@ train: # Appendix A.3
   router_lr_mult: 1.0 # A5 stability: HSN.router rate (learned routing only)
   readout_lr_mult: 1.0 # A5 stability: whole HSN.decoder rate, including shared columns
   update_limit: # project excessive optimizer displacements; no finite batch is discarded
+    norm_growth_limits: {} # optional group -> ceiling as a multiple of its initial norm (>=1)
     groups: {} # name -> {selectors: [parameter-name globs], max_ratio: relative L2 cap}
     norm_floor: 1.0e-12 # denominator floor for groups with zero/small weight norm
   gradient_growth: # reversible damping of selected groups when raw gradient medians rise

@@ -934,6 +934,9 @@ class TBPTTTrainer(Trainer):
                     self.optimizer.step(**step_kwargs)
                 self._limit_after_step(applied)
                 self._growth_after_step(applied)
+                if applied:
+                    for hook in self.update_post_hooks:
+                        hook(self)
                 self._record_captured_update(applied)
                 if applied:
                     self.hsn.update_target()

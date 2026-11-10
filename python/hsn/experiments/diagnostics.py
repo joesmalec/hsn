@@ -26,6 +26,15 @@ skipped calls no optimiser step either: the count is compared net of the trainer
 runs under ``no_grad`` with the training mode restored and keeps nothing from the training window
 (P2.8: a compiled window is not disturbed). ``seconds`` is the wall time spent inside the hooks,
 which the trainer counts as training time; the harness subtracts it.
+
+With a post-optimizer projection (update limits or gradient-growth damping), those legacy
+fields still describe the optimizer proposal. Additional ``applied_*`` measurements run after
+both projections. ``applied_update_ratio`` uses the legacy after-weight denominator;
+``applied_update_ratio_before`` uses the pre-step weights, matching update-limit bounds.
+``applied_descent_cosine`` compares the final displacement to the negative clipped gradient;
+it measures direction, not whether a finite step actually improves the objective. Additional
+``applied_state/`` fields evaluate the final weights. They preserve RNG and do not replace any
+frozen diagnostic or verdict input. Default runs retain their original records and hook order.
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ from hsn.config import RunConfig
 from hsn.data.dataset import ByteDataset, collate_windows
 from hsn.device import DeviceContext
 from hsn.model.hsn import HSN
+from hsn.train.checkpoint import capture_rng_state, restore_rng_state
 
 __all__ = [
     "Diagnostics",
@@ -120,6 +130,8 @@ class Diagnostics:
         self._trainer: Any = None
         self._scaled = False
         self._pending: dict[str, Any] | None = None
+        self._applied_pending: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self._observe_applied = False
         self._handles: list[Any] = []
 
     def attach(self, trainer: Any) -> None:
@@ -133,11 +145,20 @@ class Diagnostics:
         optimizer = trainer.optimizer
         self._handles.append(optimizer.register_step_pre_hook(self._pre))
         self._handles.append(optimizer.register_step_post_hook(self._post))
+        self._observe_applied = (
+            trainer.update_limiter is not None or trainer.gradient_growth is not None
+        )
+        if self._observe_applied:
+            trainer.update_post_hooks.append(self._applied)
 
     def detach(self) -> None:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        if self._observe_applied:
+            self._trainer.update_post_hooks.remove(self._applied)
+            self._observe_applied = False
+        self._pending = self._applied_pending = None
 
     def _pre(self, optimizer: torch.optim.Optimizer, args: Any, kwargs: Any) -> None:
         started = time.perf_counter()
@@ -184,6 +205,43 @@ class Diagnostics:
                 record[f"grad_share/{n}"] = pending["g"][n] / g_total if g_total > 0 else 0.0
         record.update(self.state_stats())
         self.records.append(record)
+        if self._observe_applied:
+            record["legacy_measurement_stage"] = "optimizer_proposal"
+            self._applied_pending = (pending, record)
+        self.seconds += time.perf_counter() - started
+
+    @torch.no_grad()
+    def _applied(self, trainer: Any) -> None:
+        saved, self._applied_pending = self._applied_pending, None
+        if saved is None:
+            return
+        started = time.perf_counter()
+        pending, record = saved
+        for name, ps in self.groups.items():
+            old = pending["before"][name]
+            deltas = [p.detach() - b for p, b in zip(ps, old, strict=True)]
+            delta_norm = _norm(deltas)
+            before_norm, after_norm = _norm(old), _norm([p.detach() for p in ps])
+            record[f"applied_update_ratio/{name}"] = (
+                delta_norm / after_norm if after_norm else math.nan
+            )
+            record[f"applied_update_ratio_before/{name}"] = (
+                delta_norm / before_norm if before_norm else math.nan
+            )
+            record[f"applied_update_norm/{name}"] = delta_norm
+            record[f"applied_weight_norm/{name}"] = after_norm
+            dot = sum(
+                float((-d.double() * p.grad.detach().double()).sum())
+                for d, p in zip(deltas, ps, strict=True)
+                if p.grad is not None
+            )
+            denominator = delta_norm * pending["g"][name]
+            record[f"applied_descent_cosine/{name}"] = dot / denominator if denominator else None
+        rng = capture_rng_state()
+        try:
+            record.update({f"applied_state/{k}": v for k, v in self.state_stats().items()})
+        finally:
+            restore_rng_state(rng)
         self.seconds += time.perf_counter() - started
 
     @torch.no_grad()

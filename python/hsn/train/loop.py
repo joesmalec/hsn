@@ -691,6 +691,8 @@ class Trainer:
         self._diagnostic_update: tuple[Path, list[tuple[str, Tensor, Tensor]]] | None = None
         self.dump_notes: dict[str, Any] = {}
         self.grad_hook: Callable[[Trainer], None] | None = None
+        # Diagnostic observers run after every parameter projection, before EMA/scheduler.
+        self.update_post_hooks: list[Callable[[Trainer], None]] = []
         self._loader_state: dict[str, Any] | None = None
         self._carried_state: Any = None
         # P1.11: parallel streams of evaluate() (None = train.batch); a harness setting, not config
@@ -1473,6 +1475,9 @@ class Trainer:
                     self.optimizer.step()
                 self._limit_after_step(applied)
                 self._growth_after_step(applied)
+                if applied:
+                    for hook in self.update_post_hooks:
+                        hook(self)
                 self._record_captured_update(applied)
                 self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
