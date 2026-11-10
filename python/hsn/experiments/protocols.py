@@ -76,7 +76,9 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
   result stored as ``partial``: ``from_step``, ``checkpoint``, ``reason``, ``final`` (the ``final``
   keys of that evaluation), ``trained``, ``probes`` (summaries) and ``seconds``; a failure while
   re-scoring is kept as ``partial.error`` and never hides the run's own failure. The rules label
-  such a record ``failed: … (from step X: …)`` (:mod:`hsn.experiments.rules`).
+  such a record ``failed: … (from step X: …)`` (:mod:`hsn.experiments.rules`). The same assessment
+  of the newest saved checkpoint is also stored as ``latest_saved``; it is diagnostic only and
+  changes neither the failure nor the conservative partial verdict.
 """
 
 from __future__ import annotations
@@ -442,6 +444,11 @@ class _StepCallback:
         )
         if evaluated or changed:
             self.publish_progress(trainer, history)
+        elif (
+            getattr(trainer, "update_limiter", None) is not None
+            and step % trainer.cfg.train.stats_every == 0
+        ):
+            self.publish_progress(trainer, history)
         if step not in self.at_steps:
             return False
         record = {
@@ -468,10 +475,13 @@ class _StepCallback:
             "elapsed_s": round(time.perf_counter() - self.started, 1),
             **controller_progress(trainer),
         }
+        limiter = getattr(trainer, "update_limiter", None)
+        if limiter is not None:
+            progress["update_limit"] = limiter.state_dict()
         if history.evals:
             last = history.evals[-1]
             progress.update(dev_accuracy=float(last["accuracy"]), dev_loss=float(last["loss"]))
-            if "adaptive_lr" in progress:
+            if "adaptive_lr" in progress or "update_limit" in progress:
                 # A monitoring update must not present an older dev score as a fresh evaluation.
                 progress["dev_step"] = int(last["step"])
         if phase is not None:
@@ -484,7 +494,11 @@ class _StepCallback:
 def _adaptive_record(trainer: Any) -> dict[str, Any]:
     """Kept in successful and partial SQLite record_json, including guard/trial decisions."""
     controller = getattr(trainer, "adaptive_lr", None)
-    return {} if controller is None else {"adaptive_lr": controller.state_dict()}
+    out = {} if controller is None else {"adaptive_lr": controller.state_dict()}
+    limiter = getattr(trainer, "update_limiter", None)
+    if limiter is not None:
+        out["update_limit"] = limiter.state_dict()
+    return out
 
 
 def _compile_info(trainer: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
@@ -641,6 +655,18 @@ def _train(
         if callback.keeper is not None and arm.record["failure"]["kind"] in _RESCORED:
             arm.record["partial"] = _rescore_partial(
                 arm, params, trainer, model, cfg, ctx, dev_ds, callback, audit_keys
+            )
+            arm.record["latest_saved"] = _rescore_partial(
+                arm,
+                params,
+                trainer,
+                model,
+                cfg,
+                ctx,
+                dev_ds,
+                callback,
+                audit_keys,
+                latest=True,
             )
         raise
     arm.walls["fit_s"] = time.perf_counter() - t1
@@ -842,6 +868,8 @@ def _rescore_partial(
     dev_ds: Any,
     callback: _StepCallback,
     audit_keys: bool,
+    *,
+    latest: bool = False,
 ) -> dict[str, Any] | None:
     """P1.16: the ``partial`` block of a run that failed on a guard (module docstring), or None
     when no kept checkpoint qualifies. Errors while re-scoring are kept in it, never raised."""
@@ -862,7 +890,7 @@ def _rescore_partial(
         return None
     first = _first_guard_event(trainer)
     limit = first if first is not None else int(trainer.step) + 1
-    candidates = [k for k in keeper.on_disk(history) if k[0] < limit]
+    candidates = [k for k in keeper.on_disk(history) if latest or k[0] < limit]
     if not candidates:
         return None
     step, path = candidates[-1]
@@ -871,6 +899,8 @@ def _rescore_partial(
         if first is not None
         else f"the newest kept checkpoint before the failure (step {int(trainer.step)})"
     )
+    if latest:
+        reason = "the newest saved checkpoint; diagnostic only, not a recovered successful run"
     out: dict[str, Any] = {"from_step": step, "checkpoint": str(path), "reason": reason}
     t0 = time.perf_counter()
     arm.stage = "partial"

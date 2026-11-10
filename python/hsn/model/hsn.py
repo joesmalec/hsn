@@ -503,12 +503,12 @@ class HSN(nn.Module):
             cost = selection.cost.detach().mean().to(state.dtype)
 
         with profiler_segment(profiler, "decode", B):
-            decoder_inputs = [new_state.q, u]
-            if cfg.selected_readout:
-                decoder_inputs.append(
-                    self._selected_readout(new_state, selection, controls.gate, mode)
-                )
-            logits = self.decoder(torch.cat(decoder_inputs, dim=-1))
+            readout = (
+                self._selected_readout(new_state, selection, controls.gate, mode)
+                if cfg.selected_readout
+                else None
+            )
+            logits = self._decode(new_state.q, u, readout)
 
         with torch.no_grad():
             probs = alpha if alpha is not None else torch.softmax(unit_logits, dim=-1)
@@ -1212,12 +1212,7 @@ class HSN(nn.Module):
             state = CellGraphState._make(
                 h=state.h, q=state.q, age=state.age, pos=positions_after[:, -1].contiguous()
             )
-        decoder_inputs = [qs, us]
-        if self.cfg.selected_readout:
-            if readouts is None:
-                raise ValueError("A5 selected_readout needs the per-position readouts")
-            decoder_inputs.append(readouts)
-        logits = self.decoder(torch.cat(decoder_inputs, dim=-1))
+        logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
             "z": pro.z,
             "z_hat": z_hats,
@@ -1267,6 +1262,24 @@ class HSN(nn.Module):
         if previous is None:
             return torch.full_like(tokens, BOS)
         return previous.masked_fill(reset, BOS)
+
+    def _decode(self, q: Tensor, u: Tensor, readout: Tensor | None) -> Tensor:
+        probability = self.cfg.decoder_shortcut_dropout
+        if self.training and probability:
+            if probability == 1.0:
+                q, u = q * 0.0, u * 0.0
+            else:
+                # One joint mask per position; no mask on the selected-cell path.
+                keep = (torch.rand_like(q[..., :1]) >= probability).to(q.dtype)
+                scale = keep / (1.0 - probability)
+                q, u = q * scale, u * scale
+        inputs = [q, u]
+        if self.cfg.selected_readout:
+            if readout is None:
+                raise ValueError("A5 selected_readout needs the per-position readouts")
+            inputs.append(readout)
+        logits: Tensor = self.decoder(torch.cat(inputs, dim=-1))
+        return logits
 
     def _selected_readout(
         self,

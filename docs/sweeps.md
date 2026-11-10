@@ -637,6 +637,11 @@ state statistics and the protocol version's probes (summaries) are taken, and th
 `from_step`, `checkpoint`, `reason`, `final` (the `final` keys of that evaluation), `trained`, `probes` and
 `seconds`. A failure while re-scoring is kept as `partial.error`.
 
+The newest saved checkpoint is assessed separately as `latest_saved`, with the same fields. This
+shows recent progress even if recovery started much earlier. It is diagnostic only: the run stays
+failed, the primary final score stays NULL, and the conservative `partial` verdict is unchanged.
+The failure column labels both checkpoint steps. Neither checkpoint is certified healthy by age.
+
 Every verdict of such a record reads `failed: <reason> @ <step> (from step X: <the rule on the kept
 checkpoint>)`: still a failure, never a pass and never a finding. Rules can read the kept checkpoint directly with
 `partial:<final key>` (for example `partial:split/later/accuracy`) and `partial:from_step`. The report's failure

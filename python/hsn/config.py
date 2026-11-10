@@ -224,6 +224,9 @@ class ModelConfig(_StrictModel):
     # Amendment A5: independently ablatable, routed HSN only; fixed codes have width d.
     key_address: bool = False
     selected_readout: bool = False
+    # Training-only joint dropout of q/u at the decoder; selected cells remain readable.
+    # A5 extension: docs/amendments/A5_stability_readout.md. Zero uses the original decoder.
+    decoder_shortcut_dropout: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
     fixed_route: list[int] = []  # cells for routing = fixed
     budget: float = Field(default=1.0, ge=0.0)  # B_t as a fraction of the dense step cost
     lambda_cost: float = Field(default=0.0, ge=0.0)  # lambda_cost in score = U - lambda * c
@@ -245,6 +248,8 @@ class ModelConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        if self.decoder_shortcut_dropout and not self.selected_readout:
+            raise ValueError("model.decoder_shortcut_dropout requires model.selected_readout")
         if self.routing == "dense" and (self.key_address or self.selected_readout):
             raise ValueError(
                 "model.key_address and model.selected_readout require routed HSN; "
@@ -345,6 +350,20 @@ class AdaptiveLRConfig(_StrictModel):
     trial_increases: bool = True
 
 
+class UpdateLimitGroup(_StrictModel):
+    """One joint L2 trust region, selected by model parameter-name globs."""
+
+    selectors: list[str] = Field(min_length=1)
+    max_ratio: float = Field(gt=0.0, allow_inf_nan=False)
+
+
+class UpdateLimitConfig(_StrictModel):
+    """Cap proposed optimizer displacement; empty groups disable all work and state."""
+
+    groups: dict[str, UpdateLimitGroup] = {}
+    norm_floor: float = Field(default=1e-12, gt=0.0, allow_inf_nan=False)
+
+
 class TrainConfig(_StrictModel):
     """Appendix A.3 ``train.*`` including loss weights and the one-at-a-time auxiliary rule."""
 
@@ -369,6 +388,7 @@ class TrainConfig(_StrictModel):
     router_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     readout_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     adaptive_lr: AdaptiveLRConfig = AdaptiveLRConfig()
+    update_limit: UpdateLimitConfig = UpdateLimitConfig()
     # --- end P1.13 ---
     # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
     # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
@@ -406,6 +426,9 @@ class TrainConfig(_StrictModel):
     rollback_lr_mult: float = Field(default=1.0, gt=0.0, le=1.0)
     rollback_lr_steps: int = Field(default=0, ge=0)
     rollback_max: int = Field(default=5, ge=1)
+    # oldest preserves the original recovery; guard_horizon uses the newest snapshot at or
+    # before the trigger's reference horizon (cadence for sharp/nonfinite, full slow history).
+    rollback_selection: Literal["oldest", "guard_horizon"] = "oldest"
     # --- end P1.16 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
@@ -552,6 +575,8 @@ class TrainConfig(_StrictModel):
                 for key in ROLLBACK_KEYS[1:]
                 if getattr(self, key) != type(self).model_fields[key].default
             ]
+            if self.rollback_selection != "oldest":
+                ignored.append(f"train.rollback_selection={self.rollback_selection}")
             if ignored:
                 raise ValueError(
                     f"{', '.join(ignored)} are read by the rollback only (P1.16), but "
@@ -1118,6 +1143,9 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.divergence_max_dumps",
     "train.divergence_healthy_every",
     "train.divergence_healthy_keep",
+    "train.rollback_selection",
+    "train.update_limit",
+    "model.decoder_shortcut_dropout",
 )
 
 

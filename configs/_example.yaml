@@ -39,6 +39,7 @@ model: # Appendix A.1
   routing: dense # dense | topk | greedy_budget | random | fixed
   key_address: false # A5 fixed byte/cell address features; routed HSN only
   selected_readout: false # A5 selected-cell mean appended to decoder input; routed HSN only
+  decoder_shortcut_dropout: 0.0 # training-only joint q/u dropout; requires selected_readout
   fixed_route: [] # cells for routing = fixed
   budget: 1.0 # B_t as a fraction of the dense step cost
   lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
@@ -73,6 +74,9 @@ train: # Appendix A.3
   cell_lr_mult: 1.0 # P1.13: the HSN cell's parameter group trains at lr * cell_lr_mult
   router_lr_mult: 1.0 # A5 stability: HSN.router rate (learned routing only)
   readout_lr_mult: 1.0 # A5 stability: whole HSN.decoder rate, including shared columns
+  update_limit: # project excessive optimizer displacements; no finite batch is discarded
+    groups: {} # name -> {selectors: [parameter-name globs], max_ratio: relative L2 cap}
+    norm_floor: 1.0e-12 # denominator floor for groups with zero/small weight norm
   adaptive_lr: # opt-in training-only feedback; scales multiply the chosen schedule
     enabled: false
     interval: 100 # accepted updates per fixed training-monitor measurement
@@ -107,6 +111,7 @@ train: # Appendix A.3
   rollback_lr_mult: 1.0 # P1.16: learning-rate factor after a rollback, in (0, 1] (0.5)
   rollback_lr_steps: 0 # P1.16: steps the factor lasts (200)
   rollback_max: 5 # P1.16: the run stops at its rollback_max + 1-th trigger
+  rollback_selection: oldest # oldest | guard_horizon (newest before the guard reference horizon)
   unroll: 256 # TBPTT window
   batch: 4
   micro_batch: 4

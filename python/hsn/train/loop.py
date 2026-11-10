@@ -622,6 +622,11 @@ class Trainer:
                 type(self.model).__name__,
             )
         self.optimizer = self._make_optimizer()
+        from hsn.train.update_limit import UpdateLimiter
+
+        self.update_limiter = (
+            UpdateLimiter(model, train.update_limit) if train.update_limit.groups else None
+        )
         # P1.16: the rollback (train.rollback_*; None: off) and its learning-rate cut, which the
         # scheduler's factor reads (no cut until a rollback sets one)
         self.rollback: RollbackPolicy | None = RollbackPolicy.from_config(train)
@@ -867,6 +872,19 @@ class Trainer:
             for p in group["params"]
         ]
 
+    def _limit_before_step(self, skipped: bool) -> None:
+        if self.update_limiter is not None and not skipped:
+            self.update_limiter.capture()
+
+    def _limit_after_step(self, applied: bool) -> None:
+        if self.update_limiter is not None and applied:
+            self.update_limiter.apply()
+            step = self.step + 1
+            if step % self.cfg.train.stats_every == 0 or step == self.cfg.train.steps:
+                logger.info(
+                    "update_limit step %d %s", step, json.dumps(self.update_limiter.state_dict())
+                )
+
     def _adaptive_after_step(
         self, applied: bool, grad_norm: float, before: list[tuple[Tensor, Tensor, str]]
     ) -> None:
@@ -969,10 +987,7 @@ class Trainer:
         self._on_skip(step, "spike", grad_norm)  # the dump, before the zeroing
         self.optimizer.zero_grad(set_to_none=True)
         if self._can_roll_back():  # P1.16: a rollback, not a skip
-            self._roll_back(step, "spike", grad_norm, median)
-            if guard == "slow_burst":
-                self.rollbacks[-1]["guard"] = guard
-                self.skipped_steps[-1]["guard"] = guard
+            self._roll_back(step, "spike", grad_norm, median, guard=guard)
             return True
         self.skipped_spike += 1
         self._skip_streak += 1
@@ -1015,13 +1030,23 @@ class Trainer:
             self._ring = SnapshotRing(self.model, self.optimizer, capacity=capacity)
         self._ring.take(self.step, self._spike_history)
 
-    def _roll_back(self, step: int, kind: str, grad_norm: float, median: float | None) -> None:
+    def _roll_back(
+        self,
+        step: int,
+        kind: str,
+        grad_norm: float,
+        median: float | None,
+        *,
+        guard: str | None = None,
+    ) -> None:
         """The rollback of ``step`` (module docstring, "Rollback"): raises at the limit, else
         restores the older snapshot in place, sets the learning-rate cut and the windows the loader
         discards before the next step, and records the event."""
         policy = self.rollback
         assert policy is not None and self._ring is not None
         what = "non-finite gradient norm" if kind == "nonfinite" else "gradient spike"
+        if guard == "slow_burst":
+            what = "slow gradient burst"
         if len(self.rollbacks) >= policy.max_rollbacks:
             raise RuntimeError(
                 f"step {step}: a {what} would be rollback {len(self.rollbacks) + 1}, above "
@@ -1029,7 +1054,11 @@ class Trainer:
                 "rolling back: stopping "
                 f"({ROLLBACK_LIMIT})"
             )
-        snap = self._ring.restore()
+        target = None
+        if policy.selection == "guard_horizon":
+            horizon = self._spike_history_limit if guard == "slow_burst" else policy.every
+            target = step - horizon
+        snap = self._ring.restore(at_or_before=target)
         self._spike_history = collections.deque(
             snap.spike_history, maxlen=self._spike_history_limit
         )
@@ -1040,7 +1069,7 @@ class Trainer:
         windows = policy.skip * self.cfg.train.grad_accum
         self._rollback_windows = windows
         norm: float | str = float(grad_norm) if math.isfinite(grad_norm) else repr(grad_norm)
-        event = {
+        event: dict[str, Any] = {
             "step": int(step),
             "kind": kind,
             "grad_norm": norm,
@@ -1060,6 +1089,15 @@ class Trainer:
                 "restored_step": int(snap.step),
             }
         )
+        if guard == "slow_burst":
+            event["guard"] = guard
+            self.skipped_steps[-1]["guard"] = guard
+        if target is not None:
+            event.update(
+                selection=policy.selection,
+                target_step=target,
+                horizon_available=snap.step <= target,
+            )
         logger.warning(
             "step %d: %s (gradient norm %s); rolled back to the snapshot of step %d (%d steps "
             "undone), %d windows discarded, fresh documents%s (rollback %d of at most %d)",
@@ -1138,6 +1176,8 @@ class Trainer:
             out["rollback_lr_cut"] = [int(c["lr_cut"][0]), float(c["lr_cut"][1])]
         if self.adaptive_lr is not None:
             out["adaptive_lr"] = c["adaptive_lr"]
+        if self.update_limiter is not None:
+            out["update_limit"] = c["update_limit"]
         if c.get("divergences"):
             out["divergences"] = c["divergences"]
         return out
@@ -1153,6 +1193,11 @@ class Trainer:
             if not isinstance(raw, dict):
                 raise ValueError(f"{path}: adaptive_lr checkpoint state is missing")
             self.adaptive_lr.load_state_dict(raw)
+        if self.update_limiter is not None:
+            raw = extra.get("update_limit")
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}: update_limit checkpoint state is missing")
+            self.update_limiter.load_checkpoint_state(raw)
         skipped = _skipped_counter(extra, "skipped_nonfinite", path)
         streak = _skipped_counter(extra, "skipped_nonfinite_streak", path)
         spikes = 0
@@ -1373,15 +1418,21 @@ class Trainer:
                     skipped = self._guard_spike(grad_norm, self.step + 1)
                 self._capture_healthy(self.step + 1, grad_norm, skipped)
                 before = self._adaptive_before_step(skipped)
+                self._limit_before_step(skipped)
                 applied = not skipped
                 if self.scaler is not None:
-                    scale_before = self.scaler.get_scale() if self.adaptive_lr is not None else None
+                    scale_before = (
+                        self.scaler.get_scale()
+                        if self.adaptive_lr is not None or self.update_limiter is not None
+                        else None
+                    )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     if scale_before is not None:
                         applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step()
+                self._limit_after_step(applied)
                 self._record_captured_update(applied)
                 self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
@@ -1557,6 +1608,11 @@ class Trainer:
             **(
                 {"adaptive_lr": self.adaptive_lr.state_dict()}
                 if self.adaptive_lr is not None
+                else {}
+            ),
+            **(
+                {"update_limit": self.update_limiter.checkpoint_state()}
+                if self.update_limiter is not None
                 else {}
             ),
         }

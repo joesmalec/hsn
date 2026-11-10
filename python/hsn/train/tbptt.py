@@ -881,6 +881,7 @@ class TBPTTTrainer(Trainer):
                     skipped = self._guard_spike(grad_norm, next_step)
                 self._capture_healthy(next_step, grad_norm, skipped)
                 before = self._adaptive_before_step(skipped)
+                self._limit_before_step(skipped)
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
@@ -890,7 +891,9 @@ class TBPTTTrainer(Trainer):
                     # or adaptive controller needs this check; defaults add no synchronisation.
                     scale_before = (
                         self.scaler.get_scale()
-                        if self.hsn.ema_target is not None or self.adaptive_lr is not None
+                        if self.hsn.ema_target is not None
+                        or self.adaptive_lr is not None
+                        or self.update_limiter is not None
                         else None
                     )
                     self.scaler.step(self.optimizer, **step_kwargs)
@@ -899,6 +902,7 @@ class TBPTTTrainer(Trainer):
                         applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step(**step_kwargs)
+                self._limit_after_step(applied)
                 self._record_captured_update(applied)
                 if applied:
                     self.hsn.update_target()

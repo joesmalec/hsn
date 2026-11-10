@@ -65,6 +65,9 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.divergence_max_dumps",
         "train.divergence_healthy_every",
         "train.divergence_healthy_keep",
+        "train.rollback_selection",
+        "train.update_limit",
+        "model.decoder_shortcut_dropout",
     )
 
 
@@ -87,6 +90,7 @@ def test_p1_16_rollback_key_set_changes_hash() -> None:
         "train.rollback_lr_mult=0.5",
         "train.rollback_lr_steps=200",
         "train.rollback_max=3",
+        "train.rollback_selection=guard_horizon",
     ],
 )
 def test_p1_16_rollback_keys_refused_without_every(override: str) -> None:
