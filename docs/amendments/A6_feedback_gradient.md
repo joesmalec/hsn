@@ -1,12 +1,47 @@
-# Amendment A6 — the feedback gradient (`train.feedback_detach`)
+# Amendment A6 — the feedback gradient (`train.state_grad_clip`, `train.feedback_detach`)
 
-Status: opt-in, default off (10 Nov 2026). No forward value changes; a training-recipe choice
-about which paths the backward pass follows. Results: see "Evidence" below and
+Status: opt-in, default off (10 Nov 2026). No forward value changes; two training-recipe choices
+about the gradient that flows back through the recurrent state. Results:
 `docs/p1_18_a6_results.md`.
 
-## What it is
+Two mechanisms, independent of each other:
 
-At every position the recurrent state `(h, q)` is read in five places:
+- **`train.state_grad_clip`** keeps every gradient path and limits, per document and per position,
+  how large the gradient passed back into the state may be. A healthy window is plain
+  backpropagation through time.
+- **`train.feedback_detach`** removes named feedback reads from the backward pass altogether.
+  With all four the backward recurrence cannot amplify at all, at the price of a biased gradient.
+
+## The state-gradient clip
+
+At the entry of every position `t`, the gradient that position `t` (and everything after it) passes
+back into the state it started from is limited per batch row:
+
+    ‖dL/dq[t−1]‖ ≤ c            ‖dL/dh[t−1]‖ ≤ c / sqrt(N)        (c = train.state_grad_clip)
+
+A row under the limit is passed on as it is (no scaling); a row over it keeps its direction and is
+scaled to the limit; a row with a non-finite entry is dropped. `sqrt(N)` is the ratio between a
+summary gradient and the cell gradient it induces (`q` is the mean of the `N` cells), so one number
+limits both. The function (`hsn.model.gradclip.clip_row_grad`) is the identity in the forward
+pass, runs inside the compiled window, and is absent without gradients (evaluation, serving).
+
+Why this and not the trainer's global clip alone: a burst is one document whose state gradient
+jumps 7× to 22× at a single write or read, several times in a row (below). The global clip then
+rescales the whole batch by that norm, so the other 31 documents' gradients vanish and the step
+follows one document's switching direction at full AdamW size. The row limit acts where the jump
+happens and leaves the other rows alone. No step is skipped, no document is dropped, nothing is
+rolled back.
+
+Calibration (B32, delayed task, exp 346's checkpoints at steps 3,000 and 8,500, 12 windows): the
+largest per-row gradient over a window is at most 0.16 in `h` and 2.95 in `q` (medians 0.03 and
+0.4). Burst windows of the same run have rows at 0.2 to 32 in `h` and up to 30 in `q`. `c = 4`
+(`h`: 0.71) is above every healthy row measured; `c = 2` trims the largest one or two `q` rows of
+a window. The limit is an absolute number, like `train.grad_clip`: per-row gradients scale with
+1 / (loss positions in the batch), so another batch size or task needs its own look.
+
+## The feedback cut
+
+At every position the recurrent state `(h, q)` is read in these places:
 
 | Read | Path | With A6 |
 | --- | --- | --- |
@@ -74,9 +109,11 @@ from the gradient instead of skipping or rolling back the steps.
 
 ## Configuration
 
+    train.state_grad_clip: null                             # default: off
+    train.state_grad_clip: 4.0                              # the per-row limit (q; h: / sqrt(N))
     train.feedback_detach: []                               # default: full backpropagation
     train.feedback_detach: [summary, eps, state, router]    # the carry alone
 
-The key is left out of the configuration hash at its default (existing checkpoints resume and
-existing arm ids are unchanged); a non-empty list hashes, and the trainer refuses a model built
-with other paths. HSN only.
+Both keys are left out of the configuration hash at their defaults (existing checkpoints resume
+and existing arm ids are unchanged); a set value hashes, and the trainer refuses a model built
+with other values. HSN only.
