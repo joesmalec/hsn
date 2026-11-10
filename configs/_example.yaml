@@ -39,6 +39,7 @@ model: # Appendix A.1
   routing: dense # dense | topk | greedy_budget | random | fixed
   key_address: false # A5 fixed byte/cell address features; routed HSN only
   selected_readout: false # A5 selected-cell mean appended to decoder input; routed HSN only
+  address_init: null # A5 extension, opt-in: start value of the scorer's two address columns (null: random init)
   decoder_shortcut_dropout: 0.0 # training-only joint q/u dropout; requires selected_readout
   fixed_route: [] # cells for routing = fixed
   budget: 1.0 # B_t as a fraction of the dense step cost

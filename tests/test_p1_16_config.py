@@ -73,6 +73,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.grad_norm_precision",
         "train.feedback_detach",
         "train.state_grad_clip",
+        "model.address_init",
     )
 
 

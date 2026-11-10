@@ -228,6 +228,12 @@ class ModelConfig(_StrictModel):
     # Amendment A5: independently ablatable, routed HSN only; fixed codes have width d.
     key_address: bool = False
     selected_readout: bool = False
+    # A5 extension (docs/amendments/A5_key_address.md, "The address columns' start"; opt-in): the
+    # scorer's two address columns (a_cur, a_prev) start at this value for every unit instead of
+    # the small random init of the other columns, so that from the first step a route follows the
+    # codes of the current and the previous byte. They stay ordinary trainable weights. None
+    # (default): the random init. Needs key_address and the linear scorer.
+    address_init: float | None = Field(default=None, allow_inf_nan=False)
     # Training-only joint dropout of q/u at the decoder; selected cells remain readable.
     # A5 extension: docs/amendments/A5_stability_readout.md. Zero uses the original decoder.
     decoder_shortcut_dropout: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
@@ -254,6 +260,10 @@ class ModelConfig(_StrictModel):
     def _check_consistency(self) -> Self:
         if self.decoder_shortcut_dropout and not self.selected_readout:
             raise ValueError("model.decoder_shortcut_dropout requires model.selected_readout")
+        if self.address_init is not None and not (self.key_address and self.scorer == "linear"):
+            raise ValueError(
+                "model.address_init requires model.key_address=true and model.scorer=linear"
+            )
         if self.routing == "dense" and (self.key_address or self.selected_readout):
             raise ValueError(
                 "model.key_address and model.selected_readout require routed HSN; "
@@ -1229,6 +1239,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.grad_norm_precision",
     "train.feedback_detach",
     "train.state_grad_clip",
+    "model.address_init",
 )
 
 
