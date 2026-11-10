@@ -164,9 +164,13 @@ def write_dump(
     step: int,
     kind: str,
     grad_norm: float,
+    record_event: bool = True,
 ) -> dict[str, Any]:
     """Write the dump of ``step`` (module docstring) and return its summary (also kept as
-    ``trainer.divergence``). Called by the guards before they zero the gradients."""
+    ``trainer.divergence``). Called by the guards before they zero the gradients.
+    ``record_event=False`` is for diagnostic capture on disposable copies: saving must not
+    change the trainer's guard/event counters or suppress later snapshots.
+    """
     from hsn.train.checkpoint import capture_rng_state, save_checkpoint
 
     run_dir = Path(trainer.run_dir)
@@ -255,7 +259,7 @@ def write_dump(
     except Exception as exc:  # the dump is a diagnostic: never kill the training run for it
         summary["error"] = f"{type(exc).__name__}: {exc}"
         logger.error("step %d: the divergence dump failed: %s", step, summary["error"])
-    if not healthy:
+    if not healthy and record_event:
         if trainer.divergence is None:  # retain the historical first-event interface
             trainer.divergence = summary
         trainer.divergences.append(summary)

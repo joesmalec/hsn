@@ -155,6 +155,46 @@ def test_earlier_weights_use_exact_source_window_and_do_not_modify_source(
     assert compare(baseline, identity)["passed"]
 
 
+def test_selected_reference_weights_preserve_other_parameters(
+    saved_case: Any, tmp_path: Path
+) -> None:
+    cfg, data, source = saved_case
+    reference = source.parent / "healthy_00000001.pt"
+    case = Case(source, cfg, train_ds=data)
+    base = case.run(tmp_path / "selected_base", compiled=False, deterministic=True)
+    changed = case.run(
+        tmp_path / "selected",
+        compiled=False,
+        deterministic=True,
+        weight_override=reference,
+        weight_selectors=("cell.*",),
+    )
+    early = torch.load(reference, weights_only=False)["model"]
+    late = dict(base.trainer.model.named_parameters())
+    assert changed.report["window_sha256"] == base.report["window_sha256"]
+    assert not changed.report["reference_buffers_loaded"]
+    selected = set(changed.report["selected_parameters"])
+    assert selected and all(name.startswith("cell.") for name in selected)
+    for name, value in changed.trainer.model.named_parameters():
+        assert torch.equal(value.cpu(), early[name] if name in selected else late[name].cpu())
+    identity = case.run(
+        tmp_path / "selected_identity",
+        compiled=False,
+        deterministic=True,
+        weight_override=source,
+        weight_selectors=("cell.*",),
+    )
+    assert compare(base, identity)["passed"]
+    with pytest.raises(ValueError, match="matches no parameters"):
+        case.run(
+            tmp_path / "bad_selector",
+            compiled=False,
+            deterministic=True,
+            weight_override=reference,
+            weight_selectors=("missing.*",),
+        )
+
+
 def test_reference_weights_reject_other_configuration(saved_case: Any, tmp_path: Path) -> None:
     cfg, data, path = saved_case
     payload = torch.load(path, map_location="cpu", weights_only=True)

@@ -17,6 +17,7 @@ import math
 import os
 import tempfile
 from collections.abc import Iterator
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal
 
@@ -309,6 +310,7 @@ class Case:
         trace: bool = False,
         cut: str | None = None,
         weight_override: Path | None = None,
+        weight_selectors: tuple[str, ...] = (),
     ) -> Pass:
         if deterministic:
             os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -320,6 +322,9 @@ class Case:
         set_deterministic(deterministic)
         trainer.resume(self.path)
         weight_step = int(self.payload["step"])
+        selected_weights: list[str] = []
+        if weight_selectors and weight_override is None:
+            raise ValueError("weight selectors require a reference checkpoint")
         if weight_override is not None:
             weights = torch.load(weight_override, map_location="cpu", weights_only=True)
             expected = self.payload["extra"].get("config_hash")
@@ -327,7 +332,20 @@ class Case:
                 raise ValueError("reference weights have a different or missing configuration hash")
             # Keep the source stream, RNG, recurrent state and previous byte. Replace only model
             # parameters and buffers (including the EMA target); stop before any optimizer update.
-            model.load_state_dict(weights["model"], strict=True)
+            if weight_selectors:
+                named = dict(model.named_parameters())
+                selected: set[str] = set()
+                for selector in weight_selectors:
+                    matches = {name for name in named if fnmatchcase(name, selector)}
+                    if not matches:
+                        raise ValueError(f"reference selector {selector!r} matches no parameters")
+                    selected.update(matches)
+                selected_weights = sorted(selected)
+                replacement = model.state_dict()
+                replacement.update({name: weights["model"][name] for name in selected_weights})
+                model.load_state_dict(replacement, strict=True)
+            else:
+                model.load_state_dict(weights["model"], strict=True)
             weight_step = int(weights["step"])
         if trainer.scaler is not None:
             raise ValueError("diagnostic backward requires an unscaled fp32/bf16 recipe")
@@ -390,6 +408,9 @@ class Case:
             "stream_checkpoint": str(self.path),
             "weights_checkpoint": str(weight_override or self.path),
             "weights_step": weight_step,
+            "weight_selectors": list(weight_selectors),
+            "selected_parameters": selected_weights,
+            "reference_buffers_loaded": weight_override is not None and not weight_selectors,
             "window_sha256": self.window_hash,
             "all_rows_reset_at_window_start": bool(self.windows[0]["reset"][:, 0].all()),
         }
@@ -515,6 +536,10 @@ def run_diagnostic(
     }
     arm.record.update(result)
     record = result["diagnostic"]
+    if params.capture is not None:
+        from hsn.experiments.capture import capture_prefix
+
+        return capture_prefix(arm, params, result, train_ds=train_ds)
     case = Case(path, arm.cfg, train_ds=train_ds)
     if params.target_doc is not None and params.target_doc not in case.docs:
         raise ValueError("target document is absent from the saved windows")
@@ -641,22 +666,33 @@ def run_diagnostic(
                 "sha256": params.reference_sha256,
                 "same_windows": True,
                 "window_sha256": case.window_hash,
+                "selectors": list(params.reference_selectors),
                 "by_mode": reference_results,
                 "interpretation": (
-                    "Reference model parameters and buffers on the source spike's exact window, "
-                    "RNG, carried state and previous byte. No optimizer update. A weight-only "
-                    "intervention, not a reconstructed earlier training trajectory."
+                    "Reference weights on the source spike's exact window, RNG, carried state "
+                    "and previous byte. With selectors, only matching parameters change; other "
+                    "parameters and buffers stay at the source. Without selectors all model "
+                    "parameters and buffers change. No optimizer update. A mixed-weight "
+                    "intervention is not a reconstructed training trajectory or proof of a cure."
                 ),
             }
             for mode, baseline in baselines.items():
-                ref = run(f"reference_{mode}", mode, weight_override=reference_path)
+                ref = run(
+                    f"reference_{mode}",
+                    mode,
+                    weight_override=reference_path,
+                    weight_selectors=params.reference_selectors,
+                )
                 reference_results[mode] = {
                     "report": ref.report,
                     "source_comparison": compare(baseline, ref),
                 }
                 for repeat in range(1, params.repeats):
                     repeated = run(
-                        f"reference_{mode}_repeat_{repeat}", mode, weight_override=reference_path
+                        f"reference_{mode}_repeat_{repeat}",
+                        mode,
+                        weight_override=reference_path,
+                        weight_selectors=params.reference_selectors,
                     )
                     check = {
                         "kind": "reference_repeatability",

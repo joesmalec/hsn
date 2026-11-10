@@ -331,6 +331,11 @@ def _run(
             != Path(parent["run_dir"]).resolve()
         ):
             raise ValueError("reference checkpoint must belong to the parent experiment")
+        if (
+            params.capture is not None
+            and Path(params.capture.trace).resolve().parent != Path(parent["run_dir"]).resolve()
+        ):
+            raise ValueError("capture trace must belong to the parent experiment")
         signal.setitimer(signal.ITIMER_REAL, params.timeout_s)
     variant_params = loads(arm["variant_json"])
     early_stop = loads(arm["early_stop_json"])

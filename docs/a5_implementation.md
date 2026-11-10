@@ -294,3 +294,37 @@ window fingerprint, weight source and whether every row resets at the first posi
 controlled weight intervention, not a reconstruction of the earlier training trajectory. The
 default `reference_mode: next_window` instead uses the earlier checkpoint's own next window;
 its fingerprint is reported separately, and a norm difference alone cannot isolate weight changes.
+
+### Capturing a burst when no guard dump exists
+
+The `spike_diagnostic` stage `capture` takes a retained checkpoint in `dump` (with its SHA-256)
+and a `capture` mapping containing `steps`, the original `result.json` in `trace`, and
+`trace_sha256`. It resumes disposable copies using the original schedule, execution mode,
+RNG, optimizer, loader, carried state and previous byte. It currently accepts sources without
+rollback or finite-gradient skipping. Every replayed task loss and raw gradient norm must match
+the source trace; `rtol` and `atol` default to zero and are explicit protocol settings. A mismatch
+fails the diagnostic and pauses its queue. Do not weaken a tolerance to call a different trajectory
+an exact reproduction.
+
+Each requested step is captured after clipping and before its update; earlier replay steps keep
+their normal updates and all documents. The final requested update is not applied. At least two
+replays compare the complete captured training state exactly, including weights, optimizer,
+scheduler, RNG, stream and recurrent state. Capture neither marks a skip nor modifies event
+counters. The parent experiment and checkpoint remain unchanged. The artifact includes the
+source trace checks, snapshot/window checksums, disposable update count, and a copied reference
+checkpoint. Existing `reproduce`, `isolate` and `same_window_weights` diagnostics can use these
+artifacts under the capture experiment as their recorded parent.
+
+These are verified reconstructions, not original in-flight captures. Metric agreement is checked
+against the original run; tensor equality across repeats establishes reproducibility of the
+reconstruction, not equality to unsaved original tensors. A failed reconstruction remains evidence
+of its own failure and must not be used to explain the original burst.
+
+For `same_window_weights`, optional `reference_selectors` select parameter-name globs from the
+reference checkpoint. Only those parameters are replaced; unselected parameters, persistent
+buffers, stream, RNG and carried state remain from the source window. Every selector must match.
+An empty selection retains the existing whole-model intervention (parameters and buffers).
+The report names exactly which parameters changed and repeats the intervention to check it.
+This can test whether a group affects sensitivity on a fixed window. Mixed checkpoints may be
+unlike any learned model, so a changed norm alone does not establish which group initiated the
+training failure or that a corresponding optimizer change will fix it.

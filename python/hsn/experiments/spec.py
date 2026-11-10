@@ -76,7 +76,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from hsn.config import REPO_ROOT, RunConfig, config_hash, load_config
 from hsn.experiments.rules import (
@@ -240,8 +240,25 @@ class DryRunParams(_TrainParams):
     record: dict[str, Any] = Field(default_factory=dict)  # merged into the synthetic record
 
 
+class CheckpointCaptureParams(_Strict):
+    """Replay a recorded prefix on disposable weights, capturing selected pre-update states."""
+
+    steps: tuple[int, ...]
+    trace: str = Field(min_length=1)
+    trace_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rtol: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    atol: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+
+    @field_validator("steps")
+    @classmethod
+    def _steps(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value or value != tuple(sorted(set(value))) or value[0] < 1:
+            raise ValueError("capture steps must be positive, unique and increasing")
+        return value
+
+
 class SpikeDiagnosticParams(_TrainParams):
-    """Bounded, checkpoint-based investigations; never a training continuation."""
+    """Bounded investigations; capture advances disposable copies only, never production."""
 
     name: Literal["spike_diagnostic"]
     steps: Literal[1] = 1
@@ -249,7 +266,8 @@ class SpikeDiagnosticParams(_TrainParams):
     parent_exp: int = Field(ge=1)
     dump: str = Field(min_length=1)
     dump_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    stage: Literal["reproduce", "isolate", "trace", "update", "compare"]
+    stage: Literal["reproduce", "isolate", "trace", "update", "compare", "capture"]
+    capture: CheckpointCaptureParams | None = None
     modes: tuple[Literal["eager", "compiled"], ...] = ("eager",)
     repeats: int = Field(default=2, ge=2, le=4)
     deterministic: bool = True
@@ -259,7 +277,30 @@ class SpikeDiagnosticParams(_TrainParams):
     reference_checkpoint: str | None = None
     reference_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     reference_mode: Literal["next_window", "same_window_weights"] = "next_window"
+    reference_selectors: tuple[str, ...] = ()
     requires: tuple[str, ...] = ()  # earlier labels in this sweep; all must have succeeded
+
+    @model_validator(mode="after")
+    def _capture(self) -> SpikeDiagnosticParams:
+        if self.reference_selectors and (
+            self.reference_checkpoint is None or self.reference_mode != "same_window_weights"
+        ):
+            raise ValueError("reference selectors require same_window_weights and a checkpoint")
+        if any(not selector.strip() for selector in self.reference_selectors) or len(
+            set(self.reference_selectors)
+        ) != len(self.reference_selectors):
+            raise ValueError("reference selectors must be nonempty and unique")
+        if (self.stage == "capture") != (self.capture is not None):
+            raise ValueError("capture settings are required only for the capture stage")
+        if self.capture is not None and (
+            len(self.modes) != 1
+            or self.reference_checkpoint is not None
+            or self.target_doc is not None
+        ):
+            raise ValueError(
+                "capture uses one original mode without reference/document interventions"
+            )
+        return self
 
     @field_validator("modes")
     @classmethod
@@ -479,7 +520,12 @@ def config_view(cfg: RunConfig) -> dict[str, Any]:
 
 #: P1.14: protocol keys that enter the arm id only when they differ from these values, so that every
 #: arm from before them keeps its id
-IDENTITY_DEFAULTS: dict[str, Any] = {"diag_dense_every": 0, "diag_windows": []}
+IDENTITY_DEFAULTS: dict[str, Any] = {
+    "diag_dense_every": 0,
+    "diag_windows": [],
+    "capture": None,
+    "reference_selectors": [],
+}
 
 
 def arm_identity(
