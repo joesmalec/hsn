@@ -62,3 +62,13 @@ arms:
       - model.address_init=1.0
       - train.state_grad_clip=null
       - train.feedback_detach=[summary,eps,state,router]
+  # the address start on exp 349's recipe (the cut with the anchored update caps)
+  - name: carry_anchored_addr1
+    family: hsn
+    overrides:
+      - model.address_init=1.0
+      - train.state_grad_clip=null
+      - train.feedback_detach=[summary,eps,state,router]
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'
