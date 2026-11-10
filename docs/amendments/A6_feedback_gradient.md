@@ -1,4 +1,4 @@
-# Amendment A6 — the feedback gradient (`train.state_grad_clip`, `train.feedback_detach`)
+# Amendment A6 — the feedback gradient (`train.feedback_detach`, `train.state_grad_ratio`, `train.state_grad_clip`)
 
 Status: opt-in, default off (10 Nov 2026). No forward value changes; two training-recipe choices
 about the gradient that flows back through the recurrent state. Results:
@@ -6,11 +6,12 @@ about the gradient that flows back through the recurrent state. Results:
 
 Two mechanisms, independent of each other:
 
-- **`train.state_grad_clip`** keeps every gradient path and limits, per document and per position,
-  how large the gradient passed back into the state may be. A healthy window is plain
-  backpropagation through time.
 - **`train.feedback_detach`** removes named feedback reads from the backward pass altogether.
   With all four the backward recurrence cannot amplify at all, at the price of a biased gradient.
+- **`train.state_grad_ratio`** / **`train.state_grad_clip`** keep every gradient path and limit,
+  per document and per position, how large the gradient passed back into the state may be
+  (relative to the batch's typical document, or as an absolute number). A healthy window is plain
+  backpropagation through time.
 
 ## The state-gradient clip
 
@@ -38,6 +39,19 @@ largest per-row gradient over a window is at most 0.16 in `h` and 2.95 in `q` (m
 (`h`: 0.71) is above every healthy row measured; `c = 2` trims the largest one or two `q` rows of
 a window. The limit is an absolute number, like `train.grad_clip`: per-row gradients scale with
 1 / (loss positions in the batch), so another batch size or task needs its own look.
+
+**The weakness of an absolute number, and the relative limit.** Healthy rows grow about twentyfold
+over a run (the largest `dL/dq` row of a window in exp 346: 0.13 at step 500, 0.35 at 1,000, 1.2
+at 2,000, 2.9 from 3,000 on), so `c = 4` is 12 to 30 times a typical row during the first 1,000
+steps: it cannot act there, and exp 354 (`c = 4`, no update caps) fell to chance by step 1,000.
+`train.state_grad_ratio = k` is the same limit without a scale: at every position a row's `dL/dq`
+(and its `dL/dh`) is at most `k` times the batch's *typical live row* there, the 90th percentile
+of the rows that carry a gradient at that position (a document that ended earlier carries none and
+is not counted; with fewer than ten live rows the typical row is their largest, so nothing is
+limited). In healthy windows the largest row is 1.2 to 2.1 times that percentile at steps 500,
+1,000, 2,000, 3,000 and 8,500, so `k = 3` leaves them alone throughout. Up to three rows of a
+B32 batch can blow up without moving the percentile. Both keys may be set; the smaller limit
+applies.
 
 ## The feedback cut
 
@@ -109,11 +123,13 @@ from the gradient instead of skipping or rolling back the steps.
 
 ## Configuration
 
+    train.state_grad_ratio: null                            # default: off
+    train.state_grad_ratio: 3.0                             # a row <= 3x the batch's typical live row
     train.state_grad_clip: null                             # default: off
-    train.state_grad_clip: 4.0                              # the per-row limit (q; h: / sqrt(N))
+    train.state_grad_clip: 4.0                              # the absolute per-row limit (q; h: / sqrt(N))
     train.feedback_detach: []                               # default: full backpropagation
     train.feedback_detach: [summary, eps, state, router]    # the carry alone
 
-Both keys are left out of the configuration hash at their defaults (existing checkpoints resume
+The keys are left out of the configuration hash at their defaults (existing checkpoints resume
 and existing arm ids are unchanged); a set value hashes, and the trainer refuses a model built
 with other values. HSN only.
