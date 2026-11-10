@@ -990,3 +990,42 @@ actual intervals can exceed the poll time (for example while CPU interference is
 Device utilization includes other processes, and samples cannot identify subsecond dips,
 allocator reservation, host RAM, kernel bottlenecks, or energy. Adopted workers report incomplete
 watch history. Default workers collect no series.
+
+### A6 keys, compiled diagnostics and the phase report (10 November)
+
+**Recipe keys** (`docs/amendments/A6_feedback_gradient.md`; all opt-in, omitted from arm identity
+at their defaults, forward values unchanged):
+
+```yaml
+- train.state_grad_clip=4.0                               # per-row limit on dL/dq at every position (dL/dh: / sqrt(N))
+- train.feedback_detach=[summary,eps,state,router]        # feedback reads held constant in the backward
+- model.address_init=1.0                                  # start value of the scorer's two address columns (A5)
+```
+
+**Diagnostics and probes under a compiled trainer.** The state window of every diagnostic sample
+used to run the eager routed forward and a batched GPU SVD (1.3 s per pass on `profile:rtx3060`
+with the card near 18 %; two passes per sample with an update limiter), and the three end-of-run
+probes ran eager too (85 s). Both now replay compiled graphs:
+
+- the state window runs the compiled window's diagnostic variant (`CompiledWindow(...,
+  capture=True)`, no gradients), compiled once in `Diagnostics.attach` before training
+  (`phases.diagnostics_warm_s`); the participation ratio comes from the Gram matrix;
+- the probes pad each batch to the evaluation window's shape and replay it
+  (`hsn.experiments.probe.PaddedWindow`; the record's `probe_execution` says `compiled`).
+
+Values agree with the eager ones to rounding (the answers of a probe are argmaxes; a near-tie can
+differ). An eager trainer (`hardware.compile_mode=none`) is unchanged. `diag_stability` still
+perturbs the state inside an eager forward and keeps its cost.
+
+**Phases.** Every training record carries `phases`: wall-clock intervals (`[unix start, seconds]`)
+of each evaluation, diagnostic sample (`[step, unix start, seconds]`) and checkpoint write, and the
+start and end of the `setup`, `fit` and `probing` stages. With the worker's card time series
+(`--telemetry-max-samples`), each utilisation sample can be attributed:
+
+```bash
+python scripts/gpu_phase_report.py --exp 346 --exp 364      # per phase: samples, mean %, share below 50 %
+```
+
+A run without `phases` (before 10 November) is split by its reported step against the diagnostic
+and evaluation cadences, labelled as an estimate. Device utilisation counts every process on the
+card: use a timing arm for a clean trace.
