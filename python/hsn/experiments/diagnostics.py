@@ -35,13 +35,23 @@ both projections. ``applied_update_ratio`` uses the legacy after-weight denomina
 it measures direction, not whether a finite step actually improves the objective. Additional
 ``applied_state/`` fields evaluate the final weights. They preserve RNG and do not replace any
 frozen diagnostic or verdict input. Default runs retain their original records and hook order.
+
+**Cost (10 Nov 2026).** The state window used to stop the card for about 1.3 s per pass on
+``profile:rtx3060`` (two passes per sample with a post-optimizer projection): 0.85 s in the eager
+``capture`` forward and 0.47 s in a batched GPU SVD. Under a compiled training window the pass now
+runs the window's own compiled diagnostic variant (:class:`~hsn.train.compile.CompiledWindow` with
+``capture=True``: same values to rounding, compiled once in :meth:`Diagnostics.attach`, before
+training starts), and the
+participation ratio is computed from the Gram matrix (:func:`participation_ratio`: the same
+quantity as from the singular values, without a decomposition). An eager trainer keeps the eager
+forward.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import Any
 
 import torch
@@ -57,6 +67,7 @@ __all__ = [
     "Diagnostics",
     "cell_stats",
     "module_groups",
+    "participation_ratio",
     "state_window",
     "trained_state",
     "window_state_stats",
@@ -137,6 +148,10 @@ class Diagnostics:
         self._applied_pending: tuple[dict[str, Any], dict[str, Any]] | None = None
         self._observe_applied = False
         self._handles: list[Any] = []
+        #: The compiled diagnostic window of the attached trainer (None: the eager forward).
+        self._capture_window: Callable[..., Any] | None = None
+        #: Wall seconds :meth:`attach` spent compiling that variant (0.0: eager, nothing compiled).
+        self.warm_seconds = 0.0
         from hsn.experiments.stability import StabilityObserver
 
         self.stability = (
@@ -153,6 +168,11 @@ class Diagnostics:
             raise ValueError("the trainer trains another model than these diagnostics observe")
         self._trainer = trainer
         self._scaled = getattr(trainer, "scaler", None) is not None
+        # P2.8: a compiled trainer's state window runs compiled too (its capture variant),
+        # compiled and recorded here, before training, so that no sample waits for a compile
+        self._capture_window = getattr(trainer, "compiled_window", None)
+        if self._capture_window is not None and self.window is not None:
+            self.warm_seconds = self._warm_capture()
         optimizer = trainer.optimizer
         self._handles.append(optimizer.register_step_pre_hook(self._pre))
         self._handles.append(optimizer.register_step_post_hook(self._post))
@@ -162,6 +182,15 @@ class Diagnostics:
         if self._observe_applied:
             trainer.update_post_hooks.append(self._applied)
 
+    def _warm_capture(self) -> float:
+        """Compile (and, on CUDA, record) the diagnostic variant of the compiled window: two
+        passes of the state window, whose results are dropped. Nothing of the run changes: no
+        gradient, no random draw, no parameter or optimiser state. Returns the wall seconds."""
+        started = time.perf_counter()
+        for _ in range(2):  # CUDA Graph trees warm up once, then record
+            self.state_stats()
+        return time.perf_counter() - started
+
     def detach(self) -> None:
         for handle in self._handles:
             handle.remove()
@@ -170,6 +199,7 @@ class Diagnostics:
             self._trainer.update_post_hooks.remove(self._applied)
             self._observe_applied = False
         self._pending = self._applied_pending = None
+        self._capture_window = None
 
     def _pre(self, optimizer: torch.optim.Optimizer, args: Any, kwargs: Any) -> None:
         started = time.perf_counter()
@@ -266,7 +296,17 @@ class Diagnostics:
     def state_stats(self) -> dict[str, float]:
         if not isinstance(self.model, HSN) or self.window is None:
             return {}
-        return window_state_stats(self.model, self.window)
+        return window_state_stats(self.model, self.window, window_fn=self._capture_window)
+
+
+def participation_ratio(hs: Tensor) -> Tensor:
+    """The participation ratio of each ``[N, d]`` matrix of ``hs [P, N, d]``, ``(Σ σ²)² / Σ σ⁴``
+    over its singular values ``σ``, without a decomposition: ``Σ σ² = ‖H‖_F²`` and
+    ``Σ σ⁴ = ‖H Hᵀ‖_F²``. One batched matmul on the device; a batched SVD of these small
+    matrices took 0.47 s per window on ``profile:rtx3060`` (0.3 ms here) for the same number to
+    fp32 rounding."""
+    gram = hs @ hs.transpose(1, 2)  # [P, N, N]
+    return hs.square().sum(dim=(1, 2)).square() / gram.square().sum(dim=(1, 2)).clamp_min(1e-24)
 
 
 def cell_stats(hs: Tensor) -> dict[str, float]:
@@ -282,8 +322,7 @@ def cell_stats(hs: Tensor) -> dict[str, float]:
     unit = hs / norms.unsqueeze(-1).clamp_min(1e-12)
     cos = unit @ unit.transpose(1, 2)  # [P, N, N]
     off = (cos.sum(dim=(1, 2)) - cos.diagonal(dim1=1, dim2=2).sum(-1)) / (n * (n - 1))
-    sv2 = torch.linalg.svdvals(hs).square()
-    pr = sv2.sum(-1).square() / sv2.square().sum(-1).clamp_min(1e-24)
+    pr = participation_ratio(hs)
     live = norms > 1e-6  # [P, N]
     eye = torch.eye(n, dtype=torch.bool, device=hs.device)
     pair = live.unsqueeze(-1) & live.unsqueeze(-2) & ~eye
@@ -322,7 +361,9 @@ def _quantiles(values: Tensor) -> dict[str, float]:
 
 
 @torch.no_grad()
-def window_state_stats(model: HSN, w: dict[str, Tensor]) -> dict[str, float]:
+def window_state_stats(
+    model: HSN, w: dict[str, Tensor], *, window_fn: Callable[..., Any] | None = None
+) -> dict[str, float]:
     """One window from a fresh state in evaluation mode: :func:`cell_stats` at answer and valid
     positions, the write gate ``b`` quantiles over the written cells at valid positions with the
     write rate and the mean gate (:func:`_write_rate`), and for a routed model the per-cell write
@@ -331,12 +372,17 @@ def window_state_stats(model: HSN, w: dict[str, Tensor]) -> dict[str, float]:
     Reads ``HSN.forward(..., capture=True)``: ``cell_states [B, T, N, d]`` (h after each position),
     ``cell_gates`` (the gate of each written cell, NaN elsewhere) and ``cell_written [B, T, N]``,
     in every routing mode. A variant whose round has no gate (the GRU-cell variants report NaN)
-    gives no gate quantiles."""
+    gives no gate quantiles. ``window_fn`` is the trainer's compiled window
+    (:class:`~hsn.train.compile.CompiledWindow`), called in place of the eager forward with the
+    same arguments: the same values to rounding, without the eager loop's host time."""
     was_training = model.training
     model.eval()
     try:
         B = int(w["tokens"].shape[0])
-        _, _, info = model(w["tokens"], w["context"], model.init_state(B), w["reset"], capture=True)
+        forward = model if window_fn is None else window_fn
+        _, _, info = forward(
+            w["tokens"], w["context"], model.init_state(B), w["reset"], capture=True
+        )
     finally:
         model.train(was_training)
     h = info["cell_states"].float()  # [B, T, N, d]

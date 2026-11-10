@@ -162,3 +162,49 @@ def test_p1_11_window_state_stats_routed(routing: str) -> None:
         assert 0.0 <= out["write_share/min"] <= out["write_share/max"] <= 1.0
     gru = build_model(tiny_gru_config())
     assert dg.trained_state(gru, tiny_gru_config(), cpu_ctx(), dev, 4) == {}
+
+
+def test_participation_ratio_equals_the_singular_value_form() -> None:
+    """The Gram form is the SVD form's number (no decomposition): random, rank-1 and zero."""
+    g = torch.Generator().manual_seed(0)
+    hs = torch.randn(40, 6, 9, generator=g, dtype=torch.float64)
+    hs[1] = torch.randn(1, 9, generator=g, dtype=torch.float64).expand(6, 9)  # rank 1
+    hs[2] = 0.0
+    sv2 = torch.linalg.svdvals(hs).square()
+    expected = sv2.sum(-1).square() / sv2.square().sum(-1).clamp_min(1e-24)
+    actual = dg.participation_ratio(hs)
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
+    assert float(actual[1]) == pytest.approx(1.0, abs=1e-9) and float(actual[2]) == 0.0
+    single = dg.participation_ratio(hs.float())
+    torch.testing.assert_close(single, expected.float(), rtol=1e-4, atol=1e-6)
+
+
+def test_diagnostics_state_window_runs_the_trainers_compiled_window(tmp_path: Path) -> None:
+    """A compiled trainer's state window goes through its compiled diagnostic variant (called
+    like the eager forward with ``capture=True``); an eager trainer keeps the eager forward."""
+    cfg = tiny_hsn_config("model.routing=topk", "train.gate_mode=ste", steps=4)
+    seed_everything(0)
+    model = build_model(cfg)
+    assert isinstance(model, HSN)
+    trainer = make_trainer(model, cfg, cpu_ctx(), run_dir=tmp_path)
+    dev = ByteDataset(docs("delayed", "dev", 4))
+    diag = dg.Diagnostics(model, cfg, cpu_ctx(), dev, 2)
+    eager = diag.state_stats()
+    calls: list[dict[str, Any]] = []
+
+    def window(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        assert not torch.is_grad_enabled() and not model.training
+        return model(*args, **kwargs)
+
+    trainer._compiled = window  # what TBPTTTrainer.compiled_window returns
+    rng = torch.get_rng_state()
+    before = {k: v.clone() for k, v in model.state_dict().items() if isinstance(v, torch.Tensor)}
+    diag.attach(trainer)  # compiles the variant now: two dropped passes
+    assert calls == [{"capture": True}] * 2 and diag.warm_seconds > 0.0
+    assert torch.equal(torch.get_rng_state(), rng), "the warm-up draws nothing"
+    assert all(torch.equal(model.state_dict()[k], v) for k, v in before.items())
+    assert diag.state_stats() == eager
+    assert len(calls) == 3
+    diag.detach()
+    assert diag.state_stats() == eager and len(calls) == 3  # detached: eager again
