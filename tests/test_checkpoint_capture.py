@@ -43,10 +43,11 @@ def source_case(
     trace.write_text(
         json.dumps(
             {
+                "arm": {"run_id": cfg.run_id},
                 "train": [
                     {"step": s.step, "loss": s.loss, "grad_norm": s.grad_norm}
                     for s in history.steps
-                ]
+                ],
             }
         )
     )
@@ -63,7 +64,8 @@ def source_case(
     )
     directory = tmp_path / "capture"
     directory.mkdir()
-    arm = ArmRun(cfg, "hsn", "pdg", {}, params, directory, RuleSet(), {})
+    diagnostic_cfg = cfg.model_copy(update={"run_id": "separate-capture-arm"})
+    arm = ArmRun(diagnostic_cfg, "hsn", "pdg", {}, params, directory, RuleSet(), {})
     return cfg, data, source, params, arm
 
 
@@ -75,6 +77,7 @@ def test_capture_matches_uninterrupted_state_and_preserves_source(
     checksum = sha256(source)
     record = run_diagnostic(arm, params, train_ds=data)["diagnostic"]
     assert record["completed"] and record["prefix_matched"]
+    assert record["source_run_id"] == cfg.run_id != arm.cfg.run_id
     assert record["production_updates"] == 0
     assert [r["disposable_updates"] for r in record["replay_runs"]] == [2, 2]
     assert all(c["passed"] for c in record["checks"])
@@ -126,6 +129,17 @@ def test_capture_rejects_source_output_alias(tmp_path: Path) -> None:
     arm.run_dir = source.parent
     checksum = sha256(source)
     with pytest.raises(ValueError, match="separate"):
+        run_diagnostic(arm, params, train_ds=data)
+    assert sha256(source) == checksum
+
+
+def test_capture_still_rejects_changed_training_configuration(tmp_path: Path) -> None:
+    cfg, data, source, params, arm = source_case(tmp_path)
+    arm.cfg = arm.cfg.model_copy(
+        update={"train": cfg.train.model_copy(update={"lr": cfg.train.lr * 2})}
+    )
+    checksum = sha256(source)
+    with pytest.raises(ValueError, match="was written for configuration"):
         run_diagnostic(arm, params, train_ds=data)
     assert sha256(source) == checksum
 

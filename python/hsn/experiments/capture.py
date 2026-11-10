@@ -79,6 +79,12 @@ def capture_prefix(
     if sha256(trace_path) != capture.trace_sha256:
         raise ValueError("capture trace checksum changed")
     trace = json.loads(trace_path.read_text())
+    source_run_id = (trace.get("arm") or {}).get("run_id")
+    if not isinstance(source_run_id, str) or not source_run_id:
+        raise ValueError("capture trace must identify the source run_id")
+    # Enqueuing assigns the diagnostic its own identity. Resume still verifies the full
+    # original trainer configuration, which includes its run_id; no other field is changed.
+    cfg = cfg.model_copy(update={"run_id": source_run_id})
     payload = torch.load(source, map_location="cpu", weights_only=False)
     start = int(payload["step"])
     if capture.steps[0] <= start or capture.steps[-1] > cfg.train.steps:
@@ -101,6 +107,8 @@ def capture_prefix(
     record = result["diagnostic"]
     record.update(
         source_step=start,
+        source_run_id=source_run_id,
+        source_config_hash=payload["extra"]["config_hash"],
         source_trace=str(trace_path),
         source_trace_sha256=capture.trace_sha256,
         data_fingerprint=train_ds.fingerprint,

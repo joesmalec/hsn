@@ -301,7 +301,10 @@ The `spike_diagnostic` stage `capture` takes a retained checkpoint in `dump` (wi
 and a `capture` mapping containing `steps`, the original `result.json` in `trace`, and
 `trace_sha256`. It resumes disposable copies using the original schedule, execution mode,
 RNG, optimizer, loader, carried state and previous byte. It currently accepts sources without
-rollback or finite-gradient skipping. Every replayed task loss and raw gradient norm must match
+rollback or finite-gradient skipping. The checksummed trace supplies the original `arm.run_id`
+for trainer resume; the diagnostic retains its separate database identity. The full resume
+configuration check remains enforced, including every training setting.
+Every replayed task loss and raw gradient norm must match
 the source trace; `rtol` and `atol` default to zero and are explicit protocol settings. A mismatch
 fails the diagnostic and pauses its queue. Do not weaken a tolerance to call a different trajectory
 an exact reproduction.
