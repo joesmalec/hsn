@@ -90,6 +90,7 @@ class WorkerOptions:
     )
     turn_file: Path | None = None
     turn_owner: str | None = None
+    telemetry_max_samples: int = 0  # opt-in, bounded per-run card time series
 
 
 def turn_remaining(path: Path | None, owner: str | None, now: float) -> float:
@@ -124,6 +125,31 @@ class _Watch:
     first: float = field(default_factory=time.time)
     last: float = field(default_factory=time.time)
     flushed: float = 0.0
+    telemetry: list[dict[str, Any]] = field(default_factory=list)
+    telemetry_dropped: int = 0
+
+    def sample_telemetry(
+        self,
+        reading: machine_module.GpuReading,
+        progress: dict[str, Any],
+        process_mib: float | None,
+        limit: int,
+    ) -> None:
+        available = reading.ok and reading.present
+        self.telemetry.append(
+            {
+                "time": reading.time,
+                "step": progress.get("step"),
+                "phase": progress.get("phase", "training_or_setup"),
+                "utilization_pct": reading.utilization_pct if available else None,
+                "device_memory_mib": reading.used_mib if available else None,
+                "process_memory_mib": process_mib if available else None,
+            }
+        )
+        if len(self.telemetry) > limit:
+            excess = len(self.telemetry) - limit
+            del self.telemetry[:excess]
+            self.telemetry_dropped += excess
 
     def card(self, adopted: bool) -> dict[str, Any]:
         return {
@@ -135,6 +161,11 @@ class _Watch:
             "foreign_cpu": list(self.cpu_foreign.values()),
             "own_with": sorted(self.own_with),
             "watch_incomplete": adopted,
+            **(
+                {"telemetry": self.telemetry, "telemetry_dropped": self.telemetry_dropped}
+                if self.telemetry
+                else {}
+            ),
         }
 
     def status(self) -> str:
@@ -180,6 +211,8 @@ class Worker:
         self.db = db
         self.root = Path(root)
         self.opt = options
+        if options.telemetry_max_samples < 0:
+            raise ValueError("telemetry_max_samples must be nonnegative")
         if (options.turn_file is None) != (options.turn_owner is None):
             raise ValueError("turn_file and turn_owner must be supplied together")
         self.machine = machine
@@ -427,6 +460,14 @@ class Worker:
             w = self.watch[exp_id]
             w.samples += 1
             w.last = now
+            if self.opt.telemetry_max_samples > 0:
+                progress = loads(r["progress_json"]) or {}
+                w.sample_telemetry(
+                    reading,
+                    progress,
+                    by_group.get(int(r["pgid"]), 0.0) if r["pgid"] is not None else None,
+                    self.opt.telemetry_max_samples,
+                )
             if r["pgid"] is not None:
                 w.peak_mib = max(w.peak_mib, by_group.get(int(r["pgid"]), 0.0))
             for p in foreign:

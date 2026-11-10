@@ -164,6 +164,10 @@ class _TrainParams(_Strict):
     # checkpoint. This is storage policy only; final metrics still come from the final weights.
     checkpoint: Literal["final", "retained", "none"] = "final"
     diag_window_docs: int = Field(default=4, ge=1)  # documents of the diagnostics window
+    diag_stability: bool = False
+    diag_sensitivity_epsilon: float = Field(default=1e-3, gt=0, allow_inf_nan=False)
+    diag_sensitivity_position: int = Field(default=64, ge=0)
+    diag_sensitivity_horizon: int = Field(default=8, ge=1)
     # P1.14, the step-time guard (hsn.experiments.steptime): the limit on the median step time,
     # and the approval note ("<who, when>") an arm above the 0.5 s rule (or an eager CUDA HSN arm)
     # needs at enqueue; both execution-only
@@ -521,6 +525,10 @@ def config_view(cfg: RunConfig) -> dict[str, Any]:
 #: P1.14: protocol keys that enter the arm id only when they differ from these values, so that every
 #: arm from before them keeps its id
 IDENTITY_DEFAULTS: dict[str, Any] = {
+    "diag_stability": False,
+    "diag_sensitivity_epsilon": 1e-3,
+    "diag_sensitivity_position": 64,
+    "diag_sensitivity_horizon": 8,
     "diag_dense_every": 0,
     "diag_windows": [],
     "capture": None,

@@ -80,6 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--require-clean", action="store_true")
     p.add_argument("--exit-when-empty", action="store_true")
     p.add_argument("--poll", type=float, default=5.0)
+    p.add_argument("--telemetry-max-samples", type=int, default=0)
     p.add_argument("--idle-gap", type=float, default=60.0)
     p.add_argument("--omp-threads", type=int, default=4)
     p.add_argument("--inductor-cache", default=None, help="compiled-artifact cache of the arms")
@@ -322,6 +323,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         exit_when_empty=args.exit_when_empty,
         poll_s=args.poll,
         omp_threads=args.omp_threads,
+        telemetry_max_samples=args.telemetry_max_samples,
         inductor_cache=Path(args.inductor_cache) if args.inductor_cache else None,
         turn_file=Path(args.turn_file) if args.turn_file else None,
         turn_owner=args.turn_owner,

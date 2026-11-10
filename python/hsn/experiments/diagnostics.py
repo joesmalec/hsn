@@ -111,6 +111,10 @@ class Diagnostics:
         n_docs: int = 4,
         *,
         schedule: Collection[int] | None = None,
+        stability: bool = False,
+        sensitivity_epsilon: float = 1e-3,
+        sensitivity_position: int = 64,
+        sensitivity_horizon: int = 8,
     ) -> None:
         if every < 1:
             raise ValueError(f"Diagnostics every must be >= 1, got {every}")
@@ -133,6 +137,13 @@ class Diagnostics:
         self._applied_pending: tuple[dict[str, Any], dict[str, Any]] | None = None
         self._observe_applied = False
         self._handles: list[Any] = []
+        from hsn.experiments.stability import StabilityObserver
+
+        self.stability = (
+            StabilityObserver(sensitivity_epsilon, sensitivity_position, sensitivity_horizon)
+            if stability
+            else None
+        )
 
     def attach(self, trainer: Any) -> None:
         """Register the step hooks on ``trainer.optimizer`` (``trainer.step`` keys the samples)."""
@@ -208,6 +219,8 @@ class Diagnostics:
         if self._observe_applied:
             record["legacy_measurement_stage"] = "optimizer_proposal"
             self._applied_pending = (pending, record)
+        else:
+            self._stability_stats(record)
         self.seconds += time.perf_counter() - started
 
     @torch.no_grad()
@@ -242,7 +255,12 @@ class Diagnostics:
             record.update({f"applied_state/{k}": v for k, v in self.state_stats().items()})
         finally:
             restore_rng_state(rng)
+        self._stability_stats(record)
         self.seconds += time.perf_counter() - started
+
+    def _stability_stats(self, record: dict[str, Any]) -> None:
+        if self.stability is not None and isinstance(self.model, HSN) and self.window is not None:
+            record.update(self.stability.observe(self.model, self.window, int(record["step"])))
 
     @torch.no_grad()
     def state_stats(self) -> dict[str, float]:

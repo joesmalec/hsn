@@ -2,6 +2,12 @@
 
 All figures below come from canonical SQLite `/home/joe/hsn-experiments/experiments.sqlite` and run records on commit `d4bd65bcbd2f0436ffcebbf2efa4174a7808308b`.
 
+**Comparison correction (10 November):** GRU and Transformer overall dev scores below combine
+five tasks; HSN and A5 are delayed-only. The 27k delayed-task scores are **78.69% GRU** and
+**70.23% Transformer**, rather than their 92% overall scores. See the
+[training findings report](p1_17_training_findings_2026_11_10.md) for every task-specific score,
+the three-seed cap comparison, and the remaining accuracy drops.
+
 ## HSN and GRU 9k resource comparison
 
 - HSN exp331 (9,000 steps): peak process GPU memory **8,156 MiB**; median step **208.92 ms**; measured training time **1,920.49 s**.
@@ -44,4 +50,4 @@ All four A5 follow-up attempts are recorded in canonical SQLite. Seed 0 control 
 - Seed 2 anchored router (exp341): final dev **76.72%**, later-query **57.10%**; peak dev **78.03%** at step 8,500.
 - Seed 0 anchored router (exp343): final dev **73.85%**, later-query **57.82%**; peak dev **73.85%** at step 9,000.
 
-Neither completed run reported optimizer skips or rollbacks. These two seeds show a large difference between the current reference and anchored-router settings, but the seed 0 reference failed before its planned endpoint, and the result is not enough to establish a reliable general advantage. The control runs' strong declines and the captured non-finite event warrant examining the saved divergence diagnostics and checkpoint trajectory before drawing a cause.
+All three completed runs reported no optimizer skips or rollbacks. These two seeds show a large difference between the current reference and anchored-router settings, but the seed 0 reference failed before its planned endpoint, and the result is not enough to establish a reliable general advantage. The control runs' strong declines and the captured non-finite event warrant examining the saved divergence diagnostics and checkpoint trajectory before drawing a cause.

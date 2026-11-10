@@ -928,3 +928,65 @@ The protocol reproduces the verdicts of four audit runs:
 Final dev accuracy must fall within ±0.03 of each reference. The bridge also has a compiled twin
 (`hardware.compile_mode=reduce-overhead`), checked against the same rule once P2.8 is merged. The results and
 the time per experiment are in the P1.11 pull request.
+
+### Training measurement views and observational logging (10 November)
+
+Install optional analytical views into an existing database:
+
+```bash
+python -m hsn.experiments.measurements --db ~/hsn-experiments/experiments.sqlite
+```
+
+This transaction only replaces the named views. It leaves schema version 2, experiment identities,
+raw JSON records, statuses, and queue contents intact, so older workers remain compatible. Views
+include future records automatically. `training_measurements` exposes task scope, data hash,
+final overall/delayed/later accuracy, binding results, peak memory, and evaluation drawdown.
+A failed run's partial score remains separate from the NULL final score. Drawdowns are in
+percentage points and reflect only saved evaluation times; a single observation gives NULL.
+Overall, delayed-task, and later-query drawdowns have separate columns.
+
+```sql
+SELECT exp_id, status, tasks_json, final_delayed_accuracy,
+       max_delayed_drawdown_pp, final_later_accuracy, binding_verdict
+FROM training_measurements WHERE exp_id >= 325;
+SELECT * FROM training_diagnostics WHERE exp_id = 343 ORDER BY step;
+SELECT * FROM training_gpu_samples WHERE exp_id = 343 ORDER BY sampled_at_unix;
+```
+
+`training_evaluations` and `training_steps` expose recorded time series. The diagnostic view keeps
+`diagnostics_json` for less common existing fields. Missing old measurements remain NULL, and
+old runs have no fabricated GPU samples. Raw records with invalid JSON are marked invalid in the
+summary and omitted from JSON time-series views. These are analytical views, not indexed copies;
+large whole-history queries may be slower than querying a small selection of experiments.
+
+Opt-in protocol settings (unchanged defaults are omitted from arm identity):
+
+```yaml
+protocol:
+  diag_stability: true
+  diag_every: 250
+  diag_sensitivity_epsilon: 0.001
+  diag_sensitivity_position: 64
+  diag_sensitivity_horizon: 8
+```
+
+At sampled accepted updates, after any projections, `stability/route_churn` measures the fraction
+of valid positions whose selected cell set changed since the prior observation on the same fixed
+diagnostic window. Slot order and invalid padding do not count. The reference step is saved;
+the first observation and the first observation after restarting the observer have NULL churn.
+The sensitivity fields measure one fixed-direction perturbation of h, preserving q's offset
+from mean(h), over a configurable horizon. Rows containing resets/padding in that horizon are
+excluded and the eligible count is saved. The model mode and RNG are restored, and no training
+state, gradient, or optimizer update is changed. Diagnostics use eager execution without autocast;
+the gain is not a Jacobian spectral norm or a replay of the compiled training backward. Diagnostic
+time is charged to existing diagnostic overhead. Latest observations also appear in
+`experiments.progress_json.stability` with their sample step; old dev scores retain `dev_step`.
+
+Worker `--telemetry-max-samples 3600 --poll 1` enables a bounded series of device utilization,
+device VRAM, and owned process VRAM, stored in `card_json.telemetry`. Samples have timestamps and
+last-reported training steps; the latter are approximate alignment. Missing readings are NULL.
+Old samples are discarded on reaching the cap and `telemetry_dropped` reports the count. The
+actual intervals can exceed the poll time (for example while CPU interference is sampled).
+Device utilization includes other processes, and samples cannot identify subsecond dips,
+allocator reservation, host RAM, kernel bottlenecks, or energy. Adopted workers report incomplete
+watch history. Default workers collect no series.

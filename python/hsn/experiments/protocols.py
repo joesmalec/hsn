@@ -445,7 +445,13 @@ class _StepCallback:
         )
         growth = getattr(trainer, "gradient_growth", None)
         growth_changed = growth is not None and len(growth.observations) != self._growth_reported
-        if evaluated or changed or growth_changed:
+        stability_sampled = (
+            self.diag is not None
+            and self.diag.stability is not None
+            and bool(self.diag.records)
+            and self.diag.records[-1]["step"] == step
+        )
+        if evaluated or changed or growth_changed or stability_sampled:
             self.publish_progress(trainer, history)
         elif (
             getattr(trainer, "update_limiter", None) is not None
@@ -484,10 +490,23 @@ class _StepCallback:
         growth = getattr(trainer, "gradient_growth", None)
         if growth is not None:
             progress["gradient_growth"] = growth.progress()
+        if self.diag is not None and self.diag.stability is not None and self.diag.records:
+            latest = self.diag.records[-1]
+            progress["stability"] = {
+                "sample_step": latest["step"],
+                **{
+                    k.removeprefix("stability/"): v
+                    for k, v in latest.items()
+                    if k.startswith("stability/")
+                },
+            }
         if history.evals:
             last = history.evals[-1]
             progress.update(dev_accuracy=float(last["accuracy"]), dev_loss=float(last["loss"]))
-            if any(k in progress for k in ("adaptive_lr", "update_limit", "gradient_growth")):
+            if any(
+                k in progress
+                for k in ("adaptive_lr", "update_limit", "gradient_growth", "stability")
+            ):
                 # A monitoring update must not present an older dev score as a fresh evaluation.
                 progress["dev_step"] = int(last["step"])
         if phase is not None:
@@ -625,6 +644,10 @@ def _train(
         max(diag_every, 1),
         n_docs=params.diag_window_docs,
         schedule=schedule if dense else None,
+        stability=params.diag_stability,
+        sensitivity_epsilon=params.diag_sensitivity_epsilon,
+        sensitivity_position=params.diag_sensitivity_position,
+        sensitivity_horizon=params.diag_sensitivity_horizon,
     )
     sampling = bool(schedule)
     if sampling:
