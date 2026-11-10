@@ -275,6 +275,22 @@ def _timed_saves(trainer: Any) -> list[list[float]]:
     return intervals
 
 
+def _probe_model(trainer: Any, model: Any, probe_batch: int) -> tuple[Any, int]:
+    """What the edit probes run and their rows per batch: under a compiled HSN trainer, the
+    compiled evaluation window padded to its one shape (:class:`hsn.experiments.probe.PaddedWindow`:
+    no eager forward, no new compile), with the evaluation batch's rows; else the model itself
+    with the protocol's ``probe_batch``."""
+    from hsn.experiments.probe import PaddedWindow
+
+    if getattr(trainer, "compiled_window", None) is None:
+        return model, probe_batch
+    batch = int(trainer.eval_batch or trainer.cfg.train.batch)
+    rows = batch - batch % 2  # the probes pair an original with its edit
+    if rows < 2:
+        return model, probe_batch
+    return PaddedWindow(trainer._eval_model(), batch, int(trainer.cfg.train.unroll)), rows
+
+
 def _phases(
     timer: _EvalTimer, diag: Any, saves: list[list[float]], stages: dict[str, list[float]]
 ) -> dict[str, Any]:
@@ -813,14 +829,16 @@ def _train(
         if isinstance(params, ReadsStateParams):
             arm.stage = "probe"
             t3 = time.perf_counter()
-            probes = edit_probe(model, ctx, dev_ds, batch_rows=params.probe_batch)
+            probe_model, probe_rows = _probe_model(trainer, model, params.probe_batch)
+            record["probe_execution"] = "compiled" if probe_model is not model else "eager"
+            probes = edit_probe(probe_model, ctx, dev_ds, batch_rows=probe_rows)
             summary = summarize(probes)
             arm.walls["probe_s"] = time.perf_counter() - t3
             if params.version >= 2:
                 arm.stage = "probe_v2"
                 t4 = time.perf_counter()
                 probes_v2 = edit_probe_v2(
-                    model, ctx, dev_ds, v1=probes, batch_rows=params.probe_batch
+                    probe_model, ctx, dev_ds, v1=probes, batch_rows=probe_rows
                 )
                 v2 = {"probe_v2": summarize_v2(probes_v2, v1=probes), "probes_v2": probes_v2}
                 arm.walls["probe_v2_s"] = time.perf_counter() - t4
@@ -828,7 +846,7 @@ def _train(
                 arm.stage = "probe_v3"
                 t5 = time.perf_counter()
                 probes_v3, originals_v3 = edit_probe_v3(
-                    model, ctx, dev_ds, batch_rows=params.probe_batch
+                    probe_model, ctx, dev_ds, batch_rows=probe_rows
                 )
                 v2["probe_v3"] = summarize_v3(probes_v3, originals_v3)
                 v2["probes_v3"] = probes_v3
