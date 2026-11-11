@@ -186,6 +186,120 @@ It reaches 0.6 dev at step 3,500, holds 74 to 85 % from step 8,500 to the start 
 The gain over the 9k runs is on later queries (70.7 % → 82.1 %) and the key swap is followed
 almost twice as often (24.6 % → 44.0 %), still under the frozen 50 % threshold. One seed.
 
+## 3b. The wobble, and scoring averaged weights
+
+With the cut the recipe no longer collapses, but its dev accuracy still moves from one evaluation
+to the next (`a5-fix/wobble.py`, evaluations after step 3,000):
+
+| Run | Typical change between evaluations | Largest fall |
+| --- | ---: | ---: |
+| before, caps only (exp 346) | 6.5 pp | 31.9 pp |
+| cut + caps (exps 360 / 361 / 349) | 1.8 / 1.8 / 3.0 pp | 2.2 / 1.2 / 4.0 pp |
+| cut + caps, 27k (exp 371) | 1.9 pp | 5.4 pp |
+| GRU (exp 347) | 0.4 pp | 0.7 pp |
+
+It is noise of the last few optimiser steps, not of the solution. Replaying exp 371 from step
+15,000 with an evaluation every 100 steps (`a5-fix/probe/ema_probe.py`, 14 evaluations):
+
+| Weights scored | Mean dev | Range | Typical change | Largest fall |
+| --- | ---: | ---: | ---: | ---: |
+| the training weights | 79.6% | 70.0 to 83.2% | 3.2 pp | 10.8 pp |
+| their moving average, decay 0.99 | 85.3% | 83.5 to 86.4% | 0.7 pp | 1.7 pp |
+| their moving average, decay 0.998 | 85.2% | 81.0 to 87.1% | 0.7 pp | 0.9 pp |
+
+`train.weight_ema` (opt-in; the amendment's "which weights are scored") makes the average what a
+run's evaluations and probes score; training is unchanged step for step. At the end of a run,
+after the learning-rate decay, the two coincide (exps 375 to 377: 85.9 / 86.5 / 86.5 % averaged,
+85.9 / 86.7 / 86.4 % for the training weights), so the average changes the curve, not the final
+score. The GRU has not been run with it yet (`p1_18_a6_ema_gru`, queued behind the work below).
+
+One change at a time on seed 2 (`p1_18_a6_wobble`, against exp 349's 84.0 %): a peak rate of
+1.5e-3 has no fall at all but learns more slowly and ends at 80.7 % (exp 373); a cosine schedule
+ends at 65.3 % (exp 374); the candidate norm is the next section.
+
+## 3c. With the candidate norm (A4)
+
+Under full backpropagation the candidate norm of amendment A4 (`model.cand_norm=rms`) diverged
+(exp 350). With the feedback cut it trains without a burst (largest gradient norm of exp 372:
+4.1), learns faster than any other arm, and ends higher:
+
+| Exp | Recipe, 9,000 steps | Final dev | Later | First | 0.6 dev at | Swap follow / unchanged | Binding |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| 372 | cut + caps + A4, seed 2, training weights | 88.9% | 80.5% | 98.4% | 2,000 | 61.1% / 19.9% | partial |
+| 375 | cut + caps + A4, seed 0, averaged weights | 85.9% | 76.7% | 96.3% | 1,500 | 42.0% / 34.0% | partial |
+| 376 | cut + caps + A4, seed 1, averaged weights | 86.5% | 76.3% | 98.1% | 1,500 | 52.9% / 28.0% | partial |
+| 377 | cut + caps + A4, seed 2, averaged weights | 86.5% | 75.8% | 98.6% | 1,500 | 36.8% / 40.0% | partial |
+| 349 / 360 / 361 | cut + caps, without A4 | 84.0 / 81.2 / 79.0% | 70.7 / 65.8 / 66.6% | – | 4,000 to 4,500 | 15 to 25% | – |
+
+Three seeds: 86.3 % mean (85.9 to 86.5), 76.3 % on later queries, against 81.4 % and 67.7 %
+without A4 and the GRU's 79.3 % best run. No step skipped.
+
+**But every run sags mid-run.** After reaching 72 to 81 % by step 2,000, each falls 10 to 21
+points between steps 2,000 and 4,000 and then recovers (worst drawdown 14.0 / 10.9 / 21.3 /
+20.0 points for exps 372, 375, 376, 377). Seeds 1 and 2 drop back under 0.6 dev during it, so the
+speed bar is passed and then lost. Gradient norms stay ordinary throughout; this is not the burst
+of section 1.
+
+## 3d. What the sag is: the router takes the value routes away
+
+`route-check` and two read-only probes on the kept checkpoints (`a5-fix/routecheck/`,
+`a5-fix/probe/route_flip.py`, `address_columns.py`):
+
+| Run @ step | Query route ∩ its fact's value-write route | ∩ other facts' |
+| --- | ---: | ---: |
+| 375 @ 2,000 → 3,500 | 0.47 → 0.16 | 0.13 → 0.12 |
+| 376 @ 2,000 → 4,000 → 9,000 | 0.51 → 0.17 → 0.14 | 0.10 → 0.12 → 0.13 |
+| 377 @ 2,000 → 3,000 | 0.44 → 0.19 | 0.12 → 0.11 |
+| 372 @ 9,000 | 0.16 | 0.13 |
+| 386 @ 5,000 (binds keys, below) | 0.62 | 0.10 |
+
+At step 2,000 a value is written into the cells its key selects: the key-address mechanism of A5
+binds. By steps 3,000 to 4,000 it no longer does, and it does not come back; the runs recover to
+86 % by a weaker strategy.
+
+How it is lost (exp 376): the positions where a fact's value is written are served by two
+dedicated router units (their weight is on the *previous* byte's address, the key); every other
+position by one common unit. That unit then takes the value positions over:
+
+| Step | Value-position slots on the dedicated units | On the common unit | Binding overlap (train documents) |
+| ---: | ---: | ---: | ---: |
+| 1,500 | 63% | 38% | 0.56 |
+| 2,000 | 44% | 55% | 0.46 |
+| 2,500 | 23% | 76% | 0.31 |
+| 3,000 | 14% | 85% | 0.22 |
+| 4,000 | 5% | 95% | 0.17 |
+
+In every run inspected (376, 389, 396, 398) the unit that takes them is the one that reads the
+query keys. Its weight on the *current* byte's address grows at a steady pace for the whole run
+(0.11 → 0.55 in exp 376, 0.13 → 0.62 in exp 389) while the value units' weights level off (0.15
+to 0.29); when its scores overtake theirs, top-K hands it the positions, the value units stop
+receiving a gradient there and cannot win them back. For a given class of positions the switch
+can be abrupt: in exp 386 the training loss doubled within ten steps (2,801 to 2,810) at ordinary
+gradient norms. The takeover is not tied to a step count.
+
+**Fixed settings delay it and do not prevent it** (seed 1; all scored on averaged weights):
+
+| Exp | Change against exp 376 | Steps | Peak dev (step) | Final dev | Later | Swap follow / unchanged | Binding |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| 376 | – | 9,000 | 81.2% (2,000) | 86.5% | 76.3% | 52.9% / 28.0% | partial |
+| 386 | cell and router caps halved (0.0015) | 5,000 | 89.5% (5,000) | 89.5% | 87.8% | 91.1% / 1.7% | **binds keys** |
+| 384 | peak rate 1.5e-3 | 5,000 | 87.3% (4,500) | 82.4% | 79.3% | 84.5% / 6.7% | **binds keys** |
+| 385 | caps on encoder, shared transform, predictor too | 5,000 | 73.9% (5,000) | 73.9% | 55.9% | 43.5% / 37.9% | partial |
+| 388 | cell and router caps halved, full length | 9,000 | 93.1% (3,000) | 84.6% | 75.0% | 70.7% / 15.0% | partial |
+| 387 | peak rate 1.5e-3, full length | 9,000 | 93.7% (4,000) | 73.1% | 64.1% | 67.9% / 14.9% | partial |
+| 389 | `train.adaptive_lr` (loss-triggered rate cuts) | 5,000 | 97.4% (3,000) | 89.0% | 89.0% | 88.5% / 2.5% | **binds keys** |
+
+While the value routes hold, the model binds held-out keys: exps 384, 386 and 389 are the first
+runs to pass the frozen key-swap verdict, and later-query accuracy reaches 85 to 96 % (key-blind
+level 62.3 %). They are stopped at step 5,000. Over the full length the same two settings lose
+the route later (exps 387, 388) and end at or below the reference. The existing loss-triggered
+controller (exp 389) cut every rate 4 to 32 times after its training monitor's loss jumped at
+step 2,700, and the takeover went on at the same pace: the router's proposed step is about ten
+times its update cap, so a rate cut does not change the step it actually takes. With the router
+held still from step 1,500 of exp 376 (`probe/freeze_probe.py`) the run stays at 79 to 83 %
+through step 2,750 and is at 74.9 % at 3,250, where the original is at 63.5 % by 3,000: most of
+the damage is the router's own movement, not all of it.
+
 ## 4. The GPU pauses
 
 `scripts/gpu_phase_report.py` on exp 346's card time series (alone on the card, one sample per
