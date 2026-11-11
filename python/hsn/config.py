@@ -606,6 +606,16 @@ class TrainConfig(_StrictModel):
     # scores are constants of that softmax): a unit that did not run gets no gradient from the
     # slot. Not adopted by any recipe: an amendment would have to do that.
     unit_credit: Literal["softmax", "executed"] = "softmax"
+    # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
+    # straight-through gradient of a routed training window can reach. "selected" (the default):
+    # the sparse round computes the selected cells with their chosen unit only, so a cell or a
+    # unit that was not selected gets no gradient: the router is told how useful its choice was,
+    # never how useful another one would have been. "all": the training window runs the masked
+    # round, the model's own reference for the sparse one (every cell computes its candidate
+    # with the selection's unit weights over every unit; only the selected cells are written), so
+    # the cell mask's and the unit weights' straight-through gradient covers every cell and
+    # unit. Costs the dense step's time. Not adopted by any recipe.
+    ste_scope: Literal["selected", "all"] = "selected"
     epsilon_start: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_end: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_steps: int = Field(default=0, ge=0)
@@ -1041,6 +1051,8 @@ class RunConfig(_StrictModel):
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.unit_credit != "softmax":
                 raise ValueError("train.unit_credit is HSN-only")
+            if self.train.ste_scope != "selected":
+                raise ValueError("train.ste_scope is HSN-only")
             if self.train.route_guard.enabled:
                 raise ValueError("train.route_guard (A6) is HSN-only")
             if self.train.state_grad_clip is not None or self.train.state_grad_ratio is not None:
@@ -1352,6 +1364,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "hardware.window",
     "hardware.sweep_twin",
     "train.unit_credit",
+    "train.ste_scope",
 )
 
 
@@ -1369,6 +1382,8 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return f"train.gate_mode={train.gate_mode!r}: the split window needs ste"
     if train.soft_until_step > 0:
         return f"train.soft_until_step={train.soft_until_step}: a soft warm-up runs every cell"
+    if train.ste_scope != "selected":
+        return f"train.ste_scope={train.ste_scope!r}: the masked round runs every cell"
     missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
     if missing:
         return (

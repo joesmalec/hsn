@@ -450,6 +450,7 @@ APPENDIX_A_KEYS_WITHOUT_DEFAULT: tuple[str, ...] = (
     "train.temperature_end",
     "train.temperature_steps",
     "train.unit_credit",
+    "train.ste_scope",
     "train.epsilon_start",
     "train.epsilon_end",
     "train.epsilon_steps",

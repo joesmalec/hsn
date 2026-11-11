@@ -80,6 +80,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "hardware.window",  # P2.10
         "hardware.sweep_twin",
         "train.unit_credit",
+        "train.ste_scope",
     )
 
 

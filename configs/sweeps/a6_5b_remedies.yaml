@@ -23,6 +23,12 @@
 #            answers "router misses later-relevant information" with "reconsider sparsity". With
 #            four slots the reader's cells and the value writer's cells compete for the same
 #            slots at a value position; with more, both sets fit. Costs step time.
+#   fullste  train.ste_scope=all: NOT one of the paper's mechanisms: an opt-in change of what the
+#            straight-through gradient covers. The training window runs the masked round (the
+#            model's reference for the sparse round: same decision, same written values, every
+#            cell and unit computed), so a cell or unit that was not selected still gets its
+#            first-order credit: a route that lost its slots is told when it would have helped.
+#            Dense step time; autograd window only. Adopting it would be an amendment.
 #   routerlr train.router_lr_mult=0.1: the router's proposed step is about ten times its update
 #            cap, so its applied step is the cap whatever the rate; at a tenth of the rate the
 #            proposal sits at the cap and the schedule's decay reaches the router
@@ -179,3 +185,7 @@ arms:
     overrides:
       - hardware.window=split
       - model.k_select=6
+  - name: native_fullste
+    family: hsn
+    overrides:
+      - train.ste_scope=all
