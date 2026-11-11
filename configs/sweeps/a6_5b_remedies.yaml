@@ -1,0 +1,104 @@
+# The remaining route takeover of the A6 recipe (docs/p1_18_a6_results.md, section 5b): the white
+# paper's own mechanisms, one at a time, configuration only, on the standard recipe
+# (configs/experiments/hsn_recipe_a6.yaml, guard on), 9,000 steps, diagnostics off, seeds 0 to 5.
+# Each arm changes one key against the recipe. The baselines are the arms of
+# p2_10_autograd_seeds.yaml (autograd window) and p2_10_split_seeds.yaml (split window), run from
+# the same checkout. "split_*" arms train with the split window (hardware.window=split,
+# docs/p2_10_split_window.md); "native_*" arms with the autograd window.
+#   dense    train.p_dense: a sample runs the dense step with this probability, so a unit that
+#            lost a position still executes there (paper section 1, "dense fallback")
+#   balance  train.lambda_b: the balance loss, mild (paper section 7)
+#   utility  train.lambda_u: the scorer regressed onto counterfactual probes (paper section 6);
+#            autograd window only (the split window does not cover the probes)
+#   temp     a constant straight-through temperature: above 1 (softer), or below 1 (sharper: the
+#            selection gradient concentrates on the cells and units near their thresholds, and a
+#            decision with a wide margin stops being pushed)
+name: a6_5b_remedies
+description: "A6 recipe + one of the paper's routing mechanisms (dense fallback, balance loss, STE temperature), seeds 0-5"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_a6.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diagnostics: false # the user's rule for these runs (11 Nov 2026): no diagnostic samples
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [0, 1, 2, 3, 4, 5]
+arms:
+  - name: split_dense10
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.p_dense=0.1
+  - name: split_dense05
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.p_dense=0.05
+  - name: split_dense25
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.p_dense=0.25
+  - name: split_balance
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.lambda_b=0.02
+  - name: split_temp2
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=2.0
+      - train.temperature_end=2.0
+  - name: split_temp025
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.25
+      - train.temperature_end=0.25
+  - name: split_temp010
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.1
+      - train.temperature_end=0.1
+  - name: native_temp025
+    family: hsn
+    overrides:
+      - train.temperature_start=0.25
+      - train.temperature_end=0.25
+  - name: native_temp010
+    family: hsn
+    overrides:
+      - train.temperature_start=0.1
+      - train.temperature_end=0.1
+  - name: native_dense10
+    family: hsn
+    overrides:
+      - train.p_dense=0.1
+  - name: native_dense05
+    family: hsn
+    overrides:
+      - train.p_dense=0.05
+  - name: native_utility
+    family: hsn
+    overrides:
+      - train.lambda_u=1.0
