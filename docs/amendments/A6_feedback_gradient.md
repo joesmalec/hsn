@@ -156,6 +156,57 @@ Any model (the baselines accept it, and the comparison runs the GRU with it too)
 averaged. Left out of the configuration hash at its default (`null`); refused together with
 `train.rollback_every`, whose snapshots do not hold the average.
 
+## Related: `train.route_guard` (acting on a route takeover when it happens)
+
+Not an equation change: a training-time controller on the router's step (`hsn.train.route_guard`,
+opt-in, routed HSN only). Evidence and runs: `docs/p1_18_a6_results.md`, sections 3d and 3e.
+
+**The event it watches for.** With the cut and the candidate norm of A4 the model learns to write
+a fact's value into the cells its key selects (A5's binding) by step 2,000, and then loses it:
+the router unit that reads the query keys keeps growing its weight on the current byte's address
+for the whole run, whatever the loss or the learning rate, while the units that serve the
+value-write positions level off; when its scores overtake theirs, top-K hands it those positions
+and they cannot be won back. Fixed settings (smaller caps, a lower rate) only move the moment;
+a loss-triggered rate cut does not reach the router, whose proposed step is about ten times its
+update cap.
+
+**What it does.** From every training window it counts the selection slots per (input byte,
+unit); no extra forward pass, no knowledge of the task. Every `interval` steps:
+
+    reference[b, u]  the largest share unit u has had of byte b's slots since the last event
+    established      routes (b, u) that held at least `specialised` of b's slots at `persistence`
+                     consecutive readings
+    lost             the mean, over the quarter of the bytes that lost most, of the share of
+                     their established routes that is gone
+
+If `lost ≥ lost_fraction` **and** the interval's mean training loss is above the lowest interval
+mean so far by `loss_rise` (units sorting positions out while the loss falls is learning), the
+applied step of the unit that gained most on those bytes is multiplied by `reduce_factor` on its
+rows of the scorer's output layer: `row ← old + scale · (new − old)`, after the optimiser step and
+the caps. Every other unit and every other module keeps its full step. No step is skipped, no
+document dropped, nothing rolled back; a run in which no event fires trains bit for bit as
+without the guard (`test_a_quiet_guard_changes_no_training_step`), the state is checkpointed
+(`test_training_with_events_resumes_exactly`) and every event is in the record (`route_guard`).
+
+    train.route_guard:
+      enabled: false        # default; hash-omitted
+      interval: 100         # steps between readings
+      lost_fraction: 0.1    # the event
+      specialised: 0.25     # a route is a unit holding this share of a byte's slots ...
+      persistence: 3        # ... at this many consecutive readings
+      loss_rise: 0.02       # ... and training no longer improving by this margin
+      min_slots: 100        # a byte with fewer slots in an interval is left out
+      min_usage: 0.001      # no event while established routes hold less of all slots
+      reduce_factor: 0.5    # the gaining unit's step scale, per event
+      min_scale: 0.015625   # ... down to this
+      restore: false        # also rewind the gaining unit's rows one reading (tested: worse)
+
+**Limits.** It needs a scorer with one output per unit (the linear scorer, or the two-layer
+scorer's second layer). A unit whose step has been halved to the floor no longer learns new
+routes. Reshuffles of routes that do not matter for the loss (the filler's) count as events too
+when the loss is not improving. Tested on one task; the first version, which watched for routes
+lost to the most-used unit, did not work (exps 396 to 398) and is described in the results.
+
 ## Related: `model.address_init` (A5 extension, diagnostic)
 
 The start value of the scorer's two address columns (`a_cur`, `a_prev`) for every unit; they stay

@@ -998,6 +998,9 @@ all opt-in, omitted from arm identity at their defaults, forward values unchange
 
 ```yaml
 - train.feedback_detach=[summary,eps,state,router]        # the tested recipe: feedback reads held constant in the backward
+- model.cand_norm=rms                                     # A4; with the cut it trains (it diverged under full backpropagation)
+- train.weight_ema=0.99                                   # evaluations and probes score a moving average of the weights
+- train.route_guard.enabled=true                          # halve the gaining router unit's step when an established route is taken over
 # tested, not sufficient or diagnostic only (kept because their runs are in the database):
 - train.state_grad_ratio=3.0                              # per-row limit on the state gradient, relative to the batch's typical row
 - train.state_grad_clip=4.0                               # the same as an absolute number (dL/dq; dL/dh: / sqrt(N))
@@ -1005,7 +1008,15 @@ all opt-in, omitted from arm identity at their defaults, forward values unchange
 ```
 
 The recipe that held on three seeds is the cut with exp 346's anchored update caps
-(`configs/sweeps/p1_18_a6_seeds.yaml`, arm `carry_anchored`).
+(`configs/sweeps/p1_18_a6_seeds.yaml`, arm `carry_anchored`). With A4 it learns faster and ends
+higher but sags mid-run (`p1_18_a6_ema`, arm `a4_ema99`); the route guard is for that
+(`p1_18_a6_guard2`, `p1_18_a6_guard_9k`).
+
+A `train.weight_ema` run's record carries `weight_ema` and `training_weights_final`; its
+checkpoints hold the training weights in `model` and the average in `extra["weight_ema"]`
+(`load_checkpoint(path, model, averaged=True)` for evaluation; `probe-check`, `probe-rerun`,
+`route-check` and `split-backfill` read the average). A guarded run's record carries `route_guard`
+(the events and every unit's final step scale).
 
 **Diagnostics and probes under a compiled trainer.** The state window of every diagnostic sample
 used to run the eager routed forward and a batched GPU SVD (1.3 s per pass on `profile:rtx3060`
