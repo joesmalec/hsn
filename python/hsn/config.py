@@ -925,6 +925,11 @@ class HardwareConfig(_StrictModel):
     pinned_memory: bool
     compile_mode: CompileMode = "none"
     window: WindowMode = "autograd"  # P2.10: autograd | split | fused (hsn.train.split)
+    # P2.10: the split window's forward sweep runs a twin of the model with its autocast weights
+    # cast once per window (hsn.train.compile.SweepTwin; the values of eager autocast). False runs
+    # the model's own compiled blocks, which cast at every position and whose fused arithmetic
+    # rounds as the autograd window's does: about 11 ms per step slower, kept to compare the two.
+    sweep_twin: bool = True
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1335,6 +1340,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.weight_ema",
     "train.route_guard",
     "hardware.window",
+    "hardware.sweep_twin",
 )
 
 

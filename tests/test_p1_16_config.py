@@ -78,6 +78,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.weight_ema",
         "train.route_guard",
         "hardware.window",  # P2.10
+        "hardware.sweep_twin",
     )
 
 

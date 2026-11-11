@@ -145,6 +145,7 @@ before.
 | CPU float64, split against `HSN.forward` (interior resets, carried start state, padded slots, refresh probes, cost and balance terms, a window without loss positions, dense-fallback rows) | every parameter gradient equal at rtol 1e-9, the same set of absent gradients |
 | CUDA fp32, compiled, split against the autograd window, 300 training steps in | identical routing decisions; gradients equal to 1.2e-7 relative |
 | CUDA bf16, the same, each against the fp32 autograd reference | autograd bf16: 2.7 % relative, cosine 0.99964. Split bf16: 2.8 %, cosine 0.99963 |
+| CUDA bf16, one tape, the replay and backward under bf16 against the same replay in fp32 | 0.33 % relative, cosine 0.999996 (the split backward's own bf16 error, with decisions and state values held equal) |
 | Sweep twin against the model's own sweep | fp32: bit-identical tape. bf16: equal to rounding (below) |
 
 Under bf16 the split window is not bit-for-bit the autograd window, and a run is not
@@ -158,7 +159,9 @@ bit-reproducible against earlier runs:
 - a batched matmul rounds its weight gradient to bf16 once per window, where the per-position
   gradients were summed in fp32 (the encoder's and the decoder's already were).
 
-The tolerance to hold it to is therefore the fp32 one, plus the accuracy of runs.
+The 2.7 to 2.8 % above are therefore differences between trajectories, which the autograd window
+has against fp32 as well; on one trajectory the split backward is within 0.33 % of fp32. The
+tolerance to hold the split window to is the fp32 one, plus the accuracy of runs.
 
 ## Accuracy
 

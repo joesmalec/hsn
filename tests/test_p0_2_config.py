@@ -489,6 +489,7 @@ APPENDIX_A_KEYS_WITHOUT_DEFAULT: tuple[str, ...] = (
     "hardware.pinned_memory",
     "hardware.compile_mode",
     "hardware.window",
+    "hardware.sweep_twin",
     "hardware.nvcc_arch",
     "hardware.power_meter",
     "hardware.recipe.batch",

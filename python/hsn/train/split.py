@@ -341,6 +341,8 @@ class SplitWindow:
         self.calls = 0
         #: ``hardware.window=fused``: the sweep's cell round is the fused CUDA op.
         self.fused = cfg.hardware.window == "fused"
+        #: ``hardware.sweep_twin``: the compiled sweep runs the pre-cast twin of the model.
+        self.twin = cfg.hardware.sweep_twin
         device = next(model.parameters()).device
         if self.fused:
             reason = (
@@ -422,6 +424,7 @@ class SplitWindow:
                     state,
                     reset,
                     fused=self.fused,
+                    twin=self.twin,
                     dense_rows=dense_rows,
                     dense_indices=dense_indices,
                 )
