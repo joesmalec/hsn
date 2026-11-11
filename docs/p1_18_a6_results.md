@@ -6,7 +6,32 @@ and logs are in `/home/joe/hsn-experiments/a5-fix/`. Runs are 9,000 steps of the
 routing, key addresses, selected-cell readout, lr 2.5e-3, β2 0.95, WSD, float64 gradient norms) on
 the delayed task, B32, compiled, unguarded: no spike guard, no rollback, every document kept.
 
-RESULTS_SUMMARY
+**What came out.** The mid-run accuracy drops are exploded gradients through the *feedback reads*
+of the recurrent state, taken as full-size steps along one document's direction. Cutting those
+reads out of the backward pass (`train.feedback_detach`, opt-in, forward unchanged) removes the
+drops on all three controlled seeds, and with exp 346's anchored update caps the same recipe
+finishes above the GRU:
+
+| | Final dev | Later queries | Worst drop during the run | Skipped steps |
+| --- | ---: | ---: | ---: | ---: |
+| Before: anchored caps, full backpropagation (exps 343 / 326 / 346, seeds 0 / 1 / 2) | 73.8 / 78.2 / 77.5 % | 57.8 / 60.2 / 62.5 % | 12.0 / 4.8 / 36.9 pp | 0 |
+| Before: current-norm caps (exps 342 / 325 / 345) | failed / 81.4 / 2.2 % | – / 65.3 / 2.2 % | 57.9 / 34.6 / 66.8 pp | 10 / 0 / 0 |
+| **After: feedback cut + anchored caps (exps 360 / 361 / 349)** | **81.2 / 79.0 / 84.0 %** | **65.8 / 66.6 / 70.7 %** | **2.2 / 6.8 / 4.5 pp** | 0 |
+| GRU, delayed task (gru_2m exp 154; delayed-only exp 347; 2e-3 exps 204, 206) | 79.3; 77.8; 78.6, 77.6 % | –; 58.3; 59.7, 57.6 % | 0.5 to 1.3 pp | 0 |
+
+Mean of the three seeds: 81.4 % final and 67.7 % on later queries, against gru_2m's 79.3 % best run
+(78.8 % five-run mean) and 58 to 61 % on later queries. Two of three seeds are above the 79.3 % bar;
+seed 1 ends 0.3 points under it (peak 79.8 % at step 8,500). All three are above the 62.3 %
+key-blind level on later queries, where the dev keys were never seen in training; none passes the
+frozen binding verdict (swap follow 15 to 25 %, two "partial"). Learning is slower than under full
+backpropagation: 0.6 dev is reached at step 4,000 to 4,500, against 2,500 to 3,000 for the GRU's
+speed bar.
+
+The GPU pauses were the periodic diagnostics and the end-of-run probes running the eager routed
+forward. Both now replay compiled graphs: per run, diagnostics went from 466 s to 12 s and the
+probes from 76 s to 10 s on the same recipe under the same load (exps 349 and 360).
+
+![Dev accuracy before and after](training_review/p1_18_a6_curves_2026_11_10.png)
 
 ## 1. What the drops are
 
@@ -44,12 +69,13 @@ What this shows:
   saturated (`|c| > 0.99`) and the gate is either closed or fully open (1 to 2 % open, mean 0.015).
   Such a cell passes almost no gradient anywhere and a very large one where a coordinate is in
   transition. The forward dynamics are just as sharp: a 1e-3 perturbation of the state at position
-  32 is a different state 64 to 96 positions later (gain 40 to 1,000), at healthy checkpoints too
-  (`prof346_*.json`).
+  32 has grown 120 to 1,000 times 96 positions later at step 6,000 and 220 to 830 times at the
+  healthy step 4,500 (10 to 330 times at steps 1,500 and 8,500; `prof346_*.json`).
 - **One document takes the step.** The exploding document's gradient is 10 to 10⁹ times the
   others'. The global clip rescales the batch by that norm, so the other 31 documents vanish from
   the step and AdamW moves at full size along one document's switching direction. A burst is some
-  hundreds of such steps (346, steps 5,750 to 6,250: 10 % of steps above 350).
+  hundreds of such steps (346: a tenth of the steps above a norm of 350 in steps 5,751 to 6,000
+  and above 4,300 in 6,001 to 6,250, against a run median of 2).
 - **A second mechanism, in the router.** Without the update caps the router's weights grow
   without bound and its routes churn (345: norm 0.7 → 16 before the collapse; exp 355 and 356
   below: 15 and 19 by step 4,500). Top-K always writes K cells; most positions are filler, where a
@@ -79,8 +105,131 @@ Framework: the diagnostics' state window and the end-of-run probes replay compil
 of the eager forward; records carry `phases`; `scripts/gpu_phase_report.py` attributes the card's
 time series (section 4).
 
-RESULTS_TABLES
+## 3. Runs
 
-RESULTS_GPU
+Seed 2 is the seed of exp 345 (collapse) and exp 346 (36.9-point drop). "Worst drawdown" is the
+largest fall from an earlier peak over the saved evaluations (every 500 steps). Arms shared the
+card three at a time, so step times are not timings. `final` of a failed or cancelled arm is not a
+score; its last evaluation is given.
 
-RESULTS_OPEN
+**The recommended recipe** — `train.feedback_detach=[summary,eps,state,router]` with exp 346's
+caps (`cell.*` and `router.*` at 0.003, the router's radius anchored to its initial norm):
+
+| Exp | Recipe | Final dev | Later | First | Worst drawdown | Skips | Swap follow / unchanged | Binding | Router norm |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |
+| 360 | **cut + caps**, seed 0 | 81.2% | 65.8% | 98.5% | 2.2 pp | 0 | 15.5% / 64.8% | does not bind keys | 1.84 |
+| 361 | **cut + caps**, seed 1 | 79.0% | 66.6% | 92.9% | 6.8 pp | 0 | 24.3% / 44.5% | partial | 2.19 |
+| 349 | **cut + caps**, seed 2 | 84.0% | 70.7% | 98.9% | 4.5 pp | 0 | 24.6% / 53.1% | partial | 2.01 |
+
+**What each part does** (seed 2):
+
+| Exp | Recipe (seed 2) | Final dev | Later | First | Worst drawdown | Skips | Swap follow / unchanged | Binding | Router norm |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |
+| 346 | caps only (before) | 77.5% | 62.5% | 94.3% | 36.9 pp | 0 | 9.1% / 73.6% | does not bind keys | 2.67 |
+| 348 | cut only | 78.2% | 59.9% | 98.9% | 4.0 pp | 0 | 11.0% / 68.0% | does not bind keys | – |
+| 349 | **cut + caps** | 84.0% | 70.7% | 98.9% | 4.5 pp | 0 | 24.6% / 53.1% | partial | 2.01 |
+| 368 | `[summary, eps]` cut + caps | 76.3% | 56.5% | 98.7% | 4.0 pp | 0 | 3.5% / 90.0% | does not bind keys | 4.25 |
+| 364 | `state_grad_ratio=3` + caps | 68.2% | 47.2% | 91.9% | 71.5 pp | 0 | 6.2% / 80.5% | does not bind keys | 5.79 |
+| 355 | `state_grad_clip=4`, no caps (collapsed at 7,000; cancelled at 8,220) | – | – | – | 52.7 pp | 0 | – / – | – | – |
+| 354 | `state_grad_clip=4` + `address_init=1`, no caps (at chance from 1,000; cancelled) | – | – | – | 19.1 pp | 0 | – / – | – | – |
+| 356 | cut + `address_init=1`, no caps (drifting down; cancelled at 5,177, last evaluation 30.2 %) | – | – | – | 14.5 pp | 0 | – / – | – | – |
+| 363 | cut + caps + `address_init=1` | 77.4% | 59.9% | 97.1% | 14.3 pp | 0 | 10.9% / 74.5% | does not bind keys | 23.08 |
+| 366 | cut + cell cap + `address_init=1`, router frozen (`router_lr_mult=0.001`) | 63.1% | 66.5% | 59.3% | 13.5 pp | 0 | 30.3% / 49.3% | partial | 4.06 |
+| 350 | A4, full backpropagation, no caps (non-finite at 1,479; stopped at 1,487) | – | – | – | 0.0 pp | 10 | – / – | – | – |
+
+The router norm is the last diagnostic sample's; runs without an update limiter do not record it
+(348 ends at 10.2, measured from its checkpoint).
+
+- *The cut alone* (348) is as smooth as with the caps but stays at the key-blind level: its router
+  grows to a norm of 10 (0.7 at the start; 2.0 with the caps) and later queries do not improve.
+- *The caps alone* (346, and 343 / 326 on the other seeds) do not remove the drops.
+- *Cutting only the summary's readers* (`[summary, eps]`, 368) is as smooth as the full cut on this
+  seed but ends at the key-blind level.
+- *A limit on the state gradient instead of the cut* does not remove them either. An absolute
+  per-document limit (355) collapsed at step 7,000 with the router at norm 23; the scale-free
+  limit with the caps (364) learned faster than any other arm here (0.67 at step 2,500, 0.73 at
+  4,000) and then fell to chance twice (steps 5,000 and 6,500). Both keys stay in the code, opt-in, because these runs are in the
+  database; neither is a fix.
+- *Starting the address columns at 1* (`model.address_init`) gives a fast start (0.52 at step
+  1,000 in 363) that does not last: the router moves away from the address routes (in 356 the
+  `a_prev` column goes from 0.9 to 0.0 and the other columns' norm from 2.9 to 18.8 by step
+  4,500). With the router all but frozen on those routes (366) the
+  key swap is followed more often than in any other run (30.3 %, unchanged 49.3 %) and later
+  queries are at 66.5 %, but the first query falls to 59.3 % and the run ends at 63.1 %. So the
+  memory does follow the key when the routes are consistent; a write route and its query's read
+  route share only about a third of their cells under this prior (0.34 simulated, 0.125 by
+  chance), which is not enough.
+- *A4 with full backpropagation* (350) is non-finite by step 1,479.
+
+FULL_RUN_SECTION
+
+## 4. The GPU pauses
+
+`scripts/gpu_phase_report.py` on exp 346's card time series (alone on the card, one sample per
+second; phases estimated from the reported step, since the run predates `phases`): 97 of the 961
+samples during the fit are below 50 % utilisation (10.1 %), 78 of them within 30 steps of a
+diagnostic or evaluation step; the GRU run 347 has none. The pauses are the 250-step diagnostics:
+each sample ran the eager routed forward on four documents (0.85 s, twice per sample with an
+update limiter) and a batched GPU SVD of 713 32×64 matrices for the participation ratio (0.47 s;
+0.05 s on the CPU), 3.7 s per sample with the stability observer, 133 s of the run. The three
+end-of-run probes ran the same eager forward for 79 s at about 25 % utilisation.
+
+Changes (all values equal to the eager ones to rounding; an eager trainer is unchanged):
+
+- the diagnostics' state window replays a compiled no-gradient variant of the training window
+  that also returns the per-position states and gates (`CompiledWindow(..., capture=True)`),
+  compiled once before training starts;
+- the participation ratio is computed from the Gram matrix (`(Σσ²)² / Σσ⁴ = ‖H‖_F⁴ / ‖HHᵀ‖_F²`), no
+  decomposition;
+- the probes pad each batch to the evaluation window's shape and replay that graph
+  (`PaddedWindow`), no new compile.
+
+| Same recipe, same load (three arms on the card) | Diagnostics | Probes (v1 + v2 + v3) | Evaluations |
+| --- | ---: | ---: | ---: |
+| exp 349, eager diagnostics and probes | 465.7 s | 76.4 s | 62.7 s |
+| exp 360, compiled diagnostics and probes | 12.4 s (0.36 s per sample) | 10.4 s | 34.7 s |
+
+GPU_SOLO_SECTION
+
+Not changed: the stability observer (`diag_stability`, opt-in) still perturbs the state inside an
+eager forward; the one-off `trained_state` window at the end is eager (3 to 6 s); the first
+compile of a run is unchanged.
+
+## 5. What is not established
+
+- **Binding.** No run passes the frozen key-swap verdict (follow ≥ 50 %, unchanged ≤ 10 %). The
+  later-query gain over the key-blind level is 3 to 8 points. `route-check` on exps 346, 348 and
+  349 (`a5-fix/routecheck/`) reads the same on all three: on dev keys a query's route overlaps the
+  route at its fact's *key* position by 0.89 to 0.90 and the route at the fact's *value* position
+  by 0.19 to 0.32, against 0.14 to 0.25 for the other facts' value positions (train keys read the
+  same). The routes follow the current byte's address and not the previous byte's, so a value is
+  not written into its key's cells. That is the router's learning (P1.17's other half), not
+  stability.
+- **Why the caps help the cut.** 349 against 348 is one seed. The caps cut the router's step
+  about tenfold and the cell's about twofold; which of the two matters was not separated.
+- **Speed.** The cut learns more slowly than full backpropagation (0.6 dev at 4,000 to 4,500
+  steps against 2,500). Cutting only the summary's two readers (368) is as smooth
+  (4.0-point worst drawdown) and a little faster in the middle of the run, but ends lower (76.3 %,
+  later 56.5 %). No arm here is both fast and smooth.
+- **Seeds and repeats.** Three seeds, one run each; execution is not bit-reproducible on this
+  card (exps 299 / 300), and no arm was repeated.
+- **The forward dynamics are unchanged.** The cell is still a bank of hard switches and still
+  sensitive to its state; the cut stops the optimiser from following those directions, it does not
+  make the cell smooth.
+- **Other tasks, the dense HSN and longer runs** were not run with the cut, apart from the 27k
+  run above.
+
+## 6. Reproduce
+
+```bash
+cd /home/joe/hsn-a5-fix                      # branch claude/a5-fix
+python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_seeds.yaml --mem-estimate-mib 3000
+python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_screen.yaml --only "carry_anchored/s2"
+setsid nohup python -m hsn.experiments worker --max-concurrent 3 --require-clean \
+    --exit-when-empty --telemetry-max-samples 20000 > worker.log 2>&1 &
+python scripts/gpu_phase_report.py --exp 346 --exp 360
+```
+
+Checks on the branch tip: 1,111 CPU tests pass (144 device skips); the CUDA default-training
+golden, the compiled-window and the A5 CUDA tests pass (18); ruff, ruff-format and mypy clean.
+Every new key is left out of the configuration hash at its default.

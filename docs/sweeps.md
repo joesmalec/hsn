@@ -993,14 +993,19 @@ watch history. Default workers collect no series.
 
 ### A6 keys, compiled diagnostics and the phase report (10 November)
 
-**Recipe keys** (`docs/amendments/A6_feedback_gradient.md`; all opt-in, omitted from arm identity
-at their defaults, forward values unchanged):
+**Recipe keys** (`docs/amendments/A6_feedback_gradient.md`, results in `docs/p1_18_a6_results.md`;
+all opt-in, omitted from arm identity at their defaults, forward values unchanged):
 
 ```yaml
-- train.state_grad_clip=4.0                               # per-row limit on dL/dq at every position (dL/dh: / sqrt(N))
-- train.feedback_detach=[summary,eps,state,router]        # feedback reads held constant in the backward
+- train.feedback_detach=[summary,eps,state,router]        # the tested recipe: feedback reads held constant in the backward
+# tested, not sufficient or diagnostic only (kept because their runs are in the database):
+- train.state_grad_ratio=3.0                              # per-row limit on the state gradient, relative to the batch's typical row
+- train.state_grad_clip=4.0                               # the same as an absolute number (dL/dq; dL/dh: / sqrt(N))
 - model.address_init=1.0                                  # start value of the scorer's two address columns (A5)
 ```
+
+The recipe that held on three seeds is the cut with exp 346's anchored update caps
+(`configs/sweeps/p1_18_a6_seeds.yaml`, arm `carry_anchored`).
 
 **Diagnostics and probes under a compiled trainer.** The state window of every diagnostic sample
 used to run the eager routed forward and a batched GPU SVD (1.3 s per pass on `profile:rtx3060`

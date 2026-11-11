@@ -84,6 +84,7 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
 from __future__ import annotations
 
 import contextlib
+import gc
 import math
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -474,6 +475,9 @@ class _StepCallback:
         self.started = time.perf_counter()
         self.history: Any = None  # P1.14: the live History, read back when the fit raises
         self.keeper: _Keeper | None = None  # P1.16: kept checkpoints (protocol keep_every)
+        #: The collector switch (protocol ``gc_freeze``) and how often it froze (the record's).
+        self.gc_freeze = False
+        self.freezes = 0
 
     def __call__(self, trainer: Any, history: Any) -> bool:
         self.history = history
@@ -481,6 +485,8 @@ class _StepCallback:
         if self.keeper is not None:
             self.keeper.prune(trainer, history)
         evaluated = bool(history.evals) and int(history.evals[-1]["step"]) == step
+        if evaluated:
+            self.freeze_collector(trainer)
         if self.guard is not None and history.steps and int(history.steps[-1].step) == step:
             # a compile or CUDA-graph recording during this step or its evaluation (P2.8)
             window = getattr(trainer, "compiled_window", None)
@@ -524,6 +530,28 @@ class _StepCallback:
             self.stop = {**stop, "elapsed_s": round(time.perf_counter() - self.started, 1)}
             return True
         return False
+
+    def freeze_collector(self, trainer: Any) -> None:
+        """After an evaluation of a compiled run (every graph of the run is compiled by the first
+        one: the training window, the diagnostic variant, the evaluation window), move what is
+        alive into the collector's permanent generation, after one full pass so that no garbage
+        is kept. A compiled process holds about a million tracked objects (the graphs, their
+        guards, the modules); each full pass walked all of them, 0.3 s with the card idle, about
+        ten times per thousand steps (measured, ``a5-fix/probe/dip_base.json``). Frozen, a full
+        pass sees only what was allocated since the last evaluation (1 ms). Nothing about the
+        training changes. Off for an eager trainer (nothing to gain) and with ``gc_freeze:
+        false``; :meth:`release_collector` undoes it when the fit ends."""
+        if not self.gc_freeze or getattr(trainer, "compiled_window", None) is None:
+            return
+        gc.collect()
+        gc.freeze()
+        self.freezes += 1
+
+    def release_collector(self) -> None:
+        """Hand the frozen objects back to the collector (the end of the fit, whatever ended it):
+        the probes and the process's shutdown then run as in a run that never froze."""
+        if self.freezes:
+            gc.unfreeze()
 
     def publish_progress(self, trainer: Any, history: Any, *, phase: str | None = None) -> None:
         from hsn.experiments.controller import controller_progress
@@ -688,6 +716,8 @@ def _train(
     # P1.14: the mixed cadence samples an explicit schedule; the single cadence keeps diag_every
     dense = params.diag_dense_every > 0
     schedule = diag_schedule(arm.steps, diag_every, params.diag_dense_every, params.diag_windows)
+    if not params.diagnostics:  # the switch: no sample during training, nothing attached
+        schedule = ()
     diag = Diagnostics(
         model,
         cfg,
@@ -696,7 +726,7 @@ def _train(
         max(diag_every, 1),
         n_docs=params.diag_window_docs,
         schedule=schedule if dense else None,
-        stability=params.diag_stability,
+        stability=params.diag_stability and params.diagnostics,
         sensitivity_epsilon=params.diag_sensitivity_epsilon,
         sensitivity_position=params.diag_sensitivity_position,
         sensitivity_horizon=params.diag_sensitivity_horizon,
@@ -712,6 +742,7 @@ def _train(
         stats_every=cfg.train.stats_every,
     )
     callback = _StepCallback(arm, diag if sampling else None, audit_keys=audit_keys, guard=guard)
+    callback.gc_freeze = params.gc_freeze
     if params.keep_every:
         callback.keeper = _Keeper(
             params.keep_every,
@@ -726,7 +757,10 @@ def _train(
     t1 = time.perf_counter()
     stages["fit"] = [time.time()]
     try:
-        history = trainer.fit(train_ds, dev_ds, arm.steps, callback=callback)
+        try:
+            history = trainer.fit(train_ds, dev_ds, arm.steps, callback=callback)
+        finally:
+            callback.release_collector()  # the frozen objects are collectable again from here
     except BaseException as exc:
         # P1.14: what the fit produced before it raised (the P1.12 stop, OOM, SIGTERM, ...)
         arm.walls["fit_s"] = time.perf_counter() - t1
@@ -811,6 +845,8 @@ def _train(
         "checkpoints": history.checkpoints,
         "step_time": guard.summary(),  # P1.14
         "phases": _phases(timer, diag, saves, stages),
+        "diagnostics_enabled": bool(params.diagnostics),
+        "gc_freezes": callback.freezes,
     }
     record = arm.record  # P1.14: filled in place, so that a later stage's failure keeps it
     record.clear()

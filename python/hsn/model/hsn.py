@@ -110,7 +110,8 @@ gradient that the position passes back into the state is limited per batch row
 sqrt(N)``; ``train.state_grad_ratio``: both to that multiple of the batch's typical live row at
 the position, a limit without a scale). The forward values are unchanged and a row under the
 limit keeps its gradient unscaled, so a healthy window is full backpropagation through time (to
-the rounding of autograd's sums); the paths stay, their blow-ups do not.
+the rounding of autograd's sums). Tested on the A5 recipe, the limit did not remove the drops (exps
+354, 355, 364); the cut above did.
 
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.

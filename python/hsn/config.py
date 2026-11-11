@@ -505,7 +505,8 @@ class TrainConfig(_StrictModel):
     # cells). A row under the limit keeps its gradient unscaled, so a healthy window is plain
     # backpropagation through time; a row whose gradient blows up at a write no longer replaces
     # the batch's. None (default): off. Calibrated at B32 on the delayed task: healthy rows stay
-    # below 0.12 in h (0.7 in q) from step 1,500 to 8,500 of exp 346.
+    # below 0.16 in h (2.95 in q) from step 3,000 to 8,500 of exp 346. Tested (exps 354, 355): it
+    # did not prevent collapses; not part of the recommended recipe (docs/p1_18_a6_results.md).
     state_grad_clip: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     # A6 (opt-in): the same limit without a scale. At every position a row's dL/dq (and its dL/dh)
     # is at most this multiple of the batch's typical live row there (the 90th percentile of the
@@ -513,7 +514,7 @@ class TrainConfig(_StrictModel):
     # 8,500 a limit of 3.0 acts on 0 % to 0.9 % of the live row-positions, at most one document
     # per window (the isolated ones at 9x to 21x), at every stage of a run, which one absolute
     # number cannot do (healthy rows grow twentyfold). May be combined with state_grad_clip: the
-    # smaller limit applies. None (default): off.
+    # smaller limit applies. None (default): off. Tested (exp 364): it did not remove the drops.
     state_grad_ratio: float | None = Field(default=None, gt=1.0, allow_inf_nan=False)
     steps: int = Field(default=1000, ge=1)  # schedule
     eval_every: int = Field(default=100, ge=1)

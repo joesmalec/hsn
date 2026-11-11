@@ -120,6 +120,8 @@ EXECUTION_ONLY = frozenset(
         "step_time_approval",
         "keep_every",
         "keep_last",
+        "diagnostics",
+        "gc_freeze",
     }
 )
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -163,6 +165,19 @@ class _TrainParams(_Strict):
     # retained also keeps intermediate evidence after success, including the best evaluated
     # checkpoint. This is storage policy only; final metrics still come from the final weights.
     checkpoint: Literal["final", "retained", "none"] = "final"
+    # The switch of the in-training diagnostics (10 Nov 2026; execution-only: the training is the
+    # same with or without them, so the arm keeps its id). False: no diagnostic sample is taken
+    # during training whatever diag_every, diag_dense_every, diag_windows and diag_stability say
+    # (no hooks, no state window, nothing compiled for them); the record's ``diagnostics`` is
+    # empty and ``diagnostics_enabled`` false. Evaluations, kept checkpoints, the end-of-run state
+    # statistics and the probes are not diagnostics in this sense and still run. A rule that reads
+    # a ``diag:`` value then has nothing to read, which expansion refuses (errors over silence).
+    diagnostics: bool = True
+    # Execution-only: freeze the garbage collector's long-lived objects once the compiled graphs
+    # are warm (hsn.experiments.protocols). A compiled run holds about a million tracked objects;
+    # every full collector pass walked them for 0.3 s with the card idle, some ten times a
+    # thousand steps. False: the collector is left alone.
+    gc_freeze: bool = True
     diag_window_docs: int = Field(default=4, ge=1)  # documents of the diagnostics window
     diag_stability: bool = False
     diag_sensitivity_epsilon: float = Field(default=1e-3, gt=0, allow_inf_nan=False)
@@ -623,9 +638,13 @@ def _variant(arm: ArmSpec, family: str) -> tuple[str, dict[str, Any]]:
         raise SpecError(f"arm {arm.name}: {exc}") from exc
 
 
-def expand(spec: SweepSpec, *, repo: Path = REPO_ROOT) -> list[Arm]:
+def expand(
+    spec: SweepSpec, *, repo: Path = REPO_ROOT, diagnostics: bool | None = None
+) -> list[Arm]:
     """Every arm of ``spec`` in a deterministic order (module docstring); raises
-    :class:`SpecError`."""
+    :class:`SpecError`. ``diagnostics`` overrides the protocol's switch of the in-training
+    diagnostics for every training arm (``enqueue --diagnostics on|off``; ``None``: as the spec
+    says). The switch is execution-only, so the arms and their ids are the same either way."""
     try:
         rules = parse_rules(spec.rules)
     except ValueError as exc:
@@ -638,7 +657,9 @@ def expand(spec: SweepSpec, *, repo: Path = REPO_ROOT) -> list[Arm]:
         for point in points:
             assignment = dict(zip(grid_keys, point, strict=True))
             for seed in entry.seeds if entry.seeds is not None else spec.seeds:
-                arm = _expand_one(spec, entry, assignment, seed, rules, repo, len(arms))
+                arm = _expand_one(
+                    spec, entry, assignment, seed, rules, repo, len(arms), diagnostics
+                )
                 if arm.label in labels:
                     raise SpecError(f"duplicate arm label {arm.label!r}")
                 labels.add(arm.label)
@@ -666,6 +687,7 @@ def _expand_one(
     rules: RuleSet,
     repo: Path,
     position: int,
+    diagnostics: bool | None = None,
 ) -> Arm:
     label = f"{entry.name}{_grid_label(assignment)}/s{seed}"
     config_overrides = dict(assignment)
@@ -730,6 +752,8 @@ def _expand_one(
     protocol = protocol_params(
         dict(entry.protocol) if other else {**spec.protocol, **entry.protocol}
     )
+    if diagnostics is not None and hasattr(protocol, "diagnostics"):
+        protocol = protocol.model_copy(update={"diagnostics": diagnostics})
     timing = entry.timing if entry.timing is not None else spec.timing
     if isinstance(protocol, SpikeDiagnosticParams) and (family != "hsn" or not timing):
         raise SpecError(
@@ -766,14 +790,17 @@ def _expand_one(
                 "diag_windows": tuple((lo, hi) for lo, hi in windows),
             }
         )
+    # The diagnostics switch (execution-only: the identity above is the sampled arm's) leaves the
+    # rules nothing to read at a diagnostic step, and check_rules says so
+    sampled = bool(getattr(protocol, "diagnostics", True))
     cadence = Cadence.of(
         steps,
         cfg.train.eval_every,
-        diag_every,
+        diag_every if sampled else 0,
         protocol_sources(protocol),
         protocol.name,
-        dense_every=dense,
-        windows=windows,
+        dense_every=dense if sampled else 0,
+        windows=windows if sampled else [],
     )
     try:
         check_rules(rules, cadence, constants, family)

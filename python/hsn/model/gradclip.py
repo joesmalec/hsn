@@ -1,5 +1,10 @@
 """A6: per-row clipping of the gradient a position passes back into the recurrent state.
 
+**Status (10 Nov 2026): tested, not sufficient.** On the A5 recipe neither the absolute limit
+(exps 354, 355) nor the relative one (exp 364) removed the mid-run drops; the recipe that did is
+``train.feedback_detach`` (``docs/p1_18_a6_results.md``). The keys stay opt-in because those runs
+are in the experiment database. What follows is what the limit does and why it was tried.
+
 :func:`clip_row_grad` is the identity in the forward pass. In the backward pass it scales each
 batch row of the incoming gradient to at most ``limit`` in L2 norm: a row under the limit is
 returned as it came (no scaling), a row above it keeps its direction. :class:`~hsn.model.hsn.HSN`

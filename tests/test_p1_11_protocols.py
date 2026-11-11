@@ -247,3 +247,107 @@ def test_p1_11_dry_run_protocol(tmp_path: Path) -> None:
                 constants={},
             )
         )
+
+
+def test_diagnostics_switch_takes_no_sample_and_changes_no_training(
+    tiny_manifest: Path,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """``protocol.diagnostics: false`` (10 Nov 2026): no diagnostic sample during training
+    whatever the cadence says, the same training (losses, evaluations) step for step, and the
+    end-of-run state statistics and probes still there."""
+    on = run_protocol(_arm("hsn", tiny_manifest, tmp_path / "on", diag_stability=True))
+    off = run_protocol(
+        _arm("hsn", tiny_manifest, tmp_path / "off", diagnostics=False, diag_stability=True)
+    )
+    assert on["diagnostics_enabled"] is True and [d["step"] for d in on["diagnostics"]] == [2, 4, 6]
+    assert off["diagnostics_enabled"] is False and off["diagnostics"] == []
+    assert off["phases"]["diagnostics"] == [] and off["walls"]["diag_s"] == 0.0
+    assert [t["loss"] for t in off["train"]] == [t["loss"] for t in on["train"]]
+    assert [e["accuracy"] for e in off["evals"]] == [e["accuracy"] for e in on["evals"]]
+    assert off["final"] == on["final"]
+    assert off["trained_state"] == on["trained_state"] and off["probe"] == on["probe"]
+    assert len(on["phases"]["diagnostics"]) == 3 and len(on["phases"]["evaluate"]) == 3
+
+
+def test_diagnostics_switch_is_execution_only_and_rules_see_it(
+    tiny_manifest: Path,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """The switch keeps the arm's id (the training is the same), ``expand(diagnostics=...)``
+    (``enqueue --diagnostics on|off``) overrides the spec either way, and a rule that reads a
+    ``diag:`` value is refused when nothing will be sampled."""
+    from hsn.experiments.spec import SpecError, expand, load_spec
+    from p1_14_support import tiny_reads_state_spec
+
+    plain, _ = load_spec(tiny_reads_state_spec(tmp_path, tiny_manifest, name="plain"))
+    off, _ = load_spec(
+        tiny_reads_state_spec(tmp_path, tiny_manifest, name="off", protocol={"diagnostics": False})
+    )
+    arm_on, arm_off = expand(plain)[0], expand(off)[0]
+    assert arm_on.protocol.diagnostics is True and arm_off.protocol.diagnostics is False
+    assert arm_on.arm_id == arm_off.arm_id
+    assert expand(plain, diagnostics=False)[0].protocol.diagnostics is False
+    assert expand(off, diagnostics=True)[0].protocol.diagnostics is True
+    assert expand(plain, diagnostics=False)[0].arm_id == arm_on.arm_id
+    needs = {
+        "verdicts": {
+            "writes": {
+                "cases": [
+                    {
+                        "label": "writes",
+                        "when": {
+                            "metric": "diag:gate/p50",
+                            "steps": {"at": 2},
+                            "op": ">=",
+                            "value": 0.0,
+                        },
+                    }
+                ],
+                "default": "no",
+            }
+        }
+    }
+    with_rule, _ = load_spec(
+        tiny_reads_state_spec(tmp_path, tiny_manifest, name="ruled", rules=needs)
+    )
+    assert expand(with_rule)  # sampled: the rule has its step
+    with pytest.raises(SpecError):
+        expand(with_rule, diagnostics=False)
+
+
+def test_collector_is_frozen_only_for_compiled_runs_and_released(
+    tiny_manifest: Path,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """``protocol.gc_freeze``: an eager run never freezes; a compiled one (here: a trainer that
+    reports a compiled window) freezes after each evaluation and unfreezes when the fit ends."""
+    import gc
+
+    from hsn.experiments import protocols
+
+    before = gc.get_freeze_count()  # the interpreter may hold a few frozen objects of its own
+    eager = run_protocol(_arm("hsn", tiny_manifest, tmp_path / "eager"))
+    assert eager["gc_freezes"] == 0 and gc.get_freeze_count() == before
+
+    arm = _arm("hsn", tiny_manifest, tmp_path / "frozen")
+    callback = protocols._StepCallback(arm, None, audit_keys=False)
+    callback.gc_freeze = True
+
+    class Compiled:
+        compiled_window = object()
+
+    class Eager:
+        compiled_window = None
+
+    callback.freeze_collector(Eager())
+    assert callback.freezes == 0 and gc.get_freeze_count() == before
+    try:
+        callback.freeze_collector(Compiled())
+        assert callback.freezes == 1 and gc.get_freeze_count() > before + 1000
+    finally:
+        callback.release_collector()
+    assert gc.get_freeze_count() == 0
+    callback.gc_freeze = False
+    callback.freeze_collector(Compiled())
+    assert callback.freezes == 1 and gc.get_freeze_count() == 0

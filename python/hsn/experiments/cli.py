@@ -5,6 +5,7 @@
 
     expand   <spec>                      arms, labels, ids (no database)
     enqueue  <spec> [--force] [--skip-imported] [--only GLOB] [--mem-estimate-mib N]
+             [--diagnostics on|off]
     worker   [--max-concurrent 3] [--reserve-mib 1024] [--requeue-orphans] [--require-clean]
              [--exit-when-empty] [--poll 5] [--idle-gap 60] [--omp-threads 4] [--inductor-cache DIR]
     status   [--sweep NAME] [--recent 10]
@@ -72,6 +73,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-imported", action="store_true", help="skip arms with an imported run")
     p.add_argument("--only", default=None, help="only labels matching this glob")
     p.add_argument("--mem-estimate-mib", type=float, default=None, help="GPU memory reservation")
+    p.add_argument(
+        "--diagnostics",
+        choices=("on", "off"),
+        default=None,
+        help="in-training diagnostics of the queued arms (default: the spec's protocol)",
+    )
 
     p = sub.add_parser("worker", help="run the queue")
     p.add_argument("--max-concurrent", type=int, default=3)
@@ -250,7 +257,8 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     from hsn.experiments.spec import digest, expand, load_spec
 
     spec, text = load_spec(args.spec)
-    arms = expand(spec)
+    switch = None if args.diagnostics is None else args.diagnostics == "on"
+    arms = expand(spec, diagnostics=switch)
     if args.only:
         arms = [a for a in arms if fnmatch.fnmatch(a.label, args.only)]
         if not arms:
