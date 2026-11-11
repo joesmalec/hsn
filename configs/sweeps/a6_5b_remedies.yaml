@@ -158,6 +158,10 @@ arms:
     overrides:
       - train.soft_until_step=1000
       - hardware.window=fused
+  - name: fused_baseline # the recipe itself on the fused window: the control of fused_softwarm
+    family: hsn
+    overrides:
+      - hardware.window=fused
   - name: split_temp050
     family: hsn
     overrides:
