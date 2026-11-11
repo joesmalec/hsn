@@ -561,6 +561,31 @@ def test_fused_sweep_tape_is_the_split_sweeps_in_fp32(extra: tuple[str, ...], re
     assert fused_twins and all(twin.merged for twin in fused_twins)  # the merged products ran
 
 
+def test_permute_rows_has_index_selects_value_and_gradient() -> None:
+    """:func:`hsn.model.units.permute_rows` (the replay's two reorderings of the pairs): the
+    value and the gradient of ``index_select`` with a permutation, bit for bit, also through a
+    second differentiation."""
+    from hsn.model.units import permute_rows
+
+    g = torch.Generator().manual_seed(4)
+    x = torch.randn(23, 5, generator=g, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(23, 5, generator=g, dtype=torch.float64)
+    perm = torch.randperm(23, generator=g)
+    inverse = torch.empty_like(perm).scatter_(0, perm, torch.arange(23))
+
+    def grads(fn) -> tuple[Tensor, Tensor]:  # type: ignore[no-untyped-def]
+        out = fn(x)
+        (first,) = torch.autograd.grad((out.square() * weight).sum(), x, create_graph=True)
+        (second,) = torch.autograd.grad((first * weight).sum(), x)
+        return first.detach(), second
+
+    want = grads(lambda t: t.index_select(0, perm))
+    got = grads(lambda t: permute_rows(t, perm, inverse))
+    assert torch.equal(permute_rows(x, perm, inverse), x.index_select(0, perm))
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+    assert torch.equal(permute_rows(permute_rows(x, perm, inverse), inverse, perm), x)
+
+
 def test_forward_static_chosen_is_the_static_pass() -> None:
     """The fused sweep's unit pass (:meth:`UnitBank.forward_static_chosen`: every unit's first
     layer, then the chosen unit's activation and second layer only) returns the static pass's

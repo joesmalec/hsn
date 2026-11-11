@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from typing import Self
+from typing import Any, Self
 
 import torch
 from torch import Tensor, nn
@@ -65,6 +65,32 @@ def _check_versions(versions: Sequence[int] | None, n_units: int) -> list[int]:
     ):
         raise ValueError(f"versions must be {n_units} integers >= 1, got {versions!r}")
     return vs
+
+
+class _PermuteRows(torch.autograd.Function):
+    """:func:`permute_rows`."""
+
+    @staticmethod
+    def forward(ctx: Any, x: Tensor, perm: Tensor, inverse: Tensor) -> Tensor:
+        ctx.save_for_backward(inverse)
+        return x.index_select(0, perm)
+
+    @staticmethod
+    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor, None, None]:
+        (inverse,) = ctx.saved_tensors
+        return grad.index_select(0, inverse), None, None
+
+
+def permute_rows(x: Tensor, perm: Tensor, inverse: Tensor) -> Tensor:
+    """``x.index_select(0, perm)`` for a permutation ``perm`` of ``range(len(x))`` with its
+    inverse ``inverse`` (``inverse[perm] = arange``; neither is checked). The value is
+    ``index_select``'s. The backward takes the gradient's rows in the inverse order, a gather:
+    ``index_select``'s own backward adds every row into a tensor of zeros (``index_add``), which
+    for a permutation writes each row exactly once, so the gradients are equal bit for bit and
+    the scatter and the zero tensor are saved (P2.10: two ``[B·T·K, ·]`` reorderings per
+    window in the replay's grouped unit pass)."""
+    out: Tensor = _PermuteRows.apply(x, perm, inverse)
+    return out
 
 
 class UnitBank(nn.Module):
@@ -248,7 +274,9 @@ class UnitBank(nn.Module):
         the backward concatenates the units' input gradients once, where a slice per unit
         allocates and adds a full ``[P, 4d]`` tensor per present unit (eight 33 MB tensors for a
         B32/T256 window). One host read (the unit histogram); ``unit_idx`` must lie in
-        ``[0, M)`` (the caller's recorded decisions)."""
+        ``[0, M)`` (the caller's recorded decisions). The two reorderings are
+        :func:`permute_rows`: their backward gathers, where ``index_select``'s scatters each
+        ``[P, ·]`` gradient into a tensor of zeros."""
         if v.ndim != 2 or v.shape[1] != self.in_dim:
             raise ValueError(
                 f"forward_grouped expects v [P, {self.in_dim}], got shape {tuple(v.shape)}"
@@ -266,7 +294,10 @@ class UnitBank(nn.Module):
         if len(counts) != self.n_units:
             raise IndexError(f"unit_idx values must lie in [0, {self.n_units})")
         order = torch.argsort(idx, stable=True)
-        blocks = torch.split(v.index_select(0, order), counts)
+        inverse = torch.empty_like(order).scatter_(
+            0, order, torch.arange(n_pairs, device=order.device)
+        )
+        blocks = torch.split(permute_rows(v, order, inverse), counts)
         w1s = self.W1.unbind(0)
         b1s = self.b1.unbind(0)
         w2s = self.W2.unbind(0)
@@ -278,10 +309,7 @@ class UnitBank(nn.Module):
             hidden = self.act(torch.addmm(b1s[j], blocks[j], w1s[j]))
             outputs.append(torch.addmm(b2s[j], hidden, w2s[j]))
         out_sorted = torch.cat(outputs, dim=0)
-        inverse = torch.empty_like(order).scatter_(
-            0, order, torch.arange(n_pairs, device=order.device)
-        )
-        return out_sorted.index_select(0, inverse)
+        return permute_rows(out_sorted, inverse, order)
 
     def forward_static(
         self, v: Tensor, unit_idx: Tensor, *, w1_flat: Tensor | None = None
