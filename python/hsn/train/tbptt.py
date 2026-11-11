@@ -863,7 +863,11 @@ class TBPTTTrainer(Trainer):
                 # reset can be missing; a check against that same CPU mask would be the same
                 # expression. (On an accelerator forward cannot check them without the copy.)
                 reset_columns = window["reset"][:, :cut].any(dim=0).nonzero().flatten().tolist()
-                if stats_step and window_index == 0 and window_fn is not None:
+                # P2.10: a split window's terms sit on one eager autograd graph, which takes the
+                # retained per-term backwards itself (no extra pass of the autograd window, and
+                # no compile of it in a split run)
+                own_graph = window_fn is None or self._split is not None
+                if stats_step and window_index == 0 and not own_graph:
                     term_norms = self._compiled_term_norms(
                         fwd, state, reset_columns, probe, reference_cost
                     )  # P2.8: before the window's own forward pass, from the same start state
@@ -898,7 +902,7 @@ class TBPTTTrainer(Trainer):
                     )
                     terms = {**terms, "task": terms["task"] * task_weight}
                 total, parts = total_and_parts(terms)
-                if stats_step and window_index == 0 and window_fn is None:  # P2.4: one window
+                if stats_step and window_index == 0 and own_graph:  # P2.4: one window
                     scale = self.scaler.get_scale() if self.scaler is not None else 1.0
                     term_norms = grad_norm_report(
                         self.model, terms, scale=scale, precision=train.grad_norm_precision

@@ -20,6 +20,18 @@ from torch import Tensor, nn
 from hsn.config import UpdateLimitConfig
 
 
+def _root_sum_squares(tensors: list[Tensor]) -> Tensor:
+    """``sqrt(sum_i sum(t_i ** 2))``: the squares through one multi-tensor product, one sum per
+    tensor, then the sum of the sums (the order of the per-tensor loop)."""
+    return torch.stack([sq.sum() for sq in torch._foreach_mul(tensors, tensors)]).sum().sqrt()
+
+
+def _difference(left: list[Tensor], right: list[Tensor]) -> tuple[Tensor, ...]:
+    """``left[i] - right[i]`` for every pair, as one multi-tensor op."""
+    result: tuple[Tensor, ...] = torch._foreach_sub(left, right)
+    return result
+
+
 class UpdateLimiter:
     def __init__(self, model: nn.Module, config: UpdateLimitConfig) -> None:
         self.config = config
@@ -64,11 +76,16 @@ class UpdateLimiter:
 
     @torch.no_grad()
     def apply(self) -> None:
+        # P2.10: the elementwise steps of a group go through torch's multi-tensor ops (the same
+        # operation per element, in the same order; tests/test_p2_10_trainer_speed.py compares
+        # them bit for bit with the per-tensor loop); the reductions stay one sum per tensor.
         for index, (group, entries) in enumerate(self.groups.items()):
-            old_norm = torch.stack([old.square().sum() for _, _, old in entries]).sum().sqrt()
+            params: list[Tensor] = [p for _, p, _ in entries]
+            olds = [old for _, _, old in entries]
+            old_norm = _root_sum_squares(olds)
             denom = old_norm.clamp_min(self.config.norm_floor)
-            deltas = [p - old for _, p, old in entries]
-            norm = torch.stack([delta.square().sum() for delta in deltas]).sum().sqrt()
+            deltas = list(_difference(params, olds))
+            norm = _root_sum_squares(deltas)
             reference = denom
             if group in self.initial_norms:
                 ceiling = self.initial_norms[group] * self.config.norm_growth_limits[group]
@@ -76,11 +93,14 @@ class UpdateLimiter:
             radius = reference * self.config.groups[group].max_ratio
             scale = radius / norm.clamp_min(radius)
             clipped = norm > radius
-            for (_, p, old), delta in zip(entries, deltas, strict=True):
-                # The where preserves the exact optimizer result when no projection is needed.
-                p.copy_(torch.where(clipped, old + delta * scale, p))
+            projected = torch._foreach_add(olds, list(torch._foreach_mul(deltas, scale)))
+            # The where preserves the exact optimizer result when no projection is needed.
+            torch._foreach_copy_(
+                params,
+                [torch.where(clipped, new, p) for new, p in zip(projected, params, strict=True)],
+            )
             proposed = norm / denom
-            actual = torch.stack([(p - old).square().sum() for _, p, old in entries]).sum().sqrt()
+            actual = _root_sum_squares(list(_difference(params, olds)))
             applied = actual / denom
             self.counts[index].add_(clipped)
             self.max_proposed[index] = torch.maximum(self.max_proposed[index], proposed)

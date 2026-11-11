@@ -8,6 +8,7 @@ MPS reductions and scaling use the CPU because MPS does not support float64.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -44,14 +45,25 @@ def clip_grad_norm_(
     if precision == "native":
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
     gradients = [p.grad for p in parameters if p.grad is not None]
-    total = norm_float64(gradients)
-    if not bool(torch.isfinite(total)):
+    if not gradients:
+        return torch.zeros((), dtype=torch.float64)
+    # P2.10: the float64 copies are made once (the norm and the scaling read the same ones),
+    # and the one host read decides both early returns. The values are those of the two-pass
+    # version, bit for bit (tests/test_p2_10_trainer_speed.py).
+    wides = [_wide(g) for g in gradients]
+    norms = [torch.linalg.vector_norm(w) for w in wides]
+    total: Tensor = torch.linalg.vector_norm(torch.stack([n.to(norms[0].device) for n in norms]))
+    value = float(total)
+    if not math.isfinite(value):
+        return total
+    if max_norm / (value + 1e-6) >= 1.0:  # the coefficient clamps to exactly 1: nothing changes
         return total
     coefficient = (max_norm / (total + 1e-6)).clamp(max=1.0)
-    for gradient in gradients:
-        wide = _wide(gradient)
+    for gradient, wide in zip(gradients, wides, strict=True):
         # Do not cast coefficient to the original dtype before multiplying.
-        product = wide * coefficient.to(wide.device)
-        # Cast on the computation device first, so MPS never receives a float64 tensor.
-        gradient.copy_(product.to(dtype=gradient.dtype))
+        product = wide.mul_(coefficient.to(wide.device))
+        if wide.device != gradient.device:
+            # Cast on the computation device first, so MPS never receives a float64 tensor.
+            product = product.to(dtype=gradient.dtype)
+        gradient.copy_(product)
     return total
