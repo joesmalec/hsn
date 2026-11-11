@@ -32,7 +32,9 @@ P1.16 added:
   routing follows the key;
 - `probe-rerun --weights dump` (a failed run's divergence dump) and `--key-alphabet train` (a diagnostic remap of
   the dev keys), and `replay --continue-steps` with a remedy;
-- [the HSN recipe file](#recipes) `configs/experiments/hsn_recipe_b095.yaml` (AdamW β2 0.95);
+- [the HSN recipe files](#recipes): `configs/experiments/hsn_recipe_a6.yaml` (the standard recipe since 11 Nov:
+  the routed HSN with amendment A6 and the route guard) and `hsn_recipe_b095.yaml` (AdamW β2 0.95, the specs
+  before it);
 - [the preset](#rules) `memory_writes_run` (the written gates' 90th percentile and the cell's update ratio, each in
   some window of the run), calibrated on the stored runs;
 - a first open's switch to WAL retries "database is locked".
@@ -693,9 +695,29 @@ so that "follows trained keys" and "follows keys never seen" can be told apart. 
 
 ### Recipes
 
-New HSN specs start from `configs/experiments/hsn_recipe_b095.yaml` (P1.16, the user's decision of 8 Nov): HSN
-d=64 + A4 (`model.cand_norm=rms`), delayed/in_range, B32, WSD 0.2 over 9,000 steps at lr 2e-3, warm-up 200, clip
-1.0, the spike guard at 1e4 and **AdamW β2 0.95**.
+**New HSN specs start from `configs/experiments/hsn_recipe_a6.yaml`** (P1.18, the user's decision of 11 Nov):
+the routed HSN of amendment A5 (top-K routing, key addresses, selected-cell readout; d=64 + A4), delayed/in_range,
+B32, WSD 0.2 over 9,000 steps at lr 2.5e-3, warm-up 200, clip 1.0, AdamW β2 0.95, with amendment A6's four parts:
+the feedback cut (`train.feedback_detach`), exp 346's update caps (`train.update_limit`), the weight average
+(`train.weight_ema=0.99`) and the route guard (`train.route_guard.enabled=true`). No spike guard and no rollback.
+
+```yaml
+base:
+  config: configs/experiments/hsn_recipe_a6.yaml
+  overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead]
+```
+
+- With these two overrides it resolves to the configuration of exps 421 to 426, so its arms have their arm ids;
+  with `train.route_guard.enabled=false` they are the arms of exps 375 to 377 and 418 to 420
+  (`configs/sweeps/example_p1_18.yaml`, `tests/test_p1_18_recipe.py`).
+- Nine runs at 9,000 steps: 87.2 % dev on held-out keys (78.5 to 95.6) and a fall of ten points or more in one
+  run, against 83.9 % and seven runs without the guard and 76.7 to 79.3 % for gru_2m
+  (`docs/p1_18_a6_results.md`). The sag is reduced, not removed; only the delayed task was run.
+- Every part is opt-in in the code: no default changed, and the earlier recipe file is as it was.
+
+**The earlier recipe**, `configs/experiments/hsn_recipe_b095.yaml` (P1.16, the user's decision of 8 Nov), is the
+base of every spec before 11 Nov: the dense HSN d=64 + A4 (`model.cand_norm=rms`), delayed/in_range, B32, WSD 0.2
+over 9,000 steps at lr 2e-3, warm-up 200, clip 1.0, the spike guard at 1e4 and **AdamW β2 0.95**.
 
 ```yaml
 base:
@@ -1010,7 +1032,8 @@ all opt-in, omitted from arm identity at their defaults, forward values unchange
 The recipe that held on three seeds is the cut with exp 346's anchored update caps
 (`configs/sweeps/p1_18_a6_seeds.yaml`, arm `carry_anchored`). With A4 it learns faster and ends
 higher but sags mid-run (`p1_18_a6_ema`, arm `a4_ema99`); the route guard is for that
-(`p1_18_a6_guard2`, `p1_18_a6_guard_9k`).
+(`p1_18_a6_final_seeds`, `p1_18_a6_final_guard_seeds`). All of it together is the standard recipe
+file since 11 Nov, `configs/experiments/hsn_recipe_a6.yaml` ([Recipes](#recipes)).
 
 A `train.weight_ema` run's record carries `weight_ema` and `training_weights_final`; its
 checkpoints hold the training weights in `model` and the average in `extra["weight_ema"]`

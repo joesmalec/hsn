@@ -17,6 +17,11 @@ runs on the same seeds end at 78.5 to 95.6 % (mean 87.2 %; exps 421 to 426, 430 
 them with such a sag. The tested recipe is therefore the cut, the anchored caps, A4,
 `train.weight_ema=0.99` and the route guard at its defaults; each part is opt-in.
 
+**Adopted as the standard recipe for new HSN specs on 11 Nov 2026 (the user's decision):**
+`configs/experiments/hsn_recipe_a6.yaml`, which resolves to the configuration of exps 421 to 426
+(`docs/sweeps.md`, "Recipes"). The code's defaults are unchanged: a configuration that does not
+name these keys trains as before.
+
 Two further keys of the same family, `train.state_grad_ratio` and `train.state_grad_clip`, are
 described at the end. They were tested and **do not remove the drops**; they are not part of the
 recommended recipe.
@@ -207,7 +212,10 @@ without the guard (`test_a_quiet_guard_changes_no_training_step`), the state is 
       min_usage: 0.001      # no event while established routes hold less of all slots
       reduce_factor: 0.5    # the gaining unit's step scale, per event
       min_scale: 0.015625   # ... down to this
-      restore: false        # also rewind the gaining unit's rows one reading (tested: worse)
+
+(A `restore` key, which also rewound the gaining unit's rows by one reading, existed on 10 and 11
+Nov and was removed: exp 400 ended at 77.9 % against 90.3 % for the guard alone. A stored
+configuration with `restore: false` still loads and keeps its hash.)
 
 **What it watches, precisely.** The units that serve the supervised positions are read from the
 loss mask (units with at least `specialised` of the slots at loss positions); in every run
@@ -231,6 +239,14 @@ that takes a route and does nothing about the units that lose it un-learning it,
 erosion remains (5 to 9 points on four of six seeds; visible over 27,000 steps). Tested on one
 task, where the supervised positions are a query's key. Two earlier versions did not work (exps
 396 to 398, 402 to 404) and are described in the results.
+
+**Open: the remaining erosion.** Left for now by the user's decision of 11 Nov; what to try is
+in `docs/p1_18_a6_results.md`, section 5b. In short: the router's proposed step is about ten times
+its cap, so it moves at a fixed pace whatever its gradient, and the units that lose a route also
+un-learn it. The proposal is to measure which gradient term does the un-learning, to try the
+existing straight-through temperature and exploration controls, and then an amendment that makes
+the router's applied step follow the size of its gradient (or bounds each unit's score row), so
+that a learned route stops moving. None of it has been run.
 
 ## Related: `model.address_init` (A5 extension, diagnostic)
 

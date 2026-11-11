@@ -23,6 +23,12 @@ the delayed task, B32, compiled, unguarded: no spike guard, no rollback, every d
 4. *The GPU pauses* were the diagnostics and probes running eager forwards, and Python's garbage
    collector; both are fixed (section 4).
 
+**Decided on 11 Nov 2026 (the user).** (1) The recipe with the route guard is the standard recipe
+for new HSN specs: `configs/experiments/hsn_recipe_a6.yaml` (`docs/sweeps.md`, "Recipes"). Every
+part stays opt-in in the code and no default changed. (2) The erosion that remains with the guard
+is left for now; what to try next is written down in section 5b. (3) The guard's `restore` option
+was removed (it was worse in its runs, exps 397 and 400).
+
 | 9,000 steps, delayed task, dev (held-out keys) | Final dev | Later queries | Worst drop during the run |
 | --- | ---: | ---: | ---: |
 | Before: anchored caps, full backpropagation (exps 343 / 326 / 346, seeds 0 / 1 / 2) | 73.8 / 78.2 / 77.5 % | 57.8 / 60.2 / 62.5 % | 12.0 / 4.8 / 36.9 pp |
@@ -407,12 +413,15 @@ step 2,500 and the readings still showed its share creeping up, because the unit
 route also un-learn it (their weight on the previous byte's address is pushed through zero, exps
 375 and 376), which slowing the taker cannot stop. An event that comes while the route is still
 forming slows that run (exps 414 and 415 at 5k: 55 % and 77 % at step 3,500 before catching up).
-The `restore` option (rewinding the gaining unit's rows) was worse in the one run that tried it
-(exp 400: 77.9 %). Runs are not bit-reproducible on this card and the variation between two runs
+A `restore` option (also rewinding the gaining unit's rows by one reading) was worse in the one
+run of this version that tried it (exp 400: 77.9 % at step 5,000 against 90.3 % for the guard
+alone, exp 399) and was removed on 11 Nov; a stored configuration that has it switched off still
+loads, hashes and resumes as before. Runs are not bit-reproducible on this card and the variation between two runs
 of one configuration is several points (seed 1 with the second version: 90.3 % at step 5,000 in
 exp 399, a 20-point dip in exp 403; with this version 93.3 % and 78.5 %, exps 422 and 431), so
 the nine-run comparison above is an indication, not a proof. The guard is opt-in and off by
-default.
+default in the code; the standard recipe file `configs/experiments/hsn_recipe_a6.yaml` switches
+it on.
 
 ## 4. The GPU pauses
 
@@ -484,7 +493,8 @@ compile of a run is unchanged.
   points late in the constant-rate phase. The guard slows the unit that takes the value routes; the
   units that lose them also un-learn them (their weight on the previous byte's address is pushed
   through zero), and nothing here addresses that. A change to how the router is trained (the
-  selection gradient, or the competition between units) would be an amendment of its own.
+  selection gradient, or the competition between units) would be an amendment of its own: section
+  5b.
 - **Seeds and repeats.** Nine runs with and nine without the guard (six seeds, three of them
   twice). Execution is not bit-reproducible on this card and two runs of one configuration differ
   by up to 15 points, so the 3.3-point difference of the means rests on the count of sags (one of
@@ -508,6 +518,55 @@ compile of a run is unchanged.
   Transformer, with 2.1 GB against 0.7 GB of GPU memory. The guard and the weight average add no
   measurable step time (0.292 s with three arms on the card, with and without).
 
+## 5b. The remaining erosion: what to try next (noted, not implemented)
+
+The user's decision of 11 Nov: the guard stays as it is for now and the fix is written down here.
+Nothing in this section has been run.
+
+**What remains with the guard.** One run of nine still fell 13.7 points (exp 431); four of six
+seeds slide 5 to 9 points late in the constant-rate phase; over 27,000 steps the value routes
+erode slowly while the rate is constant (exp 417: 95.4 % at step 10,000, 88.1 % at 15,500); six
+of the nine 9k runs end "partial" on the binding verdict.
+
+**Why the guard does not finish the job.**
+
+1. *The router moves at a fixed pace whatever its gradient.* Its proposed AdamW step is about ten
+   times its update cap (section 3d), so the step it takes is the cap, on every step. The reader
+   unit's address weight therefore grows at a steady pace for a whole run (0.11 → 0.55, 0.13 →
+   0.62), and neither a lower rate nor a loss-triggered rate cut changes that. (Inference, not
+   measured: AdamW divides a gradient by its own running size, so a small gradient that keeps its
+   sign is a full-size proposal; a route that is already learned keeps being pushed.)
+2. *The guard acts late and on one unit.* It halves the reader's step once the worst-hit routes
+   have already lost a tenth, and at its floor (1/64) the reader still moves.
+3. *The units that lose a route un-learn it.* Their weight on the previous byte's address is
+   pushed through zero (exps 375, 376), also while the reader is at the floor (seed 0). Which
+   term of the gradient does that has not been measured.
+4. *Not all of it is the router.* With the whole router held still from step 1,500 of exp 376 the
+   run still goes from about 82 % to 74.9 % by step 3,250 (the original is at 63.5 % by step
+   3,000).
+
+**What to try, in this order.**
+
+1. *Measure first* (read-only, on the kept checkpoints of exps 376, 421 and 417): the gradient on
+   the scorer's address columns per unit and per kind of position between steps 1,500 and 4,000,
+   to name the term behind point 3; and what changes in the cells while the router is held still
+   (point 4).
+2. *Configuration only:* the routing controls of P2.2 that keep a gradient on the units that are
+   not selected, a straight-through temperature above 1 (`train.temperature_*`) and exploration
+   (`train.epsilon_*`), on three seeds to step 5,000 against exps 413 to 415.
+3. *The amendment* (a change to how the router is trained; opt-in, the forward pass unchanged):
+   make the router's applied step follow the size of its gradient, so that a learned route stops
+   moving. Two candidate forms: (a) the router group's capped step scaled by its current gradient
+   norm relative to a reference taken while the routes form, never above 1; (b) a ceiling on the
+   norm of each unit's row of the scorer's output layer, so that no unit out-scores the others by
+   growing. Either is a bound that holds from the first step, in place of the guard's halving
+   after the fact; the guard's readings stay as the measurement.
+
+**What would count as fixed:** on the nine-run comparison of section 3e no run with a fall of ten
+points or more and a worst drawdown under 5 points; the binding verdict passed by most runs; and
+over 27,000 steps no erosion through the constant-rate phase (later queries above exp 417's
+83.5 %).
+
 ## 6. Reproduce
 
 ```bash
@@ -522,6 +581,9 @@ python scripts/gpu_phase_report.py --exp 346 --exp 360 --exp 416
 python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_final_seeds.yaml --mem-estimate-mib 3000
 python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_ema.yaml --only "a4_ema99/*"
 python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_final_27k.yaml      # 27k, alone on the card
+
+# a new spec on the standard recipe (it expands to the arms above, with the same arm ids)
+python -m hsn.experiments expand configs/sweeps/example_p1_18.yaml
 ```
 
 Read-only probes used above (`/home/joe/hsn-experiments/a5-fix/`): `wobble.py` (movement between
@@ -530,9 +592,12 @@ checkpoint), `probe/address_columns.py` (the scorer's address weights), `probe/f
 (a run resumed with the router held still), `guard_state.py` (the guard's events in a
 checkpoint), `plot_curves.py` (the figure).
 
-Checks on the branch tip: 1,162 CPU tests pass with the card hidden (145 device skips) and all
+Checks on the branch tip: 1,168 CPU tests pass with the card hidden (145 device skips) and all
 92 CUDA-marked tests pass on the card (the default-training golden, the compiled window and the
 A5 tests among them); ruff, ruff-format and mypy clean. Every new key is left out of the
 configuration hash at its default. The suite used to depend on test order when the CUDA tests
 were skipped (a test file left `train.deterministic` switched on for the tests after it);
-`tests/conftest.py` now restores those switches after every test.
+`tests/conftest.py` now restores those switches after every test. After the `restore` option was
+removed, a kept checkpoint of a guarded run written before the removal (exp 421, step 4,000) was
+resumed with the new code and trained on for 300 steps: the same configuration hash, the guard's
+state loaded, the guard still firing.
