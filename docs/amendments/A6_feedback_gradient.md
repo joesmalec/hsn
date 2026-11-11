@@ -122,6 +122,40 @@ typical row's size through every earlier position of the window, and the router'
 state-gradient effect at all. The keys stay because those runs are in the database; they are off
 by default and not recommended.
 
+## Related: `train.weight_ema` (which weights are scored)
+
+Not an equation change and not a change to training: an exponential moving average of the weights
+(`hsn.train.weight_ema`), updated after every applied optimiser step,
+
+    avg ← d_n · avg + (1 − d_n) · w,    d_n = min(decay, (1 + n) / (10 + n))
+
+(the warm-up `d_n` makes the average follow the weights closely early in a run; it reaches `decay`
+after 890 steps at 0.99 and 4,490 at 0.998). A run with it takes the same optimiser steps, bit for
+bit on the CPU, as a run without it (`test_training_is_unchanged_and_the_evaluations_score_the_average`).
+What changes is which weights are *scored*:
+
+- `Trainer.evaluate` runs the averaged weights (swapped in place, so the compiled window sees
+  them, and swapped back bit for bit); `evaluate(..., averaged=False)` scores the training weights;
+- when a run ends the harness installs the average in the model, so the trained-state statistics
+  and the probes describe the model the evaluations scored; the record carries `weight_ema` and
+  `training_weights_final` (the training weights' own last evaluation, for comparison);
+- a checkpoint's `model` stays the training weights and its `extra["weight_ema"]` carries the
+  average, so a resume continues both exactly; `load_checkpoint(path, model, averaged=True)` is
+  the evaluation-only reader (probe-check, probe-rerun, split-backfill and the re-score of a failed
+  run use it). Loading a checkpoint without it gives the training weights, which score lower.
+
+Why: with the cut the recipe no longer collapses, but its dev accuracy still moves 1.8 to 3.0
+points from one evaluation to the next (0.4 for the GRU). Replaying exp 371 from step 15,000 with an
+evaluation every 100 steps (`a5-fix/probe/ema_probe.py`), the training weights scored 70.0 to
+83.2 % (mean 79.6 %, largest fall 10.8 points in 100 steps) and an average of them 83.5 to 86.4 %
+(mean 85.3 % at 0.99; 85.2 % at 0.998). The routed cell is a bank of hard switches, so a few
+optimiser steps move many routing and gate decisions at once; the average is the centre those
+steps move around. Results on the controlled seeds: `docs/p1_18_a6_results.md`, section 3b.
+
+Any model (the baselines accept it, and the comparison runs the GRU with it too). Buffers are not
+averaged. Left out of the configuration hash at its default (`null`); refused together with
+`train.rollback_every`, whose snapshots do not hold the average.
+
 ## Related: `model.address_init` (A5 extension, diagnostic)
 
 The start value of the scorer's two address columns (`a_cur`, `a_prev`) for every unit; they stay
