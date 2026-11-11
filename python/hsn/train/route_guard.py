@@ -1,46 +1,45 @@
-"""``train.route_guard``: act when an established minority route is being taken over (A6, opt-in).
+"""``train.route_guard``: act when an established route is being taken over (A6, opt-in).
 
-**The event.** In a routed HSN one router unit usually serves almost every position and a few
-units serve one kind of position each (on the delayed task: the positions where a fact's value is
-written, which is what binds a value to its key). The dominant unit's scores keep growing with
-training; when they overtake a specialised unit's at its positions, top-K hands those positions to
-the dominant unit, the specialised unit stops receiving a gradient there and cannot win them back,
-and the accuracy the route carried is lost (exps 375-377: 10 to 21 points; the binding overlap
-falls from 0.44-0.51 to 0.16-0.19). The takeover is abrupt for a position and not tied to a step
-count: it happened at steps 2,000 to 4,000 at one setting and at 2,700 or 3,500 at others.
+**The event.** In a routed HSN the router's units divide the positions between them: one or two
+serve the filler, one serves the positions where a query's key is read, and a few serve the
+positions where a fact's value is written, which is what binds a value to its key. The unit that
+reads the query keys keeps growing its weight on the current byte's address for a whole run,
+whatever the loss or the learning rate (exp 389: 0.13 to 0.62; its proposed step is about ten
+times the update cap, so a rate cut does not reach it), while the value units' weights level off
+once their route is learned. When its scores overtake theirs at the value positions, top-K hands
+it those positions, the value units stop receiving a gradient there and cannot win them back, and
+the accuracy the route carried is lost (exps 375-377: 10 to 21 points; binding overlap 0.44-0.51
+to 0.16-0.19). The takeover is not tied to a step count: it began at step 1,500, 2,500 or 3,100
+depending on the settings and the run.
 
 **The measurement** needs no knowledge of the task and no extra forward pass. From every training
 window the guard counts, per input byte ``b`` and unit ``u``, the selection slots ``u`` won at
-positions whose input is ``b``. Every ``interval`` applied steps it reads the counts of the
-interval::
+positions whose input is ``b``. Every ``interval`` applied steps it reads the interval's shares
+``p[b, u]`` (unit ``u``'s share of byte ``b``'s slots)::
 
-    dominant      = the unit with the most slots
-    minority[b]   = share of byte b's slots that are not the dominant unit's
-    established   = bytes whose reference minority share is at least ``specialised``
-    lost          = sum_b n[b] * max(0, reference[b] - minority[b]) / sum_b n[b] * reference[b]
-                    over the established bytes
+    reference[b, u]  = the largest share since the last event
+    established      = routes (b, u) whose share was at least ``specialised`` at ``persistence``
+                       consecutive readings (bytes with fewer than ``min_slots`` slots are left out)
+    lost[b]          = sum_u max(0, reference - p) / sum_u reference          (established routes)
+    lost             = the mean of lost[b] over the quarter of the bytes that lost most
+    gain[u]          = sum over those bytes of n[b] * max(0, p[b, u] - p_previous[b, u])
 
-``reference[b]`` is the largest minority share byte ``b`` has had since the last event, and a
-byte is established once its minority share has been at least ``specialised`` at ``persistence``
-consecutive readings. A change of the dominant unit starts a new reference.
+(a kind of position is a group of input bytes: the values are a quarter to a third of the bytes
+in use and two per cent of the slots, so a slot-weighted total would not see their routes go).
 
-At the start of a run the dominant unit absorbs most positions while the loss falls: that is
-learning. So a reading is an event only if training is no longer improving: the interval's mean
-training loss is above the lowest interval mean so far by ``loss_rise``.
+At the start of a run the units sort the positions out while the loss falls: that is learning.
+So a reading is an event only if training is no longer improving: the interval's mean training
+loss is above the lowest interval mean so far by ``loss_rise``.
 
-**The response** is on the unit that is taking the positions over. The dominant unit's weight
-on the current byte's address grows at a steady pace for a whole run, whatever the loss is (exp
-389: 0.20 to 0.62), while a specialised unit stops growing once its route is learned; a learning
-rate cut does not touch this, because the router's proposed step is about ten times its update
-cap. So when ``lost >= lost_fraction`` the guard multiplies the *applied* step of the dominant
-unit's rows of the scorer's output layer by ``reduce_factor`` (never below ``min_scale``): from
-then on every update of those rows is ``old + scale * (new - old)``, after the optimiser step and
-the caps. The other units keep their full step, so an established route can go on strengthening.
-With ``restore`` the dominant unit's rows are also put back to their values at the last check at
-which less than half of ``lost_fraction`` was lost, which undoes the takeover instead of only
-slowing the next one (every other weight is kept: a rejected step of one router row, not a
-rollback of the run). The reference then restarts from the current usage (or stays, with
-``restore``).
+**The response** is on the unit that gained the most of what the established routes lost. Its
+*applied* step on its rows of the scorer's output layer is multiplied by ``reduce_factor`` (never
+below ``min_scale``): from then on every update of those rows is ``old + scale * (new - old)``,
+after the optimiser step and the caps. The other units keep their full step, so an established
+route can go on strengthening. With ``restore`` the gaining unit's rows are also put back to
+their values at the previous reading (one interval earlier, never further: an older snapshot
+would take back what the unit has learned since); every other weight is kept: a rejected step of
+one router row, not a rollback of the run. After an event the reference restarts from the current
+shares (or stays, with ``restore``).
 
 Nothing is skipped and no document is dropped; a run in which no event fires trains exactly as
 without the guard. Every event is recorded (:meth:`RouteGuard.report`) and the state is part of
@@ -61,30 +60,42 @@ __all__ = ["RouteGuard", "lost_usage"]
 
 
 def lost_usage(
-    counts: Tensor, reference: Tensor, specialised: float, settled: Tensor | None = None
-) -> tuple[float, float, Tensor, int]:
-    """``(lost, usage, minority, dominant)`` of one interval's ``counts [V, U]`` against
-    ``reference [V]`` (module docstring). ``usage`` is the minority share of all slots; ``lost``
-    is 0 when no byte is established. ``settled`` (bool ``[V]``) restricts the established bytes
-    to those whose minority share has persisted."""
+    counts: Tensor,
+    reference: Tensor,
+    established: Tensor,
+    min_slots: int = 1,
+    previous: Tensor | None = None,
+) -> tuple[float, float, Tensor, int | None]:
+    """``(lost, usage, shares, gaining unit)`` of one interval's ``counts [V, U]`` against
+    ``reference [V, U]`` over the ``established [V, U]`` routes of the bytes with at least
+    ``min_slots`` slots (module docstring). ``usage`` is those routes' reference share of all
+    slots; ``lost`` is 0 and the unit None when no established route lost a slot. The gaining
+    unit is the one whose share of the losing bytes grew most since ``previous`` (the last
+    reading's shares; the reference when not given)."""
     counts = counts.to(torch.float64)
     per_byte = counts.sum(dim=1)
     total = float(per_byte.sum())
-    dominant = int(counts.sum(dim=0).argmax())
-    minority = torch.where(
-        per_byte > 0,
-        1.0 - counts[:, dominant] / per_byte.clamp_min(1.0),
-        torch.zeros_like(per_byte),
+    shares = torch.where(
+        per_byte[:, None] > 0, counts / per_byte[:, None].clamp_min(1.0), torch.zeros_like(counts)
     )
-    usage = float((per_byte * minority).sum() / total) if total > 0 else 0.0
-    established = (reference >= specialised) & (per_byte > 0)
-    if settled is not None:
-        established = established & settled
-    base = float((per_byte * reference)[established].sum())
-    if base <= 0.0:
-        return 0.0, usage, minority, dominant
-    gone = float((per_byte * (reference - minority).clamp_min(0.0))[established].sum())
-    return gone / base, usage, minority, dominant
+    live = established & (per_byte[:, None] >= min_slots)
+    base = (reference * live).sum(dim=1)  # per byte: the established routes' reference share
+    usage = float((per_byte * base).sum() / total) if total > 0 else 0.0
+    held = base > 0
+    n_held = int(held.sum())
+    if n_held == 0:
+        return 0.0, usage, shares, None
+    drop = ((reference - shares).clamp_min(0.0) * live).sum(dim=1)
+    relative = torch.where(held, drop / base.clamp_min(1e-12), torch.zeros_like(drop))
+    worst = relative.topk(max(1, -(-n_held // 4)))  # the quarter of the bytes that lost most
+    lost = float(worst.values.mean())
+    if lost <= 0.0:
+        return 0.0, usage, shares, None
+    rows = worst.indices[worst.values > 0]
+    before = reference if previous is None else previous
+    gain = (per_byte[rows, None] * (shares[rows] - before[rows]).clamp_min(0.0)).sum(dim=0)
+    unit = int(gain.argmax()) if float(gain.max()) > 0.0 else None
+    return lost, usage, shares, unit
 
 
 class RouteGuard:
@@ -109,13 +120,13 @@ class RouteGuard:
         self.counts = torch.zeros(vocab * n_units, dtype=torch.int64, device=device)
         #: the applied-step scale of every unit's rows (1: untouched)
         self.scale = torch.ones(n_units, dtype=self.params[0].dtype, device=device)
-        self.reference: Tensor | None = None  # [V] float64, CPU
-        #: per byte, the consecutive readings with a minority share of at least `specialised`
-        self.streak = torch.zeros(vocab, dtype=torch.int64)
+        self.reference = torch.zeros(vocab, n_units, dtype=torch.float64)  # CPU
+        self.previous = torch.zeros(vocab, n_units, dtype=torch.float64)  # the last reading
+        #: per (byte, unit), the consecutive readings with a share of at least `specialised`
+        self.streak = torch.zeros(vocab, n_units, dtype=torch.int64)
         self.best_loss: float | None = None  # the lowest interval mean of the training loss
         self._loss_sum = 0.0
         self._loss_n = 0
-        self.dominant: int | None = None
         self.checks = 0
         self.events: list[dict[str, Any]] = []
         self.last: dict[str, Any] | None = None
@@ -180,39 +191,38 @@ class RouteGuard:
             self.best_loss = loss if self.best_loss is None else min(self.best_loss, loss)
         if int(counts.sum()) == 0:
             return None
-        if self.reference is None:
-            self.reference = torch.zeros(self.vocab, dtype=torch.float64)
-        settled = self.streak >= self.cfg.persistence
-        lost, usage, minority, dominant = lost_usage(
-            counts, self.reference, self.cfg.specialised, settled
+        established = (self.streak >= self.cfg.persistence) & (
+            self.reference >= self.cfg.specialised
         )
+        lost, usage, shares, unit = lost_usage(
+            counts, self.reference, established, self.cfg.min_slots, self.previous
+        )
+        self.previous = shares.clone()
         self.last = {
             "step": step,
             "lost": lost,
-            "minority_usage": usage,
-            "dominant": dominant,
+            "established_usage": usage,
+            "gaining_unit": unit,
             "loss": loss,
             "worse": worse,
         }
-        if self.dominant is None or dominant != self.dominant:
-            # another unit serves most positions now: what "minority" means has changed
-            self.dominant = dominant
-            self.reference = minority.clone()
-            self.streak.zero_()
-            self._set_anchor(step)
-            return None
         self.streak = torch.where(
-            minority >= self.cfg.specialised, self.streak + 1, torch.zeros_like(self.streak)
+            shares >= self.cfg.specialised, self.streak + 1, torch.zeros_like(self.streak)
         )
-        if worse and lost >= self.cfg.lost_fraction and usage >= self.cfg.min_usage:
-            before = float(self.scale[dominant])
+        if (
+            worse
+            and unit is not None
+            and lost >= self.cfg.lost_fraction
+            and usage >= self.cfg.min_usage
+        ):
+            before = float(self.scale[unit])
             after = max(before * self.cfg.reduce_factor, self.cfg.min_scale)
-            self.scale[dominant] = after
+            self.scale[unit] = after
             event = {
                 "step": step,
-                "unit": dominant,
+                "unit": unit,
                 "lost": lost,
-                "minority_usage": usage,
+                "established_usage": usage,
                 "loss": loss,
                 "best_loss": self.best_loss,
                 "scale_before": before,
@@ -221,15 +231,14 @@ class RouteGuard:
             }
             if self.cfg.restore:
                 for p, anchor in zip(self.params, self._anchor, strict=True):
-                    p[dominant].copy_(anchor[dominant])
+                    p[unit].copy_(anchor[unit])
             else:
-                self.reference = minority.clone()
+                self.reference = shares.clone()
                 self._set_anchor(step)
             self.events.append(event)
             return event
-        if lost < 0.5 * self.cfg.lost_fraction:
-            self._set_anchor(step)
-        self.reference = torch.maximum(self.reference, minority)
+        self._set_anchor(step)  # the previous reading's rows: what a restore goes back to
+        self.reference = torch.maximum(self.reference, shares)
         return None
 
     def _set_anchor(self, step: int) -> None:
@@ -251,12 +260,12 @@ class RouteGuard:
         return {
             "counts": self.counts.detach().to(device="cpu", copy=True),
             "scale": self.scale.detach().to(device="cpu", copy=True),
-            "reference": None if self.reference is None else self.reference.clone(),
+            "reference": self.reference.clone(),
+            "previous": self.previous.clone(),
             "streak": self.streak.clone(),
             "best_loss": self.best_loss,
             "loss_sum": self._loss_sum,
             "loss_n": self._loss_n,
-            "dominant": self.dominant,
             "checks": self.checks,
             "events": [dict(e) for e in self.events],
             "last": dict(self.last) if self.last is not None else None,
@@ -283,17 +292,24 @@ class RouteGuard:
             raise ValueError(f"{path}: route_guard state does not fit this model")
         self.counts.copy_(counts.to(self.counts.device))
         self.scale.copy_(scale.to(device=self.scale.device, dtype=self.scale.dtype))
-        reference = state.get("reference")
-        self.reference = None if reference is None else reference.to(torch.float64).clone()
-        streak = state.get("streak")
-        if not isinstance(streak, Tensor) or tuple(streak.shape) != tuple(self.streak.shape):
+        reference, streak = state.get("reference"), state.get("streak")
+        if (
+            not isinstance(reference, Tensor)
+            or tuple(reference.shape) != tuple(self.reference.shape)
+            or not isinstance(streak, Tensor)
+            or tuple(streak.shape) != tuple(self.streak.shape)
+        ):
             raise ValueError(f"{path}: route_guard state does not fit this model")
+        self.reference = reference.to(torch.float64).clone()
+        previous = state.get("previous")
+        if not isinstance(previous, Tensor) or tuple(previous.shape) != tuple(reference.shape):
+            raise ValueError(f"{path}: route_guard state does not fit this model")
+        self.previous = previous.to(torch.float64).clone()
         self.streak = streak.to(torch.int64).clone()
         best = state.get("best_loss")
         self.best_loss = None if best is None else float(best)
         self._loss_sum = float(state.get("loss_sum", 0.0))
         self._loss_n = int(state.get("loss_n", 0))
-        self.dominant = state.get("dominant")
         self.checks = int(state["checks"])
         self.events = [dict(e) for e in state.get("events", [])]
         last = state.get("last")

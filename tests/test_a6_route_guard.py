@@ -45,7 +45,7 @@ def _guard(**settings: object) -> tuple[RouteGuard, _Router]:
     router = _Router()
     cfg = RouteGuardConfig(
         enabled=True,
-        **{"persistence": 1, "loss_rise": 0.0, **settings},  # type: ignore[arg-type]
+        **{"persistence": 1, "loss_rise": 0.0, "min_slots": 1, **settings},  # type: ignore[arg-type]
     )
     return RouteGuard(router, cfg, n_units=3, vocab=4), router
 
@@ -61,6 +61,8 @@ def _feed(guard: RouteGuard, table: list[list[int]], loss: float | None = None) 
 INTACT = [[1000, 0, 0], [20, 80, 0], [0, 0, 0], [0, 0, 0]]
 #: the dominant unit has taken half of byte 1's minority slots
 TAKEN = [[1000, 0, 0], [60, 40, 0], [0, 0, 0], [0, 0, 0]]
+#: ... and then half of the rest
+MORE = [[1000, 0, 0], [80, 20, 0], [0, 0, 0], [0, 0, 0]]
 
 
 def test_default_is_off_and_keeps_the_hash() -> None:
@@ -75,17 +77,26 @@ def test_default_is_off_and_keeps_the_hash() -> None:
         hsn_config(4, ON)  # dense routing has no routes to guard
 
 
-def test_lost_usage_counts_established_bytes_only() -> None:
-    reference = torch.tensor([0.01, 0.8, 0.0, 0.0], dtype=torch.float64)
-    lost, usage, minority, dominant = lost_usage(torch.tensor(TAKEN), reference, 0.25)
-    assert dominant == 0
-    assert minority.tolist() == pytest.approx([0.0, 0.4, 0.0, 0.0])
-    assert lost == pytest.approx(0.5)  # byte 1 kept half of its 80 %; byte 0 is not established
-    assert usage == pytest.approx(40 / 1100)
+def test_lost_usage_reads_the_established_routes_of_the_bytes_that_lost_most() -> None:
+    reference = torch.tensor([[1.0, 0, 0], [0.2, 0.8, 0], [0, 0, 0], [0, 0, 0]]).double()
+    established = reference >= 0.25  # the filler on unit 0, byte 1 on unit 1
+    lost, usage, shares, unit = lost_usage(torch.tensor(TAKEN), reference, established)
+    assert shares[1].tolist() == pytest.approx([0.6, 0.4, 0.0])
+    assert lost == pytest.approx(0.5)  # byte 1's route kept half of its 80 %; the filler none lost
+    assert unit == 0  # the unit that took byte 1's slots
+    assert usage == pytest.approx((1000 * 1.0 + 100 * 0.8) / 1100)
     # nothing established: no loss, whatever moved
-    assert lost_usage(torch.tensor(TAKEN), torch.zeros(4, dtype=torch.float64), 0.25)[0] == 0.0
-    # minority usage that grew is not a loss
-    assert lost_usage(torch.tensor(INTACT), torch.tensor([0, 0.4, 0, 0.0]).double(), 0.25)[0] == 0.0
+    assert lost_usage(torch.tensor(TAKEN), reference, torch.zeros_like(established))[::3] == (
+        0.0,
+        None,
+    )
+    # a share that grew is not a loss
+    grown = torch.tensor([[1.0, 0, 0], [0.6, 0.4, 0], [0, 0, 0], [0, 0, 0]]).double()
+    assert lost_usage(torch.tensor(INTACT), grown, grown >= 0.25)[0] == pytest.approx(
+        (0.6 - 0.2) / 1.0
+    )  # byte 1's unit-0 route lost; its unit-1 route grew
+    # a byte with too few slots is left out
+    assert lost_usage(torch.tensor(TAKEN), reference, established, min_slots=500)[0] == 0.0
 
 
 def test_event_halves_the_dominant_units_step_only() -> None:
@@ -115,6 +126,7 @@ def test_event_halves_the_dominant_units_step_only() -> None:
     torch.testing.assert_close(weight[1:], before_w[1:] + 1.0)
     torch.testing.assert_close(bias, before_b + torch.tensor([1.0, 2.0, 2.0]))
     assert guard.report()["scale"] == [0.5, 1.0, 1.0] and guard.report()["checks"] == 4
+    assert guard.last is not None and guard.last["gaining_unit"] is None  # nothing lost at 400
 
 
 def test_no_event_while_training_improves_or_before_a_route_has_persisted() -> None:
@@ -130,7 +142,7 @@ def test_no_event_while_training_improves_or_before_a_route_has_persisted() -> N
     for step, (table, loss) in enumerate([(INTACT, 1.0), (INTACT, 1.0), (TAKEN, 1.04)]):
         _feed(near, table, loss)
         assert near.check(100 * (step + 1)) is None
-    _feed(near, TAKEN, 1.06)  # the reference still holds the intact usage
+    _feed(near, MORE, 1.06)  # the reference still holds the intact usage
     assert near.check(400) is not None
     # a route that has not persisted for `persistence` readings is not established yet
     young, _ = _guard(lost_fraction=0.1, persistence=3)
@@ -156,21 +168,25 @@ def test_scale_has_a_floor_and_small_usage_is_ignored() -> None:
     for step, table in enumerate([INTACT, TAKEN, INTACT, TAKEN, INTACT, TAKEN, INTACT, TAKEN]):
         _feed(guard, table)
         guard.check(100 * (step + 1))
-    # the first TAKEN reading comes before the route has persisted; then three events, floored
+    # four events on unit 0, floored at min_scale
     assert guard.scale.tolist() == [0.25, 1.0, 1.0]
-    assert [e["scale"] for e in guard.events] == [0.5, 0.25, 0.25]
-    quiet, _ = _guard(lost_fraction=0.1, min_usage=0.5)
-    for table in (INTACT, TAKEN):
+    assert [e["scale"] for e in guard.events] == [0.5, 0.25, 0.25, 0.25]
+    quiet, _ = _guard(lost_fraction=0.1, min_usage=0.99)
+    for table in (INTACT, INTACT, TAKEN):
         _feed(quiet, table)
-        assert quiet.check(100) is None  # minority units hold under half of the slots
+        assert quiet.check(100) is None  # the established routes hold under 99 % of the slots
 
 
-def test_a_new_dominant_unit_restarts_the_reference() -> None:
+def test_the_response_is_on_the_unit_that_gained_the_route() -> None:
     guard, _ = _guard(lost_fraction=0.1)
-    _feed(guard, INTACT)
-    guard.check(100)
-    _feed(guard, [[0, 0, 1000], [20, 80, 0], [0, 0, 0], [0, 0, 0]])  # unit 2 serves the filler
-    assert guard.check(200) is None and guard.dominant == 2 and guard.events == []
+    for step in (100, 200):
+        _feed(guard, INTACT)
+        guard.check(step)
+    # unit 2 takes byte 1's slots from unit 1 (the filler stays where it was)
+    _feed(guard, [[1000, 0, 0], [20, 30, 50], [0, 0, 0], [0, 0, 0]], loss=2.0)
+    event = guard.check(300)
+    assert event is not None and event["unit"] == 2
+    assert guard.scale.tolist() == [1.0, 1.0, 0.5]
 
 
 def test_restore_puts_the_dominant_units_rows_back() -> None:
@@ -179,7 +195,7 @@ def test_restore_puts_the_dominant_units_rows_back() -> None:
     _feed(guard, INTACT)
     guard.check(100)
     _feed(guard, INTACT)
-    guard.check(200)  # routes intact: the anchor is the weights now
+    guard.check(200)  # no event: the anchor is this reading's weights
     anchor = weight.detach().clone()
     with torch.no_grad():
         weight.add_(1.0)
@@ -189,8 +205,8 @@ def test_restore_puts_the_dominant_units_rows_back() -> None:
     assert event is not None and event["restored_from"] == 200
     torch.testing.assert_close(weight[0], anchor[0])  # the gaining unit's row is back
     torch.testing.assert_close(weight[1:], moved[1:])  # every other row keeps its weights
-    # the reference stays: the same loss again is another event, restored from the same check
-    _feed(guard, TAKEN)
+    # the reference stays: a further loss is another event, restored from the same reading
+    _feed(guard, MORE)
     again = guard.check(400)
     assert again is not None and again["restored_from"] == 200 and again["scale"] == 0.25
 
@@ -204,7 +220,8 @@ def test_state_round_trip() -> None:
     other, _ = _guard(lost_fraction=0.1)
     other.load_state_dict(guard.state_dict(), "x.pt")
     assert other.scale.tolist() == guard.scale.tolist() and other.events == guard.events
-    assert torch.equal(other.counts, guard.counts) and other.dominant == guard.dominant
+    assert torch.equal(other.counts, guard.counts)
+    assert torch.equal(other.previous, guard.previous)
     assert other.check(400) == guard.check(400)
     with pytest.raises(ValueError, match="missing"):
         other.load_state_dict(None, "x.pt")
@@ -231,7 +248,7 @@ def test_a_quiet_guard_changes_no_training_step(tmp_path: Path) -> None:
     assert history.measured["route_guard_events"] == 0.0
     assert history.measured["route_guard_scale"] == 1.0
     last = guarded.route_guard.last
-    assert last is not None and last["step"] == 8 and 0.0 <= last["minority_usage"] <= 1.0
+    assert last is not None and last["step"] == 8 and 0.0 <= last["established_usage"] <= 1.0
 
 
 def _rising_loss(trainer: Any) -> None:
@@ -253,6 +270,7 @@ def test_training_with_events_resumes_exactly(tmp_path: Path) -> None:
         "train.route_guard.specialised=0.001",
         "train.route_guard.persistence=1",
         "train.route_guard.loss_rise=0.0",
+        "train.route_guard.min_slots=1",
         "train.route_guard.min_usage=0.0",
         "train.lr=0.05",
     )

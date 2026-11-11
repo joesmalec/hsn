@@ -366,29 +366,33 @@ class AdaptiveLRConfig(_StrictModel):
 
 class RouteGuardConfig(_StrictModel):
     """``train.route_guard`` (A6, opt-in; :mod:`hsn.train.route_guard`): when an established
-    minority route is being taken over by the dominant router unit, halve that unit's applied
-    router step, at whatever step it happens. Disabled preserves existing training and hashes."""
+    route (a router unit's share of an input byte's positions) is being taken over by another
+    unit, halve the gaining unit's applied router step, at whatever step it happens. Disabled
+    preserves existing training and hashes."""
 
     enabled: bool = False
     # applied optimiser steps between two readings of the per-(input byte, unit) slot counts
     interval: int = Field(default=100, ge=1)
-    # the event: this share of the established bytes' minority-unit usage is gone
+    # the event: the quarter of the input bytes whose established routes lost most have lost
+    # this share of them on average
     lost_fraction: float = Field(default=0.1, gt=0.0, lt=1.0, allow_inf_nan=False)
-    # a byte is established once this share of its slots has been on non-dominant units at
-    # `persistence` consecutive readings
+    # a byte with fewer slots than this in an interval is left out of the reading
+    min_slots: int = Field(default=100, ge=1)
+    # a route (byte, unit) is established once the unit has held this share of the byte's slots
+    # at `persistence` consecutive readings
     specialised: float = Field(default=0.25, gt=0.0, le=1.0, allow_inf_nan=False)
     persistence: int = Field(default=3, ge=1)
     # ... and only while training is no longer improving: the interval's mean training loss is
-    # above the lowest interval mean so far by this fraction (the dominant unit absorbing
-    # positions while the loss falls is learning, not a takeover)
+    # above the lowest interval mean so far by this fraction (units sorting the positions out
+    # while the loss falls is learning, not a takeover)
     loss_rise: float = Field(default=0.02, ge=0.0, allow_inf_nan=False)
-    # no event while the minority units hold less than this share of all slots
+    # no event while the established routes hold less than this share of all slots
     min_usage: float = Field(default=0.001, ge=0.0, lt=1.0, allow_inf_nan=False)
-    # the response: the step scale of the dominant unit's scorer rows is multiplied by this,
+    # the response: the step scale of the gaining unit's scorer rows is multiplied by this,
     # down to min_scale
     reduce_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
     min_scale: float = Field(default=0.015625, gt=0.0, le=1.0, allow_inf_nan=False)
-    # also put those rows back to their values at the last check with the routes intact
+    # also put those rows back to their values at the previous reading
     restore: bool = False
 
 
