@@ -654,7 +654,7 @@ class CompiledWindow:
         #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
         #: compiled function for the native round and one for the fused round.
         self._tape_blocks: dict[tuple[bool, bool, int], Any] = {}
-        self._sweep_twin: SweepTwin | None = None
+        self._sweep_twins: dict[torch.dtype, SweepTwin] = {}
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
@@ -776,10 +776,16 @@ class CompiledWindow:
             )
         sweep: SweepTwin | None = None
         if use_twin:
-            if self._sweep_twin is None:
-                dtype = self.ctx.autocast_dtype or next(model.parameters()).dtype
-                self._sweep_twin = SweepTwin(model, dtype)
-            sweep = self._sweep_twin
+            # the dtype autocast casts to in this call (the masters' own without autocast)
+            device_type = self.ctx.device.type
+            dtype = (
+                torch.get_autocast_dtype(device_type)
+                if torch.is_autocast_enabled(device_type)
+                else next(model.parameters()).dtype
+            )
+            if dtype not in self._sweep_twins:
+                self._sweep_twins[dtype] = SweepTwin(model, dtype)
+            sweep = self._sweep_twins[dtype]
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         tape = run_tape(

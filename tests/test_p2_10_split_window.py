@@ -13,6 +13,7 @@ from hsn.model.state import CellGraphState
 from hsn.train.split import SplitWindow, recurrence_backward, scope_error
 from p1_11_support import restore_determinism  # noqa: F401
 from test_a6_feedback_detach import A5, ALL, ROUTED, _cfg, _model, _start, _window
+from test_p2_8_compile import _release_compiled_state, small_blocks  # noqa: F401
 from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
@@ -315,3 +316,91 @@ def test_split_window_falls_back_outside_training() -> None:
         logits, _, info = window(tokens, ctx, state, reset)
         want, _, _ = model(tokens, ctx, state, reset)
     assert torch.equal(logits, want) and window.calls == 0
+
+
+# --------------------------------------------------------------------------------------------------
+# CUDA: the compiled forward sweep (CUDA Graphs, the sweep twin) and the recurrence kernels
+# --------------------------------------------------------------------------------------------------
+
+CUDA_RECIPE = (
+    "model.routing=topk",
+    "train.gate_mode=ste",
+    "model.key_address=true",
+    "model.selected_readout=true",
+    "model.cand_norm=rms",
+    ALL,
+)
+
+
+def _cuda_case(*extra: str) -> tuple:
+    import test_p2_8_compile as p28
+
+    ctx = p28._cuda_ctx()
+    cfg = p28._cfg(*CUDA_RECIPE, *extra)
+    model = p28._model(cfg, training=True, scale=0.3).to(ctx.device)
+    compiled = p28._window(model, ctx, backend="inductor")
+    tokens, cx, state, reset = p28._case_inputs(model, True)
+    return p28, cfg, model, compiled, (tokens, cx, state, reset)
+
+
+@pytest.mark.cuda
+@pytest.mark.usefixtures("small_blocks", "_release_compiled_state")
+@pytest.mark.parametrize("p_dense", [0.0, 0.5])
+def test_split_window_compiled_cuda_equals_eager(p_dense: float) -> None:
+    """fp32 on CUDA: the split window over a compiled, CUDA-graph sweep (warm-up, recording,
+    replay) takes the eager window's decisions and returns its logits and gradients to the
+    tolerance of the compiled autograd window (P2.8), with and without dense-fallback rows."""
+    p28, cfg, model, compiled, inputs = _cuda_case(f"train.p_dense={p_dense}")
+    tokens, cx, state, reset = inputs
+    mask = torch.zeros_like(reset)
+    mask[:, 1::3] = True
+    params = [p for p in model.parameters()]
+    torch.manual_seed(5)
+    logits, final, info = model(tokens, cx, state, reset)
+    if p_dense:
+        assert 0.0 < float(info["dense_fallback"].mean()) < 1.0
+    assert p28._margin(info, model.cfg.k_select) > p28.MIN_MARGIN
+    want = torch.autograd.grad(_objective(logits, info, mask), params, allow_unused=True)
+    split = SplitWindow(model, cfg, compiled)
+    for _ in range(3):  # warm-up, recording, replay
+        torch.manual_seed(5)
+        s_logits, s_final, s_info = split(tokens, cx, state, reset)
+        got = torch.autograd.grad(_objective(s_logits, s_info, mask), params, allow_unused=True)
+    tol = p28.TOL[("cuda", "fp32")]
+    for key in ("cell_idx", "unit_idx", "valid"):
+        assert torch.equal(s_info[key], info[key]), key
+    assert float((s_logits - logits).abs().max()) <= tol["values"]
+    for name in ("h", "q"):
+        gap = (getattr(s_final, name) - getattr(final, name)).abs().max()
+        assert float(gap) <= tol["values"], name
+    assert torch.equal(s_final.age, final.age) and torch.equal(s_final.pos, final.pos)
+    # this objective's gradients are large (a sum of squared logits): relative to each tensor
+    for g, w in zip(got, want, strict=True):
+        assert (g is None) == (w is None)
+        if w is not None:
+            assert float((g - w).abs().max()) <= 2e-5 * float(w.abs().max()) + 1e-6
+    assert split.calls == 3 and compiled.compile_seconds > 0.0
+
+
+@pytest.mark.cuda
+@pytest.mark.usefixtures("small_blocks", "_release_compiled_state")
+def test_sweep_twin_tape_is_the_models_in_fp32() -> None:
+    """Without autocast the twin's weights are plain copies: its tape is the model's bit for
+    bit, also after the weights change (the twin is refreshed every window)."""
+    from hsn.train.compile import TAPE_KEYS
+
+    p28, cfg, model, compiled, (tokens, cx, state, reset) = _cuda_case()
+    for round_ in range(2):
+        tapes = {}
+        with torch.no_grad():
+            pro = model._window_prologue(
+                tokens, cx, state, reset, model._window_mode(), reset_first=True
+            )
+            for twin in (True, False):
+                for _ in range(3):
+                    tape = compiled.tape(pro, state, reset, twin=twin)
+                tapes[twin] = {k: v.clone() for k, v in tape.items()}
+            for key in (*TAPE_KEYS, "h", "q", "age", "pos"):
+                assert torch.equal(tapes[True][key], tapes[False][key]), (round_, key)
+            for p in model.parameters():  # an optimiser step's worth of change
+                p.add_(0.01 * torch.randn_like(p))
