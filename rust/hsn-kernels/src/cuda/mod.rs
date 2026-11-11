@@ -11,21 +11,22 @@ use crate::{Backend, CellDims, DType, Error, Result, TensorMut, TensorRef, UnitD
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtrMut, result, sys};
 use std::{ffi::CString, path::Path, sync::Arc};
 
-const PHASES: [&str; 14] = [
+const PHASES: [&str; 15] = [
     "gated_update",
     "gated_update_bwd",
-    "mlp_hidden",
-    "mlp_out",
-    "mlp_dz",
-    "mlp_dv",
-    "mlp_dw1",
-    "mlp_dw2",
+    "mlp_hidden_v2",
+    "mlp_out_v2",
+    "mlp_dz_v2",
+    "mlp_dv_v2",
+    "mlp_dw1_v2",
+    "mlp_dw2_v2",
     "messages",
     "messages_dh",
     "messages_da",
     "messages_dv",
     "gather",
     "gather_bwd",
+    "mlp_routes_v2",
 ];
 
 fn backend_error(e: impl std::fmt::Display) -> Error {
@@ -49,7 +50,8 @@ struct LaunchArgs {
 const _: () = assert!(std::mem::size_of::<LaunchArgs>() == 160);
 
 /// Pointer order is the public hsn_ops.h signature (inputs then outputs), with
-/// an additional fp32 [P,H] scratch pointer at slot 11 for MlpBackward.
+/// additional private workspace: Mlp needs fp32 [P,H] at slot 8; MlpBackward
+/// needs fp32 [P,H] at slots 11 and 12, int32 [P] at 13 and int32 [M+1] at 14.
 #[derive(Clone, Copy, Debug)]
 pub enum Operation {
     Gather,
@@ -111,7 +113,7 @@ impl Drop for FatbinModule {
 pub struct CudaBackend {
     module: FatbinModule,
     stream: Arc<CudaStream>,
-    functions: [[sys::CUfunction; 3]; 14],
+    functions: [[sys::CUfunction; 3]; PHASES.len()],
 }
 
 impl CudaBackend {
@@ -132,7 +134,7 @@ impl CudaBackend {
             handle: result::module::load(name).map_err(backend_error)?,
             context,
         };
-        let mut functions = [[std::ptr::null_mut(); 3]; 14];
+        let mut functions = [[std::ptr::null_mut(); 3]; PHASES.len()];
         for (phase, name) in PHASES.iter().enumerate() {
             for (dtype, suffix) in ["f32", "f16", "bf16"].iter().enumerate() {
                 let symbol = CString::new(format!("hsn_cuda_{name}_{suffix}")).unwrap();
@@ -162,8 +164,9 @@ impl CudaBackend {
     /// All addresses must belong to this stream's context and satisfy hsn_ops.h's sizes,
     /// dtype, alignment, index/CSR, nonaliasing and mutability preconditions. Keep every
     /// allocation and this backend alive until completion (and through any graph replay).
-    /// Coordinate other streams yourself. MlpBackward requires a private fp32 [P,H]
-    /// workspace at pointer 11. These addresses must never be treated as host slices.
+    /// Coordinate other streams yourself. Supply the private workspaces documented
+    /// on Operation; they must not alias inputs, outputs or concurrent calls' scratch.
+    /// These addresses must never be treated as host slices.
     pub unsafe fn launch_resident(
         &self,
         op: Operation,
@@ -172,28 +175,29 @@ impl CudaBackend {
         pointers: &[u64],
     ) -> Result<()> {
         let dt = dtype_code(dtype)?;
-        if matches!(op, Operation::Messages | Operation::MessagesBackward) {
-            if let Dimensions::Cell(c, _) = dims {
-                spec::element_count("projection", &[c.d, c.d])?;
-                spec::element_count(
-                    "indptr",
-                    &[c.n
-                        .checked_add(1)
-                        .ok_or_else(|| Error::SizeOverflow("indptr".into()))?],
-                )?;
-            }
+        if matches!(op, Operation::Messages | Operation::MessagesBackward)
+            && let Dimensions::Cell(c, _) = dims
+        {
+            spec::element_count("projection", &[c.d, c.d])?;
+            spec::element_count(
+                "indptr",
+                &[c.n
+                    .checked_add(1)
+                    .ok_or_else(|| Error::SizeOverflow("indptr".into()))?],
+            )?;
         }
         let packed = dims.pack()?;
         let [b, n, d, k, p, m, h, e] = packed.map(|x| x as u32);
         let (count, phases): (usize, Vec<(usize, u32)>) = match (op, dims) {
             (Operation::Gather, Dimensions::Cell(..)) => (6, vec![(12, b * k * 4 * d)]),
             (Operation::GatherBackward, Dimensions::Cell(..)) => (6, vec![(13, b * n.max(k) * d)]),
-            (Operation::Mlp, Dimensions::Unit(..)) => (8, vec![(2, p * h), (3, p * d)]),
+            (Operation::Mlp, Dimensions::Unit(..)) => (9, vec![(2, p * h), (3, p * d)]),
             (Operation::MlpBackward, Dimensions::Unit(..)) => (
-                12,
+                15,
                 vec![
                     (4, p * h),
                     (5, p * 4 * d),
+                    (14, m),
                     (6, m * 4 * d * h),
                     (7, m * h * d),
                 ],
@@ -223,11 +227,19 @@ impl CudaBackend {
                 continue;
             }
             let mut parameters = [(&mut args as *mut LaunchArgs).cast()];
+            let blocks = match phase {
+                2 => p * h.div_ceil(32),
+                3 => p * d.div_ceil(32),
+                4 => p * h.div_ceil(8),
+                5 => p * (4 * d).div_ceil(8),
+                14 => m.div_ceil(8),
+                _ => elements.div_ceil(256),
+            };
             // Safety: checked metadata and caller's resident-buffer contract above.
             unsafe {
                 result::launch_kernel(
                     self.functions[phase][dt],
-                    (elements.div_ceil(256), 1, 1),
+                    (blocks, 1, 1),
                     (256, 1, 1),
                     0,
                     self.stream.cu_stream(),
@@ -366,6 +378,7 @@ enum HostBuffer<'a> {
     Index(&'a [i32]),
     IndexMut(&'a mut [i32]),
     Scratch(usize),
+    IndexScratch(usize),
 }
 impl HostBuffer<'_> {
     fn upload(&self, s: &Arc<CudaStream>) -> Result<DeviceBuffer> {
@@ -385,6 +398,9 @@ impl HostBuffer<'_> {
                 s.clone_htod(&**x).map_err(backend_error)?,
             )),
             Self::Scratch(n) => Ok(DeviceBuffer::F32(s.alloc_zeros(*n).map_err(backend_error)?)),
+            Self::IndexScratch(n) => {
+                Ok(DeviceBuffer::I32(s.alloc_zeros(*n).map_err(backend_error)?))
+            }
         }
     }
     fn download(&mut self, d: &DeviceBuffer, s: &Arc<CudaStream>) -> Result<()> {
@@ -399,7 +415,10 @@ impl HostBuffer<'_> {
     }
 }
 
-use HostBuffer::{InOut as IO, Index as X, IndexMut as XM, Input as I, Output as O, Scratch as S};
+use HostBuffer::{
+    InOut as IO, Index as X, IndexMut as XM, IndexScratch as XS, Input as I, Output as O,
+    Scratch as S,
+};
 impl Backend for CudaBackend {
     fn name(&self) -> &'static str {
         "cuda"
@@ -444,6 +463,7 @@ impl Backend for CudaBackend {
                 I(a.b2),
                 O(a.hidden_saved),
                 O(a.out),
+                S(a.dims.p * a.dims.h),
             ],
         )
     }
@@ -466,6 +486,9 @@ impl Backend for CudaBackend {
                 O(a.grad_w2),
                 O(a.grad_b2),
                 S(a.dims.p * a.dims.h),
+                S(a.dims.p * a.dims.h),
+                XS(a.dims.p),
+                XS(a.dims.m + 1),
             ],
         )
     }

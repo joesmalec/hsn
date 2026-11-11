@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from cards import CUDA_PROFILE
+from hsn import kernels
 from hsn.config import RunConfig, config_hash, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset, collate_windows
 from hsn.data.synthetic import BOS, TaskSpec, generate, load_dataset_spec
@@ -66,7 +67,9 @@ def _model(cfg: RunConfig) -> HSN:
 @pytest.fixture(autouse=True)
 def _restore_runtime() -> Iterator[None]:
     deterministic = torch.are_deterministic_algorithms_enabled()
+    backend = kernels.current_backend()
     yield
+    kernels.set_backend(backend)
     set_deterministic(deterministic)
     torch._dynamo.reset()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
@@ -493,12 +496,15 @@ def test_p1_17_a5_serving_carries_previous_byte_and_resets(mode: str) -> None:
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("kernel_backend", ["native", "cuda"])
 def test_p1_17_a5_compiled_cuda_matches_eager(
-    training: bool, monkeypatch: pytest.MonkeyPatch
+    training: bool, kernel_backend: kernels.Backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CUDA Graph warm-up, capture and replay of A5, with a carried byte and two blocks."""
+    """Both compiled kernel backends match native A5 with carried bytes and two blocks."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device on this machine")
+    if kernel_backend == "cuda" and os.environ.get("HSN_REQUIRE_CUDA") != "1":
+        pytest.skip("custom kernels require HSN_REQUIRE_CUDA=1 under the idle guard")
     monkeypatch.setattr(compile_mod, "MAX_BLOCK", 4)
     cfg = _cfg("model.key_address=true", "model.selected_readout=true")
     model = _model(cfg)
@@ -512,8 +518,12 @@ def test_p1_17_a5_compiled_cuda_matches_eager(
     reset.zero_()
     reset[0, 4] = True
     previous = torch.tensor([112, 75], device=ctx.device)
-    compiled = compile_window(model, ctx, "reduce-overhead", backend="inductor")
+    kernels.set_backend("native")
     reference = model(tokens, context, state, reset, prev_tokens=previous)
+    if kernel_backend == "cuda":
+        kernels.prepare_cuda(ctx.device.index or 0)
+    kernels.set_backend(kernel_backend)
+    compiled = compile_window(model, ctx, "reduce-overhead", backend="inductor")
     for _ in range(3):
         actual = compiled(tokens, context, state, reset, prev_tokens=previous)
     torch.testing.assert_close(actual[0], reference[0], atol=1.5e-5, rtol=1.5e-5)

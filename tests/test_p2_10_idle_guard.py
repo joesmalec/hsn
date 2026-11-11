@@ -207,6 +207,43 @@ class IdleGuardTests(unittest.TestCase):
         observation = guard.observe([self.db], "GPU-test", owner=guard.Ownership(55))
         self.assertIn("foreign busy PIDs [11]", observation.reason)
 
+    def test_exited_owned_gpu_pid_is_reprobed_not_ignored(self):
+        owner = guard.Ownership(55, known={11: 1}, initialized=True)
+        root = guard.Process(55, 55, 1, 0, "root", 55, parent=1)
+        self.hardware(
+            cpu=(guard.Cpu(0, 1000, 500, {55: root}), guard.Cpu(1, 1100, 599, {55: root}))
+        )
+        self.patch(guard, "read_processes", return_value={55: root})
+        gpu = self.patch(
+            guard,
+            "read_gpu",
+            side_effect=[guard.Gpu("GPU-test", 0, (11,)), guard.Gpu("GPU-test", 0, ())],
+        )
+        self.assertTrue(guard.observe([self.db], "GPU-test", owner=owner).clear)
+        self.assertEqual(gpu.call_count, 2)
+
+    def test_lingering_exited_gpu_pid_still_blocks(self):
+        owner = guard.Ownership(55, known={11: 1}, initialized=True)
+        self.hardware(
+            cpu=(guard.Cpu(0, 1000, 500, {}), guard.Cpu(1, 1100, 599, {})),
+            gpu=guard.Gpu("GPU-test", 0, (11,)),
+        )
+        self.patch(guard, "read_processes", return_value={})
+        self.assertIn(
+            "GPU compute processes present",
+            guard.observe([self.db], "GPU-test", owner=owner).reason,
+        )
+
+    def test_reused_gpu_pid_never_inherits_old_ownership(self):
+        owner = guard.Ownership(55, known={11: 1}, initialized=True)
+        self.hardware(cpu=samples(reused=True), gpu=guard.Gpu("GPU-test", 0, (11,)))
+        gpu = self.patch(guard, "read_gpu", return_value=guard.Gpu("GPU-test", 0, (11,)))
+        self.assertIn(
+            "GPU compute processes present",
+            guard.observe([self.db], "GPU-test", owner=owner).reason,
+        )
+        self.assertEqual(gpu.call_count, 1)
+
     def test_process_listing_preserves_group_and_session(self):
         process = self.root / "44"
         process.mkdir()

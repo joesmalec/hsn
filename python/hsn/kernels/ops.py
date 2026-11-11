@@ -255,6 +255,21 @@ def _update_fake(
     return torch.empty_like(h), torch.empty_like(q), torch.empty_like(age), torch.empty_like(c)
 
 
+@torch.library.custom_op("hsn::gated_delta_update_state", mutates_args=(), device_types="cuda")
+def state_update_op(
+    h: Tensor, q: Tensor, age: Tensor, idx: Tensor, valid: Tensor, c: Tensor, b: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    hn, qn, an, old = _run(8, [h, q, age, idx, valid, c, b], _dims(h, idx))
+    return hn, qn, an, old
+
+
+@state_update_op.register_fake
+def _state_update_fake(
+    h: Tensor, q: Tensor, age: Tensor, idx: Tensor, valid: Tensor, c: Tensor, b: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    return torch.empty_like(h), torch.empty_like(q), torch.empty_like(age), torch.empty_like(c)
+
+
 @torch.library.custom_op("hsn::gated_delta_update_backward", mutates_args=(), device_types="cuda")
 def update_backward(
     idx: Tensor, valid: Tensor, c: Tensor, b: Tensor, old: Tensor, G: Tensor, g: Tensor
@@ -282,6 +297,7 @@ def _update_grad(ctx: Any, G: Tensor, g: Tensor, dage: Tensor, dold: Tensor) -> 
 
 
 update_op.register_autograd(_update_grad, setup_context=_update_setup)
+state_update_op.register_autograd(_update_grad, setup_context=_update_setup)
 
 
 def _supported(t: Tensor) -> bool:
@@ -324,7 +340,11 @@ def grouped_unit_mlp(
 ) -> Tensor:
     from hsn.kernels import native
 
-    if not _supported(v) or bank.activation_name != "gelu":
+    # Native autocast rounds both activations and intermediate gradients in
+    # reduced precision. The raw ABI keeps fp32 intermediates, which can exceed
+    # native's gradient tolerance at model-sized pair counts. Preserve native's
+    # mixed-precision contract until a matching autocast kernel is specified.
+    if not _supported(v) or bank.activation_name != "gelu" or torch.is_autocast_enabled("cuda"):
         return native.grouped_unit_mlp(v, unit_idx, bank, static=static, w1_flat=w1_flat)
     if not static:
         lo, hi = int(unit_idx.min()), int(unit_idx.max())
@@ -360,7 +380,10 @@ def csr_messages(
 ) -> Tensor:
     from hsn.kernels import native
 
-    if not _supported(h):
+    # Native autocast rounds the projection before its fp32 reduction. The
+    # single-dtype ABI cannot preserve that mixed-precision output/gradient
+    # contract (notably bf16 edge-weight gradients), so retain native here.
+    if not _supported(h) or torch.is_autocast_enabled("cuda"):
         return native.csr_messages(h, graph, V, cell_idx, weights=weights, validate=validate)
     B, _, _ = graph._check_h(h)
     graph._check_cell_idx(cell_idx, B, check_values=validate)
@@ -398,16 +421,15 @@ def gated_delta_update(
     native._check_bool("valid", valid, tuple(cell_idx.shape), state.device)
     if validate:
         native._validate_selection(cell_idx, valid, state.n_cells)
-    # Use a reset marker instead of narrowing int64 ages (which may exceed INT32_MAX).
-    marker = torch.ones_like(state.age, dtype=torch.int32)
-    hn, qn, reset, _ = update_op(
+    # The private functional kernel preserves int64 ages and writes fresh state
+    # directly, including unchanged cells; the public in-place ABI is unchanged.
+    hn, qn, age, _ = state_update_op(
         state.h.contiguous(),
         state.q.contiguous(),
-        marker,
+        state.age.contiguous(),
         _i32(cell_idx),
         valid.to(torch.int32).contiguous(),
         c.contiguous(),
         b.contiguous(),
     )
-    age = torch.where(reset == 0, torch.zeros_like(state.age), state.age)
     return CellGraphState._make(hn, qn, age, state.pos)

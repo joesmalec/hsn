@@ -227,7 +227,9 @@ class Ownership:
             if not added:
                 break
             owned.update(added)
-        self.known = {pid: processes[pid].start for pid in owned}
+        # Retain birth stamps through teardown: nvidia-smi can briefly list a
+        # child after /proc no longer does. A reused PID still fails this match.
+        self.known.update({pid: processes[pid].start for pid in owned})
         self.initialized = True
         return {pid: processes[pid] for pid in owned}
 
@@ -340,6 +342,18 @@ def observe(databases: list[Path], device: str, owner: Ownership | None = None) 
         gpu = read_gpu(device)
         owned = owner.members(after.processes) if owner is not None else {}
         foreign = [pid for pid in gpu.pids if pid not in owned]
+        if (
+            foreign
+            and owner is not None
+            and all(pid in owner.known and pid not in after.processes for pid in foreign)
+        ):
+            # Only retry a disappearing, previously verified child. Never waive
+            # an unknown/live foreign PID, and never accept a lingering GPU PID
+            # merely because it used to belong to us.
+            time.sleep(0.2)
+            gpu = read_gpu(device)
+            owned = owner.members(read_processes())
+            foreign = [pid for pid in gpu.pids if pid not in owned]
         if foreign:
             raise Unavailable(f"GPU compute processes present: {foreign}")
         if owner is None and gpu.utilization > 2:

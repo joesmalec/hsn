@@ -2,6 +2,7 @@
 
 import importlib.util
 import unittest
+from itertools import product
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1] / "python/hsn/profiler/attribution.py"
@@ -15,6 +16,47 @@ ROOT = "/r/hsn/python/hsn/"
 class AttributionTests(unittest.TestCase):
     def classify(self, frames):
         return attribution.classify_frames(frames, ROOT)
+
+    def test_compiled_driver_kernels_without_python_frames(self):
+        phases = (
+            "mlp_hidden",
+            "mlp_out",
+            "mlp_dz",
+            "mlp_dv",
+            "mlp_dw1",
+            "mlp_dw2",
+            "mlp_routes",
+        )
+        for phase, dtype, version, signature in product(
+            phases, ("f32", "f16", "bf16"), ("", "_v2"), ("", "(HsnCudaArgs)")
+        ):
+            with self.subTest(phase=phase, dtype=dtype, version=version, signature=signature):
+                self.assertEqual(
+                    attribution.classify_cuda_kernel(
+                        f"hsn_cuda_{phase}{version}_{dtype}{signature}"
+                    ),
+                    "selected_cells",
+                )
+        for phase in (
+            "gather",
+            "gather_bwd",
+            "messages",
+            "messages_dh",
+            "messages_da",
+            "messages_dv",
+            "gated_update",
+            "gated_update_bwd",
+            "gated_update_functional_v1",
+        ):
+            self.assertEqual(attribution.classify_cuda_kernel(f"hsn_cuda_{phase}_f32"), "messages")
+        for name in (
+            "triton_mlp",
+            "hsn_cuda_mlp_unknown_f32",
+            "hsn_cuda_mlp_out_f64",
+            "hsn_cuda_mlp_out_v3_f32",
+            "other_hsn_cuda_mlp_out_f32",
+        ):
+            self.assertIsNone(attribution.classify_cuda_kernel(name))
 
     def test_cuda_mlp_adapters_and_backward_keep_native_segment(self):
         for prefix in (ROOT, "hsn/"):
@@ -39,6 +81,7 @@ class AttributionTests(unittest.TestCase):
             "_messages_grad",
             "gated_delta_update",
             "update_op",
+            "state_update_op",
             "update_inplace",
             "update_backward",
             "_update_grad",

@@ -40,7 +40,9 @@ What the file holds:
   ``units.py`` and CUDA MLP operators → ``selected_cells``; the cell, graph, other kernel ops
   and state updates →
   ``messages``, the P2.5 partition; the router → ``scorer``; E, P, S and the embeddings →
-  ``shared_path``; the decoder → ``decode``). ``unattributed`` reports what no rule matched.
+  ``shared_path``; the decoder → ``decode``). HSN's exported device symbols identify custom
+  kernels directly when compiled driver launches lack Python stacks. ``unattributed`` reports
+  what no rule matched.
   ``bytes`` are the step's allocator peak and reserve (P0.6); they are not separable per segment
   inside one window, and DRAM traffic is not measured (Nsight Compute would be needed).
 * ``decision`` (the last key, and the last line printed): ``L2 justified: yes|no — <segment> is
@@ -92,6 +94,7 @@ import argparse
 import collections
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -526,6 +529,8 @@ def attribute(events: list[Any], provenance: Provenance) -> dict[str, Any]:
         return f"(no host) {device_name[:50]}"
 
     def segment_of(host: Any | None, device_name: str) -> dict[str, float] | None:
+        if custom := stack_attribution.classify_cuda_kernel(device_name):
+            return {custom: 1.0}
         traces = triton_traces(device_name)
         if traces is not None:  # a compiled Triton kernel
             return split(traces)
@@ -605,6 +610,19 @@ def count_launches(events: list[Any]) -> tuple[int, int, float]:
 # --------------------------------------------------------------------------------------------------
 
 
+def ungraphed_window(window: compile_mod.CompiledWindow) -> compile_mod.CompiledWindow:
+    """Compile every attribution block/bucket without CUDA Graph capture."""
+
+    def backend(graph: Any, inputs: Any) -> Any:
+        from torch._inductor import compile as compile_inductor
+
+        return compile_inductor(graph, inputs, options={"triton.cudagraphs": False})
+
+    # A backend callable applies to both the initial block and future shape buckets.
+    # Replacing _block alone leaves the bucket cache pointing at a graph-captured block.
+    return compile_mod.CompiledWindow(window.model, window.ctx, window.mode, backend)
+
+
 def profile_cuda(
     args: argparse.Namespace,
     trainer: TBPTTTrainer,
@@ -627,14 +645,7 @@ def profile_cuda(
     if args.level == "L1":
         window = trainer._compiled
         assert window is not None
-        plain = compile_mod.CompiledWindow(model, ctx, window.mode, window.backend)
-        plain.cuda_graphs = False
-        plain._block = torch.compile(
-            compile_mod._own_code(compile_mod._block),
-            mode="default",
-            fullgraph=True,
-            dynamic=False,
-        )
+        plain = ungraphed_window(window)
         trainer._compiled = plain
         # the graph window is done (timing and counts are taken): release its CUDA Graph pools,
         # or the plain window's activations come on top of them (B32 did not fit in 12 GB)
@@ -1397,6 +1408,14 @@ def main() -> None:
         "profile": args.profile,
         "tag": args.tag,
         "git_revision": git_revision(),
+        "dirty_diff_sha256": hashlib.sha256(
+            subprocess.check_output(["git", "diff", "HEAD", "--"], cwd=REPO)
+        ).hexdigest(),
+        "cuda_build": (
+            json.loads((REPO / "build/cuda_build.json").read_text())
+            if args.kernel_backend == "cuda"
+            else None
+        ),
         "torch": torch.__version__,
         "config": args.config,
         "overrides": args.override,
@@ -1435,7 +1454,12 @@ def main() -> None:
         "serving_step": serve,
         "segments": segments,
         "attribution": {
-            "method": method + "segment from the HSN frames of the stack",
+            "method": method
+            + (
+                "segment from the HSN frames of the stack"
+                if mps
+                else "segment from HSN device symbols or the HSN frames of the stack"
+            ),
             "kernels_total": attribution["kernels_total"],
             "unattributed_kernels": attribution["unattributed_kernels"],
             "unattributed_device_ms": round(attribution["unattributed_device_us"] / 1e3, 3),

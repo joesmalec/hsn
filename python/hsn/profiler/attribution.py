@@ -42,10 +42,49 @@ _KERNEL_FUNCTIONS = {
     "_messages_grad": "messages",
     "gated_delta_update": "messages",
     "update_op": "messages",
+    "state_update_op": "messages",
     "update_inplace": "messages",
     "update_backward": "messages",
     "_update_grad": "messages",
 }
+
+
+def classify_cuda_kernel(name: str) -> str | None:
+    """Classify our exported device symbols even without Python launch stacks.
+
+    Driver launches inside compiled custom ops can be linked only to a generic
+    CompiledFxGraph event. These stable, operation-specific symbols identify the
+    work directly; unrelated CUDA kernels still use their normal provenance.
+    """
+    symbol = name.partition("(")[0].strip()
+    if not symbol.startswith("hsn_cuda_"):
+        return None
+    phase, _, dtype = symbol.removeprefix("hsn_cuda_").rpartition("_")
+    if dtype not in ("f32", "f16", "bf16"):
+        return None
+    if phase.removesuffix("_v2") in (
+        "mlp_hidden",
+        "mlp_out",
+        "mlp_dz",
+        "mlp_dv",
+        "mlp_dw1",
+        "mlp_dw2",
+        "mlp_routes",
+    ):
+        return "selected_cells"
+    if phase in (
+        "gather",
+        "gather_bwd",
+        "messages",
+        "messages_dh",
+        "messages_da",
+        "messages_dv",
+        "gated_update",
+        "gated_update_bwd",
+        "gated_update_functional_v1",
+    ):
+        return "messages"
+    return None
 
 
 def in_package(path: str, package_root: str) -> bool:

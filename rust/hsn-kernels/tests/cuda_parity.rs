@@ -70,22 +70,30 @@ fn bytes(data: &Data, dtype: DType) -> Vec<u8> {
 fn values(data: &[u8], integer: bool, dtype: DType) -> Vec<f64> {
     if integer {
         return data
-            .chunks_exact(4)
-            .map(|v| i32::from_ne_bytes(v.try_into().unwrap()) as f64)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&v| i32::from_ne_bytes(v) as f64)
             .collect();
     }
     match dtype {
         DType::F32 => data
-            .chunks_exact(4)
-            .map(|v| f32::from_ne_bytes(v.try_into().unwrap()) as f64)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&v| f32::from_ne_bytes(v) as f64)
             .collect(),
         DType::F16 => data
-            .chunks_exact(2)
-            .map(|v| half::f16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())).to_f64())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&v| half::f16::from_bits(u16::from_ne_bytes(v)).to_f64())
             .collect(),
         DType::BF16 => data
-            .chunks_exact(2)
-            .map(|v| half::bf16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())).to_f64())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&v| half::bf16::from_bits(u16::from_ne_bytes(v)).to_f64())
             .collect(),
         DType::F64 => unreachable!(),
     }
@@ -110,12 +118,12 @@ fn test_p2_10_cuda_resident_vectors_all_dtypes() {
                     if matches!(role, Role::Output | Role::Grad) {
                         host.fill(0);
                     }
-                    if op == Op::GatedDeltaUpdate && role == Role::Output {
-                        if let Some(input) = name.strip_suffix("_out") {
-                            if let Some(t) = v.tensors.get(input) {
-                                host = bytes(&t.data, dtype);
-                            }
-                        }
+                    if op == Op::GatedDeltaUpdate
+                        && role == Role::Output
+                        && let Some(input) = name.strip_suffix("_out")
+                        && let Some(t) = v.tensors.get(input)
+                    {
+                        host = bytes(&t.data, dtype);
                     }
                     buffers.insert(name.clone(), stream.clone_htod(&host).unwrap());
                 }
@@ -159,6 +167,7 @@ fn test_p2_10_cuda_resident_vectors_all_dtypes() {
                             "b2",
                             "hidden_saved",
                             "out",
+                            "activation",
                         ],
                         vec![
                             "v",
@@ -173,6 +182,9 @@ fn test_p2_10_cuda_resident_vectors_all_dtypes() {
                             "grad_W2",
                             "grad_b2",
                             "scratch",
+                            "activation",
+                            "routes",
+                            "offsets",
                         ],
                     ),
                     Op::CsrMessages => (
@@ -218,6 +230,15 @@ fn test_p2_10_cuda_resident_vectors_all_dtypes() {
                     buffers.insert(
                         "scratch".into(),
                         stream.alloc_zeros(d["P"] * d["H"] * 4).unwrap(),
+                    );
+                    buffers.insert(
+                        "activation".into(),
+                        stream.alloc_zeros(d["P"] * d["H"] * 4).unwrap(),
+                    );
+                    buffers.insert("routes".into(), stream.alloc_zeros(d["P"] * 4).unwrap());
+                    buffers.insert(
+                        "offsets".into(),
+                        stream.alloc_zeros((d["M"] + 1) * 4).unwrap(),
                     );
                 }
                 for (operation, names) in [(fwd, inputs), (bwd, grads)] {

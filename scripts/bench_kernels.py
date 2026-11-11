@@ -3,6 +3,7 @@
 
 Includes casts, CSR/padded-index adapters, fresh functional state outputs and autograd.
 Forward and forward+backward are reported separately; paired samples alternate order.
+Repeated blocks reuse compilation and warmup within each operation and precision.
 This is a per-op benchmark, not integrated training evidence or an automatic enable policy.
 Use --op and the hsn/<op>/<backend>/<mode> NVTX range for narrow Nsight runs.
 """
@@ -42,8 +43,7 @@ def make_case(op: str, size: str, precision: torch.dtype):
         idx = idx.long()
     parameters: tuple[Tensor, ...]
     if op == "gather_concat":
-        # Messages are in the autocast dtype; state/u/eps stay fp32.
-        t["m"] = t["m"].to(precision).detach().requires_grad_(True)
+        # Native CUDA CSR sums, state, u and eps all stay fp32 under autocast.
         parameters = tuple(t[n] for n in ("u", "eps", "h", "m"))
 
         def invoke(backend):
@@ -101,6 +101,9 @@ def make_case(op: str, size: str, precision: torch.dtype):
             with torch.autocast("cuda", dtype=precision, enabled=precision != torch.float32):
                 return invoke(backend)
 
+        # Dynamo counts specializations per code object. Independent benchmark cases
+        # need separate identities, while their repeats should reuse the same graph.
+        forward.__code__ = forward.__code__.replace(co_name=f"forward_{op}_{backend.__name__}")
         return forward
 
     return function(native), function(cuda_ops), parameters
@@ -123,17 +126,35 @@ def measure(fn: Callable[[], object], name: str) -> dict[str, float]:
     return {"device_ms": start.elapsed_time(stop), "wall_ms": wall}
 
 
+def medians(samples: dict[str, list[dict[str, float]]]) -> dict[str, dict[str, float]]:
+    return {
+        name: {
+            metric: statistics.median(s[metric] for s in data)
+            for metric in ("device_ms", "wall_ms")
+        }
+        for name, data in samples.items()
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--op", choices=tuple(spec.OPS))
     parser.add_argument("--size", choices=("tiny", "ref", "odd"), default="ref")
     parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp32")
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=30)
+    parser.add_argument("--samples", type=int, default=30, help="paired samples per repeat")
+    parser.add_argument(
+        "--repeats", type=int, default=1, help="timing blocks sharing one compile and warmup"
+    )
     parser.add_argument("--out", type=Path, default=ROOT / "evidence/P2.10/bench.json")
     args = parser.parse_args()
-    if args.warmup < 1 or args.samples < 3 or not args.out.resolve().is_relative_to(ROOT):
-        parser.error("warmup >= 1, samples >= 3, and output inside this worktree required")
+    if (
+        args.warmup < 1
+        or args.samples < 3
+        or args.repeats < 1
+        or not args.out.resolve().is_relative_to(ROOT)
+    ):
+        parser.error("warmup >= 1, samples >= 3, repeats >= 1, and output inside worktree required")
     precision = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[
         args.precision
     ]
@@ -141,6 +162,9 @@ def main() -> None:
     torch.manual_seed(0)
     rows = []
     for op in (args.op,) if args.op else spec.OPS:
+        print(
+            f"Benchmarking {op}: {args.size}, {args.precision}, {args.repeats} repeats", flush=True
+        )
         native_fn, fused_fn, parameters = make_case(op, args.size, precision)
         compile_start = time.perf_counter()
         functions = {
@@ -156,8 +180,18 @@ def main() -> None:
         actual = functions["CUDA"]()
         actual_grad = torch.autograd.grad(actual, parameters, cotangents)
         tol = spec.tolerance(precision)
-        for got, ref in zip((*actual, *actual_grad), (*expected, *expected_grad), strict=True):
-            torch.testing.assert_close(got, ref, atol=tol.atol, rtol=tol.rtol)
+        for index, (got, ref) in enumerate(
+            zip((*actual, *actual_grad), (*expected, *expected_grad), strict=True)
+        ):
+            kind = "output" if index < len(actual) else "gradient"
+            slot = index if kind == "output" else index - len(actual)
+            torch.testing.assert_close(
+                got,
+                ref,
+                atol=tol.atol,
+                rtol=tol.rtol,
+                msg=lambda message, label=f"{op} {kind}[{slot}]": f"{label}: {message}",
+            )
         torch.cuda.synchronize()
         startup = time.perf_counter() - compile_start
         del actual, expected, actual_grad, expected_grad
@@ -180,35 +214,51 @@ def main() -> None:
 
             warm_start = time.perf_counter()
             for _ in range(args.warmup):
-                for name in functions:
-                    step(name)
+                step("L1")
+                step("CUDA")
             torch.cuda.synchronize()
             warm_seconds = time.perf_counter() - warm_start
             torch.cuda.reset_peak_memory_stats()
             samples = {name: [] for name in functions}
-            for i in range(args.samples):
-                for name in ("L1", "CUDA") if i % 2 == 0 else ("CUDA", "L1"):
-                    samples[name].append(
-                        measure(lambda name=name: step(name), f"hsn/{op}/{name}/{mode}")
-                    )
-            medians = {
-                name: {
-                    metric: statistics.median(s[metric] for s in data)
-                    for metric in ("device_ms", "wall_ms")
-                }
-                for name, data in samples.items()
-            }
+            # Flatten repeated blocks into one sequence; alternate which backend goes first.
+            for i in range(args.samples * args.repeats):
+                first, second = ("L1", "CUDA") if i % 2 == 0 else ("CUDA", "L1")
+                samples[first].append(
+                    measure(lambda name=first: step(name), f"hsn/{op}/{first}/{mode}")
+                )
+                samples[second].append(
+                    measure(lambda name=second: step(name), f"hsn/{op}/{second}/{mode}")
+                )
             rows.append(
                 {
                     "op": op,
                     "mode": mode,
                     "samples": samples,
-                    "median": medians,
+                    "median": medians(samples),
+                    "median_by_repeat": [
+                        medians(
+                            {
+                                name: data[start : start + args.samples]
+                                for name, data in samples.items()
+                            }
+                        )
+                        for start in range(0, args.samples * args.repeats, args.samples)
+                    ],
                     "startup_seconds": startup,
                     "warmup_seconds": warm_seconds,
                     "combined_peak_bytes": torch.cuda.max_memory_allocated(),
                     "cuda_kernel_used": not (
-                        op == "gated_delta_update" and precision != torch.float32
+                        op in ("grouped_unit_mlp", "csr_messages", "gated_delta_update")
+                        and precision != torch.float32
+                    ),
+                    "fallback_reason": (
+                        "native mixed-precision MLP activation/gradient contract"
+                        if op == "grouped_unit_mlp" and precision != torch.float32
+                        else "native mixed-precision reduction/gradient contract"
+                        if op == "csr_messages" and precision != torch.float32
+                        else "native mixed-precision gated update"
+                        if op == "gated_delta_update" and precision != torch.float32
+                        else None
                     ),
                     "default_backend": "native",
                     "enable_decision": "pending review of repeated and integrated measurements",
@@ -218,6 +268,9 @@ def main() -> None:
         "observed_at": datetime.now(UTC).isoformat(),
         "size": args.size,
         "precision": args.precision,
+        "samples_per_repeat": args.samples,
+        "repeats": args.repeats,
+        "repeat_setup": "compile and warmup reused; consecutive alternating paired blocks",
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "device": torch.cuda.get_device_name(0),
@@ -231,6 +284,9 @@ def main() -> None:
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
         "dirty_status": subprocess.check_output(["git", "status", "--short"], cwd=ROOT, text=True),
+        "dirty_diff_sha256": hashlib.sha256(
+            subprocess.check_output(["git", "diff", "HEAD", "--"], cwd=ROOT)
+        ).hexdigest(),
         "build": json.loads((ROOT / "build/cuda_build.json").read_text()),
         "scope": "per-op adapters versus compiled native, including casts and index conversion",
         "rows": rows,

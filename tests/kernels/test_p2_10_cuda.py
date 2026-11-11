@@ -243,6 +243,52 @@ def test_p2_10_graph_replay_routing_and_stream(op):
         torch.testing.assert_close(grads[name], expected[name])
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("routing", ("spread", "skewed", "single"))
+def test_p2_10_mlp_tails_and_grouped_routes(dtype, routing):
+    """Cross all tile/route boundaries, including units with no selected pair.
+
+    Independent CPU matmul/autograd reference with the ABI's rounded saved
+    preactivation and fp32 intermediate gradients (rounding has identity derivative).
+    Keeping the reference on CPU also makes device sanitizers practical: they
+    check our kernels without instrumenting cuBLAS reference implementations.
+    """
+    torch.manual_seed(210)
+    P, M, d, H = 65, 11, 19, 73
+    shapes = ((P, 4 * d), (M, 4 * d, H), (M, H), (M, H, d), (M, d))
+    inputs = tuple(
+        (0.1 * torch.randn(shape, device="cuda")).to(dtype).requires_grad_(True) for shape in shapes
+    )
+    idx = torch.arange(P, device="cuda", dtype=torch.int32)
+    if routing == "spread":
+        idx = (idx * 7 + 3) % M
+    elif routing == "skewed":
+        idx = torch.where(idx % 9 == 0, torch.full_like(idx, 2), M - 1)
+    else:
+        idx.fill_(M - 1)
+    v, w1, b1, w2, b2 = inputs
+    out, hidden = ops.mlp_op(v, idx, w1, b1, w2, b2)
+    cotangent = torch.randn_like(out)
+    got_grad = torch.autograd.grad(out, inputs, cotangent)
+
+    refs = tuple(x.detach().float().cpu().requires_grad_(True) for x in inputs)
+    rv, rw1, rb1, rw2, rb2 = refs
+    cpu_idx = idx.long().cpu()
+    z = torch.bmm(rv[:, None, :], rw1[cpu_idx]).squeeze(1) + rb1[cpu_idx]
+    saved = z + (z.to(dtype).float() - z).detach()
+    expected = (
+        torch.bmm(torch.nn.functional.gelu(saved)[:, None, :], rw2[cpu_idx]).squeeze(1)
+        + rb2[cpu_idx]
+    )
+    ref_grad = torch.autograd.grad(expected, refs, cotangent.float().cpu())
+    tolerance = spec.tolerance(dtype)
+    for got, ref in zip((out, hidden, *got_grad), (expected, saved, *ref_grad), strict=True):
+        torch.testing.assert_close(got.float().cpu(), ref, atol=tolerance.atol, rtol=tolerance.rtol)
+    used = torch.bincount(cpu_idx, minlength=M) != 0
+    for grad in got_grad[1:]:
+        assert torch.count_nonzero(grad.cpu()[~used]) == 0
+
+
 def test_p2_10_no_nvrtc_symbols():
     libraries = list(ops.BUILD.glob("hsn_cuda_py*.so"))
     assert len(libraries) == 1
@@ -283,3 +329,163 @@ def test_p2_10_multistep_state_gradients_and_wide_ages():
         results.append((second.h, second.q, second.age, *grad))
     for actual, expected in zip(results[1], results[0], strict=True):
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("compiled", (False, True))
+@pytest.mark.parametrize("cached_weights", (False, True))
+def test_p2_10_mlp_autocast_model_shape_matches_native(dtype, compiled, cached_weights):
+    """P64 BF16 W1 gradients exposed a mismatch hidden by the P16 vectors."""
+    from hsn.kernels import native
+    from hsn.model.units import UnitBank
+
+    vector = testvectors.load_vector("grouped_unit_mlp", "ref")
+    t, dims = vector.tensors, vector.dims
+    bank = UnitBank(dims["M"], dims["d"], dims["H"], "gelu", init="fan_in").cuda()
+    with torch.no_grad():
+        for name in ("W1", "b1", "W2", "b2"):
+            getattr(bank, name).copy_(t[name])
+    v = t["v"].repeat(4, 1).cuda().requires_grad_(True)
+    idx = torch.arange(64, device="cuda") % dims["M"]
+    flat = (
+        bank.W1.permute(1, 0, 2).reshape(4 * dims["d"], -1).detach().requires_grad_(True)
+        if cached_weights
+        else None
+    )
+    parameters = (v, bank.W1 if flat is None else flat, bank.b1, bank.W2, bank.b2)
+
+    def call(backend):
+        with torch.autocast("cuda", dtype=dtype):
+            return backend.grouped_unit_mlp(v, idx, bank, static=True, w1_flat=flat)
+
+    expected = call(native)
+    cotangent = torch.ones_like(expected)
+    expected_grad = torch.autograd.grad(expected, parameters, cotangent)
+
+    def actual_fn():
+        return call(ops)
+
+    if compiled:
+        actual_fn = torch.compile(actual_fn, fullgraph=True, mode="reduce-overhead")
+    actual = actual_fn()
+    assert actual.dtype == expected.dtype == dtype
+    actual_grad = torch.autograd.grad(actual, parameters, cotangent)
+    tolerance = spec.tolerance(dtype)
+    for got, ref in zip((actual, *actual_grad), (expected, *expected_grad), strict=True):
+        torch.testing.assert_close(got, ref, atol=tolerance.atol, rtol=tolerance.rtol)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("compiled", (False, True))
+@pytest.mark.parametrize("cached_weights", (False, True))
+def test_p2_10_csr_autocast_adapter_matches_native(dtype, compiled, cached_weights):
+    from hsn.kernels import native
+    from hsn.model.graph import CellGraph
+
+    vector = testvectors.load_vector("csr_messages", "ref")
+    t, dims = vector.tensors, vector.dims
+    graph = CellGraph(dims["N"], 4, 0, edge_norm="sigmoid")
+    graph.set_topology(
+        t["indptr"].long(), t["indices"].long(), torch.zeros(dims["E"], dtype=torch.bool)
+    )
+    graph = graph.cuda()
+    projection = torch.nn.Linear(dims["d"], dims["d"], bias=False).cuda()
+    with torch.no_grad():
+        projection.weight.copy_(t["V"])
+    h = t["h"].cuda().requires_grad_(True)
+    idx = t["cell_idx"].cuda().long()
+    weights = graph._padded_weights().detach().requires_grad_(True) if cached_weights else None
+    parameters = (h, projection.weight, graph.edge_logit if weights is None else weights)
+
+    def call(backend):
+        with torch.autocast("cuda", dtype=dtype):
+            return backend.csr_messages(h, graph, projection, idx, weights=weights, validate=False)
+
+    expected = call(native)
+
+    def actual_fn():
+        return call(ops)
+
+    if compiled:
+        actual_fn = torch.compile(actual_fn, fullgraph=True, mode="reduce-overhead")
+    actual = actual_fn()
+    assert expected.dtype == torch.float32
+    tolerance = spec.tolerance(dtype)
+    torch.testing.assert_close(actual, expected, atol=tolerance.atol, rtol=tolerance.rtol)
+    cotangent = torch.ones_like(expected)
+    expected_grad = torch.autograd.grad(expected, parameters, cotangent)
+    actual_grad = torch.autograd.grad(actual, parameters, cotangent)
+    for got, ref in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(got, ref, atol=tolerance.atol, rtol=tolerance.rtol)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("shape", ((2, 3, 5, 5), (3, 7, 19, 4)))
+def test_p2_10_functional_state_update_matches_raw(dtype, shape):
+    """Wide ages, padded K>N, tail tiles, invalid NaNs, and exact raw-ABI parity."""
+    B, N, d, K = shape
+    torch.manual_seed(211)
+    h = torch.randn(B, N, d, device="cuda", dtype=dtype).requires_grad_(True)
+    q = torch.randn(B, d, device="cuda", dtype=dtype).requires_grad_(True)
+    c = torch.randn(B, K, d, device="cuda", dtype=dtype).requires_grad_(True)
+    b = torch.sigmoid(torch.randn_like(c)).requires_grad_(True)
+    age = torch.arange(B * N, device="cuda").reshape(B, N) + 2**40
+    age[-1, -1] = torch.iinfo(torch.int64).max
+    idx = torch.full((B, K), -(2**31), device="cuda", dtype=torch.int32)
+    valid = torch.zeros_like(idx)
+    idx[:, 0], idx[:, -1] = 0, N - 2
+    valid[:, 0] = valid[:, -1] = 1
+    with torch.no_grad():
+        c[:, 1:-1] = float("nan")
+        b[:, 1:-1] = float("nan")
+    before = (h.detach().clone(), q.detach().clone(), age.clone())
+    marker = torch.ones_like(age, dtype=torch.int32)
+    expected = ops.update_op(h, q, marker, idx, valid, c, b)
+    expected_age = torch.where(expected[2] == 0, torch.zeros_like(age), age)
+    actual = ops.state_update_op(h, q, age, idx, valid, c, b)
+    for got, ref in zip(actual, (expected[0], expected[1], expected_age, expected[3]), strict=True):
+        torch.testing.assert_close(got, ref, atol=0, rtol=0)
+    G, g = torch.randn_like(h), torch.randn_like(q)
+    parameters = (h, q, c, b)
+    ref_grad = torch.autograd.grad(expected[:2], parameters, (G, g))
+    got_grad = torch.autograd.grad(actual[:2], parameters, (G, g))
+    for got, ref in zip(got_grad, ref_grad, strict=True):
+        torch.testing.assert_close(got, ref, atol=0, rtol=0)
+    for original, saved in zip((h, q, age), before, strict=True):
+        torch.testing.assert_close(original, saved, atol=0, rtol=0)
+    assert torch.count_nonzero(got_grad[2][:, 1:-1]) == 0
+    assert torch.count_nonzero(got_grad[3][:, 1:-1]) == 0
+
+
+def test_p2_10_functional_state_update_opcheck_and_replay():
+    _, t, _ = case("gated_delta_update", "odd")
+    t["age"] = t["age"].long() + 2**40
+    names = ("h", "q", "age", "cell_idx", "valid", "c", "b")
+    args = tuple(t[n] for n in names)
+    torch.library.opcheck(ops.state_update_op, args)
+    parameters = tuple(t[n] for n in ("h", "q", "c", "b"))
+    cotangent = (torch.ones_like(t["h"]), torch.ones_like(t["q"]))
+
+    def step():
+        out = ops.state_update_op(*args)
+        grad = torch.autograd.grad(out[:2], parameters, cotangent)
+        return out, grad
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual, got_grad = step()
+    with torch.no_grad():
+        t["cell_idx"].copy_(t["cell_idx"].flip(1))
+        t["valid"].copy_(t["valid"].flip(1))
+        t["c"].add_(0.01)
+        t["age"].add_(1)
+    graph.replay()
+    expected, ref_grad = step()
+    for got, ref in zip((*actual, *got_grad), (*expected, *ref_grad), strict=True):
+        torch.testing.assert_close(got, ref, atol=0, rtol=0)

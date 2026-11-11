@@ -1,4 +1,4 @@
-/* P2.10 correctness-first device kernels. No host code, allocations or float atomics.
+/* P2.10 device kernels. No host code, allocations or float atomics.
  * Every reduction has a fixed order and accumulates in fp32 for all storage dtypes.
  * Native remains the default until parity and compiled-L1 benchmarks pass.
  */
@@ -24,6 +24,57 @@ template <typename T> __device__ void gated_update(HsnCudaArgs a) {
     }
     put<T>(a, 1, t, get<T>(a, 1, t) + delta / a.N);
 }
+
+// Private functional state update. p = h, q, age(int64), idx, valid, c, b,
+// new_h, new_q, new_age(int64), old. Inputs are never mutated. A single pass
+// carries unchanged state forward and writes updates, without clone/reset kernels.
+template <typename T> __device__ void gated_update_functional_v1(HsnCudaArgs a) {
+    const auto t = tid();
+    if (t < a.B * a.N * a.d) {
+        const int x = t % a.d, n = (t / a.d) % a.N, r = t / (a.N * a.d);
+        T value = static_cast<const T*>(a.p[0])[t];
+        bool reset = false;
+        for (int k = 0; k < a.K; ++k) {
+            const int s = r * a.K + k;
+            if (index(a, 4, s) && bounded_index(a, 3, s, a.N) == n) {
+                const int o = s * a.d + x;
+                const float b = get<T>(a, 6, o), old = fp32(value);
+                value = rounded<T>((1.0f - b) * old + b * get<T>(a, 5, o));
+                reset = true;
+            }
+        }
+        static_cast<T*>(a.p[7])[t] = value;
+        if (x == 0) {
+            const int cell = r * a.N + n;
+            static_cast<int64_t*>(a.p[9])[cell] = reset ? 0
+                : static_cast<const int64_t*>(a.p[2])[cell];
+        }
+    }
+    if (t < a.B * a.d) {
+        const int r = t / a.d, x = t % a.d;
+        float delta = 0.0f;
+        for (int k = 0; k < a.K; ++k) {
+            const int s = r * a.K + k, o = s * a.d + x;
+            if (!index(a, 4, s)) continue;
+            const int n = bounded_index(a, 3, s, a.N);
+            const float old = get<T>(a, 0, (r * a.N + n) * a.d + x);
+            const float b = get<T>(a, 6, o);
+            const float next = (1.0f - b) * old + b * get<T>(a, 5, o);
+            delta += next - old;
+        }
+        put<T>(a, 8, t, get<T>(a, 1, t) + delta / a.N);
+    }
+    if (t < a.B * a.K * a.d) {
+        const int s = t / a.d, x = t % a.d, r = s / a.K;
+        float old = 0.0f;
+        if (index(a, 4, s)) {
+            const int n = bounded_index(a, 3, s, a.N);
+            old = get<T>(a, 0, (r * a.N + n) * a.d + x);
+        }
+        put<T>(a, 10, t, old);
+    }
+}
+
 
 // p = idx, valid, c, b, old, G, g, dh, dq, dc, db.
 template <typename T> __device__ void gated_update_bwd(HsnCudaArgs a) {
@@ -56,52 +107,125 @@ template <typename T> __device__ void gated_update_bwd(HsnCudaArgs a) {
     }
 }
 
-// MLP forward p = v, unit_idx, W1, b1, W2, b2, hidden, out.
+// The MLP uses 256-thread tiles. For row-vector products, a warp covers 32
+// contiguous output columns and eight warps partition the reduction. The
+// transposed products instead reduce one contiguous weight row per warp.
+__device__ __forceinline__ float warp_sum(float value) {
+    for (int offset = 16; offset; offset /= 2)
+        value += __shfl_down_sync(0xffffffff, value, offset);
+    return value;
+}
+
+// MLP forward p = v, unit_idx, W1, b1, W2, b2, hidden, out, activation(float).
 template <typename T> __device__ void mlp_hidden(HsnCudaArgs a) {
-    const auto t = tid();
-    if (t >= a.P * a.H) return;
-    const int p = t / a.H, h = t % a.H, j = bounded_index(a, 1, p, a.M);
-    float v = get<T>(a, 3, j * a.H + h);
-    for (int c = 0; c < 4 * a.d; ++c)
-        v += get<T>(a, 0, p * 4 * a.d + c) * get<T>(a, 2, (j * 4 * a.d + c) * a.H + h);
-    put<T>(a, 6, t, v);
+    __shared__ float partial[256];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int tiles = (a.H + 31) / 32;
+    const int p = blockIdx.x / tiles, h = (blockIdx.x % tiles) * 32 + lane;
+    const int j = bounded_index(a, 1, p, a.M);
+    float value = 0.0f;
+    if (h < a.H) for (int c = warp; c < 4 * a.d; c += 8)
+        value += get<T>(a, 0, p * 4 * a.d + c) * get<T>(a, 2, (j * 4 * a.d + c) * a.H + h);
+    partial[threadIdx.x] = value;
+    __syncthreads();
+    if (warp == 0 && h < a.H) {
+        float z = get<T>(a, 3, j * a.H + h);
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) z += partial[w * 32 + lane];
+        // Preserve the ABI's rounded, pre-GELU hidden value. Cache GELU in fp32
+        // once per hidden element instead of recomputing it for every output.
+        z = fp32(rounded<T>(z));
+        put<T>(a, 6, p * a.H + h, z);
+        static_cast<float*>(a.p[8])[p * a.H + h] = gelu(z);
+    }
 }
 template <typename T> __device__ void mlp_out(HsnCudaArgs a) {
-    const auto t = tid();
-    if (t >= a.P * a.d) return;
-    const int p = t / a.d, x = t % a.d, j = bounded_index(a, 1, p, a.M);
-    float out = get<T>(a, 5, j * a.d + x);
-    for (int h = 0; h < a.H; ++h)
-        out += gelu(get<T>(a, 6, p * a.H + h)) * get<T>(a, 4, (j * a.H + h) * a.d + x);
-    put<T>(a, 7, t, out);
+    __shared__ float partial[256];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int tiles = (a.d + 31) / 32;
+    const int p = blockIdx.x / tiles, x = (blockIdx.x % tiles) * 32 + lane;
+    const int j = bounded_index(a, 1, p, a.M);
+    float value = 0.0f;
+    if (x < a.d) for (int h = warp; h < a.H; h += 8)
+        value += static_cast<const float*>(a.p[8])[p * a.H + h]
+            * get<T>(a, 4, (j * a.H + h) * a.d + x);
+    partial[threadIdx.x] = value;
+    __syncthreads();
+    if (warp == 0 && x < a.d) {
+        float out = get<T>(a, 5, j * a.d + x);
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) out += partial[w * 32 + lane];
+        put<T>(a, 7, p * a.d + x, out);
+    }
 }
 
 // MLP backward p = v, idx, W1, W2, hidden, dout, dv, dW1, db1, dW2, db2, dz(float).
+// Additional scratch: activation(float) at 12, grouped pair indices(int32) at
+// 13 and unit offsets(int32, M+1) at 14. Every reduction has a fixed order.
 template <typename T> __device__ void mlp_dz(HsnCudaArgs a) {
-    const auto t = tid();
-    if (t >= a.P * a.H) return;
-    const int p = t / a.H, h = t % a.H, j = bounded_index(a, 1, p, a.M);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int tiles = (a.H + 7) / 8;
+    const int p = blockIdx.x / tiles, h = (blockIdx.x % tiles) * 8 + warp;
+    if (h >= a.H) return;  // uniform within each warp
+    const int j = bounded_index(a, 1, p, a.M), t = p * a.H + h;
     float g = 0.0f;
-    for (int x = 0; x < a.d; ++x)
+    for (int x = lane; x < a.d; x += 32)
         g += get<T>(a, 5, p * a.d + x) * get<T>(a, 3, (j * a.H + h) * a.d + x);
-    static_cast<float*>(a.p[11])[t] = g * dgelu(get<T>(a, 4, t));
+    g = warp_sum(g);
+    if (lane == 0) {
+        const float z = get<T>(a, 4, t);
+        static_cast<float*>(a.p[11])[t] = g * dgelu(z);
+        static_cast<float*>(a.p[12])[t] = gelu(z);
+    }
 }
 template <typename T> __device__ void mlp_dv(HsnCudaArgs a) {
-    const auto t = tid();
-    if (t >= a.P * 4 * a.d) return;
-    const int p = t / (4 * a.d), c = t % (4 * a.d), j = bounded_index(a, 1, p, a.M);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int tiles = (4 * a.d - 1) / 8 + 1;
+    const int p = blockIdx.x / tiles, c = (blockIdx.x % tiles) * 8 + warp;
+    if (c >= 4 * a.d) return;
+    const int j = bounded_index(a, 1, p, a.M);
     float g = 0.0f;
-    for (int h = 0; h < a.H; ++h)
+    for (int h = lane; h < a.H; h += 32)
         g += static_cast<const float*>(a.p[11])[p * a.H + h]
             * get<T>(a, 2, (j * 4 * a.d + c) * a.H + h);
-    put<T>(a, 6, t, g);
+    g = warp_sum(g);
+    if (lane == 0) put<T>(a, 6, p * 4 * a.d + c, g);
+}
+
+// One warp per unit builds a compact, ascending list of its selected pairs.
+// No host readback or atomic append: graph replay can change all routes and
+// weight gradients still accumulate in the same pair order, including zeros
+// for unused units. Work is O(M*P) here, rather than O(M*P*number_of_weights).
+template <typename T> __device__ void mlp_routes(HsnCudaArgs a) {
+    const int lane = threadIdx.x % 32;
+    const int j = blockIdx.x * 8 + threadIdx.x / 32;
+    if (j >= a.M) return;
+    int start = 0;
+    for (int base = 0; base < a.P; base += 32) {
+        const int p = base + lane;
+        const bool before = p < a.P && bounded_index(a, 1, p, a.M) < j;
+        start += __popc(__ballot_sync(0xffffffff, before));
+    }
+    if (lane == 0) {
+        static_cast<int32_t*>(a.p[14])[j] = start;
+        if (j == a.M - 1) static_cast<int32_t*>(a.p[14])[a.M] = a.P;
+    }
+    const unsigned lower = (1u << lane) - 1;
+    for (int base = 0; base < a.P; base += 32) {
+        const int p = base + lane;
+        const bool selected = p < a.P && index(a, 1, p) == j;
+        const unsigned mask = __ballot_sync(0xffffffff, selected);
+        if (selected) static_cast<int32_t*>(a.p[13])[start + __popc(mask & lower)] = p;
+        start += __popc(mask);
+    }
 }
 template <typename T> __device__ void mlp_dw1(HsnCudaArgs a) {
     const auto t = tid();
     if (t >= a.M * 4 * a.d * a.H) return;
     const int h = t % a.H, c = (t / a.H) % (4 * a.d), j = t / (4 * a.d * a.H);
     float dw = 0.0f, db = 0.0f;
-    for (int p = 0; p < a.P; ++p) if (index(a, 1, p) == j) {
+    for (int pos = index(a, 14, j); pos < index(a, 14, j + 1); ++pos) {
+        const int p = index(a, 13, pos);
         const float dz = static_cast<const float*>(a.p[11])[p * a.H + h];
         dw += get<T>(a, 0, p * 4 * a.d + c) * dz;
         if (c == 0) db += dz;
@@ -114,9 +238,10 @@ template <typename T> __device__ void mlp_dw2(HsnCudaArgs a) {
     if (t >= a.M * a.H * a.d) return;
     const int x = t % a.d, h = (t / a.d) % a.H, j = t / (a.H * a.d);
     float dw = 0.0f, db = 0.0f;
-    for (int p = 0; p < a.P; ++p) if (index(a, 1, p) == j) {
+    for (int pos = index(a, 14, j); pos < index(a, 14, j + 1); ++pos) {
+        const int p = index(a, 13, pos);
         const float g = get<T>(a, 5, p * a.d + x);
-        dw += gelu(get<T>(a, 4, p * a.H + h)) * g;
+        dw += static_cast<const float*>(a.p[12])[p * a.H + h] * g;
         if (h == 0) db += g;
     }
     put<T>(a, 9, t, dw);
@@ -224,19 +349,27 @@ template <typename T> __device__ void gather_bwd(HsnCudaArgs a) {
 }
 }  // namespace hsn
 
-// Stable, unmangled names: the same fatbin is loaded by both hosts.
+// Unmangled names: the same fatbin is loaded by both hosts. Version the MLP
+// launch contract so an old host fails during preparation instead of launching
+// these tiled kernels with the old grid or missing scratch pointers.
 #define HSN_EXPORT(OP, TYPE, SUFFIX) \
     extern "C" __global__ void hsn_cuda_##OP##_##SUFFIX(HsnCudaArgs a) { hsn::OP<TYPE>(a); }
 #define HSN_TYPES(OP) \
     HSN_EXPORT(OP, float, f32) HSN_EXPORT(OP, __half, f16) HSN_EXPORT(OP, __nv_bfloat16, bf16)
+#define HSN_EXPORT_MLP(OP, TYPE, SUFFIX) \
+    extern "C" __global__ void hsn_cuda_##OP##_v2_##SUFFIX(HsnCudaArgs a) { hsn::OP<TYPE>(a); }
+#define HSN_MLP_TYPES(OP) \
+    HSN_EXPORT_MLP(OP, float, f32) HSN_EXPORT_MLP(OP, __half, f16) HSN_EXPORT_MLP(OP, __nv_bfloat16, bf16)
 HSN_TYPES(gated_update)
 HSN_TYPES(gated_update_bwd)
-HSN_TYPES(mlp_hidden)
-HSN_TYPES(mlp_out)
-HSN_TYPES(mlp_dz)
-HSN_TYPES(mlp_dv)
-HSN_TYPES(mlp_dw1)
-HSN_TYPES(mlp_dw2)
+HSN_TYPES(gated_update_functional_v1)
+HSN_MLP_TYPES(mlp_hidden)
+HSN_MLP_TYPES(mlp_out)
+HSN_MLP_TYPES(mlp_dz)
+HSN_MLP_TYPES(mlp_dv)
+HSN_MLP_TYPES(mlp_dw1)
+HSN_MLP_TYPES(mlp_dw2)
+HSN_MLP_TYPES(mlp_routes)
 HSN_TYPES(messages)
 HSN_TYPES(messages_dh)
 HSN_TYPES(messages_da)

@@ -15,14 +15,14 @@
 #include "hsn_cuda_launch.h"
 
 namespace {
-constexpr const char* phases[] = {"gated_update", "gated_update_bwd", "mlp_hidden", "mlp_out",
-    "mlp_dz", "mlp_dv", "mlp_dw1", "mlp_dw2", "messages", "messages_dh", "messages_da",
-    "messages_dv", "gather", "gather_bwd"};
+constexpr const char* phases[] = {"gated_update", "gated_update_bwd", "mlp_hidden_v2", "mlp_out_v2",
+    "mlp_dz_v2", "mlp_dv_v2", "mlp_dw1_v2", "mlp_dw2_v2", "messages", "messages_dh", "messages_da",
+    "messages_dv", "gather", "gather_bwd", "mlp_routes_v2", "gated_update_functional_v1"};
 constexpr const char* suffixes[] = {"f32", "f16", "bf16"};
 struct Module {
     CUmodule handle;
     std::string path;
-    std::array<std::array<CUfunction, 3>, 14> functions;
+    std::array<std::array<CUfunction, 3>, std::size(phases)> functions;
 };
 // Keep modules alive through all captured graphs; process teardown releases the contexts.
 std::mutex modules_mutex;
@@ -82,7 +82,15 @@ void launch(int phase, int dtype, HsnCudaArgs args, int64_t count, void* stream)
         function = found->second.functions[phase][dtype];
     }
     void* parameters[] = {&args};
-    driver_check(cuLaunchKernel(function, (count + 255) / 256, 1, 1, 256, 1, 1, 0,
+    int64_t blocks = (count + 255) / 256;
+    switch (phase) {
+        case 2: blocks = int64_t(args.P) * ((args.H - 1) / 32 + 1); break;
+        case 3: blocks = int64_t(args.P) * ((args.d - 1) / 32 + 1); break;
+        case 4: blocks = int64_t(args.P) * ((args.H - 1) / 8 + 1); break;
+        case 5: blocks = int64_t(args.P) * ((4 * args.d - 1) / 8 + 1); break;
+        case 14: blocks = (args.M - 1) / 8 + 1; break;
+    }
+    driver_check(cuLaunchKernel(function, blocks, 1, 1, 256, 1, 1, 0,
         static_cast<CUstream>(stream), parameters, nullptr));
 }
 struct AbiError { int status; };
@@ -155,6 +163,12 @@ extern "C" int hsn_grouped_unit_mlp_fwd(const void* v, const int32_t* idx, const
     ABI_BEGIN
     auto a = unit(P, M, d, H, dtype);
     pointers(a, {v, idx, W1, b1, W2, b2, hidden, out});
+    int device;
+    TORCH_CHECK(cudaGetDevice(&device) == cudaSuccess, "cannot get current CUDA device");
+    const c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(
+        static_cast<cudaStream_t>(stream), device));
+    auto activation = at::empty({P, H}, at::TensorOptions().device(at::kCUDA, device).dtype(at::kFloat));
+    a.p[8] = activation.data_ptr();
     launch(2, dtype, a, P * H, stream); launch(3, dtype, a, P * d, stream);
     ABI_END
 }
@@ -170,9 +184,15 @@ extern "C" int hsn_grouped_unit_mlp_bwd(const void* v, const int32_t* idx, const
     const c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(
         static_cast<cudaStream_t>(stream), device));
     // The PyTorch graph memory pool owns scratch during capture and replay.
-    auto scratch = at::empty({P, H}, at::TensorOptions().device(at::kCUDA, device).dtype(at::kFloat));
+    const auto options = at::TensorOptions().device(at::kCUDA, device);
+    auto scratch = at::empty({2, P, H}, options.dtype(at::kFloat));
+    auto routes = at::empty({int64_t(P) + M + 1}, options.dtype(at::kInt));
     a.p[11] = scratch.data_ptr();
+    a.p[12] = scratch.data_ptr<float>() + int64_t(P) * H;
+    a.p[13] = routes.data_ptr();
+    a.p[14] = routes.data_ptr<int32_t>() + P;
     launch(4, dtype, a, P * H, stream); launch(5, dtype, a, P * 4 * d, stream);
+    launch(14, dtype, a, M, stream);
     launch(6, dtype, a, M * 4 * d * H, stream); launch(7, dtype, a, M * H * d, stream);
     ABI_END
 }
@@ -227,13 +247,13 @@ int dtype_code(const Tensor& tensor) {
     }
 }
 // Private Python binding, with full metadata checks before the C ABI sees pointers.
-// op: gather=0, gather_bwd=1, mlp=2, mlp_bwd=3, csr=4, csr_bwd=5, update=6, update_bwd=7.
+// op: gather=0, gather_bwd=1, mlp=2, mlp_bwd=3, csr=4, csr_bwd=5, update=6, update_bwd=7, state_update=8.
 std::vector<Tensor> run(int op, const std::vector<Tensor>& in, const Shape& dims) {
-    TORCH_CHECK(dims.size() == 8 && op >= 0 && op < 8, "invalid HSN launch descriptor");
+    TORCH_CHECK(dims.size() == 8 && op >= 0 && op < 9, "invalid HSN launch descriptor");
     for (size_t i = 0; i < dims.size(); ++i)
         TORCH_CHECK(dims[i] >= (i == 7 ? 0 : 1) && dims[i] <= INT_MAX, "HSN dimension out of range");
     const int B=dims[0], N=dims[1], d=dims[2], K=dims[3], P=dims[4], M=dims[5], H=dims[6], E=dims[7];
-    const size_t counts[] = {5, 2, 6, 6, 6, 7, 7, 7};
+    const size_t counts[] = {5, 2, 6, 6, 6, 7, 7, 7, 7};
     TORCH_CHECK(in.size() == counts[op], "wrong input count");
     const Tensor& reference = in[op == 7 ? 2 : 0];
     TORCH_CHECK(reference.is_cuda(), "HSN CUDA requires CUDA tensors");
@@ -259,10 +279,11 @@ std::vector<Tensor> run(int op, const std::vector<Tensor>& in, const Shape& dims
             break;
         case 6: shapes={{B,N,d},{B,d},{B,N},{B,K},{B,K},{B,K,d},{B,K,d}}; ints={2,3,4}; break;
         case 7: shapes={{B,K},{B,K},{B,K,d},{B,K,d},{B,K,d},{B,N,d},{B,d}}; ints={0,1}; break;
+        case 8: shapes={{B,N,d},{B,d},{B,N},{B,K},{B,K},{B,K,d},{B,K,d}}; ints={3,4}; break;
     }
     for (size_t i = 0; i < in.size(); ++i) {
-        const auto expected = std::find(ints.begin(), ints.end(), i) != ints.end()
-            ? at::kInt : reference.scalar_type();
+        const auto expected = op == 8 && i == 2 ? at::kLong
+            : std::find(ints.begin(), ints.end(), i) != ints.end() ? at::kInt : reference.scalar_type();
         TORCH_CHECK(in[i].device() == reference.device() && in[i].is_contiguous()
             && in[i].scalar_type() == expected && in[i].sizes().vec() == shapes[i],
             "invalid HSN input ", i, " for op ", op);
@@ -306,6 +327,16 @@ std::vector<Tensor> run(int op, const std::vector<Tensor>& in, const Shape& dims
         case 7:
             alloc({B,N,d}); alloc({B,d}); alloc({B,K,d}); alloc({B,K,d});
             status=hsn_gated_delta_update_bwd(ip(0),ip(1),p[2],p[3],p[4],p[5],p[6],o(0),o(1),o(2),o(3),B,N,d,K,dtype,stream); break;
+        case 8: {
+            alloc({B,N,d}); alloc({B,d});
+            out.push_back(at::empty({B,N}, in[2].options()));
+            alloc({B,K,d});
+            auto args = cell(B, N, d, K, dtype);
+            pointers(args, {p[0],p[1],p[2],p[3],p[4],p[5],p[6],o(0),o(1),o(2),o(3)});
+            launch(15, dtype, args, B * std::max(N, K) * d, stream);
+            status = HSN_OK;
+            break;
+        }
     }
     TORCH_CHECK(status == HSN_OK, "HSN CUDA status ", status, ": ", last_error);
     return out;
