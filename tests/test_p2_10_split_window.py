@@ -296,6 +296,25 @@ def test_out_of_scope_configurations_are_refused(overrides: tuple[str, ...]) -> 
         SplitWindow(model, cfg, None)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        (*A5, "train.feedback_detach=[summary,eps,state]"),
+        ("model.routing=topk", "train.gate_mode=soft", ALL),
+        (*A5, ALL, "train.epsilon_start=0.1", "train.epsilon_end=0.1"),
+        (ALL,),
+    ],
+)
+@pytest.mark.parametrize("window", ["split", "fused"])
+def test_the_configuration_refuses_the_key_outside_its_scope(
+    overrides: tuple[str, ...], window: str
+) -> None:
+    """Loading is where a spec is expanded and queued: the refusal comes there."""
+    with pytest.raises(ValueError, match="hardware.window"):
+        _cfg(*overrides, f"hardware.window={window}")
+    assert _cfg(*RECIPE, "train.p_dense=0.25", f"hardware.window={window}").hardware.window
+
+
 def test_the_key_is_opt_in_and_keeps_the_hash() -> None:
     base = _cfg(*RECIPE)
     assert base.hardware.window == "autograd"

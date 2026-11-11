@@ -375,6 +375,17 @@ loudly; once P2.8 is merged, requeue it. Each record holds the compile mode, whe
 P2.8's `compile_seconds` (training steps) and `window_compile_seconds` (every compiled variant, evaluation
 included).
 
+**Split window.** `hardware.window` is an override of the same kind (P2.10, `docs/p2_10_split_window.md`):
+`autograd` (the default: omitted from the configuration hash, so existing arm ids do not move) or `split`, the
+training window as a forward sweep without autograd plus one batched replay. It computes the same gradients
+(float64: to 1e-9; bf16: to rounding, so a run is not bit-reproducible against an `autograd` run) at about
+0.056 s per step instead of 0.100 on the A6 recipe. It needs the full A6 feedback cut, `routing: topk` and the
+`ste` gate from step 0; a configuration outside its scope is refused when it is loaded, so at `expand` and
+`enqueue` (`hsn.config.split_window_scope_error` names what is missing). `train.p_dense`, `train.lambda_b` and the cost term are
+inside it; `train.epsilon_*` and `train.lambda_u` are not. Build its two kernels once per checkout with
+`scripts/build_window_kernels.py`; without them the run is correct and slow. `fused` is an experiment that is
+slower than `split`. Example: `configs/sweeps/p2_10_split_seeds.yaml`.
+
 Compiled artifacts persist between arms: the worker gives every child `TORCHINDUCTOR_CACHE_DIR`, by default
 `<db dir>/inductor-cache` (inductor's own default is under `/tmp`). Arms that differ only in learning rate, seed
 or schedule share one compiled graph. The first arm of each memory key runs alone, so it compiles cold and fills

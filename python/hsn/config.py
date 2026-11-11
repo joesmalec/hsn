@@ -1007,6 +1007,14 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
+        # --- P2.10: the split window is only defined inside its scope ---
+        if self.hardware.window != "autograd":
+            reason = split_window_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.window={self.hardware.window!r} is not available for this "
+                    f"configuration: {reason}"
+                )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
@@ -1328,6 +1336,43 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.route_guard",
     "hardware.window",
 )
+
+
+def split_window_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
+    ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is only
+    defined where the heavy backward work is local to its position (the full A6 feedback cut)
+    and for the routed hard-gate round it replays."""
+    model, train = cfg.model, cfg.train
+    if cfg.model_name != "hsn":
+        return f"model_name={cfg.model_name!r} is not the HSN"
+    if model.routing != "topk":
+        return f"model.routing={model.routing!r}: the split window needs topk"
+    if train.gate_mode != "ste":
+        return f"train.gate_mode={train.gate_mode!r}: the split window needs ste"
+    if train.soft_until_step > 0:
+        return f"train.soft_until_step={train.soft_until_step}: a soft warm-up runs every cell"
+    missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
+    if missing:
+        return (
+            f"train.feedback_detach lacks {missing}: without the full feedback cut the heavy "
+            "backward work is not local to its position"
+        )
+    if train.epsilon_start > 0.0 or train.epsilon_end > 0.0:
+        return "train.epsilon_*: exploration draws are not replayed"
+    if train.lambda_u > 0.0:
+        return "train.lambda_u > 0: the counterfactual probes are untested with the split window"
+    if train.state_grad_clip is not None or train.state_grad_ratio is not None:
+        return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
+    if model.disabled_cells:
+        return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
+    if model.r_max != 1:
+        return f"model.r_max={model.r_max}: one round per position only"
+    if train.precision == "fp16":
+        return "train.precision=fp16 scales the loss (GradScaler)"
+    if train.grad_accum != 1:
+        return f"train.grad_accum={train.grad_accum}: one window per step only"
+    return None
 
 
 def _hash_view(cfg: RunConfig) -> dict[str, Any]:
