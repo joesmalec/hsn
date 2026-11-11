@@ -17,8 +17,8 @@ the delayed task, B32, compiled, unguarded: no spike guard, no rollback, every d
 3. *The sag.* That recipe still loses 5 to 21 points mid-run and recovers. The cause is a
    router unit taking over the positions where values are written, which undoes the key binding
    (section 3d). `train.route_guard` (opt-in) halves that unit's router step when the takeover
-   starts, at whatever step that is; on the three controlled seeds the deep sag is gone and the
-   final score is higher (section 3e).
+   starts, at whatever step that is; on all six seeds the deep sag is gone and the final score
+   is higher (section 3e).
 4. *The GPU pauses* were the diagnostics and probes running eager forwards, and Python's garbage
    collector; both are fixed (section 4).
 
@@ -28,16 +28,17 @@ the delayed task, B32, compiled, unguarded: no spike guard, no rollback, every d
 | Before: current-norm caps (exps 342 / 325 / 345) | failed / 81.4 / 2.2 % | – / 65.3 / 2.2 % | 57.9 / 34.6 / 66.8 pp |
 | Feedback cut + anchored caps (exps 360 / 361 / 349) | 81.2 / 79.0 / 84.0 % | 65.8 / 66.6 / 70.7 % | 2.2 / 6.8 / 4.5 pp |
 | + A4, scored on averaged weights, seeds 0 to 5 (exps 375-377, 418-420) | 85.9 / 86.5 / 86.5 / 84.7 / 82.1 / 84.6 % | 76.7 / 76.3 / 75.8 / 79.0 / 71.0 / 73.6 % | 10.9 / 21.3 / 20.0 / 5.1 / 13.7 / 14.7 pp |
-| **+ route guard, seeds 0 to 2 (exps 421-423)** | **86.2 / 93.3 / 88.9 %** | **75.8 / 92.3 / 82.1 %** | **5.8 / 1.8 / 8.7 pp** |
+| **+ route guard, seeds 0 to 5 (exps 421-426)** | **86.2 / 93.3 / 88.9 / 95.6 / 84.9 / 85.3 %** | **75.8 / 92.3 / 82.1 / 94.1 / 81.2 / 75.3 %** | **5.8 / 1.8 / 8.7 / 1.5 / 5.2 / 6.0 pp** |
 | GRU, delayed task (exps 154, 347, 204, 206, 405-407) | 76.7 to 79.3 % | 56.2 to 59.7 % | 0.5 to 1.3 pp |
 
-Means: 85.1 % over six seeds without the guard (86.3 % on seeds 0 to 2) and 89.5 % with it on
-seeds 0 to 2, against 79.3 % for the GRU's best run. Later queries, where the dev keys were never
-seen in training and a key-blind reader tops out at 62.3 %: 75.4 % and 83.4 %, against 56 to
-60 %. No step is skipped in any of these runs. With the guard the model reaches 0.6 dev at step
-1,000 to 1,500 and stays above it (the GRU's speed bar is 2,500 to 3,000). Eight runs pass the
-frozen key-binding verdict, the first of this project (exps 384, 386, 389, 399, 401, 413 at step
-5,000; 418 and 422 at 9,000); most runs are still "partial".
+Means over the six seeds: 85.1 % without the guard and 89.0 % with it (higher on every seed, by
+0.3 to 10.9 points), against 79.3 % for the GRU's best run. Later queries, where the dev keys
+were never seen in training and a key-blind reader tops out at 62.3 %: 75.4 % and 83.5 %, against
+56 to 60 %. No step is skipped in any of these runs. With the guard the model reaches 0.6 dev at
+step 1,000 to 1,500 and stays above it (the GRU's speed bar is 2,500 to 3,000). Ten runs pass the
+frozen key-binding verdict, the first of this project: three of the six guarded 9k runs (exps
+422, 424, 425) and one of the six unguarded (exp 418), and six runs stopped at step 5,000 (exps
+384, 386, 389, 399, 401, 413); the others are "partial".
 
 Over 27,000 steps the recipe ends at 90.6 % with the guard and at 90.6 % without it (later
 queries 83.5 % and 82.8 %, exps 417 and 416), against 78.7 % for the GRU and 70.2 % for the
@@ -334,7 +335,7 @@ that sags (caps 0.003, lr 2.5e-3, A4, averaged weights):
 | --- | --- | --- | --- |
 | 1 | routes lost to the unit with the most slots | exps 396-398 (seed 1, 5k) | did not work: the taker is not the most-used unit; 65.6 / 70.2 / 69.9 % |
 | 2 | any established (input byte, unit) route lost; the unit that gained most | exps 399-401 (seed 1, 5k); 402-404 (seeds 0-2, 9k, stopped near step 4,000) | held once (90.3 % and 93.1 % at 5k, binds keys), then dips of 8 to 20 points on all three seeds: it slowed units that were picking up the filler's positions, never the taker |
-| 3 | a unit that serves the supervised positions (from the loss mask) above its own record on bytes whose established routes belong to other units | exps 413-415 (seeds 0-2, 5k); 421-423 (seeds 0-2, 9k) | the deep sag is gone on every seed; 89.5 % mean at 9k against 86.3 % |
+| 3 | a unit that serves the supervised positions (from the loss mask) above its own record on bytes whose established routes belong to other units | exps 413-415 (seeds 0-2, 5k); 421-426 (seeds 0-5, 9k); 417 (27k) | the deep sag is gone on every seed; 89.0 % mean at 9k against 85.1 % |
 
 Version 3 over the full 9,000 steps against the same configuration without the guard (averaged
 weights; the two differ in nothing else):
@@ -344,9 +345,12 @@ weights; the two differ in nothing else):
 | 0 | 86.2% (exp 421) | 75.8% | 5.8 pp | 50.4% / 28.4%, partial | 40 | 85.9% (exp 375) | 76.7% | 10.9 pp |
 | 1 | 93.3% (exp 422) | 92.3% | 1.8 pp | 93.4% / 2.3%, **binds keys** | 62 | 86.5% (exp 376) | 76.3% | 21.3 pp |
 | 2 | 88.9% (exp 423) | 82.1% | 8.7 pp | 62.1% / 15.0%, partial | 44 | 86.5% (exp 377) | 75.8% | 20.0 pp |
-| mean | 89.5% | 83.4% | | | | 86.3% | 76.3% | |
+| 3 | 95.6% (exp 424) | 94.1% | 1.5 pp | 96.8% / 1.3%, **binds keys** | 48 | 84.7% (exp 418) | 79.0% | 5.1 pp |
+| 4 | 84.9% (exp 425) | 81.2% | 5.2 pp | 83.0% / 7.4%, **binds keys** | 63 | 82.1% (exp 419) | 71.0% | 13.7 pp |
+| 5 | 85.3% (exp 426) | 75.3% | 6.0 pp | 58.4% / 20.1%, partial | 57 | 84.6% (exp 420) | 73.6% | 14.7 pp |
+| mean | 89.0% | 83.5% | | | | 85.1% | 75.4% | |
 
-The first event comes at step 1,700 to 1,900 in each run, where the unguarded runs begin to sag;
+The first event comes at step 1,400 to 2,100 in each run, where the unguarded runs begin to sag;
 by the end exactly one unit per run (the one that serves the answer positions) is at the floor
 of its step scale and every other unit is untouched. The same guard stopped at step 5,000 (exps
 413 to 415): 88.3 / 81.6 / 82.5 % with worst drawdowns of 6.8 / 3.1 / 0.0 points, against 77.0 /
@@ -365,8 +369,8 @@ queries 83.5 % against 82.8 %, swap followed 51.5 % against 55.2 %, both "partia
 long constant-rate phase the guard fired 123 times, all on one unit, and the value routes still
 eroded slowly.
 
-What the guard does not do. It reduces the sag, it does not remove every fall: seeds 0 and 2
-still slide 6 and 9 points late in the constant-rate phase (steps 5,000 to 7,000) before the
+What the guard does not do. It reduces the sag, it does not remove every fall: four of the six
+seeds still slide 5 to 9 points late in the constant-rate phase (steps 5,000 to 7,000) before the
 decay lifts them. On seed 0 the reader's router rows were at the floor (1/64 of their step) by
 step 2,500 and the readings still showed its share creeping up, because the units that lose the
 route also un-learn it (their weight on the previous byte's address is pushed through zero, exps
@@ -375,8 +379,8 @@ forming slows that run (exps 414 and 415 at 5k: 55 % and 77 % at step 3,500 befo
 The `restore` option (rewinding the gaining unit's rows) was worse in the one run that tried it
 (exp 400: 77.9 %). Runs are not bit-reproducible on this card and the variation between two runs
 of one configuration is several points (seed 1 with the second version: 90.3 % at step 5,000 in
-exp 399, a 20-point dip in exp 403), so three seeds are an indication, not a proof. The guard is
-opt-in and off by default.
+exp 399, a 20-point dip in exp 403), so six seeds with one run each are an indication, not a
+proof. The guard is opt-in and off by default.
 
 ## 4. The GPU pauses
 
@@ -444,17 +448,17 @@ compile of a run is unchanged.
 
 ## 5. What is not established
 
-- **The sag is reduced, not removed.** With the guard, seeds 0 and 2 still slide 6 and 9 points
-  late in the constant-rate phase. The guard slows the unit that takes the value routes; the
+- **The sag is reduced, not removed.** With the guard, four of six seeds still slide 5 to 9
+  points late in the constant-rate phase. The guard slows the unit that takes the value routes; the
   units that lose them also un-learn them (their weight on the previous byte's address is pushed
   through zero), and nothing here addresses that. A change to how the router is trained (the
   selection gradient, or the competition between units) would be an amendment of its own.
-- **Seeds and repeats.** Six seeds without the guard, three with it, one run each; execution is
-  not bit-reproducible on this card and two runs of one configuration can differ by several
-  points. The guard on seeds 3 to 5 is `p1_18_a6_final_guard_seeds`.
-- **Binding.** Eight runs pass the frozen key-swap verdict (follow ≥ 50 %, unchanged ≤ 10 %);
-  most 9k runs are still "partial" (swap followed 32 to 62 %), and the runs that lose the value
-  route end with a query's route no longer overlapping its fact's (0.14 to 0.16).
+- **Seeds and repeats.** Six seeds with and without the guard, one run each; execution is not
+  bit-reproducible on this card and two runs of one configuration can differ by several points.
+- **Binding.** Ten runs pass the frozen key-swap verdict (follow ≥ 50 %, unchanged ≤ 10 %), three
+  of the six guarded 9k runs among them; the others are "partial" (swap followed 32 to 62 %),
+  and the runs that lose the value route end with a query's route no longer overlapping its
+  fact's (0.14 to 0.16).
 - **Why the caps help the cut.** 349 against 348 is one seed. The caps cut the router's step
   about tenfold and the cell's about twofold; which of the two matters was not separated.
 - **The forward dynamics are unchanged.** Without A4 the cell is still a bank of hard switches;
