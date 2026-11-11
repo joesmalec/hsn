@@ -10,6 +10,9 @@
 #   balance  train.lambda_b: the balance loss, mild (paper section 7)
 #   utility  train.lambda_u: the scorer regressed onto counterfactual probes (paper section 6);
 #            autograd window only (the split window does not cover the probes)
+#   executed train.unit_credit=executed: NOT one of the paper's mechanisms and not configuration
+#            only in spirit: an opt-in change of the straight-through unit gradient (the executed
+#            unit alone is credited). Run as a candidate; adopting it would be an amendment.
 #   routerlr train.router_lr_mult=0.1: the router's proposed step is about ten times its update
 #            cap, so its applied step is the cap whatever the rate; at a tenth of the rate the
 #            proposal sits at the cap and the schedule's decay reaches the router
@@ -117,3 +120,12 @@ arms:
       - hardware.window=split
       - train.router_lr_mult=0.1
       - train.decay_fraction=0.7
+  - name: split_executed
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.unit_credit=executed
+  - name: native_executed
+    family: hsn
+    overrides:
+      - train.unit_credit=executed
