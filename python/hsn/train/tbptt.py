@@ -865,8 +865,11 @@ class TBPTTTrainer(Trainer):
                 reset_columns = window["reset"][:, :cut].any(dim=0).nonzero().flatten().tolist()
                 # P2.10: a split window's terms sit on one eager autograd graph, which takes the
                 # retained per-term backwards itself (no extra pass of the autograd window, and
-                # no compile of it in a split run)
-                own_graph = window_fn is None or self._split is not None
+                # no compile of it in a split run). The steps of a soft warm-up are the
+                # compiled autograd window's, in a split run as in any other.
+                own_graph = self._compiled is None or (
+                    self._split is not None and self._split.splits_now()
+                )
                 if stats_step and window_index == 0 and not own_graph:
                     term_norms = self._compiled_term_norms(
                         fwd, state, reset_columns, probe, reference_cost

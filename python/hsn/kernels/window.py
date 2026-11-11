@@ -32,6 +32,20 @@ _prepared: set[int] = set()
 #: Dynamic shared memory a block may ask for without opting in to more (48 KiB on every
 #: supported architecture).
 _MAX_SHARED_BYTES = 48 * 1024
+#: Threads of a row's block in the selection kernel (one per logit of the row when they fit:
+#: the kernel then reduces a cell's units by warp shuffles; never fewer than one per cell).
+_SELECT_THREADS = 256
+#: Threads of a row's block in the end-of-round kernel (a multiple of 32; one per slot element
+#: when they fit, and the row's ``N * d`` states in ``N * d / threads`` steps).
+_UPDATE_THREADS = 512
+
+
+def _select_shared(n_cells: int, n_units: int, k: int) -> int:
+    return 4 * (4 * n_cells + n_units + 4 * k + 1 + 3 * ((n_cells + 31) // 32))
+
+
+def _update_shared(n_cells: int, d: int, k: int) -> int:
+    return 4 * (2 * k + 1 + n_cells + k * ((d + 31) // 32) + 2 * k * d)
 
 
 def available() -> bool:
@@ -326,6 +340,451 @@ def _cell_round_fake(
         torch.empty_like(q),
         torch.empty_like(age),
         h.new_empty((*cells.shape, h.shape[2])),
+    )
+
+
+@torch.library.custom_op("hsn::window_select", mutates_args=(), device_types="cuda")
+def select_op(
+    logits: Tensor,
+    age: Tensor,
+    cost: Tensor,
+    k: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """The hard decision of one position, forward only: ``(cells, units, valid, theta,
+    refreshed)`` (``kernels/cuda/hsn_window.cu``, ``hsn_win_select``). ``logits [B, N, M]`` fp32,
+    ``age [B, N]`` int64 and ``cost [M]`` fp32 are contiguous tensors on one prepared CUDA
+    device."""
+    B, N, M = (int(n) for n in logits.shape)
+    device = logits.device
+    cells = torch.empty((B, k), dtype=torch.int64, device=device)
+    units = torch.empty((B, k), dtype=torch.int64, device=device)
+    valid = torch.empty((B, k), dtype=torch.bool, device=device)
+    theta = torch.empty((B,), dtype=torch.float32, device=device)
+    refreshed = torch.empty((B, k), dtype=torch.bool, device=device)
+    _extension().launch(
+        "hsn_win_select",
+        B,
+        _SELECT_THREADS,
+        _select_shared(N, M, k),
+        [logits, age, cost, cells, units, valid, theta, refreshed],
+        [B, N, M, k, age_max, int(probes), 0, 1, 1],
+        [lambda_cost, cell_overhead, shared_cost, limit],
+    )
+    return cells, units, valid, theta, refreshed
+
+
+@select_op.register_fake
+def _select_fake(
+    logits: Tensor,
+    age: Tensor,
+    cost: Tensor,
+    k: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    B = logits.shape[0]
+    return (
+        logits.new_empty((B, k), dtype=torch.int64),
+        logits.new_empty((B, k), dtype=torch.int64),
+        logits.new_empty((B, k), dtype=torch.bool),
+        logits.new_empty((B,), dtype=torch.float32),
+        logits.new_empty((B, k), dtype=torch.bool),
+    )
+
+
+@torch.library.custom_op(
+    "hsn::window_select_tape",
+    mutates_args=("cells", "units", "valid", "theta", "refreshed"),
+    device_types="cuda",
+)
+def select_tape_op(
+    logits: Tensor,
+    age: Tensor,
+    cost: Tensor,
+    cells: Tensor,
+    units: Tensor,
+    valid: Tensor,
+    theta: Tensor,
+    refreshed: Tensor,
+    t: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> None:
+    """:func:`select_op` written into a tape: the decision of position ``t`` from ``logits
+    [B, N, M]`` and the ages ``age[:, t]`` (``[B, n + 1, N]``) into record ``t`` of ``cells`` /
+    ``units`` ``[B, n, K]`` int64, ``valid`` / ``refreshed`` ``[B, n, K]`` bool and ``theta
+    [B, n]`` (the same kernel; no other record is touched). Contiguous tensors on one prepared
+    CUDA device."""
+    B, N, M = (int(n) for n in logits.shape)
+    n, k = int(cells.shape[1]), int(cells.shape[2])
+    _extension().launch(
+        "hsn_win_select",
+        B,
+        _SELECT_THREADS,
+        _select_shared(N, M, k),
+        [logits, age, cost, cells, units, valid, theta, refreshed],
+        [B, N, M, k, age_max, int(probes), t, n, int(age.shape[1])],
+        [lambda_cost, cell_overhead, shared_cost, limit],
+    )
+
+
+@select_tape_op.register_fake
+def _select_tape_fake(
+    logits: Tensor,
+    age: Tensor,
+    cost: Tensor,
+    cells: Tensor,
+    units: Tensor,
+    valid: Tensor,
+    theta: Tensor,
+    refreshed: Tensor,
+    t: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> None:
+    return None
+
+
+def select_unsupported(n_cells: int, k: int, n_units: int = 1) -> str | None:
+    """Why :func:`select` cannot take a model of this shape (``None``: it can)."""
+    if n_cells > _SELECT_THREADS:
+        return f"model.n_cells={n_cells}: one thread per cell of a row ({_SELECT_THREADS})"
+    if k > n_cells:
+        return f"k_select={k} exceeds model.n_cells={n_cells}"
+    if _select_shared(n_cells, n_units, k) > _MAX_SHARED_BYTES:
+        return f"model.n_cells={n_cells}: the row's scores do not fit a block's shared memory"
+    return None
+
+
+def select(
+    logits: Tensor,
+    age: Tensor,
+    cost_table: Tensor,
+    *,
+    k: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """:meth:`hsn.model.router.Router.select` for the forward sweep (mode ``topk``, the hard
+    decision, no exploration, the refresh probes when ``probes``) as one kernel: ``(cells,
+    units, valid, theta, refreshed)`` with the router's values, tie rules included (equal
+    scores and equal ages in index order). ``limit`` is ``budget * (1 + BUDGET_SLACK)``."""
+    decision: tuple[Tensor, Tensor, Tensor, Tensor, Tensor] = select_op(
+        logits.to(torch.float32).contiguous(),
+        age.contiguous(),
+        cost_table.to(torch.float32).contiguous(),
+        k,
+        age_max,
+        probes,
+        lambda_cost,
+        cell_overhead,
+        shared_cost,
+        limit,
+    )
+    return decision
+
+
+@torch.library.custom_op("hsn::window_cell_update", mutates_args=(), device_types="cuda")
+def cell_update_op(
+    y: Tensor,
+    gate: Tensor,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    pos: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    cand_w: Tensor,
+    cand_norm: bool,
+    cand_eps: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """The end of one position's round, forward only: ``(h, q, age, pos, h_sel, h_max)``
+    (``kernels/cuda/hsn_window.cu``, ``hsn_win_cell_update``). Contiguous fp32 / int64 / bool
+    tensors on one prepared CUDA device."""
+    B, N, d = (int(n) for n in h.shape)
+    K = int(cells.shape[1])
+    h_next = torch.empty_like(h)
+    q_next = torch.empty_like(q)
+    age_next = torch.empty_like(age)
+    pos_next = torch.empty_like(pos)
+    h_sel = h.new_empty((B, K, d))
+    h_max = h.new_empty((B,))
+    _extension().launch(
+        "hsn_win_cell_update",
+        B,
+        _UPDATE_THREADS,
+        _update_shared(N, d, K),
+        [
+            y,
+            gate,
+            h,
+            q,
+            age,
+            pos,
+            cells,
+            valid,
+            cand_w,
+            h_next,
+            q_next,
+            age_next,
+            pos_next,
+            h_sel,
+            h_max,
+        ],  # fmt: skip
+        [B, N, d, K, int(cand_norm), 0, 1, 1, 0, 0, 1, 0],
+        [cand_eps],
+    )
+    return h_next, q_next, age_next, pos_next, h_sel, h_max
+
+
+@cell_update_op.register_fake
+def _cell_update_fake(
+    y: Tensor,
+    gate: Tensor,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    pos: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    cand_w: Tensor,
+    cand_norm: bool,
+    cand_eps: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    return (
+        torch.empty_like(h),
+        torch.empty_like(q),
+        torch.empty_like(age),
+        torch.empty_like(pos),
+        h.new_empty((*cells.shape, h.shape[2])),
+        h.new_empty((h.shape[0],)),
+    )
+
+
+@torch.library.custom_op(
+    "hsn::window_update_tape",
+    mutates_args=("tape_h", "tape_q", "tape_age", "tape_hsel", "h_max", "qs"),
+    device_types="cuda",
+)
+def update_tape_op(
+    y: Tensor,
+    gate: Tensor,
+    tape_h: Tensor,
+    tape_q: Tensor,
+    tape_age: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    cand_w: Tensor,
+    reset: Tensor,
+    tape_hsel: Tensor,
+    h_max: Tensor,
+    qs: Tensor,
+    t: int,
+    cand_norm: bool,
+    cand_eps: float,
+) -> None:
+    """:func:`cell_update_op` on a tape: the round of position ``t`` reads record ``t`` of the
+    state tape (``tape_h [B, n + 1, N, d]``, ``tape_q [B, n + 1, d]``, ``tape_age
+    [B, n + 1, N]``) and of the decision (``cells`` / ``valid`` ``[B, n, K]``) and writes record
+    ``t + 1`` of the state tape: the state after the position, zeroed on the rows whose
+    ``reset[:, t + 1]`` is set (the pre-round state of the next position; the last record,
+    ``t + 1 == n``, is never reset). Record ``t`` of ``tape_hsel [B, n, K, d]``, ``h_max
+    [B, n]`` and ``qs [B, n, d]`` (the summary after the position) are the values before that
+    reset. The same kernel as :func:`cell_update_op`; contiguous tensors on one prepared CUDA
+    device, ``reset [B, n]`` bool."""
+    B, n_state, N, d = (int(n) for n in tape_h.shape)
+    n, K = int(cells.shape[1]), int(cells.shape[2])
+    _extension().launch(
+        "hsn_win_cell_update",
+        B,
+        _UPDATE_THREADS,
+        _update_shared(N, d, K),
+        [
+            y,
+            gate,
+            tape_h,
+            tape_q,
+            tape_age,
+            tape_age,
+            cells,
+            valid,
+            cand_w,
+            tape_h,
+            tape_q,
+            tape_age,
+            tape_age,
+            tape_hsel,
+            h_max,
+            reset,
+            qs,
+        ],  # fmt: skip
+        [B, N, d, K, int(cand_norm), t, n_state, n, t + 1, int(t + 1 < n), 0, 1],
+        [cand_eps],
+    )
+
+
+@update_tape_op.register_fake
+def _update_tape_fake(
+    y: Tensor,
+    gate: Tensor,
+    tape_h: Tensor,
+    tape_q: Tensor,
+    tape_age: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    cand_w: Tensor,
+    reset: Tensor,
+    tape_hsel: Tensor,
+    h_max: Tensor,
+    qs: Tensor,
+    t: int,
+    cand_norm: bool,
+    cand_eps: float,
+) -> None:
+    return None
+
+
+def cell_update_unsupported(n_cells: int, d: int, k: int) -> str | None:
+    """Why :func:`cell_update` cannot take a model of this shape (``None``: it can)."""
+    if k > _UPDATE_THREADS:
+        return f"k_select={k}: one thread per slot computes its candidate norm"
+    if _update_shared(n_cells, d, k) > _MAX_SHARED_BYTES:
+        return f"k_select={k}, model.d={d}: the slots' states do not fit a block's shared memory"
+    return None
+
+
+def cell_update(
+    cell: PDGCell,
+    y: Tensor,
+    gate: Tensor,
+    state: CellGraphState,
+    cells: Tensor,
+    valid: Tensor,
+) -> tuple[CellGraphState, Tensor, Tensor]:
+    """The round of one position from its matrix products on
+    (:meth:`hsn.model.cell.PDGCell.sparse_products`): the candidate (its norm, ``tanh``), the
+    gate's sigmoid, :func:`hsn.kernels.native.gated_delta_update` and the tick as one kernel.
+    Returns the state after the position, the selected slots' cells after the update
+    ``[B, K, d]`` (cell 0 on padded slots) and each row's ``max |h|`` ``[B]``. fp32 state, a hard
+    decision (``alpha`` 1 on the valid slots), no autograd."""
+    from hsn.model.state import CellGraphState
+
+    cand_norm = cell.cand_norm_kind != "none"
+    h, q, age, pos, h_sel, h_max = cell_update_op(
+        y.contiguous(),
+        gate.contiguous(),
+        state.h.contiguous(),
+        state.q.contiguous(),
+        state.age.contiguous(),
+        state.pos.contiguous(),
+        cells.contiguous(),
+        valid.contiguous(),
+        cell.cand_norm.weight if cand_norm else cell.norm.weight,
+        cand_norm,
+        float(cast(nn.RMSNorm, cell.cand_norm).eps or 0.0) if cand_norm else 0.0,
+    )
+    return CellGraphState._make(h=h, q=q, age=age, pos=pos), h_sel, h_max
+
+
+def select_tape(
+    logits: Tensor,
+    tape_age: Tensor,
+    cost_table: Tensor,
+    cells: Tensor,
+    units: Tensor,
+    valid: Tensor,
+    theta: Tensor,
+    refreshed: Tensor,
+    *,
+    t: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> None:
+    """:func:`select` for position ``t`` of a block, written into record ``t`` of the block's
+    decision tape (``cells`` / ``units`` / ``valid`` / ``refreshed`` ``[B, n, K]``, ``theta
+    [B, n]``) from the ages ``tape_age[:, t]`` (``[B, n + 1, N]``): no tensor is made, no copy
+    follows."""
+    select_tape_op(
+        logits.to(torch.float32).contiguous(),
+        tape_age,
+        cost_table.to(torch.float32).contiguous(),
+        cells,
+        units,
+        valid,
+        theta,
+        refreshed,
+        t,
+        age_max,
+        probes,
+        lambda_cost,
+        cell_overhead,
+        shared_cost,
+        limit,
+    )
+
+
+def update_tape(
+    cell: PDGCell,
+    y: Tensor,
+    gate: Tensor,
+    tape_h: Tensor,
+    tape_q: Tensor,
+    tape_age: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    reset: Tensor,
+    tape_hsel: Tensor,
+    h_max: Tensor,
+    qs: Tensor,
+    *,
+    t: int,
+) -> None:
+    """:func:`cell_update` for position ``t`` of a block on its tapes (:func:`update_tape_op`):
+    reads the pre-round state at record ``t`` and writes the next position's pre-round state
+    (its reset applied) at record ``t + 1``, in place."""
+    cand_norm = cell.cand_norm_kind != "none"
+    update_tape_op(
+        y.contiguous(),
+        gate.contiguous(),
+        tape_h,
+        tape_q,
+        tape_age,
+        cells,
+        valid,
+        cell.cand_norm.weight if cand_norm else cell.norm.weight,
+        reset,
+        tape_hsel,
+        h_max,
+        qs,
+        t,
+        cand_norm,
+        float(cast(nn.RMSNorm, cell.cand_norm).eps or 0.0) if cand_norm else 0.0,
     )
 
 

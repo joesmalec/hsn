@@ -86,7 +86,7 @@ import logging
 import time
 import types
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor, nn
@@ -102,7 +102,7 @@ from hsn.model.hsn import (
     _Prologue,
     _stack_record,
 )
-from hsn.model.router import Selection
+from hsn.model.router import BUDGET_SLACK
 from hsn.model.state import CellGraphState
 
 __all__ = [
@@ -402,11 +402,30 @@ class SweepTwin:
     input buffer at every block; the sweep needs neither. The twin's values are the model's:
     the same casts, made once (``tests/kernels/test_p2_10_window.py``). ``sweep_edge`` and
     ``sweep_w1_flat`` are the window constants as buffers of the twin, so a compiled block reads
-    them at static addresses."""
+    them at static addresses.
 
-    def __init__(self, model: HSN, dtype: torch.dtype) -> None:
+    ``fused`` (``hardware.window=fused``) adds the layouts of the fused sweep
+    (:func:`_fused_tape_block`): ``sweep_w2_flat``, ``W2`` laid out for its second layer
+    (:meth:`~hsn.model.units.UnitBank.forward_static_chosen`), and, when the model's shape
+    allows (:func:`sweep_merge_error`), the merged matrix products: maps that read the same
+    input share one matmul, with the same operands (a map that reads part of the input has
+    zeros elsewhere, which add nothing):
+
+    * ``sweep_front_w1/b1/w2/b2``: ``S`` and ``P`` as one two-layer map of ``[z; q; ctx]``
+      (``P`` reads ``q`` only; the second layer is block-diagonal);
+    * ``sweep_score_w/b``: the scorer's linear with ``V`` as ``d`` more outputs (``V`` reads
+      the state columns of the scorer's features);
+    * ``sweep_w1_gate`` / ``sweep_b1_gate``: the unit bank's first layer with the gate's linear
+      as ``d`` more outputs (:class:`~hsn.model.cell.WindowConsts`).
+
+    Four matmuls per position fewer; the values agree with the separate products to rounding
+    (other matmul shapes)."""
+
+    def __init__(self, model: HSN, dtype: torch.dtype, *, fused: bool = False) -> None:
         self.model = model
         self.dtype = dtype
+        self.fused = fused
+        self.merged = fused and sweep_merge_error(model) is None
         twin = copy.deepcopy(model)
         twin.requires_grad_(False)
         self.twin = twin
@@ -443,6 +462,39 @@ class SweepTwin:
             torch.zeros(units.in_dim, units.n_units * units.hidden, dtype=dtype, device=device),
             persistent=False,
         )
+        if fused:
+            twin.cell.units.register_buffer(
+                "sweep_w2_flat",
+                torch.zeros(units.hidden, units.n_units * units.d, dtype=dtype, device=device),
+                persistent=False,
+            )
+        if self.merged:
+            pred, shared = model.predictor, model.shared
+            net = cast(nn.Linear, model.router.scorer.net)
+            hidden = shared.hidden + pred.hidden
+            wide = units.n_units * units.hidden + cell.d
+
+            def zeros(*shape: int) -> Tensor:
+                return torch.zeros(*shape, dtype=dtype, device=device)
+
+            twin.register_buffer("sweep_front_w1", zeros(shared.in_dim, hidden), persistent=False)
+            twin.register_buffer("sweep_front_b1", zeros(hidden), persistent=False)
+            twin.register_buffer(
+                "sweep_front_w2", zeros(hidden, shared.out_dim + pred.out_dim), persistent=False
+            )
+            twin.register_buffer(
+                "sweep_front_b2", zeros(shared.out_dim + pred.out_dim), persistent=False
+            )
+            twin.register_buffer(
+                "sweep_score_w", zeros(net.in_features, net.out_features + cell.d), persistent=False
+            )
+            twin.register_buffer(
+                "sweep_score_b", zeros(net.out_features + cell.d), persistent=False
+            )
+            twin.cell.units.register_buffer(
+                "sweep_w1_gate", zeros(units.in_dim, wide), persistent=False
+            )
+            twin.cell.units.register_buffer("sweep_b1_gate", zeros(wide), persistent=False)
 
     def refresh(self) -> None:
         """Bring the twin up to the model: the cast weights and the window constants are copied
@@ -463,37 +515,193 @@ class SweepTwin:
                 owner._buffers[leaf] = buffers[name]
         consts = model.cell.window_consts()
         twin.cell.get_buffer("sweep_edge").copy_(consts.edge_weights)
-        twin.cell.units.get_buffer("sweep_w1_flat").copy_(consts.w1_flat)
+        cell, units = model.cell, model.cell.units
+        if self.fused:
+            twin.cell.units.get_buffer("sweep_w2_flat").copy_(units._w2_flat())
+        if not self.merged:
+            twin.cell.units.get_buffer("sweep_w1_flat").copy_(consts.w1_flat)
+            return
+        # the merged layouts (class docstring): the blocks that are zero stay zero
+        pred, shared = model.predictor, model.shared
+        net = cast(nn.Linear, model.router.scorer.net)
+        d, hs, du = pred.in_dim, shared.hidden, shared.out_dim
+        w1 = twin.get_buffer("sweep_front_w1")
+        w1[:, :hs].copy_(shared.fc1.weight.t())
+        w1[d : 2 * d, hs:].copy_(pred.fc1.weight.t())  # P reads q, the middle block of [z; q; ctx]
+        b1 = twin.get_buffer("sweep_front_b1")
+        b1[:hs].copy_(shared.fc1.bias)
+        b1[hs:].copy_(pred.fc1.bias)
+        w2 = twin.get_buffer("sweep_front_w2")
+        w2[:hs, :du].copy_(shared.fc2.weight.t())
+        w2[hs:, du:].copy_(pred.fc2.weight.t())
+        b2 = twin.get_buffer("sweep_front_b2")
+        b2[:du].copy_(shared.fc2.bias)
+        b2[du:].copy_(pred.fc2.bias)
+        m = int(net.out_features)
+        score_w = twin.get_buffer("sweep_score_w")
+        score_w[:, :m].copy_(net.weight.t())
+        score_w[2 * d : 3 * d, m:].copy_(cell.V.weight.t())  # the features are [u; eps; h; ...]
+        twin.get_buffer("sweep_score_b")[:m].copy_(net.bias)
+        mh = units.n_units * units.hidden
+        w1_gate = twin.cell.units.get_buffer("sweep_w1_gate")
+        w1_gate[:, :mh].copy_(consts.w1_flat)
+        w1_gate[:, mh:].copy_(cell.gate.weight.t())
+        b1_gate = twin.cell.units.get_buffer("sweep_b1_gate")
+        b1_gate[:mh].copy_(units.b1.reshape(mh))
+        b1_gate[mh:].copy_(cell.gate.bias)
 
 
-def _fused_position(
+def sweep_merge_error(model: HSN) -> str | None:
+    """Why the fused sweep keeps its matrix products separate for this model (``None``: it
+    merges them, :class:`SweepTwin`). The merged layouts assume the reference shapes: ``S`` and
+    ``P`` two-layer maps with one activation, ``P`` reading the ``q`` block of ``S``'s input, a
+    linear scorer over ``[u; eps; h; ...]`` without excluded features, ``V`` without a bias and
+    a gate that reads the unit bank's input."""
+    pred, shared, cell = model.predictor, model.shared, model.cell
+    scorer = model.router.scorer
+    d = int(model.cfg.d)
+    if type(pred.act) is not type(shared.act) or pred.activation_name != shared.activation_name:
+        return "the predictor and the shared transform use different activations"
+    if pred.in_dim != d or shared.in_dim < 2 * d:
+        return "the predictor does not read the q block of the shared transform's input"
+    if scorer.kind != "linear" or not isinstance(scorer.net, nn.Linear) or scorer.exclude:
+        return "the scorer is not a plain linear map of its features"
+    if scorer.net.bias is None or scorer.net.in_features < 3 * d:
+        return "the scorer's features do not hold the cell states at [2d, 3d)"
+    if cell.V.bias is not None or cell.V.in_features != d:
+        return "the message projection has a bias"
+    if not isinstance(cell.gate, nn.Linear) or cell.gate.in_features != cell.units.in_dim:
+        return "the gate does not read the unit bank's input"
+    if cell.gate.bias is None:
+        return "the gate has no bias"
+    return None
+
+
+def _fused_tape_block(
     model: HSN,
-    state: CellGraphState,
-    z_t: Tensor,
-    ctx_t: Tensor,
-    scalars_t: Tensor,
-    mode: StepMode,
-    controls: _Controls,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    pos: Tensor,
+    z_b: Tensor,
+    c_b: Tensor,
+    s_b: Tensor,
+    r_b: Tensor,
     consts: WindowConsts,
-) -> tuple[CellGraphState, Selection, Tensor]:
-    """One position of the forward sweep with the fused cell round (P2.10): the shared path, the
-    scorer and the selection are :meth:`HSN._position`'s own operations (the model's
-    :meth:`~hsn.model.router.Router.select` decides, so every routing control it has applies);
-    the round and the tick are one CUDA op (:func:`hsn.kernels.window.cell_round`: messages,
-    inputs, norm, gate, the selected unit of each pair, ``W_out``, candidate, update, ``q``,
-    ages). Returns the state after the position, the selection and the selected slots' updated
-    states. No autograd: the sweep runs under ``torch.no_grad()``."""
-    q_prev = state.q
-    z_hat = model.predictor(q_prev)
-    u = model.shared(torch.cat([z_t, q_prev, ctx_t], dim=-1))
-    u_s, eps_s = u.to(state.dtype), (z_t - z_hat).to(state.dtype)
-    feats = model.scorer._assemble(u_s, eps_s, state.h, state.age, scalars_t)
-    _, _, sel = model._score(feats, state, mode, None, controls=controls)
-    assert sel is not None
-    new_state, slots = window_kernels.cell_round(
-        model.cell, u_s, eps_s, state, sel.cell_idx, sel.unit_idx, sel.valid, consts.edge_weights
-    )
-    return new_state, sel, slots
+    controls: _Controls,
+) -> dict[str, Tensor]:
+    """:func:`_tape_block` with the fused glue (P2.10, ``hardware.window=fused``). The matrix
+    products of a position are :meth:`HSN._position`'s own (the shared path, the scorer, and the
+    round's through :meth:`~hsn.model.cell.PDGCell.sparse_products`); what lies between them is
+    two kernels that write the block's tape in place:
+
+    * the decision (:func:`hsn.kernels.window.select_tape`: the router's top-K, budget prefix,
+      threshold and refresh probes with its tie rules) into record ``i`` of the decision tape;
+    * the end of the round (:func:`hsn.kernels.window.update_tape`: candidate, gated update,
+      summary, ages) from record ``i`` of the state tape into record ``i + 1``, with the next
+      position's reset applied, so that record ``i`` is always the pre-round state a position
+      reads and the block's last record is the state it returns.
+
+    No tensor is made per position for the state or the tape, and nothing is stacked. On a
+    :class:`SweepTwin` with merged layouts, maps that read the same input share a matmul: ``S``
+    with ``P``, the scorer with ``V``, the gate with the unit bank's first layer. No autograd,
+    no exploration, no dense-fallback rows (the caller's scope)."""
+    router = model.router
+    B, n = int(z_b.shape[0]), int(z_b.shape[1])
+    N, d = int(h.shape[1]), int(h.shape[2])
+    K = int(model.cfg.k_select)
+    front_w1 = model._buffers.get("sweep_front_w1")
+    front_b1 = model._buffers.get("sweep_front_b1")
+    front_w2 = model._buffers.get("sweep_front_w2")
+    front_b2 = model._buffers.get("sweep_front_b2")
+    score_w = model._buffers.get("sweep_score_w")
+    score_b = model._buffers.get("sweep_score_b")
+    d_u = int(model.shared.out_dim)
+    n_units = int(model.cell.units.n_units)
+    reset = r_b.contiguous()
+    first = reset[:, 0]
+    tape_h = h.new_empty((B, n + 1, N, d))
+    tape_q = q.new_empty((B, n + 1, d))
+    tape_age = age.new_empty((B, n + 1, N))
+    tape_h[:, 0] = h.masked_fill(first[:, None, None], 0)
+    tape_q[:, 0] = q.masked_fill(first[:, None], 0)
+    tape_age[:, 0] = age.masked_fill(first[:, None], 0)
+    cells = age.new_empty((B, n, K))
+    units = age.new_empty((B, n, K))
+    valid = age.new_empty((B, n, K), dtype=torch.bool)
+    refreshed = age.new_empty((B, n, K), dtype=torch.bool)
+    theta = h.new_empty((B, n))
+    h_sel = h.new_empty((B, n, K, d))
+    h_max = h.new_empty((B, n))
+    qs = q.new_empty((B, n, d))
+    limit = float(model.cfg.budget) * (1.0 + BUDGET_SLACK)
+    for i in range(n):
+        h_i, q_i, age_i = tape_h[:, i], tape_q[:, i], tape_age[:, i]
+        z_t = z_b[:, i]
+        x = torch.cat([z_t, q_i, c_b[:, i]], dim=-1)
+        if front_w1 is not None and front_b1 is not None:
+            assert front_w2 is not None and front_b2 is not None
+            hidden = model.shared.act(torch.addmm(front_b1, x, front_w1))
+            both = torch.addmm(front_b2, hidden, front_w2)
+            u, z_hat = both[:, :d_u], both[:, d_u:]
+        else:
+            z_hat = model.predictor(q_i)
+            u = model.shared(x)
+        u_s, eps_s = u.to(h.dtype), (z_t - z_hat).to(h.dtype)
+        feats = model.scorer._assemble(u_s, eps_s, h_i, age_i, s_b[:, i])
+        vh: Tensor | None = None
+        if score_w is not None and score_b is not None:
+            scored = torch.addmm(score_b, feats.reshape(B * N, -1), score_w)
+            logits = scored[:, :n_units].reshape(B, N, n_units).to(h.dtype)
+            vh = scored[:, n_units:].reshape(B, N, d)
+        else:
+            logits = router(feats).to(h.dtype)
+        window_kernels.select_tape(
+            logits,
+            tape_age,
+            router.cost_table,
+            cells,
+            units,
+            valid,
+            theta,
+            refreshed,
+            t=i,
+            age_max=int(router.age_max),
+            probes=controls.probes,
+            lambda_cost=float(router.lambda_cost),
+            cell_overhead=float(router.cell_overhead),
+            shared_cost=float(router.shared_cost),
+            limit=limit,
+        )
+        state_i = CellGraphState._make(h=h_i, q=q_i, age=age_i, pos=pos)
+        gate, y = model.cell.sparse_products(
+            u_s, eps_s, state_i, cells[:, i], units[:, i], valid[:, i], consts, vh=vh
+        )
+        window_kernels.update_tape(
+            model.cell, y, gate, tape_h, tape_q, tape_age, cells, valid, reset, h_sel, h_max, qs,
+            t=i,
+        )  # fmt: skip
+    # the position counter: positions since the row's last reset in the block, or pos + n
+    steps = torch.arange(1, n + 1, device=pos.device, dtype=pos.dtype)
+    last = (reset.to(pos.dtype) * steps).amax(dim=1)
+    return {
+        "h": tape_h[:, n].contiguous(),
+        "q": tape_q[:, n].contiguous(),
+        "age": tape_age[:, n].contiguous(),
+        "pos": torch.where(last > 0, n + 1 - last, pos + n),
+        "tape_h": tape_h[:, :n],
+        "tape_q": tape_q[:, :n],
+        "tape_age": tape_age[:, :n],
+        "tape_hsel": h_sel,
+        "tape_theta": theta,
+        "qs": qs,
+        "sel_cell_idx": cells,
+        "sel_unit_idx": units,
+        "sel_valid": valid,
+        "explored": theta.new_zeros(n),
+        "refreshed": refreshed.float().sum(dim=2).mean(dim=0),
+        "state_abs_max": h_max.amax(dim=0),
+    }
 
 
 #: The per-position stacks of :func:`_tape_block` that are joined over a window (the final state
@@ -542,15 +750,29 @@ def _tape_block(
     recomputes everything else with autograd from these. Sparse hard-gate rounds
     (:func:`hsn.train.split.scope_error`); the rows of ``dense_rows`` (P2.2's dense fallback,
     with ``dense_indices`` as in :func:`_block`) run the dense round, as in any window. ``fused``
-    (``hardware.window=fused``, no dense rows) runs the round as the fused CUDA op
-    (:func:`_fused_position`) instead of the native ops.
+    (``hardware.window=fused``, no dense rows) is :func:`_fused_tape_block`: the same tape with
+    the glue between the matrix products as two kernels that write it in place.
     ``consts=None``: ``model`` is a :class:`SweepTwin`'s twin and the window constants are its
     buffers."""
     if consts is None:
-        consts = WindowConsts(
-            edge_weights=model.cell.get_buffer("sweep_edge"),
-            w1_flat=model.cell.units.get_buffer("sweep_w1_flat"),
-        )
+        bank = model.cell.units
+        w1_gate = bank._buffers.get("sweep_w1_gate") if fused else None
+        if w1_gate is not None:  # a fused twin with merged products: W1 is its first columns
+            consts = WindowConsts(
+                edge_weights=model.cell.get_buffer("sweep_edge"),
+                w1_flat=w1_gate[:, : bank.n_units * bank.hidden],
+                w2_flat=bank.get_buffer("sweep_w2_flat"),
+                w1_gate=w1_gate,
+                b1_gate=bank.get_buffer("sweep_b1_gate"),
+            )
+        else:
+            consts = WindowConsts(
+                edge_weights=model.cell.get_buffer("sweep_edge"),
+                w1_flat=bank.get_buffer("sweep_w1_flat"),
+                w2_flat=bank._buffers.get("sweep_w2_flat") if fused else None,
+            )
+    if fused:
+        return _fused_tape_block(model, h, q, age, pos, z_b, c_b, s_b, r_b, consts, controls)
     state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
     n = int(z_b.shape[1])
     d = int(h.shape[-1])
@@ -571,32 +793,26 @@ def _tape_block(
         h_pre.append(state.h)
         q_pre.append(state.q)
         age_pre.append(state.age)
-        if fused:
-            state, sel, slots = _fused_position(
-                model, state, z_b[:, i], c_b[:, i], s_b[:, i], mode, controls, consts
-            )
-            h_sel.append(slots)
-        else:
-            result = model._position(
-                state,
-                None,
-                z_b[:, i],
-                c_b[:, i],
-                s_b[:, i],
-                mode,
-                controls,
-                dense_rows,
-                False,
-                None,
-                static=True,
-                consts=consts,
-                dense_indices=dense_indices,
-            )
-            state = result.state
-            assert result.selection is not None
-            sel = result.selection
-            safe = sel.cell_idx.masked_fill(~sel.valid, 0)
-            h_sel.append(state.h.gather(1, safe[:, :, None].expand(-1, -1, d)))
+        result = model._position(
+            state,
+            None,
+            z_b[:, i],
+            c_b[:, i],
+            s_b[:, i],
+            mode,
+            controls,
+            dense_rows,
+            False,
+            None,
+            static=True,
+            consts=consts,
+            dense_indices=dense_indices,
+        )
+        state = result.state
+        assert result.selection is not None
+        sel = result.selection
+        safe = sel.cell_idx.masked_fill(~sel.valid, 0)
+        h_sel.append(state.h.gather(1, safe[:, :, None].expand(-1, -1, d)))
         assert sel.threshold is not None
         thetas.append(sel.threshold)
         qs.append(state.q)
@@ -654,7 +870,7 @@ class CompiledWindow:
         #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
         #: compiled function for the native round and one for the fused round.
         self._tape_blocks: dict[tuple[bool, bool, int], Any] = {}
-        self._sweep_twins: dict[torch.dtype, SweepTwin] = {}
+        self._sweep_twins: dict[tuple[torch.dtype, bool], SweepTwin] = {}
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
@@ -749,11 +965,11 @@ class CompiledWindow:
         :func:`_tape_block` over the window, under ``torch.no_grad()`` in training mode. Returns
         :func:`run_tape`'s tape, cloned out of CUDA-graph memory (the next replay overwrites
         it). Counted in ``calls`` and, on the calls that compile or record, ``compile_seconds``
-        like any other variant. The native round runs a :class:`SweepTwin` (``twin=False``:
-        the model itself, for the tests; the fused round reads the fp32 masters)."""
+        like any other variant. The sweep runs a :class:`SweepTwin` (``twin=False``: the model
+        itself, for the tests; the fused sweep then keeps its matrix products separate)."""
         model = self.model
         B, T = (int(n) for n in reset.shape)
-        use_twin = twin and not fused
+        use_twin = twin
         bucket = 0 if dense_indices is None else int(dense_indices.numel())
         key: tuple[object, ...] = (
             B,
@@ -783,9 +999,9 @@ class CompiledWindow:
                 if torch.is_autocast_enabled(device_type)
                 else next(model.parameters()).dtype
             )
-            if dtype not in self._sweep_twins:
-                self._sweep_twins[dtype] = SweepTwin(model, dtype)
-            sweep = self._sweep_twins[dtype]
+            if (dtype, fused) not in self._sweep_twins:
+                self._sweep_twins[dtype, fused] = SweepTwin(model, dtype, fused=fused)
+            sweep = self._sweep_twins[dtype, fused]
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         tape = run_tape(

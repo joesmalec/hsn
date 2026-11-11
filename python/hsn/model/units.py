@@ -310,6 +310,55 @@ class UnitBank(nn.Module):
         index = unit_idx.to(torch.int64)[:, None, None].expand(P, 1, self.d)
         return every.gather(1, index).squeeze(1)
 
+    def _w2_flat(self) -> Tensor:
+        """``W2 [M, H, d]`` laid out as ``[H, M·d]`` (column ``j·d + k`` is unit ``j``'s output
+        ``k``), the second layer's counterpart of :meth:`_w1_flat`."""
+        return self.W2.permute(1, 0, 2).reshape(self.hidden, self.n_units * self.d)
+
+    def forward_static_chosen(
+        self,
+        v: Tensor,
+        unit_idx: Tensor,
+        *,
+        w1_flat: Tensor,
+        w2_flat: Tensor,
+        b1_flat: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """:meth:`forward_static` without the work nobody reads (P2.10, the forward sweep):
+        ``out[p] = F_{unit_idx[p]}(v[p])``, ``[P, 4d] -> [P, d]``, static shapes, no host
+        synchronisation. The first layer is :meth:`forward_all`'s ``addmm`` (every unit: the
+        pairs' units differ, and one matmul over all of them is what keeps the shapes static);
+        the chosen unit's hidden row is gathered *before* the activation, so the activation and
+        the second layer run on ``[P, H]`` instead of ``[M, P, H]``: one ``addmm`` against ``W2``
+        laid out ``[H, M·d]`` (:meth:`_w2_flat`, ``w2_flat``) and a gather of the chosen unit's
+        ``d`` outputs. Each value is the same dot product as :meth:`forward_static`'s (the
+        chosen unit's row of ``W1``, its activation, its ``W2`` and biases); it agrees with it to
+        rounding (the second matmul has another shape). Forward only: the unselected units'
+        second-layer weights get no gradient path here, so a caller that needs gradients keeps
+        :meth:`forward_static`.
+
+        Returns ``(out, rider)``. With ``b1_flat`` the first layer carries riders: ``w1_flat`` is
+        ``[4d, M·H + r]`` and ``b1_flat`` ``[M·H + r]``, the bank's own layout followed by ``r``
+        columns of another linear map of the same input (the cell's gate: one matmul instead
+        of two); ``rider [P, r]`` is their output, ``None`` without ``b1_flat``."""
+        if v.ndim != 2 or v.shape[1] != self.in_dim:
+            raise ValueError(
+                f"forward_static_chosen expects v [P, {self.in_dim}], got shape {tuple(v.shape)}"
+            )
+        if unit_idx.ndim != 1 or unit_idx.shape[0] != v.shape[0]:
+            raise ValueError(
+                f"unit_idx must be [P] with P = {v.shape[0]} rows of v, got shape "
+                f"{tuple(unit_idx.shape)}"
+            )
+        P, M, H, d = int(v.shape[0]), self.n_units, self.hidden, self.d
+        index = unit_idx.to(torch.int64)[:, None, None]
+        first = torch.addmm(self.b1.reshape(M * H) if b1_flat is None else b1_flat, v, w1_flat)
+        rider = None if b1_flat is None else first[:, M * H :]
+        hidden = first[:, : M * H].view(P, M, H)
+        chosen = self.act(hidden.gather(1, index.expand(P, 1, H)).squeeze(1))  # [P, H]
+        out = torch.addmm(self.b2.reshape(M * d), chosen, w2_flat).view(P, M, d)
+        return out.gather(1, index.expand(P, 1, d)).squeeze(1), rider
+
     # ----------------------------------------------------------------------------------------------
     # Accounting and metadata
     # ----------------------------------------------------------------------------------------------

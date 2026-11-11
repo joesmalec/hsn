@@ -97,6 +97,15 @@ class WindowConsts(NamedTuple):
 
     edge_weights: Tensor
     w1_flat: Tensor
+    #: ``W2`` laid out ``[H, M·d]`` (:meth:`UnitBank._w2_flat`), for the forward sweep's
+    #: :meth:`PDGCell.sparse_products` (P2.10); ``None``: built where it is read.
+    w2_flat: Tensor | None = None
+    #: The forward sweep's merged first layer (P2.10): ``w1_flat`` followed by the gate's weight
+    #: as ``d`` more columns, ``[4d, M·H + d]``, and the matching bias ``[M·H + d]``. The gate's
+    #: linear and the unit bank's first layer read the same normalised input, so one matmul
+    #: serves both (:meth:`UnitBank.forward_static_chosen`'s rider). ``None``: two matmuls.
+    w1_gate: Tensor | None = None
+    b1_gate: Tensor | None = None
 
 
 def _mix(alpha: Tensor, unit_out: Tensor) -> Tensor:
@@ -399,6 +408,68 @@ class PDGCell(nn.Module):
             "state": new_state,
         }
         return h_new, info
+
+    def sparse_products(
+        self,
+        u: Tensor,
+        eps: Tensor,
+        state: CellGraphState,
+        cells: Tensor,
+        units: Tensor,
+        valid: Tensor,
+        consts: WindowConsts,
+        *,
+        vh: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """The matrix products of :meth:`step_sparse`'s capturable round and nothing after them
+        (P2.10, the fused forward sweep): ``(gate, y)``, each ``[B, K, d]`` in the state's dtype,
+        the gate's pre-activation and ``W_out`` of the chosen unit's output. Messages, inputs,
+        norm, the gate's linear and ``W_out`` are :meth:`step_sparse`'s own calls in its order
+        (``static=True``); the unit bank runs :meth:`UnitBank.forward_static_chosen` (the static
+        pass's first layer, then only the chosen unit's activation and second layer: the same
+        values to rounding); the candidate norm, ``tanh``, the sigmoid and the state update are
+        left to the caller (:func:`hsn.kernels.window.cell_update`). No disabled cells, no
+        autograd. Two of the products can ride in a neighbour's matmul, with the same operands:
+        ``vh`` is ``V(h)`` ``[B, N, d]`` from the caller (the sweep computes it with the scorer,
+        which reads the same states), and ``consts.w1_gate`` / ``b1_gate`` put the gate's linear
+        into the unit bank's first layer."""
+        if self.disabled_cells:
+            raise ValueError("PDGCell.sparse_products does not support model.disabled_cells")
+        B, _, d = (int(n) for n in state.h.shape)
+        K = int(cells.shape[1])
+        native = kernels.ops()
+        cells = torch.where(valid, cells, torch.zeros_like(cells))
+        units = torch.where(valid, units, torch.zeros_like(units))
+        with self.graph.step():
+            h_read = state.h
+            if vh is None:
+                m = native.csr_messages(
+                    h_read, self.graph, self.V, cells, weights=consts.edge_weights, validate=False
+                )
+            else:  # V(h) came with the scorer's matmul: the native path's gather of the sources
+                m = self.graph.messages_selected(
+                    h_read, self.V, cells, weights=consts.edge_weights, validate=False, vh=vh
+                )
+            v = self.norm(native.gather_concat(u, eps, h_read, m, cells))
+            flat = v.reshape(B * K, 4 * d)
+            w2_flat = consts.w2_flat if consts.w2_flat is not None else self.units._w2_flat()
+            if consts.w1_gate is not None and consts.b1_gate is not None:
+                unit_out, rider = self.units.forward_static_chosen(
+                    flat,
+                    units.reshape(B * K),
+                    w1_flat=consts.w1_gate,
+                    w2_flat=w2_flat,
+                    b1_flat=consts.b1_gate,
+                )
+                assert rider is not None
+                gate = rider.reshape(B, K, d).to(state.dtype)
+            else:
+                gate = self.gate(v).to(state.dtype)
+                unit_out, _ = self.units.forward_static_chosen(
+                    flat, units.reshape(B * K), w1_flat=consts.w1_flat, w2_flat=w2_flat
+                )
+            y = self.W_out(unit_out.reshape(B, K, d)).to(state.dtype)
+        return gate, y
 
     def replay_sparse(
         self, u: Tensor, eps: Tensor, h_read: Tensor, sel: Selection

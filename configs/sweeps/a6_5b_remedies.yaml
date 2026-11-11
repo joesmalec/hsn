@@ -13,7 +13,10 @@
 #   softwarm train.soft_until_step=1000: the paper's soft-gate warm-up (section 6: "Warm up with
 #            soft gates, then use hard selection"): for the first 1,000 steps every cell executes
 #            under the soft mask, so every unit is observed everywhere before the hard selection
-#            starts; the recipe has no warm-up. Autograd window only.
+#            starts; the recipe has no warm-up. The warm-up steps are the autograd window's in
+#            every arm (they run every cell with autograd); fused_softwarm takes the fused
+#            window from step 1,000 on (hardware.window=fused), native_softwarm stays on the
+#            autograd window throughout.
 #   utility  train.lambda_u: the scorer regressed onto counterfactual probes (paper section 6);
 #            autograd window only (the split window does not cover the probes)
 #   executed train.unit_credit=executed: NOT one of the paper's mechanisms and not configuration
@@ -150,6 +153,11 @@ arms:
     family: hsn
     overrides:
       - train.soft_until_step=1000
+  - name: fused_softwarm
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - hardware.window=fused
   - name: split_temp050
     family: hsn
     overrides:

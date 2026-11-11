@@ -328,7 +328,8 @@ class SplitWindow:
     ``compiled`` is the run's compiled window (its ``tape`` variant runs the forward sweep and
     its counters account for it) or ``None`` (the sweep then runs eagerly: the CPU, tests).
     Calls outside the split window's use — evaluation, ``torch.no_grad()``, a diagnostic
-    ``capture`` — go to ``fallback`` (the compiled window, or the model's forward)."""
+    ``capture``, the steps of a soft warm-up — go to ``fallback`` (the compiled window, or the
+    model's forward)."""
 
     def __init__(self, model: HSN, cfg: RunConfig, compiled: CompiledWindow | None) -> None:
         reason = scope_error(cfg)
@@ -352,7 +353,12 @@ class SplitWindow:
             reason = (
                 "it needs a compiled window on CUDA (hardware.compile_mode)"
                 if compiled is None or device.type != "cuda"
-                else window_kernels.cell_round_error(model.cell)
+                else (
+                    window_kernels.select_unsupported(cfg.model.n_cells, cfg.model.k_select)
+                    or window_kernels.cell_update_unsupported(
+                        cfg.model.n_cells, cfg.model.d, cfg.model.k_select
+                    )
+                )
             )
             if reason is not None:
                 raise ValueError(f"hardware.window=fused is not available for this run: {reason}")
@@ -364,6 +370,11 @@ class SplitWindow:
             )
         #: Wall seconds of the last call's phases (forward sweep, replay), for the measurements.
         self.last_phase_seconds: dict[str, float] = {}
+
+    def splits_now(self) -> bool:
+        """True when a training window at the model's current step takes the split path; False
+        during a soft warm-up (``train.soft_until_step``), whose windows the fallback runs."""
+        return self.model.training and self.model._controls().gate == "ste"
 
     def __call__(
         self,
@@ -387,10 +398,22 @@ class SplitWindow:
                 reset_columns=reset_columns,
                 prev_tokens=prev_tokens,
             )
+        controls = model._controls()
+        if controls.gate == "soft":
+            # the soft warm-up (train.soft_until_step): every cell runs, with autograd, which
+            # is the autograd window's work; the split window takes over at the first step of
+            # the hard gate
+            return self.fallback(
+                tokens,
+                ctx,
+                state,
+                reset,
+                reset_columns=reset_columns,
+                prev_tokens=prev_tokens,
+            )
         B, T = model._check_window_inputs(tokens, ctx, state, reset)
         if reset_columns is not None:
             model._reset_columns(reset, reset_columns)  # validated; every position resets anyway
-        controls = model._controls()
         if controls.gate != "ste" or controls.epsilon > 0.0:
             raise RuntimeError(
                 f"the split window needs the ste gate without exploration at every step, got "

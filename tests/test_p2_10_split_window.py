@@ -4,6 +4,8 @@ recurrence equal :meth:`HSN.forward`'s autograd to rounding (float64 on the CPU)
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 from hsn.config import RunConfig, canonical_json, config_hash
@@ -114,11 +116,12 @@ def _objective(logits: Tensor, info: dict[str, Tensor], mask: Tensor) -> Tensor:
 
 
 def _both(
-    cfg: RunConfig, *, loss_positions: bool = True, draw_seed: int = 0
+    cfg: RunConfig, *, loss_positions: bool = True, draw_seed: int = 0, train_step: int = 0
 ) -> tuple[dict, dict, dict, dict]:
     """(reference grads, split grads, reference info, split info) on one window with interior
-    resets and a carried, non-zero start state in one row."""
+    resets and a carried, non-zero start state in one row, at training step ``train_step``."""
     model = _model(cfg)
+    model.set_train_step(train_step)
     tokens, ctx, reset = _window(cfg)
     reset[0, 0] = False  # row 0 carries its start state into the window
     reset[1, 5] = True
@@ -328,7 +331,6 @@ def test_recorded_decision_credits_the_unit_that_ran() -> None:
         (*A5, ALL, "train.epsilon_start=0.1", "train.epsilon_end=0.1"),
         (*A5, ALL, "train.state_grad_clip=1.0"),
         (*A5, ALL, "train.lambda_u=0.1", "train.probe_horizon=4"),
-        (*A5, ALL, "train.soft_until_step=2"),
         (ALL,),
     ],
 )
@@ -366,6 +368,47 @@ def test_the_key_is_opt_in_and_keeps_the_hash() -> None:
     split = _cfg(*RECIPE, "hardware.window=split")
     assert scope_error(split) is None
     assert config_hash(split) != config_hash(base)
+
+
+def test_soft_warm_up_runs_the_fallback_then_the_split_window() -> None:
+    """``train.soft_until_step``: the warm-up's windows (the soft gate: every cell runs, with
+    autograd) go to the fallback, bit for bit the model's own forward on its own graph; from
+    the first hard-gate step the split window runs and returns the model's gradients."""
+    cfg = _cfg(*RECIPE, "train.soft_until_step=3", "hardware.window=split")
+    assert scope_error(cfg) is None
+    ref, got, _, _ = _both(cfg, train_step=3)
+    _assert_same_grads(ref, got)
+    model = _model(cfg)
+    tokens, ctx, reset = _window(cfg)
+    state = _start(model, tokens.shape[0])
+    window = SplitWindow(model, cfg, None)
+    model.set_train_step(2)
+    assert not window.splits_now()
+    logits, _, _ = window(tokens, ctx, state, reset)
+    want, _, _ = model(tokens, ctx, state, reset)
+    assert torch.equal(logits, want) and logits.requires_grad and window.calls == 0
+    model.set_train_step(3)
+    assert window.splits_now()
+    window(tokens, ctx, state, reset)
+    assert window.calls == 1
+
+
+def test_training_switches_from_the_soft_warm_up_to_the_split_window(tmp_path: Path) -> None:
+    """A split run with ``train.soft_until_step`` trains: its warm-up steps are the autograd
+    run's (the same losses, bit for bit), the split window runs every step after them
+    (statistics steps included) and the losses stay with the autograd run's to rounding."""
+    from p1_15_support import datasets, hsn_config, hsn_trainer
+
+    recipe = (*RECIPE, "train.soft_until_step=3", "train.stats_every=2")
+    native = hsn_trainer(hsn_config(8, *recipe), tmp_path / "native")
+    want = native.fit(*datasets(), 8)
+    split = hsn_trainer(hsn_config(8, *recipe, "hardware.window=split"), tmp_path / "split")
+    got = split.fit(*datasets(), 8)
+    assert split._split is not None and split._split.calls == 5  # steps 3 to 7
+    assert [s.loss for s in got.steps[:3]] == [s.loss for s in want.steps[:3]]
+    for mine, theirs in zip(got.steps[3:], want.steps[3:], strict=True):
+        assert mine.loss == pytest.approx(theirs.loss, rel=1e-4)
+        assert mine.grad_norm == pytest.approx(theirs.grad_norm, rel=1e-3)
 
 
 def test_split_window_falls_back_outside_training() -> None:
@@ -467,3 +510,145 @@ def test_sweep_twin_tape_is_the_models_in_fp32() -> None:
                 assert torch.equal(tapes[True][key], tapes[False][key]), (round_, key)
             for p in model.parameters():  # an optimiser step's worth of change
                 p.add_(0.01 * torch.randn_like(p))
+
+
+@pytest.mark.cuda
+@pytest.mark.usefixtures("small_blocks", "_release_compiled_state")
+@pytest.mark.parametrize("extra", [(), ("model.age_max=2",)])
+@pytest.mark.parametrize("resets", [False, True])
+def test_fused_sweep_tape_is_the_split_sweeps_in_fp32(extra: tuple[str, ...], resets: bool) -> None:
+    """``hardware.window=fused``: the sweep whose decision is the selection kernel and whose
+    tape is written in place records the tape of the sweep that calls :meth:`Router.select`:
+    every decision, age and position bit for bit (the kernel takes the router's decision), the
+    state values to the rounding of two compilations of the same arithmetic (P2.8's tolerance),
+    with and without refresh probes, and with resets at a block's first, interior and last
+    positions (the end-of-round kernel applies the next position's reset)."""
+    from hsn.kernels import window as window_kernels
+    from hsn.train.compile import TAPE_KEYS
+
+    p28, cfg, model, compiled, (tokens, cx, state, reset) = _cuda_case(*extra)
+    if not window_kernels.available():
+        pytest.skip("window kernels not built (scripts/build_window_kernels.py)")
+    window_kernels.prepare(0)
+    if resets:  # blocks of 4 positions: the first of a block, an interior one, the last
+        reset = reset.clone()
+        reset[0, 0] = True
+        reset[1, 2] = True
+        reset[0, 3] = True
+        reset[1, 4] = True
+        reset[0, int(reset.shape[1]) - 1] = True
+    tapes = {}
+    with torch.no_grad():
+        pro = model._window_prologue(
+            tokens, cx, state, reset, model._window_mode(), reset_first=True
+        )
+        for fused in (False, True):
+            for _ in range(3):  # warm-up, recording, replay
+                tape = compiled.tape(pro, state, reset, fused=fused)
+            tapes[fused] = {k: v.clone() for k, v in tape.items()}
+    tol = p28.TOL[("cuda", "fp32")]["values"]
+    for key in (*TAPE_KEYS, "h", "q", "age", "pos"):
+        got, want = tapes[True][key], tapes[False][key]
+        if got.dtype.is_floating_point:
+            assert float((got - want).abs().max()) <= tol, key
+        else:
+            assert torch.equal(got, want), key
+    for key in ("explored", "refreshed"):
+        assert torch.equal(tapes[True][key], tapes[False][key]), key
+    if extra:
+        assert float(tapes[True]["refreshed"].sum()) > 0.0
+    fused_twins = [twin for (_, is_fused), twin in compiled._sweep_twins.items() if is_fused]
+    assert fused_twins and all(twin.merged for twin in fused_twins)  # the merged products ran
+
+
+def test_forward_static_chosen_is_the_static_pass() -> None:
+    """The fused sweep's unit pass (:meth:`UnitBank.forward_static_chosen`: every unit's first
+    layer, then the chosen unit's activation and second layer only) returns the static pass's
+    values in float64, and its rider columns are the extra linear map of the same input."""
+    from hsn.model.units import UnitBank
+
+    torch.manual_seed(3)
+    bank = UnitBank(5, 6, 16, "gelu", init="fan_in").double()
+    with torch.no_grad():
+        bank.b1.normal_()
+        bank.b2.normal_()
+    P = 11
+    v = torch.randn(P, bank.in_dim, dtype=torch.float64)
+    index = torch.randint(0, 5, (P,))
+    with torch.no_grad():
+        want = bank.forward_static(v, index)
+        got, rider = bank.forward_static_chosen(
+            v, index, w1_flat=bank._w1_flat(), w2_flat=bank._w2_flat()
+        )
+        assert rider is None
+        torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-13)
+        gate = torch.nn.Linear(bank.in_dim, 6).double()
+        got, rider = bank.forward_static_chosen(
+            v,
+            index,
+            w1_flat=torch.cat([bank._w1_flat(), gate.weight.t()], dim=1),
+            w2_flat=bank._w2_flat(),
+            b1_flat=torch.cat([bank.b1.reshape(-1), gate.bias]),
+        )
+        assert rider is not None
+        torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-13)
+        torch.testing.assert_close(rider, gate(v), rtol=1e-12, atol=1e-13)
+
+
+def test_sweep_twin_merged_layouts_are_the_separate_maps() -> None:
+    """The merged layouts of a fused :class:`SweepTwin` (float64, CPU): ``S`` with ``P``, the
+    scorer with ``V``, and the unit bank's first layer with the gate each return the separate
+    maps' values on random inputs, before and after the weights change (the zero blocks stay
+    zero across refreshes)."""
+    from hsn.train.compile import SweepTwin, sweep_merge_error
+
+    model = _model(_cfg(*RECIPE))
+    assert sweep_merge_error(model) is None
+    sweep = SweepTwin(model, torch.float64, fused=True)
+    assert sweep.merged
+    twin, cell, bank = sweep.twin, model.cell, model.cell.units
+    d, m_units = model.cfg.d, bank.n_units
+    g = torch.Generator().manual_seed(9)
+    f64 = torch.float64
+    for round_ in range(2):
+        with torch.no_grad(), cell.window():
+            sweep.refresh()
+            x = torch.randn(7, model.shared.in_dim, generator=g, dtype=f64)
+            hidden = model.shared.act(
+                torch.addmm(twin.get_buffer("sweep_front_b1"), x, twin.get_buffer("sweep_front_w1"))
+            )
+            both = torch.addmm(
+                twin.get_buffer("sweep_front_b2"), hidden, twin.get_buffer("sweep_front_w2")
+            )
+            du = model.shared.out_dim
+            torch.testing.assert_close(both[:, :du], model.shared(x), rtol=1e-11, atol=1e-12)
+            torch.testing.assert_close(
+                both[:, du:], model.predictor(x[:, d : 2 * d]), rtol=1e-11, atol=1e-12
+            )
+            net = model.router.scorer.net
+            feats = torch.randn(13, net.in_features, generator=g, dtype=f64)
+            scored = torch.addmm(
+                twin.get_buffer("sweep_score_b"), feats, twin.get_buffer("sweep_score_w")
+            )
+            n_out = net.out_features
+            torch.testing.assert_close(scored[:, :n_out], net(feats), rtol=1e-11, atol=1e-12)
+            torch.testing.assert_close(
+                scored[:, n_out:], cell.V(feats[:, 2 * d : 3 * d]), rtol=1e-11, atol=1e-12
+            )
+            v = torch.randn(5, bank.in_dim, generator=g, dtype=f64)
+            first = torch.addmm(
+                twin.cell.units.get_buffer("sweep_b1_gate"),
+                v,
+                twin.cell.units.get_buffer("sweep_w1_gate"),
+            )
+            mh = m_units * bank.hidden
+            torch.testing.assert_close(
+                first[:, :mh],
+                torch.addmm(bank.b1.reshape(mh), v, bank._w1_flat()),
+                rtol=1e-11,
+                atol=1e-12,
+            )
+            torch.testing.assert_close(first[:, mh:], cell.gate(v), rtol=1e-11, atol=1e-12)
+            for p_ in model.parameters():  # an optimiser step's worth of change, biases included
+                p_.add_(0.05 * torch.randn(p_.shape, generator=g, dtype=p_.dtype))
+        assert round_ in (0, 1)

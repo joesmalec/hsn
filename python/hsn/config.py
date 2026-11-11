@@ -1372,7 +1372,10 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
     """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
     ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is only
     defined where the heavy backward work is local to its position (the full A6 feedback cut)
-    and for the routed hard-gate round it replays."""
+    and for the routed hard-gate round it replays. A soft warm-up (``train.soft_until_step``)
+    is inside the scope: its steps run every cell with autograd, which is the autograd window's
+    work, so they take that window and the split window takes over at the first hard-gate step
+    (:meth:`hsn.train.split.SplitWindow.splits_now`)."""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn":
         return f"model_name={cfg.model_name!r} is not the HSN"
@@ -1380,8 +1383,6 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return f"model.routing={model.routing!r}: the split window needs topk"
     if train.gate_mode != "ste":
         return f"train.gate_mode={train.gate_mode!r}: the split window needs ste"
-    if train.soft_until_step > 0:
-        return f"train.soft_until_step={train.soft_until_step}: a soft warm-up runs every cell"
     if train.ste_scope != "selected":
         return f"train.ste_scope={train.ste_scope!r}: the masked round runs every cell"
     missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
