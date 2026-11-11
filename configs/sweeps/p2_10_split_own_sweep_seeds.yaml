@@ -5,7 +5,7 @@
 # p2_10_split_seeds and p2_10_autograd_seeds this separates the twin's effect from the split
 # backward's. Configuration only.
 name: p2_10_split_own_sweep_seeds
-description: "the A6 recipe with the split window on the model's own sweep (no twin), seeds 0-2: is the twin's rounding visible in accuracy?"
+description: "the A6 recipe with the split window on the model's own sweep (no twin), seeds 0-11: is the twin's rounding visible in accuracy?"
 timing: false
 base:
   config: configs/experiments/hsn_recipe_a6.yaml
@@ -33,7 +33,7 @@ rules:
   verdicts:
     reads_state_v3: {preset: reads_state_v3}
     binds_keys: {preset: binds_keys}
-seeds: [0, 1, 2]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 arms:
   - name: split_own_sweep
     family: hsn

@@ -269,6 +269,50 @@ def test_split_window_without_loss_positions_gives_the_same_none_set() -> None:
             torch.testing.assert_close(got[name], want, rtol=1e-9, atol=1e-12)
 
 
+def test_recorded_decision_credits_the_unit_that_ran() -> None:
+    """The replay recomputes the scorer's logits, and under bf16 they can round a near-tie
+    between two units the other way than the sweep's did. :meth:`Router.select` reads a cell's
+    score at the unit it runs (its ``amax`` and its decision are one tensor), so the cell
+    mask's gradient must reach the unit that ran in the replay too: with the first version's
+    ``amax`` of the recomputed scores it went to the other unit (on the A6 recipe 0.01 to 1.3 %
+    of the slots, and up to half of one unit's scorer-row gradient while a route was being
+    taken over)."""
+    model = _model(_cfg(*RECIPE))
+    router = model.router
+    n_cells, n_units = model.cell.n_cells, model.cell.units.n_units
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(2, n_cells, n_units, generator=g)
+    cells = torch.stack([torch.randperm(n_cells, generator=g)[:3] for _ in range(2)])
+    units = logits.argmax(-1).gather(1, cells)
+    valid = torch.ones_like(cells, dtype=torch.bool)
+    theta = torch.zeros(2)
+    rows = torch.arange(2)[:, None]
+
+    def mask_grad(values: Tensor, executed: bool) -> Tensor:
+        leaf = values.clone().requires_grad_(True)
+        sel = router.finish_recorded(
+            leaf, cells, units, valid, theta, mode="topk", gate="ste", executed_scores=executed
+        )
+        (grad,) = torch.autograd.grad(sel.cell_mask.gather(1, cells).sum(), leaf)
+        return grad
+
+    # the decision's own scores: the executed unit is the largest, the two readings are one
+    assert torch.equal(mask_grad(logits, True), mask_grad(logits, False))
+    # recomputed scores that put another unit a hair above the one that ran
+    other = (units + 1) % n_units
+    bumped = logits.clone()
+    bumped[rows, cells, other] = bumped[rows, cells, units] + 1e-3
+    executed, largest = mask_grad(bumped, True), mask_grad(bumped, False)
+    assert bool((executed[rows, cells, units] != 0).all())
+    assert bool((executed[rows, cells, other] == 0).all())
+    assert bool((largest[rows, cells, other] != 0).all())
+    assert bool((largest[rows, cells, units] == 0).all())
+    # the unit weights' path follows the recorded unit in both
+    sel = router.finish_recorded(bumped, cells, units, valid, theta, mode="topk", gate="ste")
+    assert torch.equal(sel.unit_idx, units)
+    assert torch.equal(sel.unit_weights[rows, cells].argmax(-1), units)
+
+
 # --------------------------------------------------------------------------------------------------
 # Scope and configuration
 # --------------------------------------------------------------------------------------------------

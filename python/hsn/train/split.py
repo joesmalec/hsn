@@ -343,6 +343,10 @@ class SplitWindow:
         self.fused = cfg.hardware.window == "fused"
         #: ``hardware.sweep_twin``: the compiled sweep runs the pre-cast twin of the model.
         self.twin = cfg.hardware.sweep_twin
+        #: The replay reads a selected cell's score at the unit the sweep ran
+        #: (:meth:`~hsn.model.router.Router.finish_recorded`); False is the first version's
+        #: ``amax`` of the recomputed scores, kept for the measurement in the write-up.
+        self.executed_scores = True
         device = next(model.parameters()).device
         if self.fused:
             reason = (
@@ -504,6 +508,7 @@ class SplitWindow:
             gate=controls.gate,
             temperature=controls.tau,
             dense_rows=dense_r,
+            executed_scores=self.executed_scores,
         )
         c_dense: Tensor | None = None
         b_dense: Tensor | None = None

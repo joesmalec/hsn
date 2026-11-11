@@ -1581,8 +1581,15 @@ class Router(nn.Module):
         explored: Tensor,
         refreshed: Tensor,
         dense: Tensor | None,
+        executed_scores: bool = False,
     ) -> Selection:
-        """The gradient-path tensors of a sparse decision (module docstring) and the Selection."""
+        """The gradient-path tensors of a sparse decision (module docstring) and the Selection.
+
+        ``executed_scores`` (:meth:`finish_recorded`): a cell's score is read at the unit that
+        ran it instead of at the largest of ``scores``. In :meth:`select` the two are one unit
+        (the decision was taken from these ``scores``); for a recorded decision ``scores`` are
+        recomputed and may round a near-tie the other way, which would hand the cell mask's
+        gradient to a unit that did not run."""
         B, N, M = (int(s) for s in logits.shape)
         K = int(cells.shape[1])
         device = logits.device
@@ -1596,7 +1603,10 @@ class Router(nn.Module):
         delta = torch.where(valid, units - unit_argmax.gather(1, cells), torch.zeros_like(units))
         unit_full = unit_argmax.scatter_add(1, cells, delta)  # the chosen unit per cell
         unit_hard = F.one_hot(unit_full, M).to(torch.float32)  # [B, N, M]
-        cell_scores = scores.amax(dim=-1)  # [B, N], autograd intact
+        if executed_scores:  # the chosen unit's score: the executed unit on the selected cells
+            cell_scores = scores.gather(2, unit_full[:, :, None]).squeeze(2)
+        else:
+            cell_scores = scores.amax(dim=-1)  # [B, N], autograd intact
         if gate is None:
             cell_mask, unit_weights = hard_mask, unit_hard
         else:
@@ -1675,6 +1685,7 @@ class Router(nn.Module):
         gate: GateMode | None,
         temperature: float = 1.0,
         dense_rows: Tensor | None = None,
+        executed_scores: bool = True,
     ) -> Selection:
         """The :class:`Selection` of a decision that was already taken (P2.10, the split window's
         replay): ``cells`` / ``units`` / ``valid`` (``[B, K]``) and the threshold ``θ [B]`` are the
@@ -1706,6 +1717,7 @@ class Router(nn.Module):
             explored=none,
             refreshed=none,
             dense=dense,
+            executed_scores=executed_scores,
         )
 
     @staticmethod

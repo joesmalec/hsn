@@ -1,11 +1,11 @@
 # P2.10: the standard recipe (configs/experiments/hsn_recipe_a6.yaml) with the split training window
-# (hardware.window=split, docs/p2_10_split_window.md) on seeds 0 to 5, 9,000 steps, diagnostics off.
+# (hardware.window=split, docs/p2_10_split_window.md) on seeds 0 to 11, 9,000 steps, diagnostics off.
 # The comparison is the nine runs of the same recipe on the autograd window (exps 421-426, 430-432:
 # 87.2 % dev accuracy on held-out keys, 78.5 to 95.6): the split window computes the same gradients
 # (to bf16 rounding), so these runs should land in that spread, at about 0.056 s per step instead of 0.100.
 # Configuration only; `hardware.window` is the one difference from example_p1_18.yaml's hsn_recipe arm.
 name: p2_10_split_seeds
-description: "the A6 recipe with the split training window on seeds 0-5 (against exps 421-426, 430-432)"
+description: "the A6 recipe with the split training window on seeds 0-11 (against exps 421-426, 430-432)"
 timing: false
 base:
   config: configs/experiments/hsn_recipe_a6.yaml
@@ -32,7 +32,7 @@ rules:
   verdicts:
     reads_state_v3: {preset: reads_state_v3}
     binds_keys: {preset: binds_keys}
-seeds: [0, 1, 2, 3, 4, 5]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 arms:
   - name: split
     family: hsn
