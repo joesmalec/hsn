@@ -149,3 +149,16 @@ arms:
       - hardware.window=split
       - train.temperature_start=0.35
       - train.temperature_end=0.35
+  - name: split_executed_decay
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.unit_credit=executed
+      - train.router_lr_mult=0.1
+      - train.decay_fraction=0.7
+  - name: split_executed_routerlr
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.unit_credit=executed
+      - train.router_lr_mult=0.1
