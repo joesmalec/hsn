@@ -62,6 +62,7 @@ from torch import Tensor
 from torch.autograd.function import FunctionCtx, once_differentiable
 
 from hsn.config import FEEDBACK_PATHS, RunConfig
+from hsn.kernels import window as window_kernels
 from hsn.model.hsn import HSN, _Prologue
 from hsn.model.router import Selection
 from hsn.model.state import CellGraphState
@@ -92,6 +93,8 @@ def scope_error(cfg: RunConfig) -> str | None:
         return f"train.p_dense={train.p_dense}: dense-fallback rows run the dense round"
     if train.epsilon_start > 0.0 or train.epsilon_end > 0.0:
         return "train.epsilon_*: exploration draws are not replayed"
+    if train.lambda_u > 0.0:
+        return "train.lambda_u > 0: the counterfactual probes are untested with the split window"
     if train.state_grad_clip is not None or train.state_grad_ratio is not None:
         return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
     if model.disabled_cells:
@@ -161,7 +164,7 @@ def recurrence_backward(
 
 #: The sweep :class:`StateRecurrence` runs: the reference above unless a faster implementation of
 #: the same contract was installed (the CUDA kernel of :mod:`hsn.kernels.window`, on CUDA tensors).
-RecurrenceFn = Callable[..., tuple[Tensor, Tensor]]
+RecurrenceFn = Callable[..., tuple[Tensor, Tensor] | None]
 _fast_recurrence: RecurrenceFn | None = None
 
 
@@ -259,6 +262,21 @@ class SplitWindow:
         self.compiled = compiled
         self.fallback: Callable[..., WindowOut] = compiled if compiled is not None else model
         self.calls = 0
+        #: ``hardware.window=fused``: the sweep's cell round is the fused CUDA op.
+        self.fused = cfg.hardware.window == "fused"
+        device = next(model.parameters()).device
+        if self.fused:
+            reason = (
+                "it needs a compiled window on CUDA (hardware.compile_mode)"
+                if compiled is None or device.type != "cuda"
+                else window_kernels.cell_round_error(model.cell)
+            )
+            if reason is not None:
+                raise ValueError(f"hardware.window=fused is not available for this run: {reason}")
+        if device.type == "cuda" and window_kernels.available():
+            # the recurrence's backward as one kernel launch per window (fp32 state)
+            window_kernels.prepare(device.index or 0)
+            set_fast_recurrence(window_kernels.recurrence_backward)
         #: Wall seconds of the last call's phases (forward sweep, replay), for the measurements.
         self.last_phase_seconds: dict[str, float] = {}
 
@@ -300,7 +318,7 @@ class SplitWindow:
         started = time.perf_counter()
         with torch.no_grad():
             if self.compiled is not None:
-                tape = self.compiled.tape(pro, state, reset)
+                tape = self.compiled.tape(pro, state, reset, fused=self.fused)
             else:
                 tape = run_tape(_tape_block, model, pro, state, reset, T)
         swept = time.perf_counter()
@@ -410,4 +428,7 @@ class SplitWindow:
         return self.compiled.compile_seconds if self.compiled is not None else 0.0
 
     def describe(self) -> dict[str, Any]:
-        return {"window": "split", "compiled_sweep": self.compiled is not None}
+        return {
+            "window": "fused" if self.fused else "split",
+            "compiled_sweep": self.compiled is not None,
+        }

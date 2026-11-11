@@ -91,6 +91,7 @@ import torch
 from torch import Tensor
 
 from hsn.device import DeviceContext
+from hsn.kernels import window as window_kernels
 from hsn.model.cell import WindowConsts
 from hsn.model.hsn import (
     HSN,
@@ -100,6 +101,7 @@ from hsn.model.hsn import (
     _Prologue,
     _stack_record,
 )
+from hsn.model.router import Selection
 from hsn.model.state import CellGraphState
 
 __all__ = [
@@ -376,6 +378,36 @@ def _block(
     return out
 
 
+def _fused_position(
+    model: HSN,
+    state: CellGraphState,
+    z_t: Tensor,
+    ctx_t: Tensor,
+    scalars_t: Tensor,
+    mode: StepMode,
+    controls: _Controls,
+    consts: WindowConsts,
+) -> tuple[CellGraphState, Selection, Tensor]:
+    """One position of the forward sweep with the fused cell round (P2.10): the shared path, the
+    scorer and the selection are :meth:`HSN._position`'s own operations (the model's
+    :meth:`~hsn.model.router.Router.select` decides, so every routing control it has applies);
+    the round and the tick are one CUDA op (:func:`hsn.kernels.window.cell_round`: messages,
+    inputs, norm, gate, the selected unit of each pair, ``W_out``, candidate, update, ``q``,
+    ages). Returns the state after the position, the selection and the selected slots' updated
+    states. No autograd: the sweep runs under ``torch.no_grad()``."""
+    q_prev = state.q
+    z_hat = model.predictor(q_prev)
+    u = model.shared(torch.cat([z_t, q_prev, ctx_t], dim=-1))
+    u_s, eps_s = u.to(state.dtype), (z_t - z_hat).to(state.dtype)
+    feats = model.scorer._assemble(u_s, eps_s, state.h, state.age, scalars_t)
+    _, _, sel = model._score(feats, state, mode, None, controls=controls)
+    assert sel is not None
+    new_state, slots = window_kernels.cell_round(
+        model.cell, u_s, eps_s, state, sel.cell_idx, sel.unit_idx, sel.valid, consts.edge_weights
+    )
+    return new_state, sel, slots
+
+
 #: The per-position stacks of :func:`_tape_block` that are joined over a window (the final state
 #: aside): per-row values ``[B, n, …]`` and per-position batch statistics ``[n]``.
 TAPE_KEYS: tuple[str, ...] = (
@@ -407,6 +439,7 @@ def _tape_block(
     consts: WindowConsts,
     mode: StepMode,
     controls: _Controls,
+    fused: bool = False,
 ) -> dict[str, Tensor]:
     """A block of consecutive positions of the split window's forward sweep (P2.10,
     :mod:`hsn.train.split`): :func:`_block` without autograd and with a tape. Per position it
@@ -417,7 +450,8 @@ def _tape_block(
     threshold ``tape_theta [B, n]``), the summary after the position (``qs``) and the updated
     states of the selected slots (``tape_hsel [B, n, K, d]``, cell 0 on padded slots). The replay
     recomputes everything else with autograd from these. Sparse hard-gate rounds without dense
-    fallback only (:func:`hsn.train.split.scope_error`)."""
+    fallback only (:func:`hsn.train.split.scope_error`). ``fused`` (``hardware.window=fused``)
+    runs the round as the fused CUDA op (:func:`_fused_position`) instead of the native ops."""
     state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
     n = int(z_b.shape[1])
     d = int(h.shape[-1])
@@ -438,26 +472,33 @@ def _tape_block(
         h_pre.append(state.h)
         q_pre.append(state.q)
         age_pre.append(state.age)
-        result = model._position(
-            state,
-            None,
-            z_b[:, i],
-            c_b[:, i],
-            s_b[:, i],
-            mode,
-            controls,
-            None,
-            False,
-            None,
-            static=True,
-            consts=consts,
-            dense_indices=None,
-        )
-        state = result.state
-        sel = result.selection
-        assert sel is not None and sel.threshold is not None
-        safe = sel.cell_idx.masked_fill(~sel.valid, 0)
-        h_sel.append(state.h.gather(1, safe[:, :, None].expand(-1, -1, d)))
+        if fused:
+            state, sel, slots = _fused_position(
+                model, state, z_b[:, i], c_b[:, i], s_b[:, i], mode, controls, consts
+            )
+            h_sel.append(slots)
+        else:
+            result = model._position(
+                state,
+                None,
+                z_b[:, i],
+                c_b[:, i],
+                s_b[:, i],
+                mode,
+                controls,
+                None,
+                False,
+                None,
+                static=True,
+                consts=consts,
+                dense_indices=None,
+            )
+            state = result.state
+            assert result.selection is not None
+            sel = result.selection
+            safe = sel.cell_idx.masked_fill(~sel.valid, 0)
+            h_sel.append(state.h.gather(1, safe[:, :, None].expand(-1, -1, d)))
+        assert sel.threshold is not None
         thetas.append(sel.threshold)
         qs.append(state.q)
         cells.append(sel.cell_idx)
@@ -511,8 +552,9 @@ class CompiledWindow:
         self._bucket_blocks: dict[int, Any] = {0: self._block}
         #: The capture variant's compiled blocks (their own code objects and recompile budgets).
         self._capture_blocks: dict[int, Any] = {}
-        #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`).
-        self._tape_block: Any = None
+        #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
+        #: compiled function for the native round and one for the fused round.
+        self._tape_blocks: dict[bool, Any] = {}
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
@@ -592,7 +634,9 @@ class CompiledWindow:
             self._variants.add((*key, "warm") if key in self._variants else key)
         return out
 
-    def tape(self, pro: _Prologue, state: CellGraphState, reset: Tensor) -> dict[str, Tensor]:
+    def tape(
+        self, pro: _Prologue, state: CellGraphState, reset: Tensor, *, fused: bool = False
+    ) -> dict[str, Tensor]:
         """The split window's forward sweep (P2.10, :mod:`hsn.train.split`): the compiled
         :func:`_tape_block` over the window, under ``torch.no_grad()`` in training mode. Returns
         :func:`run_tape`'s tape, cloned out of CUDA-graph memory (the next replay overwrites
@@ -606,16 +650,20 @@ class CompiledWindow:
             model.training,
             model._controls().gate,
             torch.is_autocast_enabled(self.ctx.device.type),
-            "tape",
+            "tape-fused" if fused else "tape",
         )
         warm = (*key, "warm")
         new = key not in self._variants or (self.cuda_graphs and warm not in self._variants)
         started = time.perf_counter()
-        if self._tape_block is None:
-            self._tape_block = _compiler(self.mode, self.backend, self.ctx.device.type)(_tape_block)
+        if fused not in self._tape_blocks:
+            self._tape_blocks[fused] = _compiler(self.mode, self.backend, self.ctx.device.type)(
+                _tape_block
+            )
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
-        tape = run_tape(self._tape_block, model, pro, state, reset, block_size(T))
+        tape = run_tape(
+            self._tape_blocks[fused], model, pro, state, reset, block_size(T), fused=fused
+        )
         if self.cuda_graphs:  # the final state would be overwritten by the next replay
             for name in ("h", "q", "age", "pos"):
                 tape[name] = tape[name].clone()
@@ -730,6 +778,8 @@ def run_tape(
     state: CellGraphState,
     reset: Tensor,
     blk: int,
+    *,
+    fused: bool = False,
 ) -> dict[str, Tensor]:
     """The forward sweep of a split window (:func:`_tape_block` as ``block``, compiled or not)
     over blocks of ``blk`` positions, without autograd: the joined tape (:data:`TAPE_KEYS`) and
@@ -759,6 +809,7 @@ def run_tape(
                 consts,
                 mode,
                 controls,
+                fused,
             )
             h, q, age, pos = out["h"], out["q"], out["age"], out["pos"]
             blocks.append(out)

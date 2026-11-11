@@ -129,7 +129,9 @@ def time_window(args: argparse.Namespace) -> dict[str, Any]:
     }
     split = getattr(trainer, "_split", None)
     if split is not None:
-        report["last_phase_ms"] = {k: round(1e3 * v, 3) for k, v in split.last_phase_seconds.items()}
+        report["last_phase_ms"] = {
+            k: round(1e3 * v, 3) for k, v in split.last_phase_seconds.items()
+        }
     return report
 
 
@@ -162,13 +164,19 @@ def _window_grads(
         for n, p in model.named_parameters()
         if p.grad is not None
     }
+    # the routing decisions ride along, so that two windows can be compared slot for slot
+    grads["__cells__"] = torch.where(info["valid"], info["cell_idx"], -1).double()
+    grads["__units__"] = torch.where(info["valid"], info["unit_idx"], -1).double()
     return grads, float(loss)
 
 
 def _compare(a: dict[str, torch.Tensor], ref: dict[str, torch.Tensor]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    names = sorted(ref)
-    assert sorted(a) == names, (sorted(set(a) ^ set(ref)),)
+    out: dict[str, Any] = {
+        "same_cells": float((a["__cells__"] == ref["__cells__"]).double().mean()),
+        "same_units": float((a["__units__"] == ref["__units__"]).double().mean()),
+    }
+    names = sorted(n for n in ref if not n.startswith("__"))
+    assert sorted(n for n in a if not n.startswith("__")) == names, (sorted(set(a) ^ set(ref)),)
     groups = sorted({_groups(n) for n in names})
     for group in [*groups, "all"]:
         members = [n for n in names if group == "all" or _groups(n) == group]
@@ -189,7 +197,12 @@ def grads(args: argparse.Namespace) -> dict[str, Any]:
     batch: dict[str, torch.Tensor] | None = None
     start: Any = None
     for precision in ("fp32", "bf16"):
-        cfg = _config(args, f"train.precision={precision}", "hardware.window=autograd")
+        cfg = _config(
+            args,
+            f"train.precision={precision}",
+            f"hardware.autocast_dtype={precision}",
+            "hardware.window=autograd",
+        )
         trainer, train_ds, dev_ds = _trainer(cfg)
         model = trainer.hsn
         if saved is None:
@@ -240,12 +253,78 @@ def grads(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def phases(args: argparse.Namespace) -> dict[str, Any]:
+    """Synchronised wall time of the parts of one split-window step (forward sweep, replay,
+    loss, backward), each as the median of ``--steps`` repeats after ``--warm`` warm-ups, on a
+    synthetic window (the routing differs from a real batch, the work does not)."""
+    cfg = _config(args, f"hardware.window={args.window}")
+    trainer, train_ds, dev_ds = _trainer(cfg)
+    if args.train_steps:
+        trainer.fit(train_ds, dev_ds, args.train_steps)
+    model = trainer.hsn
+    device = trainer.ctx.device
+    g = torch.Generator().manual_seed(args.seed)
+    B, T = cfg.train.batch, cfg.train.unroll
+    reset = torch.zeros(B, T, dtype=torch.bool)
+    reset[:, 0] = True
+    batch = {
+        "tokens": torch.randint(0, cfg.model.vocab_size, (B, T), generator=g).to(device),
+        "context": torch.randint(0, cfg.model.n_context, (B, T), generator=g).to(device),
+        "reset": reset.to(device),
+        "targets": torch.randint(0, cfg.model.vocab_size, (B, T), generator=g).to(device),
+        "loss_mask": (torch.rand(B, T, generator=g) < 0.1).to(device),
+    }
+    split = trainer._split
+    assert split is not None and split.compiled is not None
+    model.train()
+    state = model.init_state(B, device)
+    samples: dict[str, list[float]] = {}
+
+    def lap(name: str, since: float) -> float:
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        samples.setdefault(name, []).append(now - since)
+        return now
+
+    for index in range(args.warm + args.steps):
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        if index == args.warm:
+            samples.clear()
+        t0 = time.perf_counter()
+        with autocast_ctx(trainer.ctx):
+            mode = model._window_mode()
+            pro = model._window_prologue(
+                batch["tokens"], batch["context"], state, batch["reset"], mode, reset_first=True
+            )
+            t1 = lap("prologue", t0)
+            with torch.no_grad():
+                tape = split.compiled.tape(pro, state, batch["reset"], fused=split.fused)
+            t2 = lap("sweep", t1)
+            logits, _, info = split._replay(pro, tape, batch["reset"], B, T)
+            t3 = lap("replay_forward", t2)
+        mask = batch["loss_mask"]
+        task = torch.nn.functional.cross_entropy(logits[mask].float(), batch["targets"][mask])
+        loss = task + (info["z_hat"].float() - info["z_target"].float()).square().mean()
+        t4 = lap("loss", t3)
+        loss.backward()  # type: ignore[no-untyped-call]
+        lap("backward", t4)
+        lap("total", t0)
+    return {
+        "config": args.config,
+        "batch": B,
+        "unroll": T,
+        "repeats": args.steps,
+        "median_ms": {k: round(1e3 * statistics.median(v), 3) for k, v in samples.items()},
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("command", choices=["time", "grads"])
+    parser.add_argument("command", choices=["time", "grads", "phases"])
     parser.add_argument("--config", default=RECIPE)
     parser.add_argument("--profile", default="rtx3060")
-    parser.add_argument("--window", choices=["autograd", "split"], default="split")
+    parser.add_argument("--window", choices=["autograd", "split", "fused"], default="split")
     parser.add_argument("--warm", type=int, default=300)
     parser.add_argument("--steps", type=int, default=600)
     parser.add_argument("--train-steps", type=int, default=0)
@@ -254,7 +333,7 @@ def main() -> None:
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    report = time_window(args) if args.command == "time" else grads(args)
+    report = {"time": time_window, "grads": grads, "phases": phases}[args.command](args)
     text = json.dumps(report, indent=2)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)

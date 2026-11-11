@@ -222,6 +222,7 @@ def test_split_window_without_loss_positions_gives_the_same_none_set() -> None:
         (*A5, ALL, "train.p_dense=0.25"),
         (*A5, ALL, "train.epsilon_start=0.1", "train.epsilon_end=0.1"),
         (*A5, ALL, "train.state_grad_clip=1.0"),
+        (*A5, ALL, "train.lambda_u=0.1", "train.probe_horizon=4"),
         (*A5, ALL, "train.soft_until_step=2"),
         (ALL,),
     ],

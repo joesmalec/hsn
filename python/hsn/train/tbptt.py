@@ -418,7 +418,9 @@ class TBPTTTrainer(Trainer):
         # sweep without autograd and one batched replay; evaluation, the statistics steps' term
         # passes and the diagnostics keep the window above
         self._split: SplitWindow | None = (
-            SplitWindow(model, cfg, self._compiled) if cfg.hardware.window == "split" else None
+            SplitWindow(model, cfg, self._compiled)
+            if cfg.hardware.window in ("split", "fused")
+            else None
         )
         self._cut_enabled = (
             cfg.data.align_docs and cfg.model.routing == "dense" and self._compiled is None

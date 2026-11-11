@@ -128,8 +128,10 @@ MasterDtype = Literal["fp32", "fp64"]
 CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
 #: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
 #: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
-#: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut).
-WindowMode = Literal["autograd", "split"]
+#: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut); ``fused`` is ``split``
+#: with the sweep's cell round as one fused CUDA op (:mod:`hsn.kernels.window`): experimental,
+#: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
+WindowMode = Literal["autograd", "split", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
 
@@ -922,7 +924,7 @@ class HardwareConfig(_StrictModel):
     unified_memory: bool
     pinned_memory: bool
     compile_mode: CompileMode = "none"
-    window: WindowMode = "autograd"  # P2.10: autograd | split (hsn.train.split)
+    window: WindowMode = "autograd"  # P2.10: autograd | split | fused (hsn.train.split)
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()

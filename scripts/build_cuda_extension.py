@@ -14,6 +14,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cuda-home", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=2)
+    # P2.10 window kernels build a second, independent extension with the same recipe.
+    parser.add_argument("--name", default="hsn_cuda_py")
+    parser.add_argument("--source", default="python/hsn/kernels/cuda_ext.cpp")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()
@@ -31,17 +34,17 @@ def main() -> None:
         "--build-lib",
         str(out),
         "--build-temp",
-        str(out / "extension-temp"),
+        str(out / ("extension-temp" if args.name == "hsn_cuda_py" else f"{args.name}-temp")),
     ]
     setup(
-        name="hsn_cuda_py",
+        name=args.name,
         # This distribution contains only the extension, not repository packages.
         packages=[],
         py_modules=[],
         ext_modules=[
             CUDAExtension(
-                name="hsn_cuda_py",
-                sources=[str(root / "python/hsn/kernels/cuda_ext.cpp")],
+                name=args.name,
+                sources=[str(root / args.source)],
                 include_dirs=[str(root / "kernels/include")],
                 libraries=["cuda"],
                 extra_compile_args={"cxx": ["-O3", "-std=c++20"]},
