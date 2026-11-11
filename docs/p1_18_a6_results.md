@@ -39,8 +39,11 @@ seen in training and a key-blind reader tops out at 62.3 %: 75.4 % and 83.4 %, a
 frozen key-binding verdict, the first of this project (exps 384, 386, 389, 399, 401, 413 at step
 5,000; 418 and 422 at 9,000); most runs are still "partial".
 
-Over 27,000 steps the recipe without the guard ends at 90.6 % (later queries 82.8 %, exp 416),
-against 78.7 % for the GRU and 70.2 % for the Transformer at 27k.
+Over 27,000 steps the recipe ends at 90.6 % with the guard and at 90.6 % without it (later
+queries 83.5 % and 82.8 %, exps 417 and 416), against 78.7 % for the GRU and 70.2 % for the
+Transformer at 27k. The guard changes the path, not the end: with it the run is at 90.6 % by step
+3,000 and between 88 and 95 % from there on; without it the run sags to 78.6 % at step 3,000 and
+needs the whole schedule to climb back.
 
 ![Dev accuracy before and after](training_review/p1_18_a6_curves_2026_11_10.png)
 
@@ -349,6 +352,19 @@ of its step scale and every other unit is untouched. The same guard stopped at s
 413 to 415): 88.3 / 81.6 / 82.5 % with worst drawdowns of 6.8 / 3.1 / 0.0 points, against 77.0 /
 70.3 / 82.8 % and 10.9 / 21.3 / 20.0 without.
 
+Over 27,000 steps (seed 2, each run alone on the card):
+
+| Dev accuracy at step | 2,500 | 3,000 | 6,000 | 9,000 | 12,000 | 15,000 | 18,000 | 21,000 | 24,000 | 27,000 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| with the guard (exp 417) | 87.3% | 90.6% | 93.1% | 93.3% | 92.6% | 90.6% | 89.9% | 90.7% | 91.8% | 90.6% |
+| without (exp 416) | 91.7% | 78.6% | 84.1% | 86.1% | 86.3% | 87.0% | 88.0% | 87.8% | 89.5% | 90.6% |
+
+The guarded run has no early sag (worst drawdown 7.2 points, from its peak of 95.4 % at step
+10,000 to 88.1 % at 15,500, against 13.1) and ends where the unguarded one does: 90.6 %, later
+queries 83.5 % against 82.8 %, swap followed 51.5 % against 55.2 %, both "partial". Through the
+long constant-rate phase the guard fired 123 times, all on one unit, and the value routes still
+eroded slowly.
+
 What the guard does not do. It reduces the sag, it does not remove every fall: seeds 0 and 2
 still slide 6 and 9 points late in the constant-rate phase (steps 5,000 to 7,000) before the
 decay lifts them. On seed 0 the reader's router rows were at the floor (1/64 of their step) by
@@ -407,6 +423,10 @@ moved to the collector's permanent generation after an evaluation (`gc.freeze()`
 | before (`dip_base.json`) | 7 × 0.32 s | 6 (0.35 to 0.51 s) | 9 |
 | frozen after step 520 (`dip_freeze.json`) | 50 × ≤ 0.002 s | 0 | 2 |
 
+With both fixes on, the two 27,000-step runs alone on the card (exps 416 and 417, one sample
+per second over 48 minutes of training each): mean utilisation 85 %, 3.4 % and 3.3 % of the
+samples below 50 % (exp 346: 10.1 %), step time 0.100 s.
+
 What still interrupts the card after both fixes: an evaluation every 500 steps (0.8 s, mostly
 busy), a statistics step every 100 steps (0.28 s, busy: two extra passes for the per-term gradient
 norms) and the steady 88 % between them (the per-position launches of a small recurrent model).
@@ -444,8 +464,8 @@ compile of a run is unchanged.
   that task alone and the 27k baselines on the five-task mix (the delayed-only Transformer is
   lower). The guard's reading of "which unit serves the supervised positions" has only been
   tried where the supervised positions are a query's key.
-- **Long runs with the guard.** The 27k run with the guard is exp 417 (`p1_18_a6_final_27k`);
-  the 27k figures above are without it.
+- **Long runs.** Over 27,000 steps the guard gives a better path and the same end point (one
+  seed, section 3e): through 18,000 steps at a constant rate the value routes still erode.
 - **Cost.** The routed HSN step is 0.100 s against 0.014 to 0.016 s for the GRU and the
   Transformer, with 2.1 GB against 0.7 GB of GPU memory. The guard and the weight average add no
   measurable step time (0.292 s with three arms on the card, with and without).
