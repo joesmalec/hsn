@@ -9,6 +9,13 @@ which paths the backward pass follows through the recurrent state. Runs and evid
 worst drop during a run 2.2 / 6.8 / 4.5 points, no step skipped. The same recipe with full
 backpropagation (exps 343, 326, 346): 73.8 / 78.2 / 77.5 %, worst drop 12.0 / 4.8 / 36.9 points.
 
+**With the candidate norm of A4 on top** (`model.cand_norm=rms`, which diverged under full
+backpropagation and trains with the cut), six seeds end at 82.1 to 86.5 % (mean 85.1 %; exps 375
+to 377, 418 to 420), every one above every GRU run, with a mid-run sag of 5 to 21 points. With
+`train.route_guard` (below) the same six seeds end at 84.9 to 95.6 % (mean 89.0 %; exps 421 to
+426) with falls of 1.5 to 8.7 points. The tested recipe is therefore the cut, the anchored caps,
+A4, `train.weight_ema=0.99` and the route guard at its defaults; each part is opt-in.
+
 Two further keys of the same family, `train.state_grad_ratio` and `train.state_grad_clip`, are
 described at the end. They were tested and **do not remove the drops**; they are not part of the
 recommended recipe.
@@ -201,11 +208,26 @@ without the guard (`test_a_quiet_guard_changes_no_training_step`), the state is 
       min_scale: 0.015625   # ... down to this
       restore: false        # also rewind the gaining unit's rows one reading (tested: worse)
 
+**What it watches, precisely.** The units that serve the supervised positions are read from the
+loss mask (units with at least `specialised` of the slots at loss positions); in every run
+inspected the unit that takes the value routes is one of them. A reading is an event only when
+such a unit holds a larger share of some input bytes than it ever has while other units'
+established routes on those bytes shrink. Routes that move between other units (the filler's do,
+constantly) are not events: an earlier version that counted them slowed the wrong units.
+
+**Results** (9,000 steps, six seeds, against the same configuration without the guard): 86.2 /
+93.3 / 88.9 / 95.6 / 84.9 / 85.3 % against 85.9 / 86.5 / 86.5 / 84.7 / 82.1 / 84.6 %; worst
+drawdown 5.8 / 1.8 / 8.7 / 1.5 / 5.2 / 6.0 points against 10.9 / 21.3 / 20.0 / 5.1 / 13.7 / 14.7;
+three of the six pass the key-binding verdict against one. Over 27,000 steps (one seed) it
+removes the early sag and ends at the same score.
+
 **Limits.** It needs a scorer with one output per unit (the linear scorer, or the two-layer
 scorer's second layer). A unit whose step has been halved to the floor no longer learns new
-routes. Reshuffles of routes that do not matter for the loss (the filler's) count as events too
-when the loss is not improving. Tested on one task; the first version, which watched for routes
-lost to the most-used unit, did not work (exps 396 to 398) and is described in the results.
+routes; an event that comes while a route is still forming slows that run. It slows the unit
+that takes a route and does nothing about the units that lose it un-learning it, so a slower
+erosion remains (5 to 9 points on four of six seeds; visible over 27,000 steps). Tested on one
+task, where the supervised positions are a query's key. Two earlier versions did not work (exps
+396 to 398, 402 to 404) and are described in the results.
 
 ## Related: `model.address_init` (A5 extension, diagnostic)
 
