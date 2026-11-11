@@ -80,6 +80,7 @@ gradients there (an inductor Metal fusion bug in torch 2.15).
 
 from __future__ import annotations
 
+import copy
 import itertools
 import logging
 import time
@@ -88,7 +89,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from hsn.device import DeviceContext
 from hsn.kernels import window as window_kernels
@@ -378,6 +379,93 @@ def _block(
     return out
 
 
+#: The parameters autocast casts at every use (the linears of P, S, the scorer, V, the gate,
+#: W_out and the unit bank): the ones a :class:`SweepTwin` holds pre-cast.
+SWEEP_CAST_PREFIXES: tuple[str, ...] = (
+    "predictor.",
+    "shared.",
+    "router.",
+    "cell.V.",
+    "cell.gate.",
+    "cell.W_out.",
+    "cell.units.",
+)
+
+
+class SweepTwin:
+    """The model the split window's forward sweep runs (P2.10): a structural copy of the HSN
+    whose autocast-cast weights (:data:`SWEEP_CAST_PREFIXES`) are held in the autocast dtype and
+    refreshed once per window, and whose other parameters and buffers are the model's own
+    tensors. A compiled block of the model itself casts every such weight at every position
+    (under autograd it has to: the gradients of a window are summed in the fp32 masters) and
+    receives the window's ``W1`` layout as a call argument, which a CUDA graph copies into its
+    input buffer at every block; the sweep needs neither. The twin's values are the model's:
+    the same casts, made once (``tests/kernels/test_p2_10_window.py``). ``sweep_edge`` and
+    ``sweep_w1_flat`` are the window constants as buffers of the twin, so a compiled block reads
+    them at static addresses."""
+
+    def __init__(self, model: HSN, dtype: torch.dtype) -> None:
+        self.model = model
+        self.dtype = dtype
+        twin = copy.deepcopy(model)
+        twin.requires_grad_(False)
+        self.twin = twin
+        self._cast: list[tuple[Tensor, Tensor]] = []
+        self._shared: list[tuple[nn.Module, str, str]] = []  # (twin owner, leaf, dotted name)
+        masters = dict(model.named_parameters())
+        for name in [n for n, _ in twin.named_parameters()]:
+            owner_name, _, leaf = name.rpartition(".")
+            owner = twin.get_submodule(owner_name)
+            source = masters[name]
+            if source.dtype != dtype and name.startswith(SWEEP_CAST_PREFIXES):
+                target = nn.Parameter(source.detach().to(dtype), requires_grad=False)
+                owner._parameters[leaf] = target
+                self._cast.append((source, target))
+            else:
+                owner._parameters[leaf] = source
+                self._shared.append((owner, leaf, name))
+        self._buffers: list[tuple[nn.Module, str, str]] = []
+        for name, buffer in model.named_buffers():
+            owner_name, _, leaf = name.rpartition(".")
+            owner = twin.get_submodule(owner_name)
+            owner._buffers[leaf] = buffer
+            self._buffers.append((owner, leaf, name))
+        cell = model.cell
+        units = cell.units
+        device = next(model.parameters()).device
+        twin.cell.register_buffer(
+            "sweep_edge",
+            torch.zeros(cell.n_cells, cell.graph.max_in_degree, dtype=dtype, device=device),
+            persistent=False,
+        )
+        twin.cell.units.register_buffer(
+            "sweep_w1_flat",
+            torch.zeros(units.in_dim, units.n_units * units.hidden, dtype=dtype, device=device),
+            persistent=False,
+        )
+
+    def refresh(self) -> None:
+        """Bring the twin up to the model: the cast weights and the window constants are copied
+        (inside the model's ``cell.window()``, without autograd), the shared tensors re-bound if
+        the model replaced one, the mode followed."""
+        model, twin = self.model, self.twin
+        if twin.training != model.training:
+            twin.train(model.training)
+        for source, target in self._cast:
+            target.copy_(source)
+        masters = dict(model.named_parameters())
+        for owner, leaf, name in self._shared:
+            if owner._parameters[leaf] is not masters[name]:
+                owner._parameters[leaf] = masters[name]
+        buffers = dict(model.named_buffers())
+        for owner, leaf, name in self._buffers:
+            if owner._buffers[leaf] is not buffers[name]:
+                owner._buffers[leaf] = buffers[name]
+        consts = model.cell.window_consts()
+        twin.cell.get_buffer("sweep_edge").copy_(consts.edge_weights)
+        twin.cell.units.get_buffer("sweep_w1_flat").copy_(consts.w1_flat)
+
+
 def _fused_position(
     model: HSN,
     state: CellGraphState,
@@ -436,7 +524,7 @@ def _tape_block(
     c_b: Tensor,
     s_b: Tensor,
     r_b: Tensor,
-    consts: WindowConsts,
+    consts: WindowConsts | None,
     mode: StepMode,
     controls: _Controls,
     fused: bool = False,
@@ -451,7 +539,14 @@ def _tape_block(
     states of the selected slots (``tape_hsel [B, n, K, d]``, cell 0 on padded slots). The replay
     recomputes everything else with autograd from these. Sparse hard-gate rounds without dense
     fallback only (:func:`hsn.train.split.scope_error`). ``fused`` (``hardware.window=fused``)
-    runs the round as the fused CUDA op (:func:`_fused_position`) instead of the native ops."""
+    runs the round as the fused CUDA op (:func:`_fused_position`) instead of the native ops.
+    ``consts=None``: ``model`` is a :class:`SweepTwin`'s twin and the window constants are its
+    buffers."""
+    if consts is None:
+        consts = WindowConsts(
+            edge_weights=model.cell.get_buffer("sweep_edge"),
+            w1_flat=model.cell.units.get_buffer("sweep_w1_flat"),
+        )
     state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
     n = int(z_b.shape[1])
     d = int(h.shape[-1])
@@ -554,7 +649,8 @@ class CompiledWindow:
         self._capture_blocks: dict[int, Any] = {}
         #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
         #: compiled function for the native round and one for the fused round.
-        self._tape_blocks: dict[bool, Any] = {}
+        self._tape_blocks: dict[tuple[bool, bool], Any] = {}
+        self._sweep_twin: SweepTwin | None = None
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
@@ -635,15 +731,23 @@ class CompiledWindow:
         return out
 
     def tape(
-        self, pro: _Prologue, state: CellGraphState, reset: Tensor, *, fused: bool = False
+        self,
+        pro: _Prologue,
+        state: CellGraphState,
+        reset: Tensor,
+        *,
+        fused: bool = False,
+        twin: bool = True,
     ) -> dict[str, Tensor]:
         """The split window's forward sweep (P2.10, :mod:`hsn.train.split`): the compiled
         :func:`_tape_block` over the window, under ``torch.no_grad()`` in training mode. Returns
         :func:`run_tape`'s tape, cloned out of CUDA-graph memory (the next replay overwrites
         it). Counted in ``calls`` and, on the calls that compile or record, ``compile_seconds``
-        like any other variant."""
+        like any other variant. The native round runs a :class:`SweepTwin` (``twin=False``:
+        the model itself, for the tests; the fused round reads the fp32 masters)."""
         model = self.model
         B, T = (int(n) for n in reset.shape)
+        use_twin = twin and not fused
         key: tuple[object, ...] = (
             B,
             block_size(T),
@@ -651,18 +755,33 @@ class CompiledWindow:
             model._controls().gate,
             torch.is_autocast_enabled(self.ctx.device.type),
             "tape-fused" if fused else "tape",
+            use_twin,
         )
         warm = (*key, "warm")
         new = key not in self._variants or (self.cuda_graphs and warm not in self._variants)
         started = time.perf_counter()
-        if fused not in self._tape_blocks:
-            self._tape_blocks[fused] = _compiler(self.mode, self.backend, self.ctx.device.type)(
+        slot = (fused, use_twin)
+        if slot not in self._tape_blocks:
+            self._tape_blocks[slot] = _compiler(self.mode, self.backend, self.ctx.device.type)(
                 _tape_block
             )
+        sweep: SweepTwin | None = None
+        if use_twin:
+            if self._sweep_twin is None:
+                dtype = self.ctx.autocast_dtype or next(model.parameters()).dtype
+                self._sweep_twin = SweepTwin(model, dtype)
+            sweep = self._sweep_twin
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         tape = run_tape(
-            self._tape_blocks[fused], model, pro, state, reset, block_size(T), fused=fused
+            self._tape_blocks[slot],
+            model,
+            pro,
+            state,
+            reset,
+            block_size(T),
+            fused=fused,
+            twin=sweep,
         )
         if self.cuda_graphs:  # the final state would be overwritten by the next replay
             for name in ("h", "q", "age", "pos"):
@@ -780,10 +899,12 @@ def run_tape(
     blk: int,
     *,
     fused: bool = False,
+    twin: SweepTwin | None = None,
 ) -> dict[str, Tensor]:
     """The forward sweep of a split window (:func:`_tape_block` as ``block``, compiled or not)
     over blocks of ``blk`` positions, without autograd: the joined tape (:data:`TAPE_KEYS`) and
-    the final state (``h``, ``q``, ``age``, ``pos``). The prologue's stacks are read detached."""
+    the final state (``h``, ``q``, ``age``, ``pos``). The prologue's stacks are read detached.
+    With a ``twin`` the blocks run the twin (refreshed here) and read its window constants."""
     if torch.is_grad_enabled():
         raise RuntimeError("the split window's forward sweep runs under torch.no_grad()")
     T = int(reset.shape[1])
@@ -793,11 +914,17 @@ def run_tape(
     h, q, age, pos = state.h, state.q, state.age, state.pos
     blocks: list[dict[str, Tensor]] = []
     with model.cell.window():
-        consts = model.cell.window_consts()
+        consts: WindowConsts | None = None
+        runner = model
+        if twin is not None:
+            twin.refresh()
+            runner = twin.twin
+        else:
+            consts = model.cell.window_consts()
         for start in range(0, T, blk):
             cols = slice(start, start + blk)
             out = block(
-                model,
+                runner,
                 h,
                 q,
                 age,
