@@ -356,6 +356,12 @@ of its step scale and every other unit is untouched. The same guard stopped at s
 413 to 415): 88.3 / 81.6 / 82.5 % with worst drawdowns of 6.8 / 3.1 / 0.0 points, against 77.0 /
 70.3 / 82.8 % and 10.9 / 21.3 / 20.0 without.
 
+A more sensitive setting (a reading every 50 steps, an event at 5 % lost) is worse, not better
+(`p1_18_a6_final_guard_fast`, seeds 0 to 2, 9,000 steps: 95.3 / 77.9 / 81.3 %, exps 427 to 429,
+against 86.2 / 93.3 / 88.9 % at the defaults): its first events come while the routes are still
+forming, seed 1 then needs until step 4,000 to reach 0.6 dev, and seed 2 sags 21.8 points
+anyway. The defaults stay.
+
 Over 27,000 steps (seed 2, each run alone on the card):
 
 | Dev accuracy at step | 2,500 | 3,000 | 6,000 | 9,000 | 12,000 | 15,000 | 18,000 | 21,000 | 24,000 | 27,000 |
