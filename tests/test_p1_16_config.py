@@ -77,6 +77,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.state_grad_ratio",
         "train.weight_ema",
         "train.route_guard",
+        "hardware.window",  # P2.10
     )
 
 
