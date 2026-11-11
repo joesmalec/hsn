@@ -27,11 +27,22 @@ frozen binding verdict (swap follow 15 to 25 %, two "partial"). Learning is slow
 backpropagation: 0.6 dev is reached at step 4,000 to 4,500, against 2,500 to 3,000 for the GRU's
 speed bar.
 
-The GPU pauses were the periodic diagnostics and the end-of-run probes running the eager routed
-forward. Both now replay compiled graphs: per run, diagnostics went from 466 s to 12 s and the
-probes from 76 s to 10 s on the same recipe under the same load (exps 349 and 360).
+Over 27,000 steps the recipe reaches 90.0 % (later queries 82.1 %, exp 371), against 78.7 % for
+the GRU and 70.2 % for the Transformer at 27k.
+
+The GPU pauses had two causes. The long ones (4 to 5 s every 250 steps, and 79 s at the end of a
+run) were the diagnostics and the probes running the eager routed forward; both now replay
+compiled graphs (per 9k run: diagnostics 466 s → 12 s, probes 76 s → 10 s, exps 349 and 360). The
+short ones that remained (0.4 to 0.5 s every 10 to 16 s) were full passes of Python's garbage
+collector over the compiled graphs' objects, removed by freezing those objects (0.32 s → 0.002 s
+per pass). Diagnostics can be switched off per sweep or per enqueue (`protocol.diagnostics`).
 
 ![Dev accuracy before and after](training_review/p1_18_a6_curves_2026_11_10.png)
+
+(The GRU line is exp 347, the delayed-only run, evaluated every 500 steps: chance until step
+2,000, 76.2 % at 2,500, then a plateau. Every stored delayed-only GRU run has that shape: exps 154,
+204, 206. The smoother GRU curves of exps 334 to 336 are the five-task overall score, evaluated
+every 3,000 steps.)
 
 ## 1. What the drops are
 
@@ -161,7 +172,19 @@ The router norm is the last diagnostic sample's; runs without an update limiter 
   chance), which is not enough.
 - *A4 with full backpropagation* (350) is non-finite by step 1,479.
 
-FULL_RUN_SECTION
+**The full run** (exp 371: the recipe on seed 2 for 27,000 steps, alone on the card):
+
+| | Final dev | Later | First | Worst drawdown | Skips | Swap follow / unchanged | Binding |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Routed HSN, cut + caps, 27k (exp 371) | 90.0% | 82.1% | 98.9% | 5.4 pp | 0 | 44.0% / 29.3% | partial |
+| GRU 2M, 27k, five-task mix (exp 336), delayed task | 78.7% | 59.9% | – | – | 0 | – | – |
+| Transformer 2M, 27k, five-task mix (exp 339), delayed task | 70.2% | 50.7% | – | – | 0 | – | – |
+| Transformer 2M, 27k, delayed only (exp 262) | 49.9% | 31.9% | – | – | 0 | – | – |
+
+It reaches 0.6 dev at step 3,500, holds 74 to 85 % from step 8,500 to the start of the decay
+(21,600) and is still rising at the end (86.3 % at 23,000, 88.7 % at 24,500, 90.0 % at 27,000).
+The gain over the 9k runs is on later queries (70.7 % → 82.1 %) and the key swap is followed
+almost twice as often (24.6 % → 44.0 %), still under the frozen 50 % threshold. One seed.
 
 ## 4. The GPU pauses
 
@@ -189,7 +212,35 @@ Changes (all values equal to the eager ones to rounding; an eager trainer is unc
 | exp 349, eager diagnostics and probes | 465.7 s | 76.4 s | 62.7 s |
 | exp 360, compiled diagnostics and probes | 12.4 s (0.36 s per sample) | 10.4 s | 34.7 s |
 
-GPU_SOLO_SECTION
+Alone on the card (exp 371, 27,000 steps): 108 diagnostic samples took 8.5 s in total (0.08 s
+each; 3.7 s each in exp 346) and the three probes 5.0 s (78.9 s).
+
+**What was left, and the second fix.** A 5 Hz trace of exp 371 still showed half-second dips to
+0 % every 10 to 16 s (2.8 % of the time below 50 %), tied to no training event. An instrumented
+solo run (`a5-fix/probe/dip_probe.py`, 1,400 steps: every step's wall time, every collector pass,
+the card at 20 Hz) attributes every one of them to a **full pass of Python's garbage collector**:
+0.28 to 0.35 s each over about 980,000 tracked objects (the compiled graphs, their guards, the
+modules), 12 of them in 1,340 steps, each an idle stretch of 0.35 to 0.5 s on the card. Plain
+steps are otherwise steady (median 99.1 ms, 99th percentile 100.3 ms). With the long-lived objects
+moved to the collector's permanent generation after an evaluation (`gc.freeze()`; protocol
+`gc_freeze`, on by default for compiled runs, undone when the fit ends) a full pass takes 1 to
+2 ms and the idle stretches are gone:
+
+| Steps 541 to 1,400, alone on the card | Full collector passes | Idle stretches on the card | Steps over 150 ms (statistics steps aside) |
+| --- | ---: | ---: | ---: |
+| before (`dip_base.json`) | 7 × 0.32 s | 6 (0.35 to 0.51 s) | 9 |
+| frozen after step 520 (`dip_freeze.json`) | 50 × ≤ 0.002 s | 0 | 2 |
+
+What still interrupts the card after both fixes: an evaluation every 500 steps (0.8 s, mostly
+busy), a statistics step every 100 steps (0.28 s, busy: two extra passes for the per-term gradient
+norms) and the steady 88 % between them (the per-position launches of a small recurrent model).
+P2.10's fused kernels would shorten the step; they do not touch any of the pauses above.
+
+**The diagnostics switch.** `protocol: {diagnostics: false}` (or `enqueue --diagnostics off`)
+takes no diagnostic sample during training at all: no hooks, no state window, nothing compiled for
+them. It is execution-only: the training, the arm id, the evaluations, the kept checkpoints, the
+end-of-run state statistics and the probes are the same, and a rule that reads a `diag:` value is
+refused at expansion rather than left without data. Default on.
 
 Not changed: the stability observer (`diag_stability`, opt-in) still perturbs the state inside an
 eager forward; the one-off `trained_state` window at the end is eager (3 to 6 s); the first
@@ -216,8 +267,13 @@ compile of a run is unchanged.
 - **The forward dynamics are unchanged.** The cell is still a bank of hard switches and still
   sensitive to its state; the cut stops the optimiser from following those directions, it does not
   make the cell smooth.
-- **Other tasks, the dense HSN and longer runs** were not run with the cut, apart from the 27k
-  run above.
+- **Other tasks and the dense HSN** were not run with the cut. The comparison with the
+  Transformer and the GRU above is on the delayed task only, where the HSN arms trained on that
+  task alone and the 27k baselines on the five-task mix (the delayed-only Transformer is lower).
+- **Cost.** The routed HSN step is 0.099 s against 0.014 to 0.016 s for the GRU and the
+  Transformer, with 2.1 GB against 0.7 GB of GPU memory.
+- **The wobble.** Between evaluations the recipe's dev accuracy moves 1.8 to 3.0 points (largest
+  falls 1.2 to 5.4), against 0.4 for the GRU and 0.7 for the dense HSN; see section 3b.
 
 ## 6. Reproduce
 

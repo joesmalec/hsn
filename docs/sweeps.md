@@ -1022,6 +1022,28 @@ Values agree with the eager ones to rounding (the answers of a probe are argmaxe
 differ). An eager trainer (`hardware.compile_mode=none`) is unchanged. `diag_stability` still
 perturbs the state inside an eager forward and keeps its cost.
 
+**Switching the diagnostics off, and the collector.** Two execution-only protocol keys (the arm
+id and the training are the same either way):
+
+```yaml
+protocol:
+  diagnostics: false   # default true; no diagnostic sample during training, whatever the cadence keys say
+  gc_freeze: false     # default true; see below
+```
+
+`python -m hsn.experiments enqueue SPEC --diagnostics off` (or `on`) overrides the spec for the
+arms it queues. With the diagnostics off nothing is attached to the optimiser and nothing is
+compiled for them; the record's `diagnostics` is empty and `diagnostics_enabled` false; the
+evaluations, the kept checkpoints, the end-of-run state statistics (`trained_state`) and the
+probes still run. A rule that reads a `diag:` value has nothing to read then, and expansion
+refuses the arm.
+
+`gc_freeze` (compiled runs only): after every evaluation the harness calls `gc.collect()` and
+`gc.freeze()`, and `gc.unfreeze()` when the fit ends. A compiled run holds about a million objects
+the collector tracks; each full pass walked them for 0.3 s with the card idle, about ten times per
+thousand steps, which showed as half-second dips to 0 % utilisation. Frozen, a pass takes 1 to
+2 ms. The record's `gc_freezes` counts them.
+
 **Phases.** Every training record carries `phases`: wall-clock intervals (`[unix start, seconds]`)
 of each evaluation, diagnostic sample (`[step, unix start, seconds]`) and checkpoint write, and the
 start and end of the `setup`, `fit` and `probing` stages. With the worker's card time series
