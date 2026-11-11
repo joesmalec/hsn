@@ -145,6 +145,35 @@ def test_recurrence_kernel_declines_what_it_does_not_handle(device: torch.device
     )
 
 
+@pytest.mark.parametrize("shape", [(8, 256, 32, 64), (3, 7, 5, 4), (1, 1, 1, 1), (2, 33, 9, 37)])
+@pytest.mark.parametrize("present", [(True, True), (False, True), (True, False)])
+def test_dense_recurrence_kernel_equals_the_reference(
+    device: torch.device, shape: tuple[int, ...], present: tuple[bool, bool]
+) -> None:
+    from hsn.train.split import dense_recurrence_backward
+
+    Bd, T, N, d = shape
+    g = torch.Generator().manual_seed(sum(shape))
+    c = (torch.rand(Bd, T, N, d, generator=g) * 2 - 1).to(device)
+    b = torch.rand(Bd, T, N, d, generator=g).to(device)
+    h_old = (torch.rand(Bd, T, N, d, generator=g) * 2 - 1).to(device)
+    reset = (torch.rand(Bd, T, generator=g) < 0.05).to(device)
+    cots = [torch.randn(Bd, T, d, generator=g).to(device) if on else None for on in present]
+    got = window.dense_recurrence_backward(c, b, h_old, reset, N, *cots)
+    assert got is not None
+    want = dense_recurrence_backward(
+        c.double(),
+        b.double(),
+        h_old.double(),
+        reset,
+        N,
+        *(None if x is None else x.double() for x in cots),
+    )
+    for a, w in zip(got, want, strict=True):
+        scale = float(w.abs().max().clamp_min(1.0))
+        assert float((a.double() - w).abs().max()) <= 2e-5 * scale
+
+
 # --------------------------------------------------------------------------------------------------
 # The fused cell round against PDGCell.step_sparse and the tick
 # --------------------------------------------------------------------------------------------------

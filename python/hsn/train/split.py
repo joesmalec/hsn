@@ -381,7 +381,9 @@ class SplitWindow:
         if device.type == "cuda" and window_kernels.available():
             # the recurrence's backward as one kernel launch per window (fp32 state)
             window_kernels.prepare(device.index or 0)
-            set_fast_recurrence(window_kernels.recurrence_backward)
+            set_fast_recurrence(
+                window_kernels.recurrence_backward, window_kernels.dense_recurrence_backward
+            )
         #: Wall seconds of the last call's phases (forward sweep, replay), for the measurements.
         self.last_phase_seconds: dict[str, float] = {}
 

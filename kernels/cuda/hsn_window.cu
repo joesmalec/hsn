@@ -82,6 +82,54 @@ extern "C" __global__ void hsn_win_recurrence(HsnWinArgs a) {
     }
 }
 
+/* The backward recurrence of the rows that ran the dense round (hsn.train.split, "Dense-fallback
+ * rows"): every cell is written with h' = (1 - b) h + b c and q' = mean(h'), which does not
+ * read q. One block per row; A [N, d] and R [d] in shared memory.
+ *   p: 0 c, 1 b, 2 h_old [B',T,N,d] f32; 3 reset [B',T] u8; 4 d_q_pre, 5 d_q_post [B',T,d] f32
+ *      (read only when flagged); 6 dc, 7 db [B',T,N,d] f32.
+ *   i: 0 B', 1 T, 2 N, 3 d, 4 has_pre, 5 has_post.
+ */
+extern "C" __global__ void hsn_win_recurrence_dense(HsnWinArgs a) {
+    extern __shared__ float shared[];
+    const int T = a.i[1], N = a.i[2], d = a.i[3];
+    const bool has_pre = a.i[4], has_post = a.i[5];
+    const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    const float* c = fptr(a, 0);
+    const float* b = fptr(a, 1);
+    const float* h_old = fptr(a, 2);
+    const uint8_t* reset = static_cast<const uint8_t*>(a.p[3]);
+    const float* pre = fptr(a, 4);
+    const float* post = fptr(a, 5);
+    float* dc = fout(a, 6);
+    float* db = fout(a, 7);
+    float* A = shared;
+    float* R = shared + N * d;
+    for (int e = tid; e < N * d; e += nt) A[e] = 0.0f;
+    for (int x = tid; x < d; x += nt) R[x] = 0.0f;
+    __syncthreads();
+    const float inv = 1.0f / static_cast<float>(N);
+    for (int t = T - 1; t >= 0; --t) {
+        const int64_t rt = static_cast<int64_t>(row) * T + t;
+        if (has_post) {
+            for (int x = tid; x < d; x += nt) R[x] += post[rt * d + x];
+            __syncthreads();
+        }
+        for (int e = tid; e < N * d; e += nt) {
+            const int64_t o = rt * N * d + e;
+            const float g = A[e] + R[e % d] * inv;
+            const float gate = b[o];
+            dc[o] = gate * g;
+            db[o] = (c[o] - h_old[o]) * g;
+            A[e] = (1.0f - gate) * g;
+        }
+        __syncthreads();
+        const bool cut = reset[rt] != 0;
+        for (int x = tid; x < d; x += nt) R[x] = cut || !has_pre ? 0.0f : pre[rt * d + x];
+        if (cut) for (int e = tid; e < N * d; e += nt) A[e] = 0.0f;
+        __syncthreads();
+    }
+}
+
 /* ------------------------------------------------------------------------------------------------
  * The fused cell round of the forward sweep (hsn.kernels.window.cell_round): the sparse round of
  * PDGCell.step_sparse plus the tick, forward only, in five launches that share one descriptor.

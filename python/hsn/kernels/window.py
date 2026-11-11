@@ -134,6 +134,45 @@ def recurrence_backward(
     return dc, db
 
 
+def dense_recurrence_backward(
+    c: Tensor,
+    b: Tensor,
+    h_old: Tensor,
+    reset: Tensor,
+    n_cells: int,
+    d_q_pre: Tensor | None,
+    d_q_post: Tensor | None,
+) -> tuple[Tensor, Tensor] | None:
+    """:func:`hsn.train.split.dense_recurrence_backward` as one kernel launch (one block per
+    dense-fallback row), or ``None`` when the inputs are not fp32 tensors on a prepared CUDA
+    device."""
+    if not prepared(c.device) or c.dtype != torch.float32:
+        return None
+    Bd, T, N, d = (int(n) for n in c.shape)
+    shared_bytes = 4 * (N + 1) * d
+    if shared_bytes > _MAX_SHARED_BYTES or N != int(n_cells):
+        return None
+    for cot in (d_q_pre, d_q_post):
+        if cot is not None and cot.dtype != torch.float32:
+            return None
+    dc = torch.empty_like(c, memory_format=torch.contiguous_format)
+    db = torch.empty_like(c, memory_format=torch.contiguous_format)
+    absent = dc
+    tensors = [
+        _f32(c),
+        _f32(b),
+        _f32(h_old),
+        reset.contiguous(),
+        absent if d_q_pre is None else _f32(d_q_pre),
+        absent if d_q_post is None else _f32(d_q_post),
+        dc,
+        db,
+    ]
+    ints = [Bd, T, N, d, int(d_q_pre is not None), int(d_q_post is not None)]
+    _extension().launch("hsn_win_recurrence_dense", Bd, 256, shared_bytes, tensors, ints, [])
+    return dc, db
+
+
 # --------------------------------------------------------------------------------------------------
 # The fused cell round of the forward sweep
 # --------------------------------------------------------------------------------------------------
