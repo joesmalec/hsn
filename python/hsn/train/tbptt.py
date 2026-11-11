@@ -1000,16 +1000,13 @@ class TBPTTTrainer(Trainer):
                 event = self.route_guard.check(self.step)
                 if event is not None:
                     logger.warning(
-                        "route guard at step %d: %.0f %% of the established minority-unit usage "
-                        "lost to unit %d; its router step scale %.4g -> %.4g%s",
+                        "route guard at step %d: %.0f %% of the other units' established routes "
+                        "lost to unit %d; its router step scale %.4g -> %.4g",
                         self.step,
                         100 * event["lost"],
                         event["unit"],
                         event["scale_before"],
                         event["scale"],
-                        ""
-                        if event["restored_from"] is None
-                        else f"; router restored from step {event['restored_from']}",
                     )
             accuracy = float(correct) / n_loss if n_loss else float("nan")
             if self.scaler is None and not math.isfinite(mean_total) and not skipped:

@@ -90,7 +90,6 @@ train: # Appendix A.3
     min_usage: 0.001 # no event while established routes hold less than this share of all slots
     reduce_factor: 0.5 # the gaining unit's router-row step scale is multiplied by this at an event
     min_scale: 0.015625 # ... down to this
-    restore: false # also put those rows back to their values at the previous reading
   gradient_growth: # reversible damping of selected groups when raw gradient medians rise
     enabled: false # requires groups; adaptive_lr, rollback and spike skipping must be off
     groups: {} # arbitrary group name -> list of parameter-name globs

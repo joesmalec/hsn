@@ -5,14 +5,15 @@
 # the query keys, not the most-used one: the default guard never fired (92.2 % at step 2,500,
 # 70.7 % at 4,500), and the sensitive one froze the wrong unit (88.8 % to 72.7 %). The guard now
 # tracks every (input byte, unit) route, reads the loss of the quarter of the bytes that lost
-# most, and halves the applied router step of the unit that gained those routes; `restore`
-# rewinds that unit's rows one reading (it used to go back to a stale snapshot: exp 397).
+# most, and halves the applied router step of the unit that gained those routes.
 #
 # Arms: the configuration that sagged (seed 1, caps 0.003, lr 2.5e-3) with the guard, to step
 # 5,000 of the 9,000-step schedule, scored on averaged weights.
 #   guard          the defaults (a reading every 100 steps, an event at 10 % lost);
-#   guard_restore  the gaining unit's rows are also put back to the previous reading;
 #   guard_fast     a reading every 50 steps, an event at 5 % lost.
+# A third arm, guard_restore (exp 400: 77.9 % at step 5,000 against 90.3 % for guard), also put
+# the gaining unit's rows back to the previous reading (`train.route_guard.restore`). The option
+# was removed on 11 Nov 2026 and the arm with it; this file as it ran is at commit adeb660.
 name: p1_18_a6_guard2
 description: "A6 + A4 with the per-route takeover guard (seed 1, to step 5,000, against exps 376 and 396-398)"
 timing: false
@@ -61,10 +62,6 @@ seeds: [1]
 arms:
   - name: guard
     family: hsn
-  - name: guard_restore
-    family: hsn
-    overrides:
-      - train.route_guard.restore=true
   - name: guard_fast
     family: hsn
     overrides:

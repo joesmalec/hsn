@@ -392,8 +392,22 @@ class RouteGuardConfig(_StrictModel):
     # down to min_scale
     reduce_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
     min_scale: float = Field(default=0.015625, gt=0.0, le=1.0, allow_inf_nan=False)
-    # also put those rows back to their values at the previous reading
-    restore: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_removed_restore(cls, data: Any) -> Any:
+        """``restore`` (also rewind the gaining unit's rows one reading) existed on 10 and 11 Nov
+        2026 and was removed after exp 400 (77.9 % at step 5,000 against 90.3 % without it). A
+        stored configuration that has it switched off still loads and hashes as it did
+        (:func:`_hash_view`); one that has it on cannot be run by this code."""
+        if isinstance(data, Mapping) and "restore" in data:
+            if data["restore"] not in (False, None):
+                raise ValueError(
+                    "train.route_guard.restore was removed (exp 400: worse than the guard "
+                    "alone); the runs that used it are at commit adeb660"
+                )
+            data = {k: v for k, v in data.items() if k != "restore"}
+        return data
 
 
 class UpdateLimitGroup(_StrictModel):
@@ -1330,6 +1344,12 @@ def _hash_view(cfg: RunConfig) -> dict[str, Any]:
                 default = default.model_dump(mode="json")
             if node[key] == default:
                 del node[key]
+    guard = dump.get("train", {}).get("route_guard")
+    if guard is not None:
+        # the block was hashed with this key while the option existed (RouteGuardConfig); it
+        # stays in the view so that the guarded runs of 10 and 11 Nov 2026 keep their hashes
+        # and their kept checkpoints resume
+        guard["restore"] = False
     return dump
 
 

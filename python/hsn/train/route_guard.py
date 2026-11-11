@@ -43,11 +43,9 @@ loss is above the lowest interval mean so far by ``loss_rise``.
 *applied* step on its rows of the scorer's output layer is multiplied by ``reduce_factor`` (never
 below ``min_scale``): from then on every update of those rows is ``old + scale * (new - old)``,
 after the optimiser step and the caps. The other units keep their full step, so an established
-route can go on strengthening. With ``restore`` the gaining unit's rows are also put back to
-their values at the previous reading (one interval earlier, never further: an older snapshot
-would take back what the unit has learned since); every other weight is kept: a rejected step of
-one router row, not a rollback of the run. After an event the reference restarts from the current
-shares (or stays, with ``restore``).
+route can go on strengthening. No weight is put back: an option that also rewound the reader's
+rows by one reading was worse in its one run (exp 400) and was removed. After an event the
+reference restarts from the current shares.
 
 Nothing is skipped and no document is dropped; a run in which no event fires trains exactly as
 without the guard. Every event is recorded (:meth:`RouteGuard.report`) and the state is part of
@@ -146,8 +144,6 @@ class RouteGuard:
         self.events: list[dict[str, Any]] = []
         self.last: dict[str, Any] | None = None
         self._old: list[Tensor] | None = None
-        self._anchor = [p.detach().clone() for p in self.params]
-        self._anchor_step = 0
 
     # every window ----------------------------------------------------------------------------
 
@@ -249,23 +245,12 @@ class RouteGuard:
                 "best_loss": self.best_loss,
                 "scale_before": before,
                 "scale": after,
-                "restored_from": self._anchor_step if self.cfg.restore else None,
             }
-            if self.cfg.restore:
-                for p, anchor in zip(self.params, self._anchor, strict=True):
-                    p[unit].copy_(anchor[unit])
-            else:
-                self.reference = shares.clone()
-                self._set_anchor(step)
+            self.reference = shares.clone()
             self.events.append(event)
             return event
-        self._set_anchor(step)  # the previous reading's rows: what a restore goes back to
         self.reference = torch.maximum(self.reference, shares)
         return None
-
-    def _set_anchor(self, step: int) -> None:
-        torch._foreach_copy_(self._anchor, [p.detach() for p in self.params])
-        self._anchor_step = step
 
     # records and checkpoints -----------------------------------------------------------------
 
@@ -292,25 +277,20 @@ class RouteGuard:
             "checks": self.checks,
             "events": [dict(e) for e in self.events],
             "last": dict(self.last) if self.last is not None else None,
-            "anchor": [a.detach().to(device="cpu", copy=True) for a in self._anchor],
-            "anchor_step": self._anchor_step,
         }
 
     @torch.no_grad()
     def load_state_dict(self, state: Any, path: str = "checkpoint") -> None:
+        """A checkpoint written while the ``restore`` option existed also holds ``anchor`` and
+        ``anchor_step`` (the rows a restore went back to); they are not read."""
         if not isinstance(state, Mapping):
             raise ValueError(f"{path}: route_guard checkpoint state is missing")
-        counts, anchor, scale = state.get("counts"), state.get("anchor"), state.get("scale")
+        counts, scale = state.get("counts"), state.get("scale")
         if (
             not isinstance(counts, Tensor)
             or tuple(counts.shape) != tuple(self.counts.shape)
             or not isinstance(scale, Tensor)
             or tuple(scale.shape) != tuple(self.scale.shape)
-            or not isinstance(anchor, list)
-            or len(anchor) != len(self._anchor)
-            or any(
-                tuple(a.shape) != tuple(b.shape) for a, b in zip(anchor, self._anchor, strict=True)
-            )
         ):
             raise ValueError(f"{path}: route_guard state does not fit this model")
         self.counts.copy_(counts.to(self.counts.device))
@@ -341,7 +321,4 @@ class RouteGuard:
         self.events = [dict(e) for e in state.get("events", [])]
         last = state.get("last")
         self.last = dict(last) if last is not None else None
-        for mine, saved in zip(self._anchor, anchor, strict=True):
-            mine.copy_(saved.to(device=mine.device, dtype=mine.dtype))
-        self._anchor_step = int(state.get("anchor_step", 0))
         self._old = None

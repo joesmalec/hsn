@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 import torch
-from hsn.config import RouteGuardConfig, canonical_json, config_hash
+from hsn.config import RouteGuardConfig, RunConfig, canonical_json, config_hash
 from hsn.train.route_guard import RouteGuard, lost_usage
 from p1_11_support import restore_determinism  # noqa: F401
 from p1_15_support import datasets, gru_config, hsn_config, hsn_trainer
@@ -209,26 +209,32 @@ def test_the_response_is_on_the_unit_that_gained_the_route() -> None:
     assert other.scale.tolist() == [1.0, 1.0, 0.5]
 
 
-def test_restore_puts_the_dominant_units_rows_back() -> None:
-    guard, router = _guard(lost_fraction=0.1, restore=True)
-    weight = router.scorer.net.weight
-    _feed(guard, INTACT)
-    guard.check(100)
-    _feed(guard, INTACT)
-    guard.check(200)  # no event: the anchor is this reading's weights
-    anchor = weight.detach().clone()
-    with torch.no_grad():
-        weight.add_(1.0)
-    moved = weight.detach().clone()
-    _feed(guard, TAKEN)
-    event = guard.check(300)
-    assert event is not None and event["restored_from"] == 200
-    torch.testing.assert_close(weight[0], anchor[0])  # the gaining unit's row is back
-    torch.testing.assert_close(weight[1:], moved[1:])  # every other row keeps its weights
-    # the reference stays: a further loss is another event, restored from the same reading
-    _feed(guard, MORE)
-    again = guard.check(400)
-    assert again is not None and again["restored_from"] == 200 and again["scale"] == 0.25
+def test_the_removed_restore_option_still_loads_switched_off() -> None:
+    """``train.route_guard.restore`` existed on 10 and 11 Nov 2026 (exp 400: worse). A stored
+    configuration with it off loads and hashes as it did, one with it on is refused, and a
+    checkpoint written then (it also holds the rows a restore went back to) still loads."""
+    on = hsn_config(4, *A5, ON)
+    assert "restore" not in on.train.route_guard.model_dump()
+    dump = on.model_dump(mode="json")
+    dump["train"]["route_guard"]["restore"] = False  # as a resolved configuration of then has it
+    stored = RunConfig.model_validate(dump)
+    assert stored == on and config_hash(stored) == config_hash(on)
+    assert '"restore":false' in canonical_json(on)  # the hash view of while it existed
+    dump["train"]["route_guard"]["restore"] = True
+    with pytest.raises(ValueError, match="restore was removed"):
+        RunConfig.model_validate(dump)
+    with pytest.raises(ValueError, match="unknown config key"):  # and no new spec can set it
+        hsn_config(4, *A5, ON, "train.route_guard.restore=false")
+    guard, _ = _guard(lost_fraction=0.1)
+    for step, table in enumerate([INTACT, INTACT, TAKEN]):
+        _feed(guard, table)
+        guard.check(100 * (step + 1))
+    state = guard.state_dict()
+    assert "anchor" not in state and "restored_from" not in guard.events[0]
+    then = {**state, "anchor": [torch.zeros(3, 5), torch.zeros(3)], "anchor_step": 200}
+    other, _ = _guard(lost_fraction=0.1)
+    other.load_state_dict(then, "x.pt")
+    assert other.scale.tolist() == guard.scale.tolist() and other.events == guard.events
 
 
 def test_state_round_trip() -> None:
