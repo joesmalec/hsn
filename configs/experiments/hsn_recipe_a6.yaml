@@ -1,0 +1,131 @@
+# hsn_recipe_a6: the standard HSN recipe for new sweep specs (P1.18, the user's decision of 11 Nov 2026).
+#
+# The routed HSN of amendment A5 (top-K routing, key addresses, selected-cell readout; d=64 with A4's candidate
+# norm) on the delayed task, B32, WSD 0.2 over 9,000 steps at lr 2.5e-3, AdamW beta2 0.95, with the four parts
+# of amendment A6 (docs/amendments/A6_feedback_gradient.md, results in docs/p1_18_a6_results.md):
+#   train.feedback_detach   the feedback reads are held constant in the backward pass (no mid-run collapse);
+#   train.update_limit      exp 346's caps on the cell's and the router's step;
+#   train.weight_ema        evaluations and probes score a moving average of the weights;
+#   train.route_guard       the router step of a unit that is taking another unit's route is halved.
+# Unguarded otherwise: no spike guard, no rollback, no skipped step. Nine runs at 9,000 steps (seeds 0 to 5,
+# seeds 0 to 2 twice; exps 421-426, 430-432): 87.2 % dev on held-out keys (78.5 to 95.6), later queries 80.7 %,
+# a fall of ten points or more in one run of nine, against 83.9 % and seven of nine without the guard and 76.7
+# to 79.3 % for gru_2m. With `profile=rtx3060` and `hardware.compile_mode=reduce-overhead` it resolves to exp
+# 421's configuration exactly, so its arms share the arm ids of exps 421-426 (tests/test_p1_18_recipe.py).
+# Every part stays opt-in in the code: the defaults, configs/ref_a1.yaml and hsn_recipe_b095.yaml (the recipe
+# of the specs before this one) are unchanged. Known limits: the sag is reduced, not removed, and only the
+# delayed task was run (docs/p1_18_a6_results.md, section 5).
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
+#
+#   base: {config: configs/experiments/hsn_recipe_a6.yaml,
+#          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead]}  (a CUDA arm pins it, P1.11)
+
+run_id: hsn_recipe_a6
+seed: 0
+notes: "The standard HSN recipe of P1.18 (A6): routed d=64 + A4 + A5 addresses, feedback cut, anchored caps, weight average, route guard (exps 421-426)."
+profile: cpu # hardware profile: configs/hardware/<profile>.yaml; override with `profile=<name>`
+model_name: hsn
+
+model: # Appendix A.1
+  vocab_size: 256 # byte vocabulary V
+  d: 64 # width
+  n_cells: 32 # N
+  n_units: 8 # M
+  k_select: 4 # K cells per round
+  k_min: 1 # minimum selected cells
+  r_max: 1 # internal rounds cap R
+  in_degree: 4 # D_g
+  random_edges: 0 # extra random candidate edges
+  edge_norm: softmax # softmax | sigmoid
+  hidden: 512 # H for every two-layer MLP
+  n_context: 16 # context symbols
+  context_dim: 64 # context embedding width (= d)
+  activation: gelu # MLP activation (paper unspecified)
+  init: trunc_normal_0.02 # weight init of embeddings, scorer, halting, decoder (paper unspecified)
+  state_init: fan_in # P1.5a (amendment A1): E, P, S, units, V, W_out, gate weight; fan_in | trunc_normal_<std>
+  cell_norm: rms # P1.5a: RMSNorm over the 4d cell input before the units and the gate; rms | none
+  gate_bias_init: -3.0 # P1.5a: gate bias at init, sigmoid(-3) = 0.047 (cells retain by default)
+  cand_norm: rms # P1.13 amendment A4: RMSNorm before the candidate's tanh (the recipe's; opt-in elsewhere)
+  key_address: true # amendment A5: fixed byte/cell address features (the key binding)
+  selected_readout: true # amendment A5: the selected cells' mean appended to the decoder input
+  scorer: linear # linear | mlp; Appendix C counts the linear scorer (200 -> 8)
+  scorer_hidden: 128 # hidden width when scorer = mlp (the C.2 "two-layer scorer" row)
+  scorer_features:
+    exclude: [] # feature names to zero (ablation; e.g. [eps])
+  routing: topk # learned top-K routing (dense | topk | greedy_budget | random | fixed)
+  fixed_route: [] # cells for routing = fixed
+  budget: 1.0 # B_t as a fraction of the dense step cost
+  lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
+  deadline_ms: null # wall-clock deadline (serving)
+  cost_profile: null # P2.1: cost profile (P0.6 report + cost_profile block) for the router's cost table; null = uniform placeholder
+  static_k: true # pad selection to fixed K (needed for graphs / compile)
+  age_max: 64 # refresh-probe threshold
+  halt_threshold: 0.5 # inference halting threshold
+  predictor_target: fixed_embedding # fixed_embedding | ema_encoder (P1.6)
+  disabled_cells: [] # test hook
+  ablate_shared_u: false # ablation: remove u from v (not covered by the P1.1 closed forms)
+  state_schema_version: 1 # bumped on any state layout change
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [delayed] # the delayed task alone (the 8 Nov evidence; not the G1 task set)
+  variants: [in_range] # the designated in-range state tasks
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train: # the recipe of exps 421-426 (p1_18_a6_final_seeds / _final_guard_seeds, 11 Nov 2026)
+  unroll: 256 # TBPTT window T; the window synthetic_v1 defines in_range against
+  batch: 32 # B32, the batch of every 7-8 Nov comparison
+  micro_batch: 32
+  grad_accum: 1
+  precision: bf16 # bf16 | fp16 | fp32 | fp64
+  optimizer: lazy_adamw # P2.6: the routed HSN's optimiser
+  lr: 2.5e-3 # the A5 recipe's peak rate; 1.5e-3 only delays the sag and ends lower (exps 384, 387)
+  betas: [0.9, 0.95] # AdamW beta2 0.95, as hsn_recipe_b095
+  weight_decay: 0.01
+  warmup_steps: 200
+  schedule: wsd # warmup-stable-decay (P1.13): the peak holds until the last 20 %
+  decay_fraction: 0.2
+  grad_clip: 1.0
+  grad_norm_precision: float64 # A5: the global gradient norm and its clip reduced in float64
+  steps: 9000
+  eval_every: 500
+  ckpt_every: 9000
+  stats_every: 100
+  q_resync_every: 64
+  lambda_p: 1.0 # L_pred with the fixed-embedding target (P1.6); the only auxiliary term of Phase 1
+  search_trials: 4 # as hsn_recipe_b095 (unused by the harness; kept so the recipe resolves to exp 421's configuration)
+  probe_horizon: null # the probes read to the window end
+  # unguarded: no spike guard and no rollback, every document is trained on (the user's rule of 9 Nov: a
+  # rollback or a skipped step is a band-aid, not a fix)
+  spike_factor: null
+  rollback_every: null
+  # amendment A6: the feedback reads of the recurrent state are held constant in the backward pass (the
+  # forward pass is unchanged); it removes the A5 runs' mid-run collapses on every seed
+  feedback_detach: [summary, eps, state, router]
+  # the update caps of exp 346: the cell's and the router's step at most 0.003 of the group's norm, the
+  # router's norm held at its initial value as the reference
+  update_limit:
+    groups:
+      memory: {selectors: ["cell.*"], max_ratio: 0.003}
+      routing: {selectors: ["router.*"], max_ratio: 0.003}
+    norm_floor: 1.0e-12
+    norm_growth_limits: {routing: 1.0}
+  # A6: evaluations, probes and the final checkpoint score a moving average of the weights (decay 0.99)
+  weight_ema: 0.99
+  # A6: when the unit that serves the answer positions starts taking another unit's established route while
+  # the training loss is no longer improving, its applied router step is halved (the other keys at their
+  # defaults: configs/_example.yaml)
+  route_guard:
+    enabled: true
+  # P2.2 routing controls: the straight-through gate, the others at their defaults
+  gate_mode: ste
+  soft_until_step: 0
+  temperature_start: 1.0
+  temperature_end: 1.0
+  temperature_steps: 0
+  epsilon_start: 0.0
+  epsilon_end: 0.0
+  epsilon_steps: 0
+  p_dense: 0.0
+  reinforce_baseline_decay: 0.9

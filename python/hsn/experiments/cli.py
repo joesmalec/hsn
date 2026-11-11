@@ -5,6 +5,7 @@
 
     expand   <spec>                      arms, labels, ids (no database)
     enqueue  <spec> [--force] [--skip-imported] [--only GLOB] [--mem-estimate-mib N]
+             [--diagnostics on|off]
     worker   [--max-concurrent 3] [--reserve-mib 1024] [--requeue-orphans] [--require-clean]
              [--exit-when-empty] [--poll 5] [--idle-gap 60] [--omp-threads 4] [--inductor-cache DIR]
     status   [--sweep NAME] [--recent 10]
@@ -24,6 +25,7 @@
              [--rollback-lr-mult F] [--rollback-lr-steps N] [--rollback-max N]]   (P1.16)
     route-check --exp N [--split dev|train] [--n-docs 1000] [--cpu] [--batch-rows 64] [--out FILE]
              (P1.16: does routing follow the key; read-only)
+    controller-report --exp N [--exp M ...] [--out FILE]  (read-only signals and matched ablations)
     run-arm  --db DB --exp N --root ROOT       (the worker's child; not for direct use)
 
 Every command takes ``--db`` (default ``$HSN_EXPERIMENTS_DB`` or
@@ -71,6 +73,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-imported", action="store_true", help="skip arms with an imported run")
     p.add_argument("--only", default=None, help="only labels matching this glob")
     p.add_argument("--mem-estimate-mib", type=float, default=None, help="GPU memory reservation")
+    p.add_argument(
+        "--diagnostics",
+        choices=("on", "off"),
+        default=None,
+        help="in-training diagnostics of the queued arms (default: the spec's protocol)",
+    )
 
     p = sub.add_parser("worker", help="run the queue")
     p.add_argument("--max-concurrent", type=int, default=3)
@@ -79,13 +87,22 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--require-clean", action="store_true")
     p.add_argument("--exit-when-empty", action="store_true")
     p.add_argument("--poll", type=float, default=5.0)
+    p.add_argument("--telemetry-max-samples", type=int, default=0)
     p.add_argument("--idle-gap", type=float, default=60.0)
     p.add_argument("--omp-threads", type=int, default=4)
     p.add_argument("--inductor-cache", default=None, help="compiled-artifact cache of the arms")
+    p.add_argument("--turn-file", default=None, help="require an explicitly claimed compute turn")
+    p.add_argument("--turn-owner", default=None, help="owner name in --turn-file")
 
     p = sub.add_parser("status", help="queue, running and recent results")
     p.add_argument("--sweep", default=None)
     p.add_argument("--recent", type=int, default=10)
+
+    p = sub.add_parser(
+        "controller-report", help="controller signals and matched ablations (read-only)"
+    )
+    p.add_argument("--exp", type=int, action="append", required=True)
+    p.add_argument("--out", default=None)
 
     for name in ("cancel", "requeue"):
         p = sub.add_parser(name)
@@ -135,6 +152,9 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("probe-rerun", help="v1 again vs the stored probes, then probe v2 (P1.14)")
     p.add_argument("--exp", type=int, required=True)
+    p.add_argument(
+        "--checkpoint-step", type=int, help="probe this retained step instead of the last"
+    )
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
     p.add_argument("--batch-rows", type=int, default=None, help="default: the run's probe_batch")
     p.add_argument(
@@ -153,6 +173,9 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("route-check", help="does routing follow the key (P1.16; read-only)")
     p.add_argument("--exp", type=int, required=True)
+    p.add_argument(
+        "--checkpoint-step", type=int, help="probe this retained step instead of the last"
+    )
     p.add_argument("--split", choices=("dev", "train"), default="dev")
     p.add_argument("--n-docs", type=int, default=1000)
     p.add_argument("--cpu", action="store_true", help="profile:cpu in fp32, not the run's hardware")
@@ -234,7 +257,8 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     from hsn.experiments.spec import digest, expand, load_spec
 
     spec, text = load_spec(args.spec)
-    arms = expand(spec)
+    switch = None if args.diagnostics is None else args.diagnostics == "on"
+    arms = expand(spec, diagnostics=switch)
     if args.only:
         arms = [a for a in arms if fnmatch.fnmatch(a.label, args.only)]
         if not arms:
@@ -307,7 +331,10 @@ def cmd_worker(args: argparse.Namespace) -> int:
         exit_when_empty=args.exit_when_empty,
         poll_s=args.poll,
         omp_threads=args.omp_threads,
+        telemetry_max_samples=args.telemetry_max_samples,
         inductor_cache=Path(args.inductor_cache) if args.inductor_cache else None,
+        turn_file=Path(args.turn_file) if args.turn_file else None,
+        turn_owner=args.turn_owner,
     )
     return Worker(db, _root(args, db), options).run()
 
@@ -363,8 +390,52 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     print(f"\nrunning ({len(running)}):")
     rows = []
+    controller_rows = []
+    growth_rows = []
     for r in running:
         progress = loads(r["progress_json"]) or {}
+        growth = progress.get("gradient_growth")
+        if growth is not None:
+            observation = growth.get("latest") or {}
+            for name, scale in growth["scales"].items():
+                group = observation.get("groups", {}).get(name, {})
+                growth_rows.append(
+                    (
+                        r["exp_id"],
+                        observation.get("step", ""),
+                        name,
+                        group.get("action", "warming up"),
+                        group.get("recent_median", ""),
+                        group.get("share", ""),
+                        group.get("growth", ""),
+                        scale,
+                        growth["damped_steps"].get(name, 0),
+                    )
+                )
+        controller = progress.get("adaptive_lr")
+        if controller is not None:
+            from hsn.experiments.controller import format_rates
+
+            latest = controller.get("latest_observation") or {}
+            change = controller.get("last_adjustment") or {}
+            rates = controller.get("next_update_lrs") or {}
+            controller_rows.append(
+                (
+                    r["exp_id"],
+                    latest.get("step", ""),
+                    latest.get("decision", "initializing"),
+                    f"{change['decision']} @ {change['step']}" if change else "none",
+                    latest.get("loss", ""),
+                    latest.get("grad_median", ""),
+                    format_rates(rates.get("shared", [])),
+                    format_rates(rates.get("router", [])),
+                    format_rates(rates.get("decoder", [])),
+                    controller.get("cooldown_windows", ""),
+                    "pending"
+                    if controller.get("trial")
+                    else ("blocked" if controller.get("trial_blocked") else "none"),
+                )
+            )
         rows.append(
             (
                 r["exp_id"],
@@ -372,11 +443,54 @@ def cmd_status(args: argparse.Namespace) -> int:
                 r["pid"],
                 r["worker"],
                 (r["started_at"] or r["claimed_at"] or "")[:19],
-                f"{progress.get('step', '')}/{progress.get('of', '')}",
+                progress.get("stage") or f"{progress.get('step', '')}/{progress.get('of', '')}",
                 progress.get("dev_accuracy", ""),
+                progress.get("dev_step", progress.get("step", ""))
+                if "dev_accuracy" in progress
+                else "",
             )
         )
-    print(_table(rows, ["exp", "label", "pid", "worker", "started", "step", "dev acc"]))
+    print(
+        _table(rows, ["exp", "label", "pid", "worker", "started", "step", "dev acc", "dev @ step"])
+    )
+    if controller_rows:
+        print("\ncontroller (training monitor; learning rates are for the next update):")
+        print(
+            _table(
+                controller_rows,
+                [
+                    "exp",
+                    "observed step",
+                    "decision",
+                    "last rate change",
+                    "train monitor loss",
+                    "grad median",
+                    "shared lr",
+                    "router lr",
+                    "readout lr",
+                    "cooldown",
+                    "trial",
+                ],
+            )
+        )
+    if growth_rows:
+        print("\ngradient growth (pre-clip training norms; update scales for selected groups):")
+        print(
+            _table(
+                growth_rows,
+                [
+                    "exp",
+                    "observed step",
+                    "group",
+                    "action",
+                    "grad median",
+                    "norm share",
+                    "growth",
+                    "update scale",
+                    "damped steps",
+                ],
+            )
+        )
     print(f"\nrecent ({len(recent)}):")
     recent_rows: list[tuple[Any, ...]] = []
     for r in recent:
@@ -523,6 +637,7 @@ def cmd_probe_rerun(args: argparse.Namespace) -> int:
         batch_rows=args.batch_rows,
         weights=args.weights,
         key_alphabet=args.key_alphabet,
+        checkpoint_step=args.checkpoint_step,
     )
     text = json.dumps(out, indent=1, default=str)
     if args.out:
@@ -610,11 +725,24 @@ def cmd_route_check(args: argparse.Namespace) -> int:
         n_docs=args.n_docs,
         cpu=args.cpu,
         batch_rows=args.batch_rows,
+        checkpoint_step=args.checkpoint_step,
     )
     text = json.dumps(out, indent=1, default=str)
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
     print(text)
+    return 0
+
+
+def cmd_controller_report(args: argparse.Namespace) -> int:
+    from hsn.experiments.controller import controller_report
+
+    db = Database(Path(args.db) if args.db else default_db_path(), read_only=True)
+    report = controller_report(db, args.exp)
+    body = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    if args.out:
+        Path(args.out).write_text(body, encoding="utf-8")
+    print(body, end="")
     return 0
 
 
@@ -631,6 +759,7 @@ COMMANDS = {
     "enqueue": cmd_enqueue,
     "worker": cmd_worker,
     "status": cmd_status,
+    "controller-report": cmd_controller_report,
     "cancel": cmd_cancel,
     "requeue": cmd_requeue,
     "report": cmd_report,

@@ -534,3 +534,46 @@ def test_p1_17_a5_compiled_cuda_matches_eager(
             else:
                 assert got is not None
                 torch.testing.assert_close(got, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_address_init_starts_routes_on_the_byte_codes() -> None:
+    """``model.address_init`` sets the scorer's two address columns for every unit (trainable as
+    before), changes no other parameter, and makes the first routes follow ``a_cur + a_prev``."""
+    base, on = (
+        _cfg("model.key_address=true"),
+        _cfg("model.key_address=true", "model.address_init=1.0"),
+    )
+    assert base.model.address_init is None and config_hash(on) != config_hash(base)
+    from hsn.config import canonical_json
+
+    assert "address_init" not in canonical_json(base)
+    seed_everything(0)
+    plain = HSN.from_config(base)
+    seed_everything(0)
+    model = HSN.from_config(on)
+    weight = model.scorer.net.weight
+    assert weight.requires_grad and torch.equal(weight[:, -2:], torch.ones(base.model.n_units, 2))
+    for (name, a), (_, b) in zip(plain.named_parameters(), model.named_parameters(), strict=True):
+        if name == "router.scorer.net.weight":
+            assert torch.equal(a[:, :-2], b[:, :-2])
+        else:
+            assert torch.equal(a, b), name
+    B, K = 5, base.model.k_select
+    g = torch.Generator().manual_seed(3)
+    tokens = torch.randint(0, 256, (B,), generator=g)
+    previous = torch.randint(0, 256, (B,), generator=g)
+    out = model.eval().step(
+        tokens, torch.zeros(B, dtype=torch.int64), model.init_state(B), prev_tokens=previous
+    )
+    # a fresh state is a document start: the previous byte the scorer sees there is BOS
+    start = torch.full_like(previous, BOS)
+    address = model.scorer.address_features(tokens, start).sum(-1)  # [B, N]: a_cur + a_prev
+    expected = address.topk(K, dim=1).indices.sort(dim=1).values
+    assert out.selection is not None
+    assert torch.equal(out.selection.cell_idx.sort(dim=1).values, expected)
+    for bad in (
+        ("model.address_init=1.0",),
+        ("model.key_address=true", "model.scorer=mlp", "model.address_init=1.0"),
+    ):
+        with pytest.raises(ValueError, match="address_init"):
+            _cfg(*bad)

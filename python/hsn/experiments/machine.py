@@ -76,6 +76,7 @@ class GpuReading:
     processes: tuple[GpuProcess, ...] = ()
     error: str | None = None
     time: float = field(default_factory=time.time)
+    utilization_pct: float | None = None
 
 
 def _smi(args: list[str], timeout: float) -> str:
@@ -89,7 +90,11 @@ def read_gpu(timeout: float = 20.0) -> GpuReading:
         return GpuReading(present=False, ok=True)
     try:
         mem = _smi(
-            ["--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"], timeout
+            [
+                "--query-gpu=memory.total,memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout,
         )
         apps = _smi(
             ["--query-compute-apps=pid,used_memory,process_name", "--format=csv,noheader,nounits"],
@@ -106,7 +111,11 @@ def read_gpu(timeout: float = 20.0) -> GpuReading:
                 except ValueError:
                     mib = float("inf")  # unreadable: counts as large
                 procs.append(GpuProcess(int(parts[0]), mib, ",".join(parts[2:])))
-        return GpuReading(True, True, total, used, tuple(procs))
+        try:
+            utilization = float(first[2]) if len(first) > 2 else None
+        except ValueError:
+            utilization = None  # unsupported telemetry must not make the card look unavailable
+        return GpuReading(True, True, total, used, tuple(procs), utilization_pct=utilization)
     except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
         return GpuReading(present=True, ok=False, error=f"{type(exc).__name__}: {exc}")
 

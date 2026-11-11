@@ -39,6 +39,8 @@ model: # Appendix A.1
   routing: dense # dense | topk | greedy_budget | random | fixed
   key_address: false # A5 fixed byte/cell address features; routed HSN only
   selected_readout: false # A5 selected-cell mean appended to decoder input; routed HSN only
+  address_init: null # A5 extension, opt-in: start value of the scorer's two address columns (null: random init)
+  decoder_shortcut_dropout: 0.0 # training-only joint q/u dropout; requires selected_readout
   fixed_route: [] # cells for routing = fixed
   budget: 1.0 # B_t as a fraction of the dense step cost
   lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
@@ -71,21 +73,84 @@ train: # Appendix A.3
   schedule: constant # constant | cosine | linear | wsd (P1.13: warmup-stable-decay)
   decay_fraction: null # P1.13: wsd only (required there): decay (1 - sqrt, to 0) over this fraction of steps
   cell_lr_mult: 1.0 # P1.13: the HSN cell's parameter group trains at lr * cell_lr_mult
+  router_lr_mult: 1.0 # A5 stability: HSN.router rate (learned routing only)
+  readout_lr_mult: 1.0 # A5 stability: whole HSN.decoder rate, including shared columns
+  update_limit: # project excessive optimizer displacements; no finite batch is discarded
+    norm_growth_limits: {} # optional group -> ceiling as a multiple of its initial norm (>=1)
+    groups: {} # name -> {selectors: [parameter-name globs], max_ratio: relative L2 cap}
+    norm_floor: 1.0e-12 # denominator floor for groups with zero/small weight norm
+  route_guard: # A6, opt-in: when an established route is being taken over, halve the gaining unit's router step
+    enabled: false
+    interval: 100 # applied steps between readings of the per-(input byte, unit) slot counts
+    lost_fraction: 0.1 # the event: the quarter of bytes that lost most lost this share of their established routes
+    min_slots: 100 # a byte with fewer slots than this in an interval is left out
+    specialised: 0.25 # a route (byte, unit) is established once the unit held this share of the byte's slots ...
+    persistence: 3 # ... at this many consecutive readings
+    loss_rise: 0.02 # an event only while the interval's training loss is this far above the lowest so far
+    min_usage: 0.001 # no event while established routes hold less than this share of all slots
+    reduce_factor: 0.5 # the gaining unit's router-row step scale is multiplied by this at an event
+    min_scale: 0.015625 # ... down to this
+  gradient_growth: # reversible damping of selected groups when raw gradient medians rise
+    enabled: false # requires groups; adaptive_lr, rollback and spike skipping must be off
+    groups: {} # arbitrary group name -> list of parameter-name globs
+    window: 100 # recent/reference median widths in finite accepted samples
+    reference_lag: 500 # distance between windows; at least window
+    interval: 100 # sample cadence of decisions
+    growth_threshold: 1.5 # minimum group norm growth before damping
+    global_growth_threshold: 1.25 # global norm growth required to call a group hot
+    min_share: 0.25 # minimum group share of the pre-clip gradient norm
+    share_power: 1.0 # rising share strengthens the response (zero ignores share growth)
+    response_power: 1.0 # exponent of the inverse excess-growth response
+    recovery_threshold: 1.1 # group growth at/below this permits recovery toward scale 1
+    recovery_rate: 0.1 # maximum scale increase at one observation
+    min_scale: 0.25 # floor for each selected group; other parameters are unchanged
+    norm_floor: 1.0e-12 # protects ratios with zero/near-zero reference norms
+  adaptive_lr: # opt-in training-only feedback; scales multiply the chosen schedule
+    enabled: false
+    interval: 100 # accepted updates per fixed training-monitor measurement
+    monitor_docs: 32 # increased automatically to cover every task/variant
+    patience: 2
+    cooldown: 2 # monitor windows after a rate change
+    threshold: 0.01 # relative monitor-loss change
+    reduce_factor: 0.5
+    increase_factor: 1.1 # bounded plateau trial; only kept if loss improves
+    min_scale: 0.03125
+    max_scale: 1.0 # default trials can recover cuts but cannot exceed the initial rate
+    grad_growth: 3.0
+    max_update_ratio: 0.01 # sampled ||weight change|| / ||weight after update||
+    router_max_update_ratio: 0.005
+    readout_max_update_ratio: 0.005
+    trial_windows: 2
+    loss_cuts: true # false ablates cuts from sustained loss regression alone
+    gradient_cuts: true # false ablates the joint loss/gradient warning and its trial veto
+    update_cuts: true # false ablates per-component update cuts and their trial veto
+    trial_increases: true # false disables upward trials; emergency guard cuts are always active
   cell_weight_decay: null # P1.13: weight decay of the cell's tensors with ndim >= 2; null = weight_decay
   spike_factor: null # P1.15: skip a step whose grad norm > factor x the running median (null: off; 1e3-1e4)
   spike_window: 100 # P1.15: applied steps in that median (read only with spike_factor set)
+  slow_burst_factor: null # optional sustained rise of the median; requires spike_factor
+  slow_burst_window: 250 # applied steps between median windows; requires slow_burst_factor
   divergence_dump: true # P1.15: dump the pre-step state at the first skipped step (replay it)
+  divergence_max_dumps: 1 # bounded event capture; set 5 for a spike investigation
+  divergence_healthy_every: 0 # optional pre-update healthy reference cadence; 0 disables it
+  divergence_healthy_keep: 2 # rolling references frozen alongside each captured event
   rollback_every: null # P1.16: snapshot cadence of the rollback on a guard trigger (null: off; 50)
   rollback_skip: 0 # P1.16: extra steps' worth of windows discarded after a rollback (10)
   rollback_lr_mult: 1.0 # P1.16: learning-rate factor after a rollback, in (0, 1] (0.5)
   rollback_lr_steps: 0 # P1.16: steps the factor lasts (200)
   rollback_max: 5 # P1.16: the run stops at its rollback_max + 1-th trigger
+  rollback_selection: oldest # oldest | guard_horizon (newest before the guard reference horizon)
   unroll: 256 # TBPTT window
   batch: 4
   micro_batch: 4
   grad_accum: 1
   precision: bf16 # bf16 | fp16 | fp32 | fp64 (fp64 only for gradcheck)
   grad_clip: 1.0 # global norm clip
+  grad_norm_precision: native # native | float64; wide global reduction and clipping, opt-in
+  feedback_detach: [] # A6, opt-in: summary | eps | state | router; feedback reads held constant in the backward
+  state_grad_clip: null # A6, opt-in: per-row limit on the gradient a position passes back into the state (q; h gets / sqrt(N))
+  state_grad_ratio: null # A6, opt-in: the same limit as a multiple of the batch's typical live row (scale-free)
+  weight_ema: null # A6, opt-in: decay of a moving average of the weights; evaluations and probes score the average
   steps: 1000
   eval_every: 100
   ckpt_every: 500

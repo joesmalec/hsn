@@ -81,7 +81,7 @@ def probe_check(db: Database, exp_id: int, *, batch_rows: int = 64) -> dict[str,
     model = build_model(cfg)
     install_variant(model, arm["variant"], cfg.seed, loads(arm["variant_json"]))
     model.to(device=ctx.device, dtype=ctx.master_dtype)
-    load_checkpoint(checkpoint, model)
+    load_checkpoint(checkpoint, model, averaged=True)  # A6: the weights the run scored
     t0 = time.perf_counter()
     batched = edit_probe(model, ctx, dev, batch_rows=batch_rows, margins=True)
     batched_s = time.perf_counter() - t0
@@ -164,7 +164,13 @@ def train_key_alphabet(dev: Any) -> Any:
 
 
 def _restored(
-    db: Database, exp_id: int, run_dir: Path, *, cpu: bool, weights: str = "checkpoint"
+    db: Database,
+    exp_id: int,
+    run_dir: Path,
+    *,
+    cpu: bool,
+    weights: str = "checkpoint",
+    checkpoint_step: int | None = None,
 ) -> tuple[Any, Any, Any, Any, Path, Any]:
     """The experiment's model at the last checkpoint in ``run_dir`` (rebuilt as the run, the variant
     installed the same way), on the run's hardware or (``cpu``) on ``profile:cpu`` in fp32.
@@ -186,7 +192,21 @@ def _restored(
         raise ValueError(f"experiment {exp_id} ran {params.name}, not reads_state")
     if weights not in ("checkpoint", "dump"):
         raise ValueError(f"weights must be 'checkpoint' or 'dump', got {weights!r}")
-    if weights == "dump":
+    checkpoint: Path | None
+    if checkpoint_step is not None:
+        if (
+            isinstance(checkpoint_step, bool)
+            or not isinstance(checkpoint_step, int)
+            or checkpoint_step < 0
+            or weights != "checkpoint"
+        ):
+            raise ValueError(
+                "checkpoint_step must be a non-negative integer with weights=checkpoint"
+            )
+        checkpoint = run_dir / f"step_{checkpoint_step:08d}.pt"
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"no checkpoint at step {checkpoint_step} in {run_dir}")
+    elif weights == "dump":
         dumps = dump_paths(run_dir)
         checkpoint = dumps[-1] if dumps else None
         if checkpoint is None:
@@ -202,7 +222,9 @@ def _restored(
     model = build_model(cfg)
     install_variant(model, arm["variant"], cfg.seed, loads(arm["variant_json"]))
     model.to(device=ctx.device, dtype=ctx.master_dtype)
-    load_checkpoint(checkpoint, model)  # loads on the CPU, copies into the model on its device
+    # loads on the CPU, copies into the model on its device; A6: with train.weight_ema the
+    # averaged weights, which are what the run's evaluations and probes scored
+    load_checkpoint(checkpoint, model, averaged=True)
     return exp, params, ctx, dev, checkpoint, model
 
 
@@ -245,6 +267,7 @@ def probe_rerun(
     batch_rows: int | None = None,
     weights: str = "checkpoint",
     key_alphabet: str | None = None,
+    checkpoint_step: int | None = None,
 ) -> dict[str, Any]:
     """P1.14: v1 (batched, the run's ``probe_batch`` unless ``batch_rows``) on the experiment's last
     checkpoint, compared document by document with the per-document probes stored in its
@@ -272,7 +295,7 @@ def probe_rerun(
     json_path = Path(result["json_path"])
     run_dir = Path(db.experiment(exp_id)["run_dir"] or json_path.parent)
     exp, params, ctx, dev, checkpoint, model = _restored(
-        db, exp_id, run_dir, cpu=cpu, weights=weights
+        db, exp_id, run_dir, cpu=cpu, weights=weights, checkpoint_step=checkpoint_step
     )
     if key_alphabet == "train":
         dev = train_key_alphabet(dev)
@@ -286,7 +309,12 @@ def probe_rerun(
     v1_s = time.perf_counter() - t0
     # P1.16: the stored probes are of the stored weights and the original keys; with another
     # source of weights, other keys or no stored probes (a failed run) there is nothing to compare
-    compare = bool(stored) and weights == "checkpoint" and key_alphabet is None
+    compare = (
+        bool(stored)
+        and weights == "checkpoint"
+        and key_alphabet is None
+        and checkpoint_step is None
+    )
     if compare and [p["doc"] for p in v1] != [p["doc"] for p in stored]:
         raise ValueError(f"experiment {exp_id}: the stored probes are of other documents")
     differ = []
@@ -362,6 +390,7 @@ def probe_rerun(
         ),
         "compared_with_stored": compare,
         "checkpoint": str(checkpoint),
+        "checkpoint_step": checkpoint_step,
         "device": str(ctx.device),
         "autocast": str(ctx.autocast_dtype),
         "batch_rows": rows,

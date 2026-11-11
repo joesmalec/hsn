@@ -99,6 +99,7 @@ from hsn.device import DeviceContext
 from hsn.train.amp import autocast_ctx
 
 __all__ = [
+    "PaddedWindow",
     "KEYS",
     "PROBE_V3_MIN_CORRECT",
     "PROBE_V3_MIN_VOCAB",
@@ -265,6 +266,67 @@ def _record(item: ProbeItem, a0: int, a1: int) -> dict[str, Any]:
         "follows_new_value": a1 == item.new_value,
         "original_correct": a0 == item.old_value,
     }
+
+
+class PaddedWindow:
+    """A trainer's compiled evaluation window as the probes' model (10 Nov 2026).
+
+    The probes run fresh-state windows of varying width and row count through ``model(tokens,
+    context, state, reset)``. The eager forward of a routed HSN spends its time on the host (the
+    three probes took 85 s of a 9,000-step run on ``profile:rtx3060`` with the card near 25 %).
+    This adapter pads every probe batch to the one shape the evaluations already compiled (``batch``
+    rows, ``window`` columns; padded rows and columns are fresh, empty and dropped from the
+    result), so the probes replay that graph: the same logits to rounding, and no new compile.
+    Every row must reset at column 0 (the probes' windows do): the state passed in is not read.
+    ``compiled`` is the evaluation-mode model of the trainer
+    (:meth:`hsn.train.tbptt.TBPTTTrainer._eval_model`)."""
+
+    def __init__(self, compiled: Any, batch: int, window: int) -> None:
+        if batch < 1 or window < 1:
+            raise ValueError(
+                f"PaddedWindow needs batch >= 1 and window >= 1, got {batch}, {window}"
+            )
+        self.compiled = compiled
+        self.batch = batch
+        self.window = window
+        self.cfg = getattr(compiled, "cfg", None)
+
+    @property
+    def training(self) -> bool:
+        return bool(self.compiled.training)
+
+    def train(self, mode: bool = True) -> PaddedWindow:
+        self.compiled.train(mode)
+        return self
+
+    def eval(self) -> PaddedWindow:
+        self.compiled.eval()
+        return self
+
+    def init_state(self, B: int, device: torch.device | str | None = None) -> Any:
+        return self.compiled.init_state(B, device)
+
+    def __call__(
+        self, tokens: Tensor, context: Tensor, state: Any, reset: Tensor, **kwargs: Any
+    ) -> tuple[Tensor, Any, dict[str, Tensor]]:
+        B, T = (int(n) for n in tokens.shape)
+        if B > self.batch or T > self.window:
+            raise ValueError(
+                f"a probe batch of {B} rows x {T} columns does not fit the compiled evaluation "
+                f"window of {self.batch} x {self.window}"
+            )
+        if not bool(reset[:, 0].all()):
+            raise ValueError("PaddedWindow runs fresh-state windows: every row resets at column 0")
+        device = tokens.device
+        tok = torch.zeros((self.batch, self.window), dtype=tokens.dtype, device=device)
+        ctxt = torch.full((self.batch, self.window), NO_CONTEXT, dtype=context.dtype, device=device)
+        rst = torch.zeros((self.batch, self.window), dtype=torch.bool, device=device)
+        tok[:B, :T], ctxt[:B, :T], rst[:B, :T] = tokens, context, reset
+        rst[:, 0] = True
+        logits, new_state, info = self.compiled(
+            tok, ctxt, self.compiled.init_state(self.batch, device), rst
+        )
+        return logits[:B, :T], new_state, info
 
 
 def _forward(model: nn.Module, tokens: Tensor, context: Tensor, reset: Tensor) -> Tensor:

@@ -1,0 +1,86 @@
+# A6 screening, third batch (10 Nov 2026): can the stabilised A5 recipe bind held-out keys?
+# Dev keys (0x70-0x7f) never appear in training, and a key-blind strategy scores at most about
+# 0.80 overall (every first query, 0.623 of the later ones): gru_2m's 0.793 and the dense HSN's
+# 0.798 sit there. Going past it needs the key-addressed route of A5, which so far had to emerge
+# from the scorer's small random address columns. model.address_init starts those two columns at
+# one value, so a route follows the byte codes from step 0. Seed 2, with the state-gradient clip.
+name: p1_18_a6_bind
+description: "A6 clip plus address-column start on the A5 recipe: seed-2 binding screen"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - model.routing=topk
+    - model.cand_norm=none
+    - model.key_address=true
+    - model.selected_readout=true
+    - train.optimizer=lazy_adamw
+    - train.gate_mode=ste
+    - train.lr=2.5e-3
+    - train.betas=[0.9,0.95]
+    - train.probe_horizon=null
+    - train.spike_factor=null
+    - train.rollback_every=null
+    - train.grad_norm_precision=float64
+    - train.state_grad_clip=4.0
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [2]
+arms:
+  - name: clip4_addr1
+    family: hsn
+    overrides:
+      - model.address_init=1.0
+  # the address start with the decoder's q/u shortcut dropped half the time (A5 extension)
+  - name: clip4_addr1_drop
+    family: hsn
+    overrides:
+      - model.address_init=1.0
+      - model.decoder_shortcut_dropout=0.5
+  # the address start on the full feedback cut (no clip: the cut backward cannot amplify)
+  - name: carry_addr1
+    family: hsn
+    overrides:
+      - model.address_init=1.0
+      - train.state_grad_clip=null
+      - train.feedback_detach=[summary,eps,state,router]
+  # the address start on exp 349's recipe (the cut with the anchored update caps)
+  - name: carry_anchored_addr1
+    family: hsn
+    overrides:
+      - model.address_init=1.0
+      - train.state_grad_clip=null
+      - train.feedback_detach=[summary,eps,state,router]
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+  # Diagnostic (A5's kill-rule question: is the router's learning the obstacle, or storage and
+  # readout?): the address start with the router all but frozen (router_lr_mult 0.001), so every
+  # route follows a_cur + a_prev for the whole run; the cell keeps its cap, the cut as above.
+  - name: carry_addr1_router_fixed
+    family: hsn
+    overrides:
+      - model.address_init=1.0
+      - train.router_lr_mult=0.001
+      - train.state_grad_clip=null
+      - train.feedback_detach=[summary,eps,state,router]
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12

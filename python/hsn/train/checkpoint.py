@@ -196,13 +196,23 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    *,
+    averaged: bool = False,
 ) -> dict[str, Any]:
     """Load a checkpoint into ``model`` (and the optimiser and scheduler when given); return it.
 
     The returned dict holds everything :func:`save_checkpoint` wrote (``step``, ``rng_state``,
     ``loader_state``, ``extra``, ...). RNG state is *not* restored here, since evaluation-only
     callers must not touch the generators; the trainer calls :func:`restore_rng_state` itself.
+
+    ``averaged`` (evaluation-only callers; refused with an optimiser or scheduler): a checkpoint
+    of a ``train.weight_ema`` run holds the training weights in ``model`` and their moving
+    average in ``extra["weight_ema"]``; with ``averaged`` the average replaces the loaded
+    weights, which is the model the run's evaluations scored. A checkpoint without an average
+    loads as usual.
     """
+    if averaged and (optimizer is not None or scheduler is not None):
+        raise ValueError("load_checkpoint(averaged=True) is for evaluation only: no optimizer")
     file = Path(path)
     if not file.is_file():
         raise FileNotFoundError(f"checkpoint {file} does not exist")
@@ -221,6 +231,10 @@ def load_checkpoint(
         if loaded["scheduler"] is None:
             raise ValueError(f"{file}: checkpoint has no scheduler state to load")
         scheduler.load_state_dict(loaded["scheduler"])
+    if averaged:
+        from hsn.train.weight_ema import install_averaged
+
+        install_averaged(model, loaded.get("extra") or {}, str(file))
     return dict(loaded)
 
 

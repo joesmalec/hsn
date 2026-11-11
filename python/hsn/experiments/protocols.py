@@ -76,12 +76,15 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
   result stored as ``partial``: ``from_step``, ``checkpoint``, ``reason``, ``final`` (the ``final``
   keys of that evaluation), ``trained``, ``probes`` (summaries) and ``seconds``; a failure while
   re-scoring is kept as ``partial.error`` and never hides the run's own failure. The rules label
-  such a record ``failed: … (from step X: …)`` (:mod:`hsn.experiments.rules`).
+  such a record ``failed: … (from step X: …)`` (:mod:`hsn.experiments.rules`). The same assessment
+  of the newest saved checkpoint is also stored as ``latest_saved``; it is diagnostic only and
+  changes neither the failure nor the conservative partial verdict.
 """
 
 from __future__ import annotations
 
 import contextlib
+import gc
 import math
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -95,13 +98,14 @@ from hsn.experiments.spec import (
     DryRunParams,
     OverfitParams,
     ReadsStateParams,
+    SpikeDiagnosticParams,
     TrainEvalParams,
 )
 from hsn.experiments.steptime import StepTimeGuard
 
 __all__ = ["ArmRun", "run_protocol"]
 
-Params = ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams
+Params = ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams
 
 
 @dataclass
@@ -135,6 +139,10 @@ def run_protocol(arm: ArmRun) -> dict[str, Any]:
     try:
         if isinstance(arm.params, DryRunParams):
             record = _dry_run(arm, arm.params)
+        elif isinstance(arm.params, SpikeDiagnosticParams):
+            from hsn.experiments.spike import run_diagnostic
+
+            record = run_diagnostic(arm, arm.params)
         else:
             record = _train(arm, arm.params)
     except BaseException as exc:
@@ -194,6 +202,8 @@ def failure_info(
         kind, reason = "interrupted", "interrupted"
     elif name == "StepTimeExceeded":
         kind, reason = "step_time", first
+    elif isinstance(exc, TimeoutError):
+        kind, reason = "timeout", first
     elif name == "OutOfMemoryError":
         kind, reason = "oom", "out of memory"
     elif isinstance(exc, RuntimeError) and _ROLLBACK_LIMIT in message:  # P1.16
@@ -232,18 +242,68 @@ class _EvalTimer:
     def __init__(self) -> None:
         self.seconds = 0.0
         self.count = 0
+        #: ``[unix start, seconds]`` of every evaluation (the record's ``phases``).
+        self.intervals: list[list[float]] = []
 
     @contextlib.contextmanager
     def segment(self, name: str, tokens: int = 0) -> Iterator[None]:
         if name != "evaluate":
             yield
             return
-        started = time.perf_counter()
+        started, wall = time.perf_counter(), time.time()
         try:
             yield
         finally:
             self.seconds += time.perf_counter() - started
             self.count += 1
+            self.intervals.append([wall, time.perf_counter() - started])
+
+
+def _timed_saves(trainer: Any) -> list[list[float]]:
+    """Wrap ``trainer.save`` so that every checkpoint write is logged as ``[unix start,
+    seconds]`` (the record's ``phases``); the checkpoint itself is unchanged."""
+    intervals: list[list[float]] = []
+    save = trainer.save
+
+    def timed(*args: Any, **kwargs: Any) -> Any:
+        started, wall = time.perf_counter(), time.time()
+        try:
+            return save(*args, **kwargs)
+        finally:
+            intervals.append([wall, time.perf_counter() - started])
+
+    trainer.save = timed
+    return intervals
+
+
+def _probe_model(trainer: Any, model: Any, probe_batch: int) -> tuple[Any, int]:
+    """What the edit probes run and their rows per batch: under a compiled HSN trainer, the
+    compiled evaluation window padded to its one shape (:class:`hsn.experiments.probe.PaddedWindow`:
+    no eager forward, no new compile), with the evaluation batch's rows; else the model itself
+    with the protocol's ``probe_batch``."""
+    from hsn.experiments.probe import PaddedWindow
+
+    if getattr(trainer, "compiled_window", None) is None:
+        return model, probe_batch
+    batch = int(trainer.eval_batch or trainer.cfg.train.batch)
+    rows = batch - batch % 2  # the probes pair an original with its edit
+    if rows < 2:
+        return model, probe_batch
+    return PaddedWindow(trainer._eval_model(), batch, int(trainer.cfg.train.unroll)), rows
+
+
+def _phases(
+    timer: _EvalTimer, diag: Any, saves: list[list[float]], stages: dict[str, list[float]]
+) -> dict[str, Any]:
+    """When the run was not training (wall-clock intervals, for the card's time series): the
+    evaluations, the diagnostic samples, the checkpoint writes and the run's stages."""
+    return {
+        "evaluate": timer.intervals,
+        "diagnostics": [list(x) for x in getattr(diag, "intervals", [])],
+        "diagnostics_warm_s": float(getattr(diag, "warm_seconds", 0.0)),
+        "checkpoint": saves,
+        "stages": stages,
+    }
 
 
 def _eval_entry(e: Mapping[str, Any], *, audit_keys: bool) -> dict[str, Any]:
@@ -334,6 +394,7 @@ class _Keeper:
     keep_every: int
     keep_last: int
     ckpt_every: int
+    keep_best: bool = False
 
     @staticmethod
     def on_disk(history: Any) -> list[tuple[int, Path]]:
@@ -353,6 +414,24 @@ class _Keeper:
             if step % self.keep_every == 0 and step % self.ckpt_every != 0
         ]
 
+    @staticmethod
+    def best(history: Any) -> dict[str, Any] | None:
+        """Best dev accuracy among checkpoints evaluated at their exact saved step.
+
+        Ties keep the earlier checkpoint. No score is inferred for unevaluated checkpoints.
+        """
+        on_disk = dict(_Keeper.on_disk(history))
+        candidates = [
+            e
+            for e in history.evals
+            if int(e["step"]) in on_disk and math.isfinite(float(e["accuracy"]))
+        ]
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda e: (float(e["accuracy"]), -int(e["step"])))
+        step = int(best["step"])
+        return {"step": step, "accuracy": float(best["accuracy"]), "path": str(on_disk[step])}
+
     def prune(self, trainer: Any, history: Any) -> None:
         kept = self.kept(history)
         first = _first_guard_event(trainer)
@@ -360,8 +439,9 @@ class _Keeper:
         if first is not None:
             before = [k for k in kept if k[0] < first]
             pinned = before[-1] if before else None
+        best = self.best(history) if self.keep_best else None
         for entry in kept[: -self.keep_last]:
-            if entry != pinned:
+            if entry != pinned and (best is None or entry[0] != best["step"]):
                 entry[1].unlink(missing_ok=True)
 
 
@@ -372,8 +452,7 @@ def _first_guard_event(trainer: Any) -> int | None:
 
 
 class _StepCallback:
-    """Progress at every evaluation; the step-time guard (P1.14) at every step; the early-stop rules
-    at their steps."""
+    """Progress at evaluations and controller observations; guard/stop rules at their cadence."""
 
     def __init__(
         self,
@@ -388,12 +467,17 @@ class _StepCallback:
         self.audit_keys = audit_keys
         self.guard = guard
         self._compile_seen = 0.0
+        self._controller_reported = -1
+        self._growth_reported = -1
         self.at_steps = {s for r in arm.rules.early_stop for s in r.at_steps}
         self.stop: dict[str, Any] | None = None
         self.log: list[dict[str, Any]] = []
         self.started = time.perf_counter()
         self.history: Any = None  # P1.14: the live History, read back when the fit raises
         self.keeper: _Keeper | None = None  # P1.16: kept checkpoints (protocol keep_every)
+        #: The collector switch (protocol ``gc_freeze``) and how often it froze (the record's).
+        self.gc_freeze = False
+        self.freezes = 0
 
     def __call__(self, trainer: Any, history: Any) -> bool:
         self.history = history
@@ -401,6 +485,8 @@ class _StepCallback:
         if self.keeper is not None:
             self.keeper.prune(trainer, history)
         evaluated = bool(history.evals) and int(history.evals[-1]["step"]) == step
+        if evaluated:
+            self.freeze_collector(trainer)
         if self.guard is not None and history.steps and int(history.steps[-1].step) == step:
             # a compile or CUDA-graph recording during this step or its evaluation (P2.8)
             window = getattr(trainer, "compiled_window", None)
@@ -409,20 +495,29 @@ class _StepCallback:
             self.guard.observe(
                 step, float(history.steps[-1].seconds), compiled=compiled, evaluated=evaluated
             )  # raises StepTimeExceeded above the arm's max_step_s
-        if evaluated:
-            last = history.evals[-1]
-            self.arm.on_progress(
-                {
-                    "step": step,
-                    "of": self.arm.steps,
-                    "dev_accuracy": float(last["accuracy"]),
-                    "dev_loss": float(last["loss"]),
-                    "elapsed_s": round(time.perf_counter() - self.started, 1),
-                }
-            )
+        controller = getattr(trainer, "adaptive_lr", None)
+        changed = controller is not None and (
+            len(controller.state.observations) != self._controller_reported
+        )
+        growth = getattr(trainer, "gradient_growth", None)
+        growth_changed = growth is not None and len(growth.observations) != self._growth_reported
+        stability_sampled = (
+            self.diag is not None
+            and self.diag.stability is not None
+            and bool(self.diag.records)
+            and self.diag.records[-1]["step"] == step
+        )
+        if evaluated or changed or growth_changed or stability_sampled:
+            self.publish_progress(trainer, history)
+        elif (
+            getattr(trainer, "update_limiter", None) is not None
+            and step % trainer.cfg.train.stats_every == 0
+        ):
+            self.publish_progress(trainer, history)
         if step not in self.at_steps:
             return False
         record = {
+            **_adaptive_record(trainer),
             "evals": [_eval_entry(e, audit_keys=False) for e in history.evals],
             "diagnostics": list(self.diag.records) if self.diag is not None else [],
             "train": [_train_entry(s) for s in history.steps],
@@ -435,6 +530,83 @@ class _StepCallback:
             self.stop = {**stop, "elapsed_s": round(time.perf_counter() - self.started, 1)}
             return True
         return False
+
+    def freeze_collector(self, trainer: Any) -> None:
+        """After an evaluation of a compiled run (every graph of the run is compiled by the first
+        one: the training window, the diagnostic variant, the evaluation window), move what is
+        alive into the collector's permanent generation, after one full pass so that no garbage
+        is kept. A compiled process holds about a million tracked objects (the graphs, their
+        guards, the modules); each full pass walked all of them, 0.3 s with the card idle, about
+        ten times per thousand steps (measured, ``a5-fix/probe/dip_base.json``). Frozen, a full
+        pass sees only what was allocated since the last evaluation (1 ms). Nothing about the
+        training changes. Off for an eager trainer (nothing to gain) and with ``gc_freeze:
+        false``; :meth:`release_collector` undoes it when the fit ends."""
+        if not self.gc_freeze or getattr(trainer, "compiled_window", None) is None:
+            return
+        gc.collect()
+        gc.freeze()
+        self.freezes += 1
+
+    def release_collector(self) -> None:
+        """Hand the frozen objects back to the collector (the end of the fit, whatever ended it):
+        the probes and the process's shutdown then run as in a run that never froze."""
+        if self.freezes:
+            gc.unfreeze()
+
+    def publish_progress(self, trainer: Any, history: Any, *, phase: str | None = None) -> None:
+        from hsn.experiments.controller import controller_progress
+
+        progress: dict[str, Any] = {
+            "step": int(trainer.step),
+            "of": self.arm.steps,
+            "elapsed_s": round(time.perf_counter() - self.started, 1),
+            **controller_progress(trainer),
+        }
+        limiter = getattr(trainer, "update_limiter", None)
+        if limiter is not None:
+            progress["update_limit"] = limiter.state_dict()
+        growth = getattr(trainer, "gradient_growth", None)
+        if growth is not None:
+            progress["gradient_growth"] = growth.progress()
+        if self.diag is not None and self.diag.stability is not None and self.diag.records:
+            latest = self.diag.records[-1]
+            progress["stability"] = {
+                "sample_step": latest["step"],
+                **{
+                    k.removeprefix("stability/"): v
+                    for k, v in latest.items()
+                    if k.startswith("stability/")
+                },
+            }
+        if history.evals:
+            last = history.evals[-1]
+            progress.update(dev_accuracy=float(last["accuracy"]), dev_loss=float(last["loss"]))
+            if any(
+                k in progress
+                for k in ("adaptive_lr", "update_limit", "gradient_growth", "stability")
+            ):
+                # A monitoring update must not present an older dev score as a fresh evaluation.
+                progress["dev_step"] = int(last["step"])
+        if phase is not None:
+            progress["phase"] = phase
+        self.arm.on_progress(progress)
+        if "adaptive_lr" in progress:
+            self._controller_reported = int(progress["adaptive_lr"]["observation_count"])
+        if "gradient_growth" in progress:
+            self._growth_reported = int(progress["gradient_growth"]["observation_count"])
+
+
+def _adaptive_record(trainer: Any) -> dict[str, Any]:
+    """Kept in successful and partial SQLite record_json, including guard/trial decisions."""
+    controller = getattr(trainer, "adaptive_lr", None)
+    out = {} if controller is None else {"adaptive_lr": controller.state_dict()}
+    limiter = getattr(trainer, "update_limiter", None)
+    if limiter is not None:
+        out["update_limit"] = limiter.state_dict()
+    growth = getattr(trainer, "gradient_growth", None)
+    if growth is not None:
+        out["gradient_growth"] = growth.state_dict()
+    return out
 
 
 def _compile_info(trainer: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
@@ -523,6 +695,8 @@ def _train(
     arm.record["variant"] = variant
     timer = _EvalTimer()
     trainer = make_trainer(model, cfg, ctx, run_dir=arm.run_dir, profiler=timer)
+    saves = _timed_saves(trainer)
+    stages: dict[str, list[float]] = {"setup": [time.time()]}
     trainer.eval_batch = params.eval_batch
     if params.keep_every:  # P1.16: kept checkpoints (a harness setting, not the configuration)
         trainer.extra_ckpt_every = params.keep_every
@@ -542,6 +716,8 @@ def _train(
     # P1.14: the mixed cadence samples an explicit schedule; the single cadence keeps diag_every
     dense = params.diag_dense_every > 0
     schedule = diag_schedule(arm.steps, diag_every, params.diag_dense_every, params.diag_windows)
+    if not params.diagnostics:  # the switch: no sample during training, nothing attached
+        schedule = ()
     diag = Diagnostics(
         model,
         cfg,
@@ -550,6 +726,10 @@ def _train(
         max(diag_every, 1),
         n_docs=params.diag_window_docs,
         schedule=schedule if dense else None,
+        stability=params.diag_stability and params.diagnostics,
+        sensitivity_epsilon=params.diag_sensitivity_epsilon,
+        sensitivity_position=params.diag_sensitivity_position,
+        sensitivity_horizon=params.diag_sensitivity_horizon,
     )
     sampling = bool(schedule)
     if sampling:
@@ -562,19 +742,32 @@ def _train(
         stats_every=cfg.train.stats_every,
     )
     callback = _StepCallback(arm, diag if sampling else None, audit_keys=audit_keys, guard=guard)
+    callback.gc_freeze = params.gc_freeze
     if params.keep_every:
-        callback.keeper = _Keeper(params.keep_every, params.keep_last, cfg.train.ckpt_every)
+        callback.keeper = _Keeper(
+            params.keep_every,
+            params.keep_last,
+            cfg.train.ckpt_every,
+            keep_best=params.checkpoint == "retained",
+        )
     arm.walls["setup_s"] = time.perf_counter() - t0
+    stages["setup"].append(time.time())
 
     arm.stage = "train"
     t1 = time.perf_counter()
+    stages["fit"] = [time.time()]
     try:
-        history = trainer.fit(train_ds, dev_ds, arm.steps, callback=callback)
+        try:
+            history = trainer.fit(train_ds, dev_ds, arm.steps, callback=callback)
+        finally:
+            callback.release_collector()  # the frozen objects are collectable again from here
     except BaseException as exc:
         # P1.14: what the fit produced before it raised (the P1.12 stop, OOM, SIGTERM, ...)
         arm.walls["fit_s"] = time.perf_counter() - t1
+        stages["fit"].append(time.time())
         diag.detach()
         _partial_training(arm, params, trainer, callback, diag, timer, audit_keys)
+        arm.record["phases"] = _phases(timer, diag, saves, stages)
         spike_on = getattr(trainer, "spike_factor", None) is not None
         arm.record["failure"] = failure_info(
             exc,
@@ -587,9 +780,34 @@ def _train(
             arm.record["partial"] = _rescore_partial(
                 arm, params, trainer, model, cfg, ctx, dev_ds, callback, audit_keys
             )
+            arm.record["latest_saved"] = _rescore_partial(
+                arm,
+                params,
+                trainer,
+                model,
+                cfg,
+                ctx,
+                dev_ds,
+                callback,
+                audit_keys,
+                latest=True,
+            )
         raise
     arm.walls["fit_s"] = time.perf_counter() - t1
+    stages["fit"].append(time.time())
     diag.detach()
+    # A6 (train.weight_ema): the model the evaluations scored is the averaged one; from here on
+    # (trained state, probes) the model holds it. The checkpoints keep the training weights,
+    # which are scored once here, at the last step, for the record (one more evaluation).
+    training_weights: dict[str, Any] | None = None
+    if getattr(trainer, "weight_ema", None) is not None:
+        training_weights = _eval_entry(
+            {"step": int(trainer.step), **trainer.evaluate(dev_ds, averaged=False)},
+            audit_keys=audit_keys,
+        )
+    averaged = trainer.install_averaged_weights()
+    # A6: the route-takeover guard (HSN, opt-in)
+    route_guard = getattr(trainer, "route_guard", None)
     measured = dict(history.measured)
     arm.walls["train_s"] = float(measured.get("train_seconds", 0.0)) - diag.seconds
     arm.walls["compile_s"] = float(measured.get("compile_seconds") or 0.0)
@@ -601,16 +819,9 @@ def _train(
 
     evals = [_eval_entry(e, audit_keys=audit_keys) for e in history.evals]
     train = _mark_skipped([_train_entry(s) for s in history.steps], trainer)
-    if evals:  # the trainer does not call back at its last step: report it, and the phase after
-        arm.on_progress(
-            {
-                "step": int(history.steps[-1].step),
-                "of": arm.steps,
-                "dev_accuracy": evals[-1]["accuracy"],
-                "dev_loss": evals[-1]["loss"],
-                "phase": "stopped, probing" if callback.stop else "trained, probing",
-                "elapsed_s": round(time.perf_counter() - t1, 1),
-            }
+    if evals:
+        callback.publish_progress(
+            trainer, history, phase="stopped, probing" if callback.stop else "trained, probing"
         )
     full: dict[str, Any] = {
         "protocol": params.name,
@@ -636,13 +847,26 @@ def _train(
             "rollbacks": measured.get("rollbacks"),  # P1.16: None with the rollback off
         },
         "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+        **_adaptive_record(trainer),
         "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
         "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
+        "divergences": getattr(trainer, "divergences", []),
         "stopped": callback.stop,
         "early_stop_log": callback.log,
         "eval_count": timer.count,
         "checkpoints": history.checkpoints,
         "step_time": guard.summary(),  # P1.14
+        "phases": _phases(timer, diag, saves, stages),
+        "diagnostics_enabled": bool(params.diagnostics),
+        "gc_freezes": callback.freezes,
+        # A6: the decay of the weight average the evaluations and probes scored (None: the
+        # training weights, as before)
+        "weight_ema": cfg.train.weight_ema if averaged else None,
+        # the last step's dev evaluation of the training weights (an evaluation entry; None
+        # without the average, where "evals" already are the training weights')
+        "training_weights_final": training_weights,
+        # A6: the route-takeover guard's events and final router step scale (None: off)
+        "route_guard": route_guard.report() if route_guard is not None else None,
     }
     record = arm.record  # P1.14: filled in place, so that a later stage's failure keeps it
     record.clear()
@@ -652,6 +876,7 @@ def _train(
     if isinstance(params, (ReadsStateParams, TrainEvalParams)):
         arm.stage = "trained_state"
         t2 = time.perf_counter()
+        stages["probing"] = [time.time()]
         state = trained_state(model, cfg, ctx, dev_ds, params.diag_docs)
         arm.walls["trained_s"] = time.perf_counter() - t2
         probes: list[dict[str, Any]] | None = None
@@ -660,14 +885,16 @@ def _train(
         if isinstance(params, ReadsStateParams):
             arm.stage = "probe"
             t3 = time.perf_counter()
-            probes = edit_probe(model, ctx, dev_ds, batch_rows=params.probe_batch)
+            probe_model, probe_rows = _probe_model(trainer, model, params.probe_batch)
+            record["probe_execution"] = "compiled" if probe_model is not model else "eager"
+            probes = edit_probe(probe_model, ctx, dev_ds, batch_rows=probe_rows)
             summary = summarize(probes)
             arm.walls["probe_s"] = time.perf_counter() - t3
             if params.version >= 2:
                 arm.stage = "probe_v2"
                 t4 = time.perf_counter()
                 probes_v2 = edit_probe_v2(
-                    model, ctx, dev_ds, v1=probes, batch_rows=params.probe_batch
+                    probe_model, ctx, dev_ds, v1=probes, batch_rows=probe_rows
                 )
                 v2 = {"probe_v2": summarize_v2(probes_v2, v1=probes), "probes_v2": probes_v2}
                 arm.walls["probe_v2_s"] = time.perf_counter() - t4
@@ -675,12 +902,13 @@ def _train(
                 arm.stage = "probe_v3"
                 t5 = time.perf_counter()
                 probes_v3, originals_v3 = edit_probe_v3(
-                    model, ctx, dev_ds, batch_rows=params.probe_batch
+                    probe_model, ctx, dev_ds, batch_rows=probe_rows
                 )
                 v2["probe_v3"] = summarize_v3(probes_v3, originals_v3)
                 v2["probes_v3"] = probes_v3
                 v2["probes_v3_originals"] = originals_v3
                 arm.walls["probe_v3_s"] = time.perf_counter() - t5
+        stages["probing"].append(time.time())
         if callback.stop is not None:
             record["at_stop"] = {
                 "step": callback.stop["step"],
@@ -697,7 +925,12 @@ def _train(
     if params.checkpoint == "none":
         for path in history.checkpoints:
             Path(path).unlink(missing_ok=True)
-    elif callback.keeper is not None:  # P1.16: a finished run keeps no mid-run kept checkpoint
+    elif params.checkpoint == "retained":
+        record["retained_checkpoints"] = [
+            {"step": step, "path": str(path)} for step, path in _Keeper.on_disk(history)
+        ]
+        record["best_checkpoint"] = _Keeper.best(history)
+    elif callback.keeper is not None:  # legacy final-only policy
         for _step, kept in callback.keeper.kept(history):
             kept.unlink(missing_ok=True)
     arm.stage = "done"
@@ -760,8 +993,10 @@ def _partial_training(
                 "rollbacks": rollbacks,  # P1.16
             },
             "skipped_steps": list(getattr(trainer, "skipped_steps", [])),  # P1.15
+            **_adaptive_record(trainer),
             "rollbacks": [dict(r) for r in getattr(trainer, "rollbacks", [])],  # P1.16
             "divergence": getattr(trainer, "divergence", None),  # P1.15: the dump, when written
+            "divergences": getattr(trainer, "divergences", []),
             "stopped": None,
             "early_stop_log": list(callback.log),
             "eval_count": timer.count,
@@ -785,6 +1020,8 @@ def _rescore_partial(
     dev_ds: Any,
     callback: _StepCallback,
     audit_keys: bool,
+    *,
+    latest: bool = False,
 ) -> dict[str, Any] | None:
     """P1.16: the ``partial`` block of a run that failed on a guard (module docstring), or None
     when no kept checkpoint qualifies. Errors while re-scoring are kept in it, never raised."""
@@ -797,7 +1034,6 @@ def _rescore_partial(
         summarize_v2,
         summarize_v3,
     )
-    from hsn.train.checkpoint import load_checkpoint
 
     history = callback.history
     keeper = callback.keeper
@@ -805,7 +1041,7 @@ def _rescore_partial(
         return None
     first = _first_guard_event(trainer)
     limit = first if first is not None else int(trainer.step) + 1
-    candidates = [k for k in keeper.on_disk(history) if k[0] < limit]
+    candidates = [k for k in keeper.on_disk(history) if latest or k[0] < limit]
     if not candidates:
         return None
     step, path = candidates[-1]
@@ -814,11 +1050,15 @@ def _rescore_partial(
         if first is not None
         else f"the newest kept checkpoint before the failure (step {int(trainer.step)})"
     )
+    if latest:
+        reason = "the newest saved checkpoint; diagnostic only, not a recovered successful run"
     out: dict[str, Any] = {"from_step": step, "checkpoint": str(path), "reason": reason}
     t0 = time.perf_counter()
     arm.stage = "partial"
     try:
-        load_checkpoint(path, model)  # weights only, in place (the compiled window keeps them)
+        # weights only, in place (the compiled window keeps them); A6: with train.weight_ema the
+        # checkpoint's averaged weights, as the run's own evaluations scored
+        trainer.load_for_evaluation(path)
         result = trainer.evaluate(dev_ds)
         entry = _eval_entry({"step": step, **result}, audit_keys=audit_keys)
         train = [_train_entry(s) for s in history.steps if int(s.step) <= step]

@@ -322,9 +322,11 @@ class Scorer(nn.Module):
     is given; :attr:`ema` views them and :meth:`load_ema` writes them (module docstring).
 
     A5: ``key_address`` appends ``a_cur`` and ``a_prev`` after ``one``, giving ``3d+10``
-    features. ``seed`` is required then and seeds fixed byte codes and cell addresses without
-    changing the global RNG or the existing scorer columns. The code buffers travel with the
-    checkpoint; the previous byte comes from the caller and is never stored in the scorer.
+    features (``model.address_init``: the value their two columns start at, for every unit; the
+    default is the random init of the other columns). ``seed`` is required then and seeds fixed
+    byte codes and cell addresses without changing the global RNG or the existing scorer columns.
+    The code buffers travel with the checkpoint; the previous byte comes from the caller and is
+    never stored in the scorer.
     """
 
     #: State-dict version (``nn.Module`` convention): 2 since P2.3 added the EMA buffers.
@@ -399,6 +401,12 @@ class Scorer(nn.Module):
             extra = first.weight.new_empty(first.out_features, 2)
             std = 1 / math.sqrt(self.in_features) if cfg.init == "fan_in" else parse_init(cfg.init)
             nn.init.trunc_normal_(extra, std=std, a=-2 * std, b=2 * std, generator=generator)
+            if cfg.address_init is not None:
+                # The address columns start at one value for every unit (model.address_init): a
+                # route then follows the byte codes from the first step, and which feature a unit
+                # follows at which byte class is left to training. The draw above is kept, so the
+                # generator's later use is the same either way.
+                extra = torch.full_like(extra, float(cfg.address_init))
             first.weight = nn.Parameter(torch.cat([first.weight.detach(), extra], dim=1))
             first.in_features = self.in_features
             if isinstance(self.net, MLP2):

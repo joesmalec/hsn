@@ -284,6 +284,7 @@ def _block(
     consts: WindowConsts,
     mode: StepMode,
     controls: _Controls,
+    capture: bool = False,
 ) -> dict[str, Tensor]:
     """A block of consecutive positions (the compile unit): :meth:`HSN._position` at every column
     of ``z_b`` / ``c_b`` / ``s_b`` (``[B, n, …]``) with the column's reset ``r_b[:, i]``, the
@@ -291,7 +292,8 @@ def _block(
     ``(pos [B, n], pos_after [B, n])``: its ages are ``age`` at the block's first position (the
     window's start age in the first block, zeros after) and zeros afterwards, made here, so that
     no tensor is passed twice (dynamo specialises on aliased inputs). Returns the final state and
-    the block's per-position stacks."""
+    the block's per-position stacks; with ``capture`` (a diagnostic, no-grad window) also the
+    per-position cell states, gates and written masks of :meth:`HSN.forward`'s ``capture``."""
     state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
     n = int(z_b.shape[1])
     z_hats: list[Tensor] = []
@@ -302,6 +304,9 @@ def _block(
     logit_steps: list[Tensor] = []
     records: list[dict[str, Tensor]] = []
     readouts: list[Tensor] = []
+    hs: list[Tensor] = []
+    gates: list[Tensor] = []
+    written: list[Tensor] = []
     zero_age = torch.zeros_like(age) if dense_in is not None else None
     for i in range(n):
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
@@ -318,13 +323,18 @@ def _block(
             mode,
             controls,
             dense_rows,
-            False,
+            capture,
             counters,
             static=True,
             consts=consts,
             dense_indices=dense_indices,
         )
         state = result.state
+        if capture:
+            assert result.gate is not None and result.written is not None
+            hs.append(state.h.detach())
+            gates.append(result.gate)
+            written.append(result.written)
         if model.cfg.selected_readout:
             readouts.append(model._selected_readout(state, result.selection, controls.gate, mode))
         z_hats.append(result.z_hat)
@@ -352,6 +362,10 @@ def _block(
             out["sel_" + key] = _stack_record([r[key] for r in records])
     if readouts:
         out["readouts"] = torch.stack(readouts, dim=1)
+    if capture:
+        out["cap_h"] = torch.stack(hs, dim=1)
+        out["cap_gate"] = torch.stack(gates, dim=1)
+        out["cap_written"] = torch.stack(written, dim=1)
     return out
 
 
@@ -362,11 +376,13 @@ def _cat_record(parts: Sequence[Tensor]) -> Tensor:
 
 class CompiledWindow:
     """The compiled training window (:func:`compile_window`): called like
-    :meth:`HSN.forward` (``tokens``, ``ctx``, ``state``, ``reset``; ``capture`` refused,
-    ``reset_columns`` validated and otherwise unused, since every block resets as tensor ops) and
-    returning the same ``(logits, state, info)``. ``compile_seconds`` accumulates the wall time of
-    the calls that compiled or recorded (the first call of each new variant), ``calls`` counts
-    calls."""
+    :meth:`HSN.forward` (``tokens``, ``ctx``, ``state``, ``reset``; ``reset_columns`` validated
+    and otherwise unused, since every block resets as tensor ops) and returning the same
+    ``(logits, state, info)``. ``capture=True`` is the diagnostic window (the per-position cell
+    states, gates and written masks of :meth:`HSN.forward`): its own compiled variant, without
+    gradients only (a training window never captures). ``compile_seconds`` accumulates the wall
+    time of the calls that compiled or recorded (the first call of each new variant), ``calls``
+    counts calls."""
 
     def __init__(self, model: HSN, ctx: DeviceContext, mode: CompileMode, backend: Backend) -> None:
         self.model = model
@@ -376,15 +392,19 @@ class CompiledWindow:
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
         self._block = _compiler(mode, backend, ctx.device.type)(_block)
         self._bucket_blocks: dict[int, Any] = {0: self._block}
+        #: The capture variant's compiled blocks (their own code objects and recompile budgets).
+        self._capture_blocks: dict[int, Any] = {}
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
 
-    def variant(self, B: int, T: int, dense_bucket: int) -> tuple[object, ...]:
+    def variant(
+        self, B: int, T: int, dense_bucket: int, capture: bool = False
+    ) -> tuple[object, ...]:
         """What selects a compiled graph: batch, block, grad mode, training mode, gate, autocast
-        and the padded dense-fallback batch size."""
+        and the padded dense-fallback batch size (and the diagnostic capture)."""
         model = self.model
-        return (
+        key: tuple[object, ...] = (
             B,
             block_size(T),
             torch.is_grad_enabled(),
@@ -393,10 +413,11 @@ class CompiledWindow:
             torch.is_autocast_enabled(self.ctx.device.type),
             dense_bucket,
         )
+        return (*key, "capture") if capture else key
 
-    def is_new_variant(self, B: int, T: int, dense_bucket: int) -> bool:
+    def is_new_variant(self, B: int, T: int, dense_bucket: int, capture: bool = False) -> bool:
         """True when the next call with these properties compiles (or records) a graph."""
-        key = self.variant(B, T, dense_bucket)
+        key = self.variant(B, T, dense_bucket, capture)
         warm = (*key, "warm")
         if self.cuda_graphs:  # CUDA Graph trees warm up once, then record on the second call
             return key not in self._variants or warm not in self._variants
@@ -414,10 +435,12 @@ class CompiledWindow:
         prev_tokens: Tensor | None = None,
     ) -> WindowOut:
         model = self.model
-        if capture:
+        if not isinstance(capture, bool):
+            raise TypeError(f"capture must be a bool, got {capture!r}")
+        if capture and torch.is_grad_enabled():
             raise ValueError(
-                "capture=True runs eager: call the model's forward (the compiled window returns "
-                "no per-position states)"
+                "capture=True is the diagnostic window: call it under torch.no_grad() (a "
+                "training window returns no per-position states), or call the model's forward"
             )
         B, T = model._check_window_inputs(tokens, ctx, state, reset)
         if reset_columns is not None:
@@ -427,11 +450,20 @@ class CompiledWindow:
         dense_indices = model._dense_indices(dense_rows, bucket=True)
         dense_bucket = 0 if dense_indices is None else int(dense_indices.numel())
         controls = model._controls()
-        key = self.variant(B, T, dense_bucket)
-        new = self.is_new_variant(B, T, dense_bucket)
+        key = self.variant(B, T, dense_bucket, capture)
+        new = self.is_new_variant(B, T, dense_bucket, capture)
         started = time.perf_counter()
         out = self._run(
-            tokens, ctx, state, reset, mode, controls, dense_rows, prev_tokens, dense_indices
+            tokens,
+            ctx,
+            state,
+            reset,
+            mode,
+            controls,
+            dense_rows,
+            prev_tokens,
+            dense_indices,
+            capture=capture,
         )
         self.calls += 1
         if new:
@@ -452,6 +484,8 @@ class CompiledWindow:
         dense_rows: Tensor | None,
         prev_tokens: Tensor | None = None,
         dense_indices: Tensor | None = None,
+        *,
+        capture: bool = False,
     ) -> WindowOut:
         model = self.model
         T = int(tokens.shape[1])
@@ -472,13 +506,12 @@ class CompiledWindow:
             q = q.detach().requires_grad_(True)
         blocks: list[dict[str, Tensor]] = []
         bucket = 0 if dense_indices is None else int(dense_indices.numel())
-        if bucket not in self._bucket_blocks:
+        table = self._capture_blocks if capture else self._bucket_blocks
+        if bucket not in table:
             # Each shape bucket has its own Dynamo code object/recompile budget. A B32 window
             # needs at most six fallback shapes, independent of which row IDs were drawn.
-            self._bucket_blocks[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(
-                _block
-            )
-        block = self._bucket_blocks[bucket]
+            table[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
+        block = table[bucket]
         with model.cell.window():
             consts = model.cell.window_consts()
             for start in range(0, T, blk):
@@ -503,6 +536,7 @@ class CompiledWindow:
                     consts,
                     mode,
                     controls,
+                    capture,
                 )
                 h, q, age, pos = out["h"], out["q"], out["age"], out["pos"]
                 blocks.append(out)
@@ -525,12 +559,12 @@ class CompiledWindow:
             epss=joined("eps"),
             us=joined("u"),
             qs=joined("qs"),
-            hs=None,
+            hs=joined("cap_h") if capture else None,
             state_abs_max=torch.cat([b["state_abs_max"] for b in blocks]),
             unit_logits=joined("unit_logits_d"),
             routed=routed,
-            gates=None,
-            written=None,
+            gates=joined("cap_gate") if capture else None,
+            written=joined("cap_written") if capture else None,
             readouts=joined("readouts") if model.cfg.selected_readout else None,
         )
 
