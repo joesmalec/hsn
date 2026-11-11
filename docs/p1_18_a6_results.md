@@ -545,22 +545,58 @@ of the nine 9k runs end "partial" on the binding verdict.
    run still goes from about 82 % to 74.9 % by step 3,250 (the original is at 63.5 % by step
    3,000).
 
+**What the white paper already provides, all of it switched off in these runs.** The paper names
+the risk ("deciding what matters may require the computation the router avoids") and has three
+mechanisms against it (`HSN_Implementation_Plan.md` §1, §2.5, §2.6; chunks P2.2 to P2.4, all
+implemented). The A5 and A6 runs, the standard recipe included, train the router by the
+straight-through gradient of the training loss alone:
+
+| Mechanism | What it does about a takeover | Key | In the recipe |
+| --- | --- | --- | --- |
+| Utility from counterfactual probes (paper §6) | The score `U` is regressed onto the measured loss difference of executing a candidate. A score that predicts correctly stops moving, and it cannot outgrow real loss differences. | `train.lambda_u` (with `probe_fraction`, `n_probe`, `probe_horizon`) | 0 |
+| Dense fallback and exploration (paper §1: "mandatory design features, not options") | A share of the rows runs every cell, or a selected cell is swapped for a random one, so a unit that lost a route still executes there and can win it back. | `train.p_dense`, `train.epsilon_*` | 0 |
+| Balance loss (paper §7) | A unit is penalised in proportion to its share of the assignments. | `train.lambda_b` | 0 |
+
+A score that is trained to predict a loss difference has the property the amendment below would
+impose from outside. These come first.
+
 **What to try, in this order.**
 
 1. *Measure first* (read-only, on the kept checkpoints of exps 376, 421 and 417): the gradient on
    the scorer's address columns per unit and per kind of position between steps 1,500 and 4,000,
    to name the term behind point 3; and what changes in the cells while the router is held still
    (point 4).
-2. *Configuration only:* the routing controls of P2.2 that keep a gradient on the units that are
-   not selected, a straight-through temperature above 1 (`train.temperature_*`) and exploration
-   (`train.epsilon_*`), on three seeds to step 5,000 against exps 413 to 415.
-3. *The amendment* (a change to how the router is trained; opt-in, the forward pass unchanged):
-   make the router's applied step follow the size of its gradient, so that a learned route stops
-   moving. Two candidate forms: (a) the router group's capped step scaled by its current gradient
-   norm relative to a reference taken while the routes form, never above 1; (b) a ceiling on the
-   norm of each unit's row of the scorer's output layer, so that no unit out-scores the others by
-   growing. Either is a bound that holds from the first step, in place of the guard's halving
-   after the fact; the guard's readings stay as the measurement.
+2. *The paper's own mechanisms, configuration only, one at a time* (the paper's rule for
+   penalties), on three seeds to step 5,000 against exps 413 to 415 and then on the nine-run
+   comparison:
+   - the dense fallback, `train.p_dense` (it runs inside the compiled window);
+   - utility from counterfactual probes, `train.lambda_u` (a probe window adds rollouts: its
+     step time has to be measured against the 0.5 s limit first);
+   - the balance loss, `train.lambda_b`, at a small weight: it pushes toward equal use of the
+     units, and the solution that works here is not equal (one unit serves the filler);
+   - a constant straight-through temperature above 1 (`train.temperature_start` =
+     `temperature_end`; a ramp is not compiled);
+   - exploration, `train.epsilon_*`, only with approval or after the compiled window can draw
+     on the device: today it draws from the CPU generator at every position and runs eager,
+     over the step-time limit.
+3. *An amendment, only if step 2 does not hold* (a change to how the router is trained; opt-in,
+   the forward pass unchanged): make the router's applied step follow the size of its gradient,
+   so that a learned route stops moving. Two candidate forms: (a) the router group's capped step
+   scaled by its current gradient norm relative to a reference taken while the routes form,
+   never above 1; (b) a ceiling on the norm of each unit's row of the scorer's output layer, so
+   that no unit out-scores the others by growing. Form (a) is the less invasive: it touches the
+   optimiser's step only. Form (b) restricts what the scorer can represent and is the last
+   resort. Neither is in the paper; each more controller on a straight-through router moves away
+   from what the paper says the router is, an estimator of benefit against cost.
+
+**When** (the user, 11 Nov): these runs wait for P2.10 (the fused CUDA kernels). The mechanisms
+above act in the router's selection, the losses and the optimiser; P2.10's four ops are the
+selected cells' execution (gather, unit bank, messages, gated update), so neither should need
+the other changed. Two things follow. The fused kernels round differently, and two runs of one
+configuration already differ by up to 15 points, so the comparison's baseline (the recipe as it
+is) has to be run again on the new kernels rather than read from exps 421 to 432. And P2.10
+should be measured and tested on this recipe: the feedback cut and the A5 options change what a
+step computes around those ops.
 
 **What would count as fixed:** on the nine-run comparison of section 3e no run with a fall of ten
 points or more and a worst drawdown under 5 points; the binding verdict passed by most runs; and

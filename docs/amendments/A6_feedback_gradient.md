@@ -243,10 +243,12 @@ task, where the supervised positions are a query's key. Two earlier versions did
 **Open: the remaining erosion.** Left for now by the user's decision of 11 Nov; what to try is
 in `docs/p1_18_a6_results.md`, section 5b. In short: the router's proposed step is about ten times
 its cap, so it moves at a fixed pace whatever its gradient, and the units that lose a route also
-un-learn it. The proposal is to measure which gradient term does the un-learning, to try the
-existing straight-through temperature and exploration controls, and then an amendment that makes
-the router's applied step follow the size of its gradient (or bounds each unit's score row), so
-that a learned route stops moving. None of it has been run.
+un-learn it. The white paper has its own mechanisms against a takeover, and every A5 and A6 run
+has them off: utility trained from counterfactual probes (`train.lambda_u`), the dense fallback
+and exploration (`train.p_dense`, `train.epsilon_*`) and the balance loss (`train.lambda_b`).
+They come first, after a measurement of which gradient term does the un-learning. A further
+amendment (the router's applied step following the size of its gradient) is the fallback if they
+do not hold. None of it has been run; the runs wait for P2.10.
 
 ## Related: `model.address_init` (A5 extension, diagnostic)
 
