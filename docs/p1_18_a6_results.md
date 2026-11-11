@@ -545,16 +545,21 @@ of the nine 9k runs end "partial" on the binding verdict.
    run still goes from about 82 % to 74.9 % by step 3,250 (the original is at 63.5 % by step
    3,000).
 
-**What the white paper already provides, all of it switched off in these runs.** The paper names
-the risk ("deciding what matters may require the computation the router avoids") and has three
-mechanisms against it (`HSN_Implementation_Plan.md` §1, §2.5, §2.6; chunks P2.2 to P2.4, all
-implemented). The A5 and A6 runs, the standard recipe included, train the router by the
-straight-through gradient of the training loss alone:
+**What the white paper already provides, all of it switched off in these runs.** The paper
+(v1.0, 3 Nov 2026; quoted from its text) names the risk in §1: "deciding what matters may require
+the very computation the router is trying to avoid. Dense fallback, exploration, and
+delayed-relevance tests are therefore essential design features." Its risk register (§17) lists
+this symptom first, with likelihood and impact both high: "Router misses later-relevant
+information", trigger "Delayed recall falls >2 pp", response "add exploration/fallback, reconsider
+sparsity". The sags here are 5 to 21 points of delayed recall. The paper has three mechanisms
+against it (chunks P2.2 to P2.4 of `HSN_Implementation_Plan.md`, all implemented). The A5 and A6
+runs, the standard recipe included, train the router by the straight-through gradient of the
+training loss alone:
 
 | Mechanism | What it does about a takeover | Key | In the recipe |
 | --- | --- | --- | --- |
-| Utility from counterfactual probes (paper §6) | The score `U` is regressed onto the measured loss difference of executing a candidate. A score that predicts correctly stops moving, and it cannot outgrow real loss differences. | `train.lambda_u` (with `probe_fraction`, `n_probe`, `probe_horizon`) | 0 |
-| Dense fallback and exploration (paper §1: "mandatory design features, not options") | A share of the rows runs every cell, or a selected cell is swapped for a random one, so a unit that lost a route still executes there and can win it back. | `train.p_dense`, `train.epsilon_*` | 0 |
+| Utility from counterfactual probes (paper §6: "Utility means predicted reduction in downstream loss, not raw surprise") | The score `U` is regressed onto the measured loss difference of executing a candidate. A score that predicts correctly stops moving, and it cannot outgrow real loss differences. | `train.lambda_u` (with `probe_fraction`, `n_probe`, `probe_horizon`) | 0 |
+| Dense fallback and exploration (paper §1: "essential design features"; §6: they "reduce the bias from observing only selected routes") | A share of the rows runs every cell, or a selected cell is swapped for a random one, so a unit that lost a route still executes there and can win it back. | `train.p_dense`, `train.epsilon_*` | 0 |
 | Balance loss (paper §7) | A unit is penalised in proportion to its share of the assignments. | `train.lambda_b` | 0 |
 
 A score that is trained to predict a loss difference has the property the amendment below would
@@ -573,12 +578,15 @@ impose from outside. These come first.
    - utility from counterfactual probes, `train.lambda_u` (a probe window adds rollouts: its
      step time has to be measured against the 0.5 s limit first);
    - the balance loss, `train.lambda_b`, at a small weight: it pushes toward equal use of the
-     units, and the solution that works here is not equal (one unit serves the filler);
+     units, and the solution that works here is not equal (one unit serves the filler); the
+     paper says as much (§7: "forced uniform use can fight real specialization");
    - a constant straight-through temperature above 1 (`train.temperature_start` =
      `temperature_end`; a ramp is not compiled);
    - exploration, `train.epsilon_*`, only with approval or after the compiled window can draw
      on the device: today it draws from the CPU generator at every position and runs eager,
-     over the step-time limit.
+     over the step-time limit;
+   - the register's other response, reconsidering sparsity (more selected cells per position,
+     `model.k_select`), last: it changes the step's cost and with it the efficiency claim.
 3. *An amendment, only if step 2 does not hold* (a change to how the router is trained; opt-in,
    the forward pass unchanged): make the router's applied step follow the size of its gradient,
    so that a learned route stops moving. Two candidate forms: (a) the router group's capped step
