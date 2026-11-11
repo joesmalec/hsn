@@ -50,10 +50,17 @@ def _guard(**settings: object) -> tuple[RouteGuard, _Router]:
     return RouteGuard(router, cfg, n_units=3, vocab=4), router
 
 
-def _feed(guard: RouteGuard, table: list[list[int]], loss: float | None = None) -> None:
-    """One interval's slots (``table[byte][unit]``) and its training loss: 1.0 while the routes
-    are intact, 2.0 (worse than the best so far) once they are taken, unless given."""
+def _feed(
+    guard: RouteGuard,
+    table: list[list[int]],
+    loss: float | None = None,
+    read: tuple[int, int, int] = (100, 0, 0),
+) -> None:
+    """One interval's slots (``table[byte][unit]``), the slots per unit at supervised positions
+    (unit 0 reads the answers unless given) and the training loss: 1.0 while the routes are
+    intact, 2.0 (worse than the best so far) once they are taken, unless given."""
     guard.counts.copy_(torch.tensor(table, dtype=torch.int64).reshape(-1))
+    guard.read_counts.copy_(torch.tensor(read, dtype=torch.int64))
     guard.note_loss((1.0 if table is INTACT else 2.0) if loss is None else loss)
 
 
@@ -77,26 +84,30 @@ def test_default_is_off_and_keeps_the_hash() -> None:
         hsn_config(4, ON)  # dense routing has no routes to guard
 
 
-def test_lost_usage_reads_the_established_routes_of_the_bytes_that_lost_most() -> None:
+def test_lost_usage_reads_the_routes_a_reader_is_taking() -> None:
     reference = torch.tensor([[1.0, 0, 0], [0.2, 0.8, 0], [0, 0, 0], [0, 0, 0]]).double()
     established = reference >= 0.25  # the filler on unit 0, byte 1 on unit 1
-    lost, usage, shares, unit = lost_usage(torch.tensor(TAKEN), reference, established)
+    reader = torch.tensor([True, False, False])  # unit 0 serves the supervised positions
+    lost, usage, shares, unit = lost_usage(torch.tensor(TAKEN), reference, established, reader)
     assert shares[1].tolist() == pytest.approx([0.6, 0.4, 0.0])
-    assert lost == pytest.approx(0.5)  # byte 1's route kept half of its 80 %; the filler none lost
-    assert unit == 0  # the unit that took byte 1's slots
-    assert usage == pytest.approx((1000 * 1.0 + 100 * 0.8) / 1100)
+    assert lost == pytest.approx(0.5)  # byte 1's route on unit 1 kept half of its 80 %
+    assert unit == 0  # the reader that took byte 1's slots
+    assert usage == pytest.approx(100 * 0.8 / 1100)  # the other units' established routes
     # nothing established: no loss, whatever moved
-    assert lost_usage(torch.tensor(TAKEN), reference, torch.zeros_like(established))[::3] == (
-        0.0,
-        None,
-    )
-    # a share that grew is not a loss
+    nothing = torch.zeros_like(established)
+    assert lost_usage(torch.tensor(TAKEN), reference, nothing, reader)[::3] == (0.0, None)
+    # the reader below its own record on a byte is not taking it
     grown = torch.tensor([[1.0, 0, 0], [0.6, 0.4, 0], [0, 0, 0], [0, 0, 0]]).double()
-    assert lost_usage(torch.tensor(INTACT), grown, grown >= 0.25)[0] == pytest.approx(
-        (0.6 - 0.2) / 1.0
-    )  # byte 1's unit-0 route lost; its unit-1 route grew
+    assert lost_usage(torch.tensor(INTACT), grown, grown >= 0.25, reader)[0] == 0.0
+    # a route that moves between units that do not read the answers is not this event
+    moved = torch.tensor([[1000, 0, 0], [20, 30, 50], [0, 0, 0], [0, 0, 0]])
+    assert lost_usage(moved, reference, established, reader)[::3] == (0.0, None)
+    assert lost_usage(moved, reference, established, torch.tensor([False, False, True]))[::3] == (
+        pytest.approx(0.625),
+        2,
+    )
     # a byte with too few slots is left out
-    assert lost_usage(torch.tensor(TAKEN), reference, established, min_slots=500)[0] == 0.0
+    assert lost_usage(torch.tensor(TAKEN), reference, established, reader, min_slots=500)[0] == 0.0
 
 
 def test_event_halves_the_dominant_units_step_only() -> None:
@@ -158,19 +169,20 @@ def test_no_event_while_training_improves_or_before_a_route_has_persisted() -> N
     # a step without a finite loss is left out; an interval without any loss is never "worse"
     blind, _ = _guard(lost_fraction=0.1)
     for step, table in enumerate([INTACT, INTACT, TAKEN]):
-        blind.counts.copy_(torch.tensor(table, dtype=torch.int64).reshape(-1))
+        _feed(blind, table)
+        blind._loss_sum, blind._loss_n = 0.0, 0
         blind.note_loss(float("nan"))
         assert blind.check(100 * (step + 1)) is None
 
 
 def test_scale_has_a_floor_and_small_usage_is_ignored() -> None:
-    guard, _ = _guard(lost_fraction=0.1, reduce_factor=0.5, min_scale=0.25)
-    for step, table in enumerate([INTACT, TAKEN, INTACT, TAKEN, INTACT, TAKEN, INTACT, TAKEN]):
-        _feed(guard, table)
+    guard, _ = _guard(lost_fraction=0.1, reduce_factor=0.5, min_scale=0.5)
+    for step, table in enumerate([INTACT, TAKEN, TAKEN, MORE]):
+        _feed(guard, table, loss=float(step + 1))
         guard.check(100 * (step + 1))
-    # four events on unit 0, floored at min_scale
-    assert guard.scale.tolist() == [0.25, 1.0, 1.0]
-    assert [e["scale"] for e in guard.events] == [0.5, 0.25, 0.25, 0.25]
+    # two events on unit 0 (a reader at its own record again is not taking more), floored
+    assert guard.scale.tolist() == [0.5, 1.0, 1.0]
+    assert [(e["step"], e["scale"]) for e in guard.events] == [(200, 0.5), (400, 0.5)]
     quiet, _ = _guard(lost_fraction=0.1, min_usage=0.99)
     for table in (INTACT, INTACT, TAKEN):
         _feed(quiet, table)
@@ -183,10 +195,18 @@ def test_the_response_is_on_the_unit_that_gained_the_route() -> None:
         _feed(guard, INTACT)
         guard.check(step)
     # unit 2 takes byte 1's slots from unit 1 (the filler stays where it was)
-    _feed(guard, [[1000, 0, 0], [20, 30, 50], [0, 0, 0], [0, 0, 0]], loss=2.0)
-    event = guard.check(300)
-    assert event is not None and event["unit"] == 2
-    assert guard.scale.tolist() == [1.0, 1.0, 0.5]
+    moved = [[1000, 0, 0], [20, 30, 50], [0, 0, 0], [0, 0, 0]]
+    _feed(guard, moved, loss=2.0)  # unit 0 reads the answers: not its doing, no event
+    assert guard.check(300) is None and guard.last is not None
+    assert guard.last["readers"] == [0] and guard.last["gaining_unit"] is None
+    other, _ = _guard(lost_fraction=0.1)
+    for step in (100, 200):
+        _feed(other, INTACT, read=(50, 0, 50))
+        other.check(step)
+    _feed(other, moved, loss=2.0, read=(50, 0, 50))  # units 0 and 2 read the answers
+    event = other.check(300)
+    assert event is not None and event["unit"] == 2 and other.last["readers"] == [0, 2]
+    assert other.scale.tolist() == [1.0, 1.0, 0.5]
 
 
 def test_restore_puts_the_dominant_units_rows_back() -> None:
@@ -221,6 +241,7 @@ def test_state_round_trip() -> None:
     other.load_state_dict(guard.state_dict(), "x.pt")
     assert other.scale.tolist() == guard.scale.tolist() and other.events == guard.events
     assert torch.equal(other.counts, guard.counts)
+    assert torch.equal(other.read_counts, guard.read_counts)
     assert torch.equal(other.previous, guard.previous)
     assert other.check(400) == guard.check(400)
     with pytest.raises(ValueError, match="missing"):

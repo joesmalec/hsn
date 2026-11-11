@@ -12,26 +12,34 @@ the accuracy the route carried is lost (exps 375-377: 10 to 21 points; binding o
 to 0.16-0.19). The takeover is not tied to a step count: it began at step 1,500, 2,500 or 3,100
 depending on the settings and the run.
 
-**The measurement** needs no knowledge of the task and no extra forward pass. From every training
-window the guard counts, per input byte ``b`` and unit ``u``, the selection slots ``u`` won at
-positions whose input is ``b``. Every ``interval`` applied steps it reads the interval's shares
-``p[b, u]`` (unit ``u``'s share of byte ``b``'s slots)::
+**The measurement** needs no knowledge of the task beyond the loss mask and no extra forward
+pass. From every training window the guard counts, per input byte ``b`` and unit ``u``, the
+selection slots ``u`` won at positions whose input is ``b``, and per unit the slots it won at the
+supervised positions. Every ``interval`` applied steps it reads the interval's shares ``p[b, u]``
+(unit ``u``'s share of byte ``b``'s slots)::
 
+    readers          = units with at least ``specialised`` of the slots at supervised positions
+                       (the units whose routes feed the answers; in every run inspected the
+                       taker is one of them)
     reference[b, u]  = the largest share since the last event
     established      = routes (b, u) whose share was at least ``specialised`` at ``persistence``
                        consecutive readings (bytes with fewer than ``min_slots`` slots are left out)
-    lost[b]          = sum_u max(0, reference - p) / sum_u reference          (established routes)
-    lost             = the mean of lost[b] over the quarter of the bytes that lost most
-    gain[u]          = sum over those bytes of n[b] * max(0, p[b, u] - p_previous[b, u])
+    taken bytes      = bytes on which a reader's share is above its own reference
+    lost[b]          = sum_u max(0, reference - p) / sum_u reference    (other units' established
+                       routes)
+    lost             = the mean of lost[b] over the quarter of the taken bytes that lost most
+    gain[u]          = sum over those bytes of n[b] * max(0, p[b, u] - p_previous[b, u]), readers
 
 (a kind of position is a group of input bytes: the values are a quarter to a third of the bytes
-in use and two per cent of the slots, so a slot-weighted total would not see their routes go).
+in use and two per cent of the slots, so a slot-weighted total would not see their routes go; and
+routes that move between non-reader units, as the filler's do, are not this event: a guard that
+counted them slowed the wrong units, exps 402 to 404).
 
 At the start of a run the units sort the positions out while the loss falls: that is learning.
 So a reading is an event only if training is no longer improving: the interval's mean training
 loss is above the lowest interval mean so far by ``loss_rise``.
 
-**The response** is on the unit that gained the most of what the established routes lost. Its
+**The response** is on the reader that gained the most of what the established routes lost. Its
 *applied* step on its rows of the scorer's output layer is multiplied by ``reduce_factor`` (never
 below ``min_scale``): from then on every update of those rows is ``old + scale * (new - old)``,
 after the optimiser step and the caps. The other units keep their full step, so an established
@@ -63,37 +71,42 @@ def lost_usage(
     counts: Tensor,
     reference: Tensor,
     established: Tensor,
+    readers: Tensor,
     min_slots: int = 1,
     previous: Tensor | None = None,
 ) -> tuple[float, float, Tensor, int | None]:
-    """``(lost, usage, shares, gaining unit)`` of one interval's ``counts [V, U]`` against
-    ``reference [V, U]`` over the ``established [V, U]`` routes of the bytes with at least
-    ``min_slots`` slots (module docstring). ``usage`` is those routes' reference share of all
-    slots; ``lost`` is 0 and the unit None when no established route lost a slot. The gaining
-    unit is the one whose share of the losing bytes grew most since ``previous`` (the last
-    reading's shares; the reference when not given)."""
+    """``(lost, usage, shares, gaining reader)`` of one interval's ``counts [V, U]`` against
+    ``reference [V, U]`` (module docstring): over the bytes with at least ``min_slots`` slots on
+    which a reader unit (``readers``, bool ``[U]``) holds a larger share than it ever has, the
+    share of the other units' ``established [V, U]`` routes that is gone, averaged over the
+    quarter of those bytes that lost most. ``usage`` is the other units' established routes'
+    reference share of all slots; ``lost`` is 0 and the unit None when no reader is taking an
+    established route. The gaining reader is the one whose share of those bytes grew most since
+    ``previous`` (the last reading's shares; the reference when not given)."""
     counts = counts.to(torch.float64)
     per_byte = counts.sum(dim=1)
     total = float(per_byte.sum())
     shares = torch.where(
         per_byte[:, None] > 0, counts / per_byte[:, None].clamp_min(1.0), torch.zeros_like(counts)
     )
-    live = established & (per_byte[:, None] >= min_slots)
-    base = (reference * live).sum(dim=1)  # per byte: the established routes' reference share
+    others = established & ~readers[None, :] & (per_byte[:, None] >= min_slots)
+    base = (reference * others).sum(dim=1)  # per byte: the other units' established share
     usage = float((per_byte * base).sum() / total) if total > 0 else 0.0
-    held = base > 0
-    n_held = int(held.sum())
-    if n_held == 0:
+    rising = ((shares - reference) * readers[None, :]).clamp_min(0.0).sum(dim=1) > 0
+    taken = (base > 0) & rising  # bytes where a reader is above its own record
+    n_taken = int(taken.sum())
+    if n_taken == 0:
         return 0.0, usage, shares, None
-    drop = ((reference - shares).clamp_min(0.0) * live).sum(dim=1)
-    relative = torch.where(held, drop / base.clamp_min(1e-12), torch.zeros_like(drop))
-    worst = relative.topk(max(1, -(-n_held // 4)))  # the quarter of the bytes that lost most
+    drop = ((reference - shares).clamp_min(0.0) * others).sum(dim=1)
+    relative = torch.where(taken, drop / base.clamp_min(1e-12), torch.zeros_like(drop))
+    worst = relative.topk(max(1, -(-n_taken // 4)))  # the quarter of those bytes that lost most
     lost = float(worst.values.mean())
     if lost <= 0.0:
         return 0.0, usage, shares, None
     rows = worst.indices[worst.values > 0]
     before = reference if previous is None else previous
     gain = (per_byte[rows, None] * (shares[rows] - before[rows]).clamp_min(0.0)).sum(dim=0)
+    gain = gain * readers
     unit = int(gain.argmax()) if float(gain.max()) > 0.0 else None
     return lost, usage, shares, unit
 
@@ -118,6 +131,8 @@ class RouteGuard:
             raise ValueError("train.route_guard: the scorer's output layer is not trainable")
         device = self.params[0].device
         self.counts = torch.zeros(vocab * n_units, dtype=torch.int64, device=device)
+        #: per unit, the slots won at supervised positions in the interval
+        self.read_counts = torch.zeros(n_units, dtype=torch.int64, device=device)
         #: the applied-step scale of every unit's rows (1: untouched)
         self.scale = torch.ones(n_units, dtype=self.params[0].dtype, device=device)
         self.reference = torch.zeros(vocab, n_units, dtype=torch.float64)  # CPU
@@ -137,13 +152,16 @@ class RouteGuard:
     # every window ----------------------------------------------------------------------------
 
     @torch.no_grad()
-    def observe(self, tokens: Tensor, info: Mapping[str, Tensor]) -> None:
-        """Count a window's selection slots per (input byte, unit); a dense window has none."""
+    def observe(self, tokens: Tensor, loss_mask: Tensor, info: Mapping[str, Tensor]) -> None:
+        """Count a window's selection slots per (input byte, unit) and, at the supervised
+        positions (``loss_mask [B, T]``), per unit; a dense window has none."""
         if "unit_idx" not in info:
             return
-        units, valid = info["unit_idx"], info["valid"]
-        index = tokens.to(torch.int64).unsqueeze(-1) * self.n_units + units.to(torch.int64)
-        self.counts.index_add_(0, index.reshape(-1), valid.reshape(-1).to(torch.int64))
+        units, valid = info["unit_idx"].to(torch.int64), info["valid"].to(torch.int64)
+        index = tokens.to(torch.int64).unsqueeze(-1) * self.n_units + units
+        self.counts.index_add_(0, index.reshape(-1), valid.reshape(-1))
+        supervised = valid * loss_mask.to(torch.int64).unsqueeze(-1)
+        self.read_counts.index_add_(0, units.reshape(-1), supervised.reshape(-1))
 
     def note_loss(self, loss: float) -> None:
         """A step's mean training loss (a non-finite one is left out)."""
@@ -178,7 +196,9 @@ class RouteGuard:
         """Read the interval's counts (one host copy) and decide; the event's record, or None."""
         # a copy: on the CPU .cpu() would alias the counts that are zeroed next
         counts = self.counts.view(self.vocab, self.n_units).to(device="cpu", copy=True)
+        read = self.read_counts.to(device="cpu", copy=True).to(torch.float64)
         self.counts.zero_()
+        self.read_counts.zero_()
         self.checks += 1
         loss = self._loss_sum / self._loss_n if self._loss_n else None
         self._loss_sum, self._loss_n = 0.0, 0
@@ -194,8 +214,9 @@ class RouteGuard:
         established = (self.streak >= self.cfg.persistence) & (
             self.reference >= self.cfg.specialised
         )
+        readers = read >= self.cfg.specialised * read.sum().clamp_min(1.0)
         lost, usage, shares, unit = lost_usage(
-            counts, self.reference, established, self.cfg.min_slots, self.previous
+            counts, self.reference, established, readers, self.cfg.min_slots, self.previous
         )
         self.previous = shares.clone()
         self.last = {
@@ -203,6 +224,7 @@ class RouteGuard:
             "lost": lost,
             "established_usage": usage,
             "gaining_unit": unit,
+            "readers": [u for u in range(self.n_units) if bool(readers[u])],
             "loss": loss,
             "worse": worse,
         }
@@ -259,6 +281,7 @@ class RouteGuard:
     def state_dict(self) -> dict[str, Any]:
         return {
             "counts": self.counts.detach().to(device="cpu", copy=True),
+            "read_counts": self.read_counts.detach().to(device="cpu", copy=True),
             "scale": self.scale.detach().to(device="cpu", copy=True),
             "reference": self.reference.clone(),
             "previous": self.previous.clone(),
@@ -291,6 +314,10 @@ class RouteGuard:
         ):
             raise ValueError(f"{path}: route_guard state does not fit this model")
         self.counts.copy_(counts.to(self.counts.device))
+        read = state.get("read_counts")
+        if not isinstance(read, Tensor) or tuple(read.shape) != tuple(self.read_counts.shape):
+            raise ValueError(f"{path}: route_guard state does not fit this model")
+        self.read_counts.copy_(read.to(self.read_counts.device))
         self.scale.copy_(scale.to(device=self.scale.device, dtype=self.scale.dtype))
         reference, streak = state.get("reference"), state.get("streak")
         if (

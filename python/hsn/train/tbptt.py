@@ -871,7 +871,7 @@ class TBPTTTrainer(Trainer):
                 if window_active is not None:
                     active = window_active if active is None else active | window_active
                 if self.route_guard is not None:  # A6: slots per (input byte, unit)
-                    self.route_guard.observe(fwd["tokens"], info)
+                    self.route_guard.observe(fwd["tokens"], fwd["loss_mask"], info)
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
                 loss_mask = fwd["loss_mask"]
