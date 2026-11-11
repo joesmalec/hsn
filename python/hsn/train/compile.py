@@ -528,6 +528,8 @@ def _tape_block(
     mode: StepMode,
     controls: _Controls,
     fused: bool = False,
+    dense_rows: Tensor | None = None,
+    dense_indices: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """A block of consecutive positions of the split window's forward sweep (P2.10,
     :mod:`hsn.train.split`): :func:`_block` without autograd and with a tape. Per position it
@@ -537,9 +539,11 @@ def _tape_block(
     (``sel_cell_idx`` / ``sel_unit_idx`` / ``sel_valid`` ``[B, n, K]``, the straight-through
     threshold ``tape_theta [B, n]``), the summary after the position (``qs``) and the updated
     states of the selected slots (``tape_hsel [B, n, K, d]``, cell 0 on padded slots). The replay
-    recomputes everything else with autograd from these. Sparse hard-gate rounds without dense
-    fallback only (:func:`hsn.train.split.scope_error`). ``fused`` (``hardware.window=fused``)
-    runs the round as the fused CUDA op (:func:`_fused_position`) instead of the native ops.
+    recomputes everything else with autograd from these. Sparse hard-gate rounds
+    (:func:`hsn.train.split.scope_error`); the rows of ``dense_rows`` (P2.2's dense fallback,
+    with ``dense_indices`` as in :func:`_block`) run the dense round, as in any window. ``fused``
+    (``hardware.window=fused``, no dense rows) runs the round as the fused CUDA op
+    (:func:`_fused_position`) instead of the native ops.
     ``consts=None``: ``model`` is a :class:`SweepTwin`'s twin and the window constants are its
     buffers."""
     if consts is None:
@@ -581,12 +585,12 @@ def _tape_block(
                 s_b[:, i],
                 mode,
                 controls,
-                None,
+                dense_rows,
                 False,
                 None,
                 static=True,
                 consts=consts,
-                dense_indices=None,
+                dense_indices=dense_indices,
             )
             state = result.state
             assert result.selection is not None
@@ -649,7 +653,7 @@ class CompiledWindow:
         self._capture_blocks: dict[int, Any] = {}
         #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
         #: compiled function for the native round and one for the fused round.
-        self._tape_blocks: dict[tuple[bool, bool], Any] = {}
+        self._tape_blocks: dict[tuple[bool, bool, int], Any] = {}
         self._sweep_twin: SweepTwin | None = None
         self.calls = 0
         self.compile_seconds = 0.0
@@ -738,6 +742,8 @@ class CompiledWindow:
         *,
         fused: bool = False,
         twin: bool = True,
+        dense_rows: Tensor | None = None,
+        dense_indices: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """The split window's forward sweep (P2.10, :mod:`hsn.train.split`): the compiled
         :func:`_tape_block` over the window, under ``torch.no_grad()`` in training mode. Returns
@@ -748,6 +754,7 @@ class CompiledWindow:
         model = self.model
         B, T = (int(n) for n in reset.shape)
         use_twin = twin and not fused
+        bucket = 0 if dense_indices is None else int(dense_indices.numel())
         key: tuple[object, ...] = (
             B,
             block_size(T),
@@ -756,11 +763,13 @@ class CompiledWindow:
             torch.is_autocast_enabled(self.ctx.device.type),
             "tape-fused" if fused else "tape",
             use_twin,
+            bucket,
         )
         warm = (*key, "warm")
         new = key not in self._variants or (self.cuda_graphs and warm not in self._variants)
         started = time.perf_counter()
-        slot = (fused, use_twin)
+        # as the autograd window: one compiled function per padded dense-fallback batch size
+        slot = (fused, use_twin, bucket)
         if slot not in self._tape_blocks:
             self._tape_blocks[slot] = _compiler(self.mode, self.backend, self.ctx.device.type)(
                 _tape_block
@@ -782,6 +791,8 @@ class CompiledWindow:
             block_size(T),
             fused=fused,
             twin=sweep,
+            dense_rows=dense_rows,
+            dense_indices=dense_indices,
         )
         if self.cuda_graphs:  # the final state would be overwritten by the next replay
             for name in ("h", "q", "age", "pos"):
@@ -900,6 +911,8 @@ def run_tape(
     *,
     fused: bool = False,
     twin: SweepTwin | None = None,
+    dense_rows: Tensor | None = None,
+    dense_indices: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """The forward sweep of a split window (:func:`_tape_block` as ``block``, compiled or not)
     over blocks of ``blk`` positions, without autograd: the joined tape (:data:`TAPE_KEYS`) and
@@ -909,7 +922,10 @@ def run_tape(
         raise RuntimeError("the split window's forward sweep runs under torch.no_grad()")
     T = int(reset.shape[1])
     mode = model._window_mode()
-    controls = model._controls()
+    # The sweep takes the hard decision only (gate=None): the same slots, threshold and probes
+    # as the step's gate, whose gradient path (the soft unit weights and cell mask) the replay
+    # rebuilds from the recorded slots. Nothing here would read it.
+    controls = model._controls()._replace(gate=None)
     z, context, scalars = pro.z.detach(), pro.context.detach(), pro.scalars.detach()
     h, q, age, pos = state.h, state.q, state.age, state.pos
     blocks: list[dict[str, Tensor]] = []
@@ -937,6 +953,8 @@ def run_tape(
                 mode,
                 controls,
                 fused,
+                dense_rows,
+                dense_indices,
             )
             h, q, age, pos = out["h"], out["q"], out["age"], out["pos"]
             blocks.append(out)

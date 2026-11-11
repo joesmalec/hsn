@@ -112,7 +112,9 @@ def _objective(logits: Tensor, info: dict[str, Tensor], mask: Tensor) -> Tensor:
     return task + 0.7 * pred + 0.3 * cost + 0.2 * balance
 
 
-def _both(cfg: RunConfig, *, loss_positions: bool = True) -> tuple[dict, dict, dict, dict]:
+def _both(
+    cfg: RunConfig, *, loss_positions: bool = True, draw_seed: int = 0
+) -> tuple[dict, dict, dict, dict]:
     """(reference grads, split grads, reference info, split info) on one window with interior
     resets and a carried, non-zero start state in one row."""
     model = _model(cfg)
@@ -128,10 +130,12 @@ def _both(cfg: RunConfig, *, loss_positions: bool = True) -> tuple[dict, dict, d
     names = [n for n, _ in model.named_parameters()]
     params = [p for _, p in model.named_parameters()]
 
+    torch.manual_seed(draw_seed)  # the dense-fallback draw of the window (train.p_dense)
     logits, ref_state, ref_info = model(tokens, ctx, state, reset)
     ref = torch.autograd.grad(_objective(logits, ref_info, mask), params, allow_unused=True)
 
     window = SplitWindow(model, cfg, None)
+    torch.manual_seed(draw_seed)
     s_logits, s_state, s_info = window(tokens, ctx, state, reset)
     got = torch.autograd.grad(_objective(s_logits, s_info, mask), params, allow_unused=True)
 
@@ -189,6 +193,63 @@ def test_split_gradients_with_padded_slots() -> None:
     _assert_same_grads(ref, got)
 
 
+@pytest.mark.parametrize("draw_seed", [0, 1, 2, 3])
+def test_split_gradients_with_dense_fallback_rows(draw_seed: int) -> None:
+    """``train.p_dense``: the rows drawn for the dense round are replayed through the dense
+    step and their own recurrence; the other rows are untouched by them."""
+    cfg = _cfg(*RECIPE, "train.p_dense=0.5", "model.lambda_cost=0.05")
+    ref, got, ref_info, s_info = _both(cfg, draw_seed=draw_seed)
+    _assert_same_grads(ref, got)
+    torch.testing.assert_close(s_info["dense_fallback"], ref_info["dense_fallback"])
+    for key in ("cost", "expected_cost", "eps_abs_mean", "alpha_entropy"):
+        torch.testing.assert_close(s_info[key], ref_info[key], rtol=1e-9, atol=1e-12)
+
+
+def test_dense_fallback_draws_cover_mixed_and_full_windows() -> None:
+    """The four draws above are not all of one kind: some rows dense, and all or none."""
+    cfg = _cfg(*RECIPE, "train.p_dense=0.5")
+    model = _model(cfg)
+    state = _start(model, cfg.train.batch)
+    counts = set()
+    for seed in range(4):
+        torch.manual_seed(seed)
+        rows = model._draw_dense_rows(cfg.train.batch, state)
+        counts.add(0 if rows is None else int(rows.sum()))
+    assert len(counts) >= 2 and any(0 < n < cfg.train.batch for n in counts)
+
+
+def test_dense_recurrence_equals_autograd() -> None:
+    from hsn.train.split import dense_recurrence_backward
+
+    g = torch.Generator().manual_seed(5)
+    Bd, T, N, d = 2, 7, 4, 3
+    f64 = torch.float64
+    c = torch.rand(Bd, T, N, d, generator=g, dtype=f64, requires_grad=True)
+    b = torch.rand(Bd, T, N, d, generator=g, dtype=f64, requires_grad=True)
+    reset = torch.zeros(Bd, T, dtype=torch.bool)
+    reset[0, 0] = reset[1, 3] = True
+    w_pre = torch.randn(Bd, T, d, generator=g, dtype=f64)
+    w_post = torch.randn(Bd, T, d, generator=g, dtype=f64)
+    h = torch.rand(Bd, N, d, generator=g, dtype=f64)
+    q = h.mean(dim=1)
+    total = torch.zeros((), dtype=f64)
+    olds = []
+    for t in range(T):
+        h = h.masked_fill(reset[:, t, None, None], 0)
+        q = q.masked_fill(reset[:, t, None], 0)
+        total = total + (q * w_pre[:, t]).sum()
+        olds.append(h.detach())
+        h = (1 - b[:, t]) * h + b[:, t] * c[:, t]
+        q = h.mean(dim=1)
+        total = total + (q * w_post[:, t]).sum()
+    want_c, want_b = torch.autograd.grad(total, [c, b])
+    got_c, got_b = dense_recurrence_backward(
+        c.detach(), b.detach(), torch.stack(olds, dim=1), reset, N, w_pre, w_post
+    )
+    torch.testing.assert_close(got_c, want_c, rtol=1e-12, atol=1e-14)
+    torch.testing.assert_close(got_b, want_b, rtol=1e-12, atol=1e-14)
+
+
 def test_split_gradients_without_selected_readout() -> None:
     cfg = _cfg(*ROUTED, ALL)
     ref, got, _, _ = _both(cfg)
@@ -219,7 +280,6 @@ def test_split_window_without_loss_positions_gives_the_same_none_set() -> None:
         (*A5, "train.feedback_detach=[eps,state,router]"),
         (*A5,),
         ("model.routing=topk", "train.gate_mode=soft", ALL),
-        (*A5, ALL, "train.p_dense=0.25"),
         (*A5, ALL, "train.epsilon_start=0.1", "train.epsilon_end=0.1"),
         (*A5, ALL, "train.state_grad_clip=1.0"),
         (*A5, ALL, "train.lambda_u=0.1", "train.probe_horizon=4"),

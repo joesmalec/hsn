@@ -46,9 +46,15 @@ window's to bf16 rounding, not bit for bit: a batched matmul rounds differently 
 ones, and its weight gradient is rounded to bf16 once per window (as the encoder's and the
 decoder's already are) where the per-position gradients were summed in fp32.
 
+Dense-fallback rows (``train.p_dense``). A row that runs the dense round for a window is replayed
+through :meth:`~hsn.model.cell.PDGCell.step_dense` (every cell, the softmax mix of the units) and
+has its own recurrence (:func:`dense_recurrence_backward`): every cell is written,
+``q' = mean(h')`` does not read ``q``, so with ``g = A + R / N`` the sweep is ``dĉ = b ⊙ g``,
+``db̂ = (c − h) ⊙ g``, ``A = (1 − b) ⊙ g`` and ``R`` restarts at ``P_t``. Its readout is ``q``.
+
 Scope (:func:`scope_error`; anything else keeps the autograd window): routed ``topk`` with the
-``ste`` gate at every step, all four feedback paths cut, no dense fallback, no exploration, no
-state-gradient clip, no disabled cells, one round, no loss scaler.
+``ste`` gate at every step, all four feedback paths cut, no exploration, no counterfactual
+probes, no state-gradient clip, no disabled cells, one round, no loss scaler.
 """
 
 from __future__ import annotations
@@ -69,7 +75,16 @@ from hsn.model.router import Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.train.compile import CompiledWindow, WindowOut, _tape_block, run_tape
 
-__all__ = ["SplitWindow", "StateRecurrence", "recurrence_backward", "scope_error"]
+__all__ = [
+    "SplitWindow",
+    "StateRecurrence",
+    "dense_recurrence_backward",
+    "recurrence_backward",
+    "scope_error",
+]
+
+#: The most memory a window's dense-fallback replay may take (:meth:`SplitWindow.__call__`).
+DENSE_BYTES = 4 << 30
 
 
 def scope_error(cfg: RunConfig) -> str | None:
@@ -90,8 +105,6 @@ def scope_error(cfg: RunConfig) -> str | None:
             f"train.feedback_detach lacks {missing}: without the full feedback cut the heavy "
             "backward work is not local to its position"
         )
-    if train.p_dense > 0.0:
-        return f"train.p_dense={train.p_dense}: dense-fallback rows run the dense round"
     if train.epsilon_start > 0.0 or train.epsilon_end > 0.0:
         return "train.epsilon_*: exploration draws are not replayed"
     if train.lambda_u > 0.0:
@@ -163,17 +176,57 @@ def recurrence_backward(
     return dc, db
 
 
+def dense_recurrence_backward(
+    c: Tensor,
+    b: Tensor,
+    h_old: Tensor,
+    reset: Tensor,
+    n_cells: int,
+    d_q_pre: Tensor | None,
+    d_q_post: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    """The sweep of the rows that ran the dense round (module docstring, "Dense-fallback rows"):
+    ``(dL/dc, dL/db)``, each ``[B', T, N, d]``, from ``c``, ``b``, ``h_old`` ``[B', T, N, d]``
+    (every cell of every position), ``reset [B', T]`` and the cotangents of ``q`` before and
+    after each position (``[B', T, d]`` or ``None``). The vector-Jacobian product of
+    ``h' = (1 − b) h + b c``, ``q' = mean(h')`` and the reset over the window."""
+    Bd, T, N, d = (int(n) for n in c.shape)
+    assert N == int(n_cells)
+    A = c.new_zeros(Bd, N, d)
+    R = c.new_zeros(Bd, d)
+    dc = torch.zeros_like(c)
+    db = torch.zeros_like(b)
+    for t in range(T - 1, -1, -1):
+        if d_q_post is not None:
+            R = R + d_q_post[:, t]
+        g = A + (R / N)[:, None, :]
+        b_t = b[:, t]
+        dc[:, t] = b_t * g
+        db[:, t] = (c[:, t] - h_old[:, t]) * g
+        A = (1 - b_t) * g
+        R = torch.zeros_like(R) if d_q_pre is None else d_q_pre[:, t]
+        row = reset[:, t]
+        A = A.masked_fill(row[:, None, None], 0)
+        R = R.masked_fill(row[:, None], 0)
+    return dc, db
+
+
 #: The sweep :class:`StateRecurrence` runs: the reference above unless a faster implementation of
 #: the same contract was installed (the CUDA kernel of :mod:`hsn.kernels.window`, on CUDA tensors).
 RecurrenceFn = Callable[..., tuple[Tensor, Tensor] | None]
 _fast_recurrence: RecurrenceFn | None = None
 
 
-def set_fast_recurrence(fn: RecurrenceFn | None) -> None:
-    """Install (or, with ``None``, remove) a faster :func:`recurrence_backward`. It is called
-    with the same arguments and must return ``None`` for inputs it does not handle."""
-    global _fast_recurrence
+_fast_dense_recurrence: RecurrenceFn | None = None
+
+
+def set_fast_recurrence(fn: RecurrenceFn | None, dense: RecurrenceFn | None = None) -> None:
+    """Install (or, with ``None``, remove) a faster :func:`recurrence_backward` (and
+    :func:`dense_recurrence_backward`). Each is called with the reference's arguments and must
+    return ``None`` for inputs it does not handle."""
+    global _fast_recurrence, _fast_dense_recurrence
     _fast_recurrence = fn
+    _fast_dense_recurrence = dense
 
 
 class StateRecurrence(torch.autograd.Function):
@@ -182,17 +235,23 @@ class StateRecurrence(torch.autograd.Function):
     the linear sweep that yields ``dL/dĉ`` and ``dL/db̂``. The outputs are *recorded* values, not
     recomputed from ``ĉ`` / ``b̂`` (they agree to the rounding of the replay's batched matmuls),
     so the node is not a forward/backward pair in the ``gradcheck`` sense; its backward is exact
-    for the recorded trajectory."""
+    for the recorded trajectory. ``c_dense`` / ``b_dense`` (``[B', T, N, d]`` or ``None``) are
+    the dense-fallback rows' candidates and gates (``tape["dense_ids"]`` names the rows)."""
 
     @staticmethod
     def forward(
         ctx: FunctionCtx,
         c: Tensor,
         b: Tensor,
+        c_dense: Tensor | None,
+        b_dense: Tensor | None,
         tape: dict[str, Tensor],
         n_cells: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        ctx.save_for_backward(c, b)
+        if c_dense is None or b_dense is None:
+            ctx.save_for_backward(c, b)
+        else:
+            ctx.save_for_backward(c, b, c_dense, b_dense)
         ctx.tape = tape  # type: ignore[attr-defined]
         ctx.n_cells = n_cells  # type: ignore[attr-defined]
         # fresh tensors: the tape's own are read as constants elsewhere in the replay
@@ -202,9 +261,12 @@ class StateRecurrence(torch.autograd.Function):
     @once_differentiable
     def backward(
         ctx: FunctionCtx, d_q_pre: Tensor | None, d_q_post: Tensor | None, d_h_sel: Tensor | None
-    ) -> tuple[Tensor, Tensor, None, None]:
-        c, b = ctx.saved_tensors  # type: ignore[attr-defined]
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, None, None]:
+        saved = ctx.saved_tensors  # type: ignore[attr-defined]
+        c, b = saved[0], saved[1]
+        c_dense, b_dense = (saved[2], saved[3]) if len(saved) == 4 else (None, None)
         tape: dict[str, Tensor] = ctx.tape  # type: ignore[attr-defined]
+        n_cells: int = ctx.n_cells  # type: ignore[attr-defined]
         args = (
             c,
             b,
@@ -212,7 +274,7 @@ class StateRecurrence(torch.autograd.Function):
             tape["cells"],
             tape["valid"],
             tape["reset"],
-            ctx.n_cells,  # type: ignore[attr-defined]
+            n_cells,
             d_q_pre,
             d_q_post,
             d_h_sel,
@@ -221,7 +283,25 @@ class StateRecurrence(torch.autograd.Function):
         if result is None:
             result = recurrence_backward(*args)
         dc, db = result
-        return dc, db, None, None
+        if c_dense is None or b_dense is None:
+            return dc, db, None, None, None, None
+        # the dense-fallback rows: their slots were not executed (zeros), their cells all were
+        rows = tape["dense_ids"]
+        dc = dc.index_fill(0, rows, 0)
+        db = db.index_fill(0, rows, 0)
+        dense_args = (
+            c_dense,
+            b_dense,
+            tape["h_dense_old"],
+            tape["reset"].index_select(0, rows),
+            n_cells,
+            None if d_q_pre is None else d_q_pre.index_select(0, rows),
+            None if d_q_post is None else d_q_post.index_select(0, rows),
+        )
+        dense = _fast_dense_recurrence(*dense_args) if _fast_dense_recurrence is not None else None
+        if dense is None:
+            dense = dense_recurrence_backward(*dense_args)
+        return dc, db, dense[0], dense[1], None, None
 
 
 def _scorer_logits(
@@ -337,23 +417,73 @@ class SplitWindow:
                 f"gate={controls.gate!r}, epsilon={controls.epsilon!r}"
             )
         mode = model._window_mode()
+        # P2.2's dense fallback: drawn here, once per row per window, as the autograd window does
+        rng = torch.get_rng_state()
+        dense_rows = model._draw_dense_rows(B, state)
+        dense_ids: Tensor | None = None
+        dense_indices: Tensor | None = None
+        if dense_rows is not None:
+            dense_ids = dense_rows.nonzero().flatten()
+            if self.fused or self._dense_replay_bytes(int(dense_ids.numel()), T) > DENSE_BYTES:
+                # the fused round has no dense rows; a window with too many would not fit the
+                # batched replay: the autograd window runs it, from the same draw
+                torch.set_rng_state(rng)
+                return self.fallback(
+                    tokens,
+                    ctx,
+                    state,
+                    reset,
+                    reset_columns=reset_columns,
+                    prev_tokens=prev_tokens,
+                )
+            dense_indices = model._dense_indices(dense_rows, bucket=self.compiled is not None)
         pro = model._window_prologue(
             tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
         )
         started = time.perf_counter()
         with torch.no_grad():
             if self.compiled is not None:
-                tape = self.compiled.tape(pro, state, reset, fused=self.fused)
+                tape = self.compiled.tape(
+                    pro,
+                    state,
+                    reset,
+                    fused=self.fused,
+                    dense_rows=dense_rows,
+                    dense_indices=dense_indices,
+                )
             else:
-                tape = run_tape(_tape_block, model, pro, state, reset, T)
+                tape = run_tape(
+                    _tape_block,
+                    model,
+                    pro,
+                    state,
+                    reset,
+                    T,
+                    dense_rows=dense_rows,
+                    dense_indices=dense_indices,
+                )
         swept = time.perf_counter()
-        out = self._replay(pro, tape, reset, B, T)
+        out = self._replay(pro, tape, reset, B, T, dense_ids)
         self.calls += 1
         self.last_phase_seconds = {"sweep": swept - started, "replay": time.perf_counter() - swept}
         return out
 
+    def _dense_replay_bytes(self, rows: int, T: int) -> int:
+        """A bound on the memory of replaying ``rows`` dense-fallback rows: every unit's hidden
+        layer for every cell of every position, about three times over (the activation, what
+        its backward keeps, its gradient)."""
+        cfg = self.model.cfg
+        width = 2 if torch.is_autocast_enabled(next(self.model.parameters()).device.type) else 4
+        return 3 * rows * T * cfg.n_cells * cfg.n_units * cfg.hidden * width
+
     def _replay(
-        self, pro: _Prologue, tape: dict[str, Tensor], reset: Tensor, B: int, T: int
+        self,
+        pro: _Prologue,
+        tape: dict[str, Tensor],
+        reset: Tensor,
+        B: int,
+        T: int,
+        dense_ids: Tensor | None = None,
     ) -> WindowOut:
         model = self.model
         cfg = model.cfg
@@ -383,6 +513,10 @@ class SplitWindow:
         unit_logits = _scorer_logits(
             model.scorer, u_s.detach(), eps_s.detach(), h_pre, age_pre, scalars
         ).to(dtype)  # [R, N, M]
+        dense_r: Tensor | None = None
+        if dense_ids is not None:
+            dense_b = torch.zeros(B, dtype=torch.bool, device=reset.device)
+            dense_r = dense_b.index_fill(0, dense_ids, True)[:, None].expand(B, T).reshape(R)
         selection = model.router.finish_recorded(
             unit_logits,
             cells,
@@ -392,9 +526,32 @@ class SplitWindow:
             mode=cfg.routing,
             gate=controls.gate,
             temperature=controls.tau,
+            dense_rows=dense_r,
         )
+        c_dense: Tensor | None = None
+        b_dense: Tensor | None = None
+        h_dense_old: Tensor | None = None
         with cell.window():
             c, b = cell.replay_sparse(u_s, eps_s, h_pre, selection)  # [R, K, d]
+            if dense_ids is not None:
+                # the rows that ran the dense round: every cell, the softmax mix of the units
+                Bd = int(dense_ids.numel())
+
+                def rows(x: Tensor) -> Tensor:
+                    picked = x.reshape(B, T, *x.shape[1:]).index_select(0, dense_ids)
+                    return picked.reshape(Bd * T, *x.shape[1:])
+
+                h_dense_old = rows(h_pre)
+                dense_state = CellGraphState._make(
+                    h=h_dense_old,
+                    q=rows(q_pre),
+                    age=rows(age_pre),
+                    pos=torch.zeros(Bd * T, dtype=torch.int64, device=reset.device),
+                )
+                alpha = torch.softmax(rows(unit_logits), dim=-1)
+                _, dense_info = cell.step_dense(rows(u_s), rows(eps_s), dense_state, alpha)
+                c_dense = dense_info["c"].reshape(Bd, T, N, d)
+                b_dense = dense_info["b"].reshape(Bd, T, N, d)
 
         safe = cells.masked_fill(~valid, 0)
         recurrence_tape = {
@@ -406,8 +563,12 @@ class SplitWindow:
             "q_post": tape["qs"],
             "h_sel": tape["tape_hsel"],
         }
+        if dense_ids is not None:
+            assert h_dense_old is not None
+            recurrence_tape["dense_ids"] = dense_ids
+            recurrence_tape["h_dense_old"] = h_dense_old.reshape(-1, T, N, d)
         q_pre_n, q_post_n, h_sel_n = StateRecurrence.apply(
-            c.reshape(B, T, K, d), b.reshape(B, T, K, d), recurrence_tape, N
+            c.reshape(B, T, K, d), b.reshape(B, T, K, d), c_dense, b_dense, recurrence_tape, N
         )
 
         # the reads of the state that carry gradient: P, the selected readout, the decoder
@@ -428,7 +589,11 @@ class SplitWindow:
             "route_log_prob": selection.log_prob.reshape(B, T),
             "explored": tape["explored"],
             "refreshed": tape["refreshed"],
-            "dense_fallback": torch.zeros(T, dtype=torch.float32, device=reset.device),
+            "dense_fallback": (
+                torch.zeros(T, dtype=torch.float32, device=reset.device)
+                if dense_r is None
+                else dense_r.reshape(B, T).float().mean(dim=0)
+            ),
         }
         final = CellGraphState._make(h=tape["h"], q=tape["q"], age=tape["age"], pos=tape["pos"])
         return model._window_epilogue(

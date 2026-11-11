@@ -1674,6 +1674,7 @@ class Router(nn.Module):
         mode: SelectionMode,
         gate: GateMode | None,
         temperature: float = 1.0,
+        dense_rows: Tensor | None = None,
     ) -> Selection:
         """The :class:`Selection` of a decision that was already taken (P2.10, the split window's
         replay): ``cells`` / ``units`` / ``valid`` (``[B, K]``) and the threshold ``θ [B]`` are the
@@ -1681,8 +1682,10 @@ class Router(nn.Module):
         recomputed with autograd. Nothing is decided again: the hard values (``alpha``, the masks,
         the cost) follow the recorded slots exactly, and ``logits`` only supply the gradient path
         of ``gate`` (:meth:`_finish`). No probes are flagged (``explored`` / ``refreshed`` are
-        the recording's) and no row is a dense fallback."""
-        B, _, _ = self._check_logits(logits)
+        the recording's). ``dense_rows`` (bool ``[B]``) are the rows that ran the dense step
+        instead (:meth:`select`'s ``dense_rows``)."""
+        B, N, _ = self._check_logits(logits)
+        dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
         if mode not in SCORED_MODES:
             raise ValueError(f"finish_recorded needs a scored mode {SCORED_MODES}, got {mode!r}")
         tau = self._check_gate_args(mode, gate, temperature, 0.0)
@@ -1702,7 +1705,7 @@ class Router(nn.Module):
             log_prob=torch.zeros(B, dtype=torch.float32, device=device),
             explored=none,
             refreshed=none,
-            dense=None,
+            dense=dense,
         )
 
     @staticmethod
