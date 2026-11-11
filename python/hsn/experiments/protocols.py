@@ -806,6 +806,8 @@ def _train(
             audit_keys=audit_keys,
         )
     averaged = trainer.install_averaged_weights()
+    # A6: the route-takeover guard (HSN, opt-in)
+    route_guard = getattr(trainer, "route_guard", None)
     measured = dict(history.measured)
     arm.walls["train_s"] = float(measured.get("train_seconds", 0.0)) - diag.seconds
     arm.walls["compile_s"] = float(measured.get("compile_seconds") or 0.0)
@@ -863,6 +865,8 @@ def _train(
         # the last step's dev evaluation of the training weights (an evaluation entry; None
         # without the average, where "evals" already are the training weights')
         "training_weights_final": training_weights,
+        # A6: the route-takeover guard's events and final router step scale (None: off)
+        "route_guard": route_guard.report() if route_guard is not None else None,
     }
     record = arm.record  # P1.14: filled in place, so that a later stage's failure keeps it
     record.clear()

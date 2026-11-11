@@ -1,0 +1,77 @@
+# A6 + A4, the route-takeover guard (10 Nov 2026).
+#
+# The sag of exps 375-377 is the router's dominant unit taking the value-write positions over
+# from the units that bind a value to its key (route_flip.py on exp 376: the dedicated units hold
+# 63 % of those slots at step 1,500, 44 % at 2,000, 14 % at 3,000, 5 % at 4,000). Fixed settings
+# only delay it (halved caps, exp 388: 93.1 % at step 3,000, 77.9 % at 5,500; lr 1.5e-3, exp 387:
+# 93.7 % at 4,000, 85 % at 6,000), and a loss-triggered rate cut does not reach it, because the
+# router's proposed step is about ten times its cap (exp 389: the dominant unit's address weight
+# kept growing at the same pace while every rate was cut 4 to 32 times).
+#
+# `train.route_guard` acts on the event itself, at whatever step it happens: when an established
+# minority route loses a tenth of its usage to the dominant unit while the training loss is no
+# longer improving, the applied router step of the dominant unit's rows is halved.
+#
+# Arms: the configuration that sagged (exp 376: seed 1, caps 0.003, lr 2.5e-3) with the guard, to
+# step 5,000 of the 9,000-step schedule, scored on averaged weights.
+#   guard          the defaults (a reading every 100 steps, an event at 10 % lost);
+#   guard_restore  the gaining unit's rows are also put back to the last intact reading;
+#   guard_fast     a reading every 50 steps, an event at 5 % lost, with the restore.
+name: p1_18_a6_guard
+description: "A6 + A4 with the route-takeover guard (seed 1, to step 5,000, against exp 376)"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - model.routing=topk
+    - model.cand_norm=rms
+    - model.key_address=true
+    - model.selected_readout=true
+    - train.optimizer=lazy_adamw
+    - train.gate_mode=ste
+    - train.lr=2.5e-3
+    - train.betas=[0.9,0.95]
+    - train.probe_horizon=null
+    - train.spike_factor=null
+    - train.rollback_every=null
+    - train.grad_norm_precision=float64
+    - train.feedback_detach=[summary,eps,state,router]
+    - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+    - train.update_limit.norm_floor=1e-12
+    - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+    - train.weight_ema=0.99
+    - train.route_guard.enabled=true
+protocol:
+  name: reads_state
+  version: 3
+  steps: 5000
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [1]
+arms:
+  - name: guard
+    family: hsn
+  - name: guard_restore
+    family: hsn
+    overrides:
+      - train.route_guard.restore=true
+  - name: guard_fast
+    family: hsn
+    overrides:
+      - train.route_guard.restore=true
+      - train.route_guard.interval=50
+      - train.route_guard.lost_fraction=0.05

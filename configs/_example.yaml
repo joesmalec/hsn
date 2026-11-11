@@ -79,6 +79,17 @@ train: # Appendix A.3
     norm_growth_limits: {} # optional group -> ceiling as a multiple of its initial norm (>=1)
     groups: {} # name -> {selectors: [parameter-name globs], max_ratio: relative L2 cap}
     norm_floor: 1.0e-12 # denominator floor for groups with zero/small weight norm
+  route_guard: # A6, opt-in: when a minority route is being taken over, halve the gaining unit's router step
+    enabled: false
+    interval: 100 # applied steps between readings of the per-(input byte, unit) slot counts
+    lost_fraction: 0.1 # the event: this share of the established bytes' minority-unit usage is gone
+    specialised: 0.25 # a byte is established once this share of its slots was on non-dominant units ...
+    persistence: 3 # ... at this many consecutive readings
+    loss_rise: 0.02 # an event only while the interval's training loss is this far above the lowest so far
+    min_usage: 0.001 # no event while minority units hold less than this share of all slots
+    reduce_factor: 0.5 # the gaining unit's router-row step scale is multiplied by this at an event
+    min_scale: 0.015625 # ... down to this
+    restore: false # also put those rows back to their values at the last check with the routes intact
   gradient_growth: # reversible damping of selected groups when raw gradient medians rise
     enabled: false # requires groups; adaptive_lr, rollback and spike skipping must be off
     groups: {} # arbitrary group name -> list of parameter-name globs

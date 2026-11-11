@@ -364,6 +364,34 @@ class AdaptiveLRConfig(_StrictModel):
     trial_increases: bool = True
 
 
+class RouteGuardConfig(_StrictModel):
+    """``train.route_guard`` (A6, opt-in; :mod:`hsn.train.route_guard`): when an established
+    minority route is being taken over by the dominant router unit, halve that unit's applied
+    router step, at whatever step it happens. Disabled preserves existing training and hashes."""
+
+    enabled: bool = False
+    # applied optimiser steps between two readings of the per-(input byte, unit) slot counts
+    interval: int = Field(default=100, ge=1)
+    # the event: this share of the established bytes' minority-unit usage is gone
+    lost_fraction: float = Field(default=0.1, gt=0.0, lt=1.0, allow_inf_nan=False)
+    # a byte is established once this share of its slots has been on non-dominant units at
+    # `persistence` consecutive readings
+    specialised: float = Field(default=0.25, gt=0.0, le=1.0, allow_inf_nan=False)
+    persistence: int = Field(default=3, ge=1)
+    # ... and only while training is no longer improving: the interval's mean training loss is
+    # above the lowest interval mean so far by this fraction (the dominant unit absorbing
+    # positions while the loss falls is learning, not a takeover)
+    loss_rise: float = Field(default=0.02, ge=0.0, allow_inf_nan=False)
+    # no event while the minority units hold less than this share of all slots
+    min_usage: float = Field(default=0.001, ge=0.0, lt=1.0, allow_inf_nan=False)
+    # the response: the step scale of the dominant unit's scorer rows is multiplied by this,
+    # down to min_scale
+    reduce_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
+    min_scale: float = Field(default=0.015625, gt=0.0, le=1.0, allow_inf_nan=False)
+    # also put those rows back to their values at the last check with the routes intact
+    restore: bool = False
+
+
 class UpdateLimitGroup(_StrictModel):
     """One joint L2 trust region, selected by model parameter-name globs."""
 
@@ -442,6 +470,7 @@ class TrainConfig(_StrictModel):
     adaptive_lr: AdaptiveLRConfig = AdaptiveLRConfig()
     update_limit: UpdateLimitConfig = UpdateLimitConfig()
     gradient_growth: GradientGrowthConfig = GradientGrowthConfig()
+    route_guard: RouteGuardConfig = RouteGuardConfig()  # A6, opt-in; hash-omitted at its default
     # --- end P1.13 ---
     # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
     # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
@@ -964,6 +993,8 @@ class RunConfig(_StrictModel):
                 )
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
+            if self.train.route_guard.enabled:
+                raise ValueError("train.route_guard (A6) is HSN-only")
             if self.train.state_grad_clip is not None or self.train.state_grad_ratio is not None:
                 raise ValueError(
                     "train.state_grad_clip and train.state_grad_ratio (A6) are HSN-only"
@@ -986,6 +1017,8 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 "train.router_lr_mult requires learned routing (topk or greedy_budget)"
             )
+        if routing in ("dense", "random", "fixed") and train.route_guard.enabled:
+            raise ValueError("train.route_guard requires learned routing (topk or greedy_budget)")
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
         if train.gate_mode == "reinforce" and routing != "topk":
             raise ValueError(
@@ -1267,6 +1300,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_init",
     "train.state_grad_ratio",
     "train.weight_ema",
+    "train.route_guard",
 )
 
 

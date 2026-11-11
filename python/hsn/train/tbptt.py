@@ -226,6 +226,7 @@ from hsn.train.probes import (
     utility_predictions,
     window_split,
 )
+from hsn.train.route_guard import RouteGuard
 from hsn.train.schedules import SelectionSchedule
 
 __all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer", "trailing_cut"]
@@ -389,6 +390,17 @@ class TBPTTTrainer(Trainer):
         # A5's previous byte belongs to the stream, not CellGraphState's versioned layout.
         self._prev_tokens: Tensor | None = None
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
+        # A6: the route-takeover guard (train.route_guard; None: off)
+        self.route_guard: RouteGuard | None = (
+            RouteGuard(
+                model.router,
+                cfg.train.route_guard,
+                n_units=cfg.model.n_units,
+                vocab=cfg.model.vocab_size,
+            )
+            if cfg.train.route_guard.enabled
+            else None
+        )
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
         # P1.10d: the trailing-padding cut (exact in math under dense routing only, to rounding in
         # floats since P1.10a; module docstring)
@@ -858,6 +870,8 @@ class TBPTTTrainer(Trainer):
                 window_active = self._window_active_units(info)
                 if window_active is not None:
                     active = window_active if active is None else active | window_active
+                if self.route_guard is not None:  # A6: slots per (input byte, unit)
+                    self.route_guard.observe(fwd["tokens"], info)
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
                 loss_mask = fwd["loss_mask"]
@@ -929,6 +943,8 @@ class TBPTTTrainer(Trainer):
                 before = self._adaptive_before_step(skipped)
                 self._limit_before_step(skipped)
                 self._growth_before_step(skipped, grad_norm, growth_norms)
+                if self.route_guard is not None and not skipped:
+                    self.route_guard.capture()
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
@@ -952,6 +968,8 @@ class TBPTTTrainer(Trainer):
                     self.optimizer.step(**step_kwargs)
                 self._limit_after_step(applied)
                 self._growth_after_step(applied)
+                if self.route_guard is not None and applied:
+                    self.route_guard.apply()  # A6: the router's step at the guard's scale
                 if applied:
                     for hook in self.update_post_hooks:
                         hook(self)
@@ -973,6 +991,26 @@ class TBPTTTrainer(Trainer):
             dependency_total += probe_counts["probe_dependency_total"]
             mean_total = total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
+            if self.route_guard is not None:
+                self.route_guard.note_loss(mean_loss)
+            if (
+                self.route_guard is not None
+                and self.step % self.cfg.train.route_guard.interval == 0
+            ):
+                event = self.route_guard.check(self.step)
+                if event is not None:
+                    logger.warning(
+                        "route guard at step %d: %.0f %% of the established minority-unit usage "
+                        "lost to unit %d; its router step scale %.4g -> %.4g%s",
+                        self.step,
+                        100 * event["lost"],
+                        event["unit"],
+                        event["scale_before"],
+                        event["scale"],
+                        ""
+                        if event["restored_from"] is None
+                        else f"; router restored from step {event['restored_from']}",
+                    )
             accuracy = float(correct) / n_loss if n_loss else float("nan")
             if self.scaler is None and not math.isfinite(mean_total) and not skipped:
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
@@ -1088,6 +1126,14 @@ class TBPTTTrainer(Trainer):
                 self._compiled.compile_seconds if self._compiled is not None else 0.0
             ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
+            **(
+                {
+                    "route_guard_events": float(len(self.route_guard.events)),
+                    "route_guard_scale": float(self.route_guard.scale.min()),
+                }
+                if self.route_guard is not None
+                else {}
+            ),
             **self._spike_measured(),  # P1.15
             **self._rollback_measured(),  # P1.16
             **(
@@ -1155,6 +1201,11 @@ class TBPTTTrainer(Trainer):
             ),
             **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
             **self._ema_extra(),  # A6: the averaged weights (train.weight_ema)
+            **(
+                {"route_guard": self.route_guard.state_dict()}
+                if self.route_guard is not None
+                else {}
+            ),
         }
 
     def _counters(self) -> dict[str, Any]:
@@ -1235,6 +1286,8 @@ class TBPTTTrainer(Trainer):
         self.resyncs = counters["resyncs"]
         self._restore_guard(extra, str(path))  # P1.12
         self._restore_ema(extra, str(path))  # A6
+        if self.route_guard is not None:
+            self.route_guard.load_state_dict(extra.get("route_guard"), str(path))
         if "reinforce_baseline" in extra:
             baseline = extra["reinforce_baseline"]
             if baseline is not None and (
