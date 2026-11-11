@@ -8,6 +8,10 @@
 #   dense    train.p_dense: a sample runs the dense step with this probability, so a unit that
 #            lost a position still executes there (paper section 1, "dense fallback")
 #   balance  train.lambda_b: the balance loss, mild (paper section 7)
+#   softwarm train.soft_until_step=1000: the paper's soft-gate warm-up (section 6: "Warm up with
+#            soft gates, then use hard selection"): for the first 1,000 steps every cell executes
+#            under the soft mask, so every unit is observed everywhere before the hard selection
+#            starts; the recipe has no warm-up. Autograd window only.
 #   utility  train.lambda_u: the scorer regressed onto counterfactual probes (paper section 6);
 #            autograd window only (the split window does not cover the probes)
 #   executed train.unit_credit=executed: NOT one of the paper's mechanisms and not configuration
@@ -129,3 +133,19 @@ arms:
     family: hsn
     overrides:
       - train.unit_credit=executed
+  - name: native_softwarm
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+  - name: split_temp050
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.5
+      - train.temperature_end=0.5
+  - name: split_temp035
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.35
+      - train.temperature_end=0.35
