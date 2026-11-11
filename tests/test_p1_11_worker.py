@@ -7,7 +7,9 @@ nvidia-smi, an idle CPU) and hides CUDA from every child; the scheduler's GPU ca
 
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -134,6 +136,77 @@ def _worker(db: dbm.Database, tmp: Path, **options: Any) -> Worker:
     return Worker(db, tmp / "runs", WorkerOptions(**options), log=lambda m: None)
 
 
+def test_diagnostic_deadline_pauses_then_kills_only_owned_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = dbm.Database(db_path())
+    enqueue_spec(db, dry_spec(tmp_path, n=2))
+    first, foreign = _claim_all(db)
+    protocol = json.dumps({"name": "spike_diagnostic", "timeout_s": 10})
+    for exp_id in (first, foreign):
+        _set(
+            db,
+            exp_id,
+            protocol_json=protocol,
+            pid=1000 + exp_id,
+            pgid=1000 + exp_id,
+            started_at="1970-01-01T00:00:00+00:00",
+        )
+    worker = _worker(db, tmp_path)
+    worker.adopted.add(first)
+    signals = []
+    monkeypatch.setattr(worker.machine, "pid_alive", lambda *args: True)
+    monkeypatch.setattr(worker.machine, "process_groups", lambda: {1000 + first: 1000 + first})
+    monkeypatch.setattr("hsn.experiments.worker.time.time", lambda: 20.0)
+    monkeypatch.setattr("hsn.experiments.worker.os.kill", lambda *args: signals.append(args))
+    monkeypatch.setattr("hsn.experiments.worker.os.killpg", lambda *args: signals.append(args))
+    worker.enforce_deadlines()
+    assert signals == [(1000 + first, signal.SIGALRM)] and db.paused
+    monkeypatch.setattr("hsn.experiments.worker.time.time", lambda: 31.0)
+    worker.enforce_deadlines()
+    assert signals[-1] == (1000 + first, signal.SIGKILL)
+    assert db.experiment(first)["status"] == "failed"
+    assert db.experiment(foreign)["status"] == "running"
+
+
+def test_diagnostic_head_cannot_be_bypassed_and_must_fit_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = dbm.Database(db_path())
+    enqueue_spec(db, dry_spec(tmp_path, n=2))
+    first, second = [r["exp_id"] for r in db.queued()]
+    _set(
+        db,
+        first,
+        protocol_json=json.dumps({"name": "spike_diagnostic", "timeout_s": 100}),
+        timing=1,
+    )
+    turn = tmp_path / "turn.json"
+    turn.write_text(
+        json.dumps(
+            {
+                "owner": "A5",
+                "status": "active",
+                "released_at": None,
+                "start": "1970-01-01T00:00:00Z",
+                "end": "1970-01-01T00:10:00Z",
+            }
+        )
+    )
+    worker = _worker(db, tmp_path, turn_file=turn, turn_owner="A5")
+    launches = []
+    monkeypatch.setattr(worker, "spawn", lambda e: launches.append(e["exp_id"]) or e["exp_id"])
+    monkeypatch.setattr("hsn.experiments.worker.time.time", lambda: 100.0)
+    # Head needs the idle streak. The younger CPU job could fit, but must not pass it.
+    assert worker.launch((Card(), {})) is None and not launches
+    worker.idle_since = 0
+    monkeypatch.setattr("hsn.experiments.worker.time.time", lambda: 500.0)
+    assert worker.launch((Card(), {})) is None  # 100-second budget + drain no longer fits
+    monkeypatch.setattr("hsn.experiments.worker.time.time", lambda: 450.0)
+    assert worker.launch((Card(), {})) == first
+    assert launches == [first] and db.experiment(second)["status"] == "queued"
+
+
 @pytest.mark.parametrize("requeue", [False, True])
 def test_p1_11_worker_recovers_dead_running_row(tmp_path: Path, requeue: bool) -> None:
     db = dbm.Database(db_path())
@@ -243,6 +316,7 @@ def test_p1_11_queue_side_imports_no_torch() -> None:
         "import sys\n"
         "import hsn.experiments.cli, hsn.experiments.db, hsn.experiments.spec\n"
         "import hsn.experiments.rules\n"
+        "import hsn.experiments.controller\n"
         "import hsn.experiments.scheduler, hsn.experiments.machine, hsn.experiments.worker\n"
         "import hsn.experiments.report, hsn.experiments.importer, hsn.experiments.run_arm\n"
         "loaded = sorted(m for m in sys.modules if m.startswith('torch'))\n"

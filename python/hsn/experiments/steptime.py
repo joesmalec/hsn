@@ -166,7 +166,7 @@ def enqueue_refusal(arm: Any, estimate: tuple[float, int] | None) -> str | None:
     """Why the expanded arm ``arm`` (:class:`hsn.experiments.spec.Arm`) may not be queued under the
     step-time rule (module docstring), or None."""
     protocol = arm.protocol
-    if protocol.name == "dry_run":
+    if protocol.name in ("dry_run", "spike_diagnostic"):
         return None
     limit = float(protocol.max_step_s)
     approval = str(protocol.step_time_approval).strip()

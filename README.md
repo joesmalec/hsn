@@ -40,6 +40,25 @@ Bare `cargo` commands build PyO3 against `.venv/bin/python` (see `.cargo/config.
 `uv sync` before `cargo test`. A test that needs a GPU is marked `@pytest.mark.cuda` or
 `@pytest.mark.mps` and skips when the device is absent.
 
+For faster CPU regression runs, the `dev` extra includes `pytest-xdist`. Use eight workers on the
+shared 32-logical-CPU development host (start with four on smaller machines) and
+keep each file together so its module fixtures are reused. Bound each worker's numerical and
+compiler threads to avoid oversubscribing the host:
+
+```bash
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  TORCHINDUCTOR_COMPILE_THREADS=1 uv run --no-sync pytest -q -n 8 --dist=loadfile --durations=20
+```
+
+Run affected files during iteration (for example, `tests/test_adaptive_lr.py` and
+`tests/test_adaptive_evidence.py`), then the full CPU suite before completion. Keep CUDA tests
+sequential on a shared card: `uv run --no-sync pytest -q -n 0 -m cuda`. Both commands must respect
+the shared compute window. The default pytest invocation remains sequential.
+
+On 9 November 2026 the same 956 CPU tests passed in 460.65 s sequentially, 115.52 s with four
+workers, and 71.43 s with eight (136 device skips in each run). These are local measured runtimes,
+with existing compiler caches, rather than a guarantee for other machines.
+
 ## Hardware profiles
 
 Chunks never name a device; they refer to a profile (plan §3.1 and Appendix E):
@@ -65,7 +84,9 @@ uv pip install --index-url https://download.pytorch.org/whl/cu132 torch==2.15.0 
 uv pip install --index-url https://download.pytorch.org/whl/cpu torch==2.15.0     # CPU-only Linux
 ```
 
-Optional extras: `uv sync --extra cuda` (pynvml, for the energy meter) and `--extra viz` (matplotlib).
+Optional extras: `uv sync --extra cuda` (nvidia-ml-py, for the energy meter) and `--extra viz`
+(matplotlib). NVIDIA's bindings retain the `pynvml` import name; the deprecated `pynvml`
+distribution is not required.
 
 ## Continuous integration
 

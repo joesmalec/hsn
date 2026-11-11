@@ -1,0 +1,76 @@
+# A6 screening, second batch (10 Nov 2026): the per-row state-gradient clip
+# (train.state_grad_clip) on the A5 recipe, full backpropagation through time otherwise.
+# The first batch (p1_18_a6_screen) showed that cutting every feedback read keeps training stable
+# but learns slowly (0.44 dev at step 3,500 against 0.72 for full BPTT). The clip leaves a healthy
+# window's gradient alone (healthy rows stay under 0.12 in h, 0.7 in q, from step 1,500 to 8,500
+# of exp 346) and limits the rows that blow up. Seed 2, as the first batch.
+name: p1_18_a6_clip
+description: "A6 state-gradient clip on the A5 recipe: seed-2 screen against exps 345/346"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - model.routing=topk
+    - model.cand_norm=none
+    - model.key_address=true
+    - model.selected_readout=true
+    - train.optimizer=lazy_adamw
+    - train.gate_mode=ste
+    - train.lr=2.5e-3
+    - train.betas=[0.9,0.95]
+    - train.probe_horizon=null
+    - train.spike_factor=null
+    - train.rollback_every=null
+    - train.grad_norm_precision=float64
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [2]
+arms:
+  # the clip alone: no update caps, every gradient path kept
+  - name: clip4
+    family: hsn
+    overrides:
+      - train.state_grad_clip=4.0
+  # a tighter limit (3x the largest healthy row in h)
+  - name: clip2
+    family: hsn
+    overrides:
+      - train.state_grad_clip=2.0
+  # the clip on exp 346's anchored-cap recipe
+  - name: clip4_anchored
+    family: hsn
+    overrides:
+      - train.state_grad_clip=4.0
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+  # the scale-free limit: a row at most 3x the batch's typical live row at each position
+  - name: ratio3
+    family: hsn
+    overrides:
+      - train.state_grad_ratio=3.0
+  - name: ratio3_anchored
+    family: hsn
+    overrides:
+      - train.state_grad_ratio=3.0
+      - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+      - train.update_limit.norm_floor=1e-12
+      - 'train.update_limit.norm_growth_limits={routing: 1.0}'

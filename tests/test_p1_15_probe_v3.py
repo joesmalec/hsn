@@ -389,3 +389,37 @@ def test_p1_15_probe_rerun_and_report_v3(
     row = build_report(db, per_seed=True).rows[0]
     assert row["v3_vocab"] == stored["probe_v3"]["vocab_size"]
     assert row["swap_follow"] == stored["probe_v3"]["swap/follow_frac"]
+
+
+def test_probes_through_the_padded_compiled_window_match_eager() -> None:
+    """The probes of a compiled trainer replay its evaluation window, padded to that window's one
+    shape (:class:`hsn.experiments.probe.PaddedWindow`): the same answers as the eager forward,
+    for v1 and v3, whatever the probe batch; a batch that does not fit is refused."""
+    from hsn.train.compile import compile_window
+    from hsn.train.tbptt import _CompiledEval
+
+    cfg = tiny_hsn_config("model.routing=topk", "train.gate_mode=ste")
+    seed_everything(0)
+    model = build_model(cfg)
+    assert isinstance(model, torch.nn.Module)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(0.2 * torch.randn_like(p))
+    dev = _full_dev(24)
+    ctx = cpu_ctx()
+    window = compile_window(model, ctx, "reduce-overhead", backend="aot_eager")
+    width = 256  # the documents' window (the tiny configuration trains on a shorter unroll)
+    padded = probe.PaddedWindow(_CompiledEval(model, window), 16, width)
+    eager_v1 = probe.edit_probe(model, ctx, dev, batch_rows=6, margins=True)
+    fast_v1 = probe.edit_probe(padded, ctx, dev, batch_rows=16, margins=True)
+    assert [r["argmax_original"] for r in fast_v1] == [r["argmax_original"] for r in eager_v1]
+    assert [r["argmax_modified"] for r in fast_v1] == [r["argmax_modified"] for r in eager_v1]
+    for a, b in zip(fast_v1, eager_v1, strict=True):
+        assert a["margin_original"] == pytest.approx(b["margin_original"], rel=1e-3, abs=1e-4)
+    eager_v3, eager_orig = probe.edit_probe_v3(model, ctx, dev, batch_rows=6)
+    fast_v3, fast_orig = probe.edit_probe_v3(padded, ctx, dev, batch_rows=16)
+    assert fast_orig == eager_orig and fast_v3 == eager_v3
+    assert model.training == padded.training
+    small = probe.PaddedWindow(_CompiledEval(model, window), 4, width)
+    with pytest.raises(ValueError, match="does not fit"):
+        probe.edit_probe(small, ctx, dev, batch_rows=6)

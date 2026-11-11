@@ -110,6 +110,10 @@ def test_p1_16_failed_run_partial_from_checkpoint(failed_run: dict[str, Any]) ->
     assert partial["final"]["eval_step"] == 8 and "split/later/accuracy" in partial["final"]
     assert set(partial["probes"]) == {"probe", "probe_v2", "probe_v3"}
     assert "gate/write_rate" in partial["trained"]
+    latest = record["latest_saved"]
+    assert latest["from_step"] == 16 and "error" not in latest
+    assert "diagnostic only" in latest["reason"]
+    assert _result(db, exp_id)["final_dev_accuracy"] is None
     # pruning: the pinned checkpoint before the first event (8) and the newest kept one (16) stay
     run_dir = _run_dir(db, exp_id)
     assert sorted(p.name for p in run_dir.glob("step_*.pt")) == [
@@ -122,6 +126,7 @@ def test_p1_16_failed_run_partial_from_checkpoint(failed_run: dict[str, Any]) ->
     report = build_report(db, sweep="p116fail", per_seed=True)
     (row,) = report.rows
     assert "partial from step 8 (dev " in row["failure"]
+    assert "latest saved step 16 (dev " in row["failure"]
 
 
 def test_p1_16_probe_rerun_from_dump(failed_run: dict[str, Any]) -> None:

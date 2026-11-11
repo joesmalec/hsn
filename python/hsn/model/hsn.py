@@ -94,13 +94,32 @@ the statistics, ``info``) — which the compiled window reuses: it compiles bloc
 the unit bank's static pass) and the window's constants passed as tensors
 (:class:`~hsn.model.cell.WindowConsts`). The eager path is unchanged, bit for bit.
 
+A6 (``train.feedback_detach``, ``docs/amendments/A6_feedback_gradient.md``; opt-in): the feedback
+reads of the recurrent state can be constants in the backward pass, with every forward value
+unchanged. ``summary``: ``S`` reads ``q_{t−1}.detach()``; ``eps``: the cell and the scorer read
+``z_t − ẑ_t.detach()`` (``StepOutput.eps`` and the prediction loss keep ``ẑ_t``'s gradient into
+``P`` and ``q``); ``state``: the cell's units, gate and messages read ``h.detach()``
+(:attr:`PDGCell.detach_state_read`); ``router``: the scorer's features are detached, so a
+selection gradient trains the scorer's weights only. With all four the state's backward recurrence
+is the gated carry ``(1 − b) ⊙ h`` and the linear summary update, whose Jacobian has no singular
+value above 1: a gradient cannot grow on its way back through a window.
+
+A6, the other half (``train.state_grad_clip``; opt-in): at the entry of every position the
+gradient that the position passes back into the state is limited per batch row
+(:func:`hsn.model.gradclip.clip_row_grad`: ``dL/dq`` to the limit, ``dL/dh`` to ``limit /
+sqrt(N)``; ``train.state_grad_ratio``: both to that multiple of the batch's typical live row at
+the position, a limit without a scale). The forward values are unchanged and a row under the
+limit keeps its gradient unscaled, so a healthy window is full backpropagation through time (to
+the rounding of autograd's sums). Tested on the A5 recipe, the limit did not remove the drops (exps
+354, 355, 364); the cut above did.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple, Self
 
@@ -108,11 +127,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from hsn.config import GateMode, ModelConfig, RunConfig
+from hsn.config import FEEDBACK_PATHS, GateMode, ModelConfig, RunConfig
 from hsn.data.synthetic import BOS
 from hsn.model.cell import PDGCell, WindowConsts, profiler_segment
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
+from hsn.model.gradclip import clip_row_grad
 from hsn.model.halting import HaltingHead
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
@@ -289,7 +309,9 @@ class HSN(nn.Module):
     (``train.ema_tau``) for the :class:`~hsn.model.encoder.EMATarget` copy of ``E`` (``ema_target``;
     ``None`` otherwise). ``schedule`` is the P2.2 :class:`~hsn.train.schedules.SelectionSchedule`
     (``train.gate_mode`` and the ramps; the config defaults when ``None``: soft gates, τ = 1, no
-    exploration, no dense fallback)."""
+    exploration, no dense fallback). ``feedback_detach`` is A6's ``train.feedback_detach`` (module
+    docstring; empty: full backpropagation through time) and ``state_grad_clip`` its
+    ``train.state_grad_clip`` (``None``: off)."""
 
     def __init__(
         self,
@@ -299,8 +321,54 @@ class HSN(nn.Module):
         unroll: int,
         ema_tau: float | None = None,
         schedule: SelectionSchedule | None = None,
+        feedback_detach: Collection[str] = (),
+        state_grad_clip: float | None = None,
+        state_grad_ratio: float | None = None,
     ) -> None:
         super().__init__()
+        if state_grad_clip is not None and (
+            isinstance(state_grad_clip, bool)
+            or not isinstance(state_grad_clip, int | float)
+            or not 0.0 < state_grad_clip < float("inf")
+        ):
+            raise ValueError(
+                f"state_grad_clip must be None or a finite number > 0, got {state_grad_clip!r}"
+            )
+        if state_grad_ratio is not None and (
+            isinstance(state_grad_ratio, bool)
+            or not isinstance(state_grad_ratio, int | float)
+            or not 1.0 < state_grad_ratio < float("inf")
+        ):
+            raise ValueError(
+                f"state_grad_ratio must be None or a finite number > 1, got {state_grad_ratio!r}"
+            )
+        #: A6: the relative per-row limit (a multiple of the batch's typical live row); None: off.
+        self.state_grad_ratio: float | None = (
+            None if state_grad_ratio is None else float(state_grad_ratio)
+        )
+        #: A6: the per-row limit on dL/dq at every position (dL/dh: this / sqrt(N)); None: off.
+        self.state_grad_clip: float | None = (
+            None if state_grad_clip is None else float(state_grad_clip)
+        )
+        self._clip_h = (
+            None if state_grad_clip is None else float(state_grad_clip) / cfg.n_cells**0.5
+        )
+        if isinstance(feedback_detach, str) or not isinstance(feedback_detach, Collection):
+            raise TypeError(
+                f"feedback_detach must be a collection of path names, got {feedback_detach!r}"
+            )
+        unknown = sorted(set(feedback_detach) - set(FEEDBACK_PATHS))
+        if unknown:
+            raise ValueError(
+                f"feedback_detach names unknown paths {unknown}; known: {list(FEEDBACK_PATHS)}"
+            )
+        #: A6: the feedback reads that are constants in the backward pass, in FEEDBACK_PATHS order.
+        self.feedback_detach: tuple[str, ...] = tuple(
+            name for name in FEEDBACK_PATHS if name in feedback_detach
+        )
+        self._cut_summary = "summary" in self.feedback_detach
+        self._cut_eps = "eps" in self.feedback_detach
+        self._cut_router = "router" in self.feedback_detach
         if schedule is not None and not isinstance(schedule, SelectionSchedule):
             raise TypeError(
                 f"schedule must be a SelectionSchedule or None, got {type(schedule).__name__}"
@@ -330,6 +398,7 @@ class HSN(nn.Module):
         self.predictor = Predictor(cfg)
         self.shared = SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
+        self.cell.detach_state_read = "state" in self.feedback_detach  # A6
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
         self.router = Router.from_config(cfg, unroll=unroll, seed=seed)
         self.halting = HaltingHead(cfg)
@@ -347,7 +416,9 @@ class HSN(nn.Module):
     @classmethod
     def from_config(cls, run: RunConfig) -> Self:
         """``HSN(run.model, seed=run.seed, unroll=run.train.unroll, ema_tau=run.train.ema_tau,
-        schedule=SelectionSchedule.from_config(run.train))``."""
+        schedule=SelectionSchedule.from_config(run.train),
+        feedback_detach=run.train.feedback_detach, state_grad_clip=run.train.state_grad_clip,
+        state_grad_ratio=run.train.state_grad_ratio)``."""
         if not isinstance(run, RunConfig):
             raise TypeError(f"from_config needs a RunConfig, got {type(run).__name__}")
         return cls(
@@ -356,6 +427,9 @@ class HSN(nn.Module):
             unroll=run.train.unroll,
             ema_tau=run.train.ema_tau,
             schedule=SelectionSchedule.from_config(run.train),
+            feedback_detach=run.train.feedback_detach,
+            state_grad_clip=run.train.state_grad_clip,
+            state_grad_ratio=run.train.state_grad_ratio,
         )
 
     def set_train_step(self, step: int) -> None:
@@ -453,20 +527,21 @@ class HSN(nn.Module):
         cfg = self.cfg
         B = state.batch_size
         controls = self._controls()
+        state = self._clip_state_grad(state)  # A6: what this position passes back is limited
 
         with profiler_segment(profiler, "shared_path", B):
             z_hat, z, z_target, eps, u = self._shared_path(x_t, ctx_t, state)
         # P1.7: under autocast E, P and S emit the autocast dtype (bf16 / fp16); the state path
         # (scorer features, the softmax over units, the cell update and q) runs in the state's
         # dtype, the fp32 master precision of §3.7. Without autocast these casts are no-ops.
-        u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)
+        u_s, eps_s = u.to(state.dtype), self._eps_read(z, z_hat, eps).to(state.dtype)
 
         with self.cell.graph.step():
             with profiler_segment(profiler, "scorer", B):
                 feats = self.scorer.features(
-                    u_s,
-                    eps_s,
-                    state,
+                    u_s.detach() if self._cut_router else u_s,
+                    eps_s.detach() if self._cut_router else eps_s,
+                    self._router_state(state),
                     ctx_t,
                     budget_frac=cfg.budget,
                     round_idx=0,
@@ -503,12 +578,12 @@ class HSN(nn.Module):
             cost = selection.cost.detach().mean().to(state.dtype)
 
         with profiler_segment(profiler, "decode", B):
-            decoder_inputs = [new_state.q, u]
-            if cfg.selected_readout:
-                decoder_inputs.append(
-                    self._selected_readout(new_state, selection, controls.gate, mode)
-                )
-            logits = self.decoder(torch.cat(decoder_inputs, dim=-1))
+            readout = (
+                self._selected_readout(new_state, selection, controls.gate, mode)
+                if cfg.selected_readout
+                else None
+            )
+            logits = self._decode(new_state.q, u, readout)
 
         with torch.no_grad():
             probs = alpha if alpha is not None else torch.softmax(unit_logits, dim=-1)
@@ -543,8 +618,38 @@ class HSN(nn.Module):
         z = self.encoder(emb)
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         eps = z - z_hat
-        u = self.shared(torch.cat([z, q_prev, self.ctx_emb(ctx_t)], dim=-1))
+        u = self.shared(torch.cat([z, self._summary_read(q_prev), self.ctx_emb(ctx_t)], dim=-1))
         return z_hat, z, z_target, eps, u
+
+    # -- A6: the feedback reads (values unchanged; see the module docstring) ----------------------
+
+    def _summary_read(self, q_prev: Tensor) -> Tensor:
+        """What ``S`` reads of the carried summary: a constant in the backward with ``summary``."""
+        return q_prev.detach() if self._cut_summary else q_prev
+
+    def _eps_read(self, z: Tensor, z_hat: Tensor, eps: Tensor) -> Tensor:
+        """The error the cell and the scorer read: ``z − ẑ.detach()`` with ``eps`` (the same
+        value; ``z`` keeps its gradient, the prediction does not), else ``eps`` itself."""
+        return z - z_hat.detach() if self._cut_eps else eps
+
+    def _clip_state_grad(self, state: CellGraphState) -> CellGraphState:
+        """``state`` with the gradient into ``h`` and ``q`` limited per row
+        (``train.state_grad_clip``, ``train.state_grad_ratio``); ``state`` itself when both are
+        off or nothing is recorded (evaluation, serving)."""
+        if (self._clip_h is None and self.state_grad_ratio is None) or not torch.is_grad_enabled():
+            return state
+        return CellGraphState._make(
+            h=clip_row_grad(state.h, self._clip_h, ratio=self.state_grad_ratio),
+            q=clip_row_grad(state.q, self.state_grad_clip, ratio=self.state_grad_ratio),
+            age=state.age,
+            pos=state.pos,
+        )
+
+    def _router_state(self, state: CellGraphState) -> CellGraphState:
+        """The state whose ``h`` the scorer's features read (detached with ``router``)."""
+        if not self._cut_router:
+            return state
+        return CellGraphState._make(h=state.h.detach(), q=state.q, age=state.age, pos=state.pos)
 
     def _gate(self) -> GateMode | None:
         """The gate of this step: the schedule's in training, ``None`` (hard, no gradient path) in
@@ -1134,13 +1239,20 @@ class HSN(nn.Module):
             state = CellGraphState._make(h=h, q=q, age=dense_counters[0], pos=dense_counters[1])
         elif reset_t is not None:
             state = state.reset(reset_t)
+        state = self._clip_state_grad(state)  # A6: what this position passes back is limited
         q_prev = state.q
         z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
         eps = z_t - z_hat
-        u = self.shared(torch.cat([z_t, q_prev, ctx_t], dim=-1))
-        u_s, eps_s = u.to(state.dtype), eps.to(state.dtype)  # P1.7: see step
+        u = self.shared(torch.cat([z_t, self._summary_read(q_prev), ctx_t], dim=-1))
+        # P1.7: see step. A6: the reads of the cell and the scorer (the same values)
+        u_s, eps_s = u.to(state.dtype), self._eps_read(z_t, z_hat, eps).to(state.dtype)
         age = None if dense_counters is not None else state.age  # dense: a column of the scalars
-        feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalars_t)
+        if self._cut_router:
+            feats = self.scorer._assemble(
+                u_s.detach(), eps_s.detach(), state.h.detach(), age, scalars_t
+            )
+        else:
+            feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalars_t)
         unit_logits, alpha, selection = self._score(
             feats, state, mode, dense_rows, controls=controls
         )
@@ -1212,12 +1324,7 @@ class HSN(nn.Module):
             state = CellGraphState._make(
                 h=state.h, q=state.q, age=state.age, pos=positions_after[:, -1].contiguous()
             )
-        decoder_inputs = [qs, us]
-        if self.cfg.selected_readout:
-            if readouts is None:
-                raise ValueError("A5 selected_readout needs the per-position readouts")
-            decoder_inputs.append(readouts)
-        logits = self.decoder(torch.cat(decoder_inputs, dim=-1))
+        logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
             "z": pro.z,
             "z_hat": z_hats,
@@ -1267,6 +1374,24 @@ class HSN(nn.Module):
         if previous is None:
             return torch.full_like(tokens, BOS)
         return previous.masked_fill(reset, BOS)
+
+    def _decode(self, q: Tensor, u: Tensor, readout: Tensor | None) -> Tensor:
+        probability = self.cfg.decoder_shortcut_dropout
+        if self.training and probability:
+            if probability == 1.0:
+                q, u = q * 0.0, u * 0.0
+            else:
+                # One joint mask per position; no mask on the selected-cell path.
+                keep = (torch.rand_like(q[..., :1]) >= probability).to(q.dtype)
+                scale = keep / (1.0 - probability)
+                q, u = q * scale, u * scale
+        inputs = [q, u]
+        if self.cfg.selected_readout:
+            if readout is None:
+                raise ValueError("A5 selected_readout needs the per-position readouts")
+            inputs.append(readout)
+        logits: Tensor = self.decoder(torch.cat(inputs, dim=-1))
+        return logits
 
     def _selected_readout(
         self,
@@ -1341,6 +1466,12 @@ class HSN(nn.Module):
         text = f"seed={self.seed}, unroll={self.unroll}, routing={self.cfg.routing!r}"
         if self.ema_target is not None:
             text += f", ema_tau={self.ema_tau}"
+        if self.feedback_detach:
+            text += f", feedback_detach={list(self.feedback_detach)}"
+        if self.state_grad_clip is not None:
+            text += f", state_grad_clip={self.state_grad_clip}"
+        if self.state_grad_ratio is not None:
+            text += f", state_grad_ratio={self.state_grad_ratio}"
         return text
 
     # -- validation -------------------------------------------------------------------------------

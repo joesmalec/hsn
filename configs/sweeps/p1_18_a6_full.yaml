@@ -1,0 +1,61 @@
+# A6 full run (10 Nov 2026): the recipe of exps 349/360/361 (every feedback read cut, anchored
+# update caps) over 27,000 steps, alone on the card with the worker's GPU time series
+# (`worker --telemetry-max-samples`), as the long run of the recipe and the clean utilisation
+# trace of the compiled diagnostics and probes (scripts/gpu_phase_report.py).
+name: p1_18_a6_full
+description: "A6 carry_anchored at 27k steps, a timing arm with the card's time series"
+timing: true
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - model.routing=topk
+    - model.cand_norm=none
+    - model.key_address=true
+    - model.selected_readout=true
+    - train.optimizer=lazy_adamw
+    - train.gate_mode=ste
+    - train.lr=2.5e-3
+    - train.betas=[0.9,0.95]
+    - train.probe_horizon=null
+    - train.spike_factor=null
+    - train.rollback_every=null
+    - train.grad_norm_precision=float64
+    - train.feedback_detach=[summary,eps,state,router]
+    - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+    - train.update_limit.norm_floor=1e-12
+    - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+    - train.steps=27000
+    - train.ckpt_every=27000
+protocol:
+  name: reads_state
+  version: 3
+  steps: 27000
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 1500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [2]
+arms:
+  - name: carry_anchored_27k
+    family: hsn
+  # the same recipe at 9,000 steps, alone: the like-for-like trace against exp 346
+  - name: carry_anchored_9k_solo
+    family: hsn
+    overrides:
+      - train.steps=9000
+      - train.ckpt_every=9000
+    protocol:
+      steps: 9000
+      keep_every: 500

@@ -188,6 +188,26 @@ def test_p0_3_set_deterministic_roundtrip() -> None:
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = env_before
 
 
+def test_p0_3_a_test_may_leave_determinism_on() -> None:
+    """What a test that builds a ``train.deterministic`` trainer does: the switches stay on when
+    it ends. The suite's autouse fixture (``tests/conftest.py``) puts them back, which the next
+    test checks."""
+    set_deterministic(True)
+    assert torch.are_deterministic_algorithms_enabled()
+    torch.backends.cudnn.benchmark = True
+
+
+def test_p0_3_determinism_does_not_leak_into_the_next_test(
+    _determinism_baseline: tuple[bool, bool, bool, str | None],
+) -> None:
+    """Runs right after the test above: every switch is the session's again."""
+    flag, cudnn_deterministic, cudnn_benchmark, env = _determinism_baseline
+    assert torch.are_deterministic_algorithms_enabled() == flag
+    assert torch.backends.cudnn.deterministic == cudnn_deterministic
+    assert torch.backends.cudnn.benchmark == cudnn_benchmark
+    assert os.environ.get("CUBLAS_WORKSPACE_CONFIG") == env
+
+
 # --------------------------------------------------------------------------------------------------
 # memory statistics, caps, synchronisation
 # --------------------------------------------------------------------------------------------------
