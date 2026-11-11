@@ -516,6 +516,14 @@ class TrainConfig(_StrictModel):
     # number cannot do (healthy rows grow twentyfold). May be combined with state_grad_clip: the
     # smaller limit applies. None (default): off. Tested (exp 364): it did not remove the drops.
     state_grad_ratio: float | None = Field(default=None, gt=1.0, allow_inf_nan=False)
+    # A6 (opt-in; hsn.train.weight_ema): the decay of an exponential moving average of the weights,
+    # updated after every applied optimiser step (with a warm-up, so the average follows the
+    # weights closely early in a run). Training itself is unchanged, step for step; evaluations
+    # during the run, the final evaluation, the trained-state diagnostics and the probes score the
+    # averaged weights. A checkpoint's "model" stays the training weights and its
+    # extra["weight_ema"] carries the average (load_checkpoint(..., averaged=True) reads it). Any
+    # model. None (default): off, every score is of the training weights as before.
+    weight_ema: float | None = Field(default=None, gt=0.0, lt=1.0, allow_inf_nan=False)
     steps: int = Field(default=1000, ge=1)  # schedule
     eval_every: int = Field(default=100, ge=1)
     ckpt_every: int = Field(default=500, ge=1)
@@ -675,6 +683,12 @@ class TrainConfig(_StrictModel):
             raise ValueError(
                 f"train.feedback_detach={self.feedback_detach} names a path twice; known: "
                 f"{list(FEEDBACK_PATHS)}"
+            )
+        if self.weight_ema is not None and self.rollback_every is not None:
+            raise ValueError(
+                f"train.weight_ema={self.weight_ema} with train.rollback_every="
+                f"{self.rollback_every}: the rollback's snapshots do not hold the averaged "
+                "weights; use one of them"
             )
         return self
 
@@ -1252,6 +1266,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.state_grad_clip",
     "model.address_init",
     "train.state_grad_ratio",
+    "train.weight_ema",
 )
 
 

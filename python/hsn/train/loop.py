@@ -195,6 +195,7 @@ from hsn.train.divergence import StepSnapshot, persistent_buffers, write_dump
 from hsn.train.grad_norm import clip_grad_norm_
 from hsn.train.lazy_adam import build_lazy_adamw, cell_parameters
 from hsn.train.rollback import RollbackPolicy, SnapshotRing
+from hsn.train.weight_ema import WeightEMA
 
 __all__ = [
     "NONFINITE_MAX_CONSECUTIVE",
@@ -693,6 +694,11 @@ class Trainer:
         self.grad_hook: Callable[[Trainer], None] | None = None
         # Diagnostic observers run after every parameter projection, before EMA/scheduler.
         self.update_post_hooks: list[Callable[[Trainer], None]] = []
+        # A6: the moving average of the weights that evaluate() scores (train.weight_ema; None:
+        # off). Built after the model moved to its device; training never reads it.
+        self.weight_ema: WeightEMA | None = (
+            WeightEMA(model, train.weight_ema) if train.weight_ema is not None else None
+        )
         self._loader_state: dict[str, Any] | None = None
         self._carried_state: Any = None
         # P1.11: parallel streams of evaluate() (None = train.batch); a harness setting, not config
@@ -1364,6 +1370,7 @@ class Trainer:
             )
         if steps < self.step:
             raise ValueError(f"steps={steps} is before the current step {self.step}")
+        self._refuse_installed_average()
         self._refuse_test(train_ds, False)
         self._refuse_test(dev_ds, False)
         self._prepare_adaptive_monitor(train_ds)
@@ -1479,6 +1486,7 @@ class Trainer:
                     for hook in self.update_post_hooks:
                         hook(self)
                 self._record_captured_update(applied)
+                self._average_weights(applied)
                 self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
             self.step += 1
@@ -1571,11 +1579,14 @@ class Trainer:
         metrics: Mapping[str, Metric] | None = None,
         *,
         allow_test: bool = False,
+        averaged: bool = True,
     ) -> dict[str, Any]:
         """Metrics over every document of ``ds`` (one pass, no gradients), overall and per task.
 
         Per-task entries live under ``"per_group"`` keyed ``"<task>/<variant>"``. The test split
-        raises unless ``allow_test`` (gate scripts only).
+        raises unless ``allow_test`` (gate scripts only). With ``train.weight_ema`` the averaged
+        weights are scored (A6); ``averaged=False`` scores the training weights instead (without
+        the key the two are the same model).
         """
         self._refuse_test(ds, allow_test)
         if len(ds) == 0:
@@ -1589,7 +1600,10 @@ class Trainer:
                 names.append(group)
             ids.append(names.index(group))
         loader = self._loader(ds, shuffle=False, epochs=1, batch=self.eval_batch)
-        with self._segment("evaluate"):
+        # A6: with train.weight_ema the averaged weights are scored (the training weights are
+        # back, bit for bit, when the block ends)
+        weights = self._averaged_weights() if averaged else contextlib.nullcontext()
+        with self._segment("evaluate"), weights:
             result = evaluate_windows(
                 self._eval_model(),
                 loader,
@@ -1607,6 +1621,59 @@ class Trainer:
         """What :meth:`evaluate` runs over the windows: the model itself (P2.8: the HSN trainer
         hands its compiled window when it has one)."""
         return self.model
+
+    # the averaged weights (A6, train.weight_ema) -----------------------------------------------
+
+    def _average_weights(self, applied: bool) -> None:
+        """One step of the weight average after an applied optimiser step (and its projections
+        and the target encoder's step); a skipped step moved no weight."""
+        if applied and self.weight_ema is not None:
+            self.weight_ema.update()
+
+    def _averaged_weights(self) -> AbstractContextManager[None]:
+        """The block :meth:`evaluate` runs in: the averaged weights with ``train.weight_ema``,
+        else (or once they are installed) the model as it is."""
+        if self.weight_ema is None:
+            return contextlib.nullcontext()
+        return self.weight_ema.averaged()
+
+    def install_averaged_weights(self) -> bool:
+        """The end of a run with ``train.weight_ema``: the averaged weights become the model's,
+        so that everything scored after it (diagnostics, probes, :meth:`evaluate`) reads the model
+        the run's evaluations scored. One way: :meth:`fit` refuses afterwards (resume a
+        checkpoint, which holds the training weights, to train on). False with the key off."""
+        if self.weight_ema is None:
+            return False
+        self.weight_ema.install()
+        return True
+
+    def load_for_evaluation(self, path: str | Path) -> dict[str, Any]:
+        """Load a checkpoint's weights into the model for scoring only (the harness's re-score of
+        a failed run): with ``train.weight_ema`` its averaged weights, and :meth:`evaluate` then
+        scores the model as it is. The optimiser and the trainer's counters are not touched."""
+        loaded = load_checkpoint(path, self.model, averaged=True)
+        if self.weight_ema is not None:
+            if loaded["extra"].get("weight_ema") is None:
+                raise ValueError(f"{path} holds no averaged weights (train.weight_ema)")
+            self.weight_ema.installed = True
+        return loaded
+
+    def _refuse_installed_average(self) -> None:
+        if self.weight_ema is not None and self.weight_ema.installed:
+            raise RuntimeError(
+                "train.weight_ema: the model holds the averaged weights (install_averaged_weights "
+                "or load_for_evaluation); resume a checkpoint to train on"
+            )
+
+    def _ema_extra(self) -> dict[str, Any]:
+        """The average for a checkpoint's ``extra`` (absent with the key off)."""
+        if self.weight_ema is None:
+            return {}
+        return {"weight_ema": self.weight_ema.state_dict()}
+
+    def _restore_ema(self, extra: Mapping[str, Any], path: str) -> None:
+        if self.weight_ema is not None:
+            self.weight_ema.load_state_dict(extra.get("weight_ema"), path)
 
     # checkpoints -----------------------------------------------------------------------------
 
@@ -1638,6 +1705,7 @@ class Trainer:
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "carried_state": _map_state(detach_state(state), lambda t: t.cpu()),
             **self._guard_extra(counters),  # P1.12
+            **self._ema_extra(),  # A6
         }
 
     def _counters(self) -> dict[str, Any]:
@@ -1760,6 +1828,7 @@ class Trainer:
             raise ValueError(f"{path} has no loader state")
         self._loader_state = dict(loaded["loader_state"])
         self._restore_guard(extra, str(path))  # P1.12
+        self._restore_ema(extra, str(path))  # A6
         device = self.ctx.device
         self._carried_state = _map_state(extra.get("carried_state"), lambda t: t.to(device))
         self.step = int(loaded["step"])

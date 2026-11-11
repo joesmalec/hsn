@@ -81,7 +81,7 @@ def probe_check(db: Database, exp_id: int, *, batch_rows: int = 64) -> dict[str,
     model = build_model(cfg)
     install_variant(model, arm["variant"], cfg.seed, loads(arm["variant_json"]))
     model.to(device=ctx.device, dtype=ctx.master_dtype)
-    load_checkpoint(checkpoint, model)
+    load_checkpoint(checkpoint, model, averaged=True)  # A6: the weights the run scored
     t0 = time.perf_counter()
     batched = edit_probe(model, ctx, dev, batch_rows=batch_rows, margins=True)
     batched_s = time.perf_counter() - t0
@@ -222,7 +222,9 @@ def _restored(
     model = build_model(cfg)
     install_variant(model, arm["variant"], cfg.seed, loads(arm["variant_json"]))
     model.to(device=ctx.device, dtype=ctx.master_dtype)
-    load_checkpoint(checkpoint, model)  # loads on the CPU, copies into the model on its device
+    # loads on the CPU, copies into the model on its device; A6: with train.weight_ema the
+    # averaged weights, which are what the run's evaluations and probes scored
+    load_checkpoint(checkpoint, model, averaged=True)
     return exp, params, ctx, dev, checkpoint, model
 
 

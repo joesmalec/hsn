@@ -796,6 +796,16 @@ def _train(
     arm.walls["fit_s"] = time.perf_counter() - t1
     stages["fit"].append(time.time())
     diag.detach()
+    # A6 (train.weight_ema): the model the evaluations scored is the averaged one; from here on
+    # (trained state, probes) the model holds it. The checkpoints keep the training weights,
+    # which are scored once here, at the last step, for the record (one more evaluation).
+    training_weights: dict[str, Any] | None = None
+    if getattr(trainer, "weight_ema", None) is not None:
+        training_weights = _eval_entry(
+            {"step": int(trainer.step), **trainer.evaluate(dev_ds, averaged=False)},
+            audit_keys=audit_keys,
+        )
+    averaged = trainer.install_averaged_weights()
     measured = dict(history.measured)
     arm.walls["train_s"] = float(measured.get("train_seconds", 0.0)) - diag.seconds
     arm.walls["compile_s"] = float(measured.get("compile_seconds") or 0.0)
@@ -847,6 +857,12 @@ def _train(
         "phases": _phases(timer, diag, saves, stages),
         "diagnostics_enabled": bool(params.diagnostics),
         "gc_freezes": callback.freezes,
+        # A6: the decay of the weight average the evaluations and probes scored (None: the
+        # training weights, as before)
+        "weight_ema": cfg.train.weight_ema if averaged else None,
+        # the last step's dev evaluation of the training weights (an evaluation entry; None
+        # without the average, where "evals" already are the training weights')
+        "training_weights_final": training_weights,
     }
     record = arm.record  # P1.14: filled in place, so that a later stage's failure keeps it
     record.clear()
@@ -1014,7 +1030,6 @@ def _rescore_partial(
         summarize_v2,
         summarize_v3,
     )
-    from hsn.train.checkpoint import load_checkpoint
 
     history = callback.history
     keeper = callback.keeper
@@ -1037,7 +1052,9 @@ def _rescore_partial(
     t0 = time.perf_counter()
     arm.stage = "partial"
     try:
-        load_checkpoint(path, model)  # weights only, in place (the compiled window keeps them)
+        # weights only, in place (the compiled window keeps them); A6: with train.weight_ema the
+        # checkpoint's averaged weights, as the run's own evaluations scored
+        trainer.load_for_evaluation(path)
         result = trainer.evaluate(dev_ds)
         entry = _eval_entry({"step": step, **result}, audit_keys=audit_keys)
         train = [_train_entry(s) for s in history.steps if int(s.step) <= step]

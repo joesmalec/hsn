@@ -717,6 +717,7 @@ class TBPTTTrainer(Trainer):
             )
         if steps < self.step:
             raise ValueError(f"steps={steps} is before the current step {self.step}")
+        self._refuse_installed_average()
         self._refuse_test(train_ds, False)
         self._refuse_test(dev_ds, False)
         self._prepare_adaptive_monitor(train_ds)
@@ -957,6 +958,7 @@ class TBPTTTrainer(Trainer):
                 self._record_captured_update(applied)
                 if applied:
                     self.hsn.update_target()
+                self._average_weights(applied)  # A6 (train.weight_ema)
                 self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
             self.step = next_step
@@ -1152,6 +1154,7 @@ class TBPTTTrainer(Trainer):
                 else {}
             ),
             **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
+            **self._ema_extra(),  # A6: the averaged weights (train.weight_ema)
         }
 
     def _counters(self) -> dict[str, Any]:
@@ -1231,6 +1234,7 @@ class TBPTTTrainer(Trainer):
         self.windows_since_resync = counters["since_resync"]
         self.resyncs = counters["resyncs"]
         self._restore_guard(extra, str(path))  # P1.12
+        self._restore_ema(extra, str(path))  # A6
         if "reinforce_baseline" in extra:
             baseline = extra["reinforce_baseline"]
             if baseline is not None and (

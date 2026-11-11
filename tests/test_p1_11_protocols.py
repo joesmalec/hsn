@@ -33,12 +33,14 @@ def _arm(
     run_dir: Path,
     *,
     rules: dict[str, Any] | None = None,
+    overrides: tuple[str, ...] = (),
     **protocol: Any,
 ) -> ArmRun:
+    extra = [*disk_overrides(manifest, steps=6), *overrides]
     if family == "hsn":
-        cfg = load_config(REF_A1, [*TINY_HSN_OVERRIDES, *disk_overrides(manifest, steps=6)])
+        cfg = load_config(REF_A1, [*TINY_HSN_OVERRIDES, *extra])
     else:
-        cfg = load_config(GRU_2M, [*TINY_GRU_OVERRIDES, *disk_overrides(manifest, steps=6)])
+        cfg = load_config(GRU_2M, [*TINY_GRU_OVERRIDES, *extra])
     params = protocol_params(
         {"name": "reads_state", "diag_every": 2, "diag_docs": 8, "probe_batch": 8, **protocol}
     )
@@ -351,3 +353,59 @@ def test_collector_is_frozen_only_for_compiled_runs_and_released(
     callback.gc_freeze = False
     callback.freeze_collector(Compiled())
     assert callback.freezes == 1 and gc.get_freeze_count() == 0
+
+
+@pytest.mark.parametrize("family", ["hsn", "gru"])
+def test_weight_average_is_what_the_evaluations_and_probes_score(
+    family: str,
+    tiny_manifest: Path,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """``train.weight_ema`` (A6): the same training steps; the evaluations, the trained state and
+    the probes score the averaged weights, which the model holds once the fit has ended; the
+    checkpoint keeps the training weights and carries the average."""
+    import torch
+    from hsn.train.checkpoint import load_checkpoint
+
+    plain_arm = _arm(family, tiny_manifest, tmp_path / "plain", checkpoint="final")
+    plain = run_protocol(plain_arm)
+    arm = _arm(
+        family,
+        tiny_manifest,
+        tmp_path / "avg",
+        overrides=("train.weight_ema=0.5",),
+        checkpoint="final",
+    )
+    record = run_protocol(arm)
+    assert plain["weight_ema"] is None and record["weight_ema"] == 0.5
+    # the training weights' own last evaluation is the run without the average's
+    assert plain["training_weights_final"] is None
+    assert record["training_weights_final"] == plain["evals"][-1]
+    assert record["training_weights_final"] != record["evals"][-1]
+    assert record["eval_count"] == plain["eval_count"] + 1
+    assert [t["loss"] for t in record["train"]] == [t["loss"] for t in plain["train"]]
+    assert [e["loss"] for e in record["evals"]] != [e["loss"] for e in plain["evals"]]
+    assert record["probe"] is not None and record["trained_state"] is not None
+    if family == "hsn":  # the state statistics are the averaged model's
+        assert record["trained_state"] != plain["trained_state"]
+    (path,) = record["checkpoints"]
+    (plain_path,) = plain["checkpoints"]
+    from hsn.runner import build_model
+
+    def weights(file: str, cfg: Any, *, averaged: bool = False) -> dict[str, torch.Tensor]:
+        model = build_model(cfg)
+        load_checkpoint(file, model, averaged=averaged)
+        return {name: p.detach().clone() for name, p in model.named_parameters()}
+
+    training = weights(path, arm.cfg)
+    reference = weights(plain_path, plain_arm.cfg)
+    assert all(torch.equal(training[k], v) for k, v in reference.items())  # "model": unchanged
+    extra = torch.load(path, map_location="cpu", weights_only=True)["extra"]
+    assert extra["weight_ema"]["updates"] == 6
+    plain_extra = torch.load(plain_path, map_location="cpu", weights_only=True)["extra"]
+    assert "weight_ema" not in plain_extra
+    # the evaluation-only reader gives the model the run scored
+    scored = weights(path, arm.cfg, averaged=True)
+    shadow = extra["weight_ema"]["shadow"]
+    assert all(torch.equal(scored[k], shadow[k]) for k in scored)
+    assert not all(torch.equal(scored[k], training[k]) for k in scored)

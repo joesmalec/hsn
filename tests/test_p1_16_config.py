@@ -75,6 +75,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.state_grad_clip",
         "model.address_init",
         "train.state_grad_ratio",
+        "train.weight_ema",
     )
 
 
