@@ -6,43 +6,48 @@ and logs are in `/home/joe/hsn-experiments/a5-fix/`. Runs are 9,000 steps of the
 routing, key addresses, selected-cell readout, lr 2.5e-3, β2 0.95, WSD, float64 gradient norms) on
 the delayed task, B32, compiled, unguarded: no spike guard, no rollback, every document kept.
 
-**What came out.** The mid-run accuracy drops are exploded gradients through the *feedback reads*
-of the recurrent state, taken as full-size steps along one document's direction. Cutting those
-reads out of the backward pass (`train.feedback_detach`, opt-in, forward unchanged) removes the
-drops on all three controlled seeds, and with exp 346's anchored update caps the same recipe
-finishes above the GRU:
+**What came out.**
 
-| | Final dev | Later queries | Worst drop during the run | Skipped steps |
-| --- | ---: | ---: | ---: | ---: |
-| Before: anchored caps, full backpropagation (exps 343 / 326 / 346, seeds 0 / 1 / 2) | 73.8 / 78.2 / 77.5 % | 57.8 / 60.2 / 62.5 % | 12.0 / 4.8 / 36.9 pp | 0 |
-| Before: current-norm caps (exps 342 / 325 / 345) | failed / 81.4 / 2.2 % | – / 65.3 / 2.2 % | 57.9 / 34.6 / 66.8 pp | 10 / 0 / 0 |
-| **After: feedback cut + anchored caps (exps 360 / 361 / 349)** | **81.2 / 79.0 / 84.0 %** | **65.8 / 66.6 / 70.7 %** | **2.2 / 6.8 / 4.5 pp** | 0 |
-| GRU, delayed task (gru_2m exp 154; delayed-only exp 347; 2e-3 exps 204, 206) | 79.3; 77.8; 78.6, 77.6 % | –; 58.3; 59.7, 57.6 % | 0.5 to 1.3 pp | 0 |
+1. *The collapses.* The mid-run accuracy drops of the A5 runs are exploded gradients through the
+   *feedback reads* of the recurrent state, taken as full-size steps along one document's
+   direction. Cutting those reads out of the backward pass (`train.feedback_detach`, opt-in,
+   forward unchanged) removes them on every seed (sections 1 to 3).
+2. *The accuracy.* With the cut, the candidate norm of amendment A4 trains (it diverged before)
+   and the recipe finishes above every GRU run on every one of six seeds (section 3c).
+3. *The sag.* That recipe still loses 5 to 21 points mid-run and recovers. The cause is a
+   router unit taking over the positions where values are written, which undoes the key binding
+   (section 3d). `train.route_guard` (opt-in) halves that unit's router step when the takeover
+   starts, at whatever step that is; on the three controlled seeds the deep sag is gone and the
+   final score is higher (section 3e).
+4. *The GPU pauses* were the diagnostics and probes running eager forwards, and Python's garbage
+   collector; both are fixed (section 4).
 
-Mean of the three seeds: 81.4 % final and 67.7 % on later queries, against gru_2m's 79.3 % best run
-(78.8 % five-run mean) and 58 to 61 % on later queries. Two of three seeds are above the 79.3 % bar;
-seed 1 ends 0.3 points under it (peak 79.8 % at step 8,500). All three are above the 62.3 %
-key-blind level on later queries, where the dev keys were never seen in training; none passes the
-frozen binding verdict (swap follow 15 to 25 %, two "partial"). Learning is slower than under full
-backpropagation: 0.6 dev is reached at step 4,000 to 4,500, against 2,500 to 3,000 for the GRU's
-speed bar.
+| 9,000 steps, delayed task, dev (held-out keys) | Final dev | Later queries | Worst drop during the run |
+| --- | ---: | ---: | ---: |
+| Before: anchored caps, full backpropagation (exps 343 / 326 / 346, seeds 0 / 1 / 2) | 73.8 / 78.2 / 77.5 % | 57.8 / 60.2 / 62.5 % | 12.0 / 4.8 / 36.9 pp |
+| Before: current-norm caps (exps 342 / 325 / 345) | failed / 81.4 / 2.2 % | – / 65.3 / 2.2 % | 57.9 / 34.6 / 66.8 pp |
+| Feedback cut + anchored caps (exps 360 / 361 / 349) | 81.2 / 79.0 / 84.0 % | 65.8 / 66.6 / 70.7 % | 2.2 / 6.8 / 4.5 pp |
+| + A4, scored on averaged weights, seeds 0 to 5 (exps 375-377, 418-420) | 85.9 / 86.5 / 86.5 / 84.7 / 82.1 / 84.6 % | 76.7 / 76.3 / 75.8 / 79.0 / 71.0 / 73.6 % | 10.9 / 21.3 / 20.0 / 5.1 / 13.7 / 14.7 pp |
+| **+ route guard, seeds 0 to 2 (exps 421-423)** | **86.2 / 93.3 / 88.9 %** | **75.8 / 92.3 / 82.1 %** | **5.8 / 1.8 / 8.7 pp** |
+| GRU, delayed task (exps 154, 347, 204, 206, 405-407) | 76.7 to 79.3 % | 56.2 to 59.7 % | 0.5 to 1.3 pp |
 
-Over 27,000 steps the recipe reaches 90.0 % (later queries 82.1 %, exp 371), against 78.7 % for
-the GRU and 70.2 % for the Transformer at 27k.
+Means: 85.1 % over six seeds without the guard (86.3 % on seeds 0 to 2) and 89.5 % with it on
+seeds 0 to 2, against 79.3 % for the GRU's best run. Later queries, where the dev keys were never
+seen in training and a key-blind reader tops out at 62.3 %: 75.4 % and 83.4 %, against 56 to
+60 %. No step is skipped in any of these runs. With the guard the model reaches 0.6 dev at step
+1,000 to 1,500 and stays above it (the GRU's speed bar is 2,500 to 3,000). Eight runs pass the
+frozen key-binding verdict, the first of this project (exps 384, 386, 389, 399, 401, 413 at step
+5,000; 418 and 422 at 9,000); most runs are still "partial".
 
-The GPU pauses had two causes. The long ones (4 to 5 s every 250 steps, and 79 s at the end of a
-run) were the diagnostics and the probes running the eager routed forward; both now replay
-compiled graphs (per 9k run: diagnostics 466 s → 12 s, probes 76 s → 10 s, exps 349 and 360). The
-short ones that remained (0.4 to 0.5 s every 10 to 16 s) were full passes of Python's garbage
-collector over the compiled graphs' objects, removed by freezing those objects (0.32 s → 0.002 s
-per pass). Diagnostics can be switched off per sweep or per enqueue (`protocol.diagnostics`).
+Over 27,000 steps the recipe without the guard ends at 90.6 % (later queries 82.8 %, exp 416),
+against 78.7 % for the GRU and 70.2 % for the Transformer at 27k.
 
 ![Dev accuracy before and after](training_review/p1_18_a6_curves_2026_11_10.png)
 
-(The GRU line is exp 347, the delayed-only run, evaluated every 500 steps: chance until step
-2,000, 76.2 % at 2,500, then a plateau. Every stored delayed-only GRU run has that shape: exps 154,
-204, 206. The smoother GRU curves of exps 334 to 336 are the five-task overall score, evaluated
-every 3,000 steps.)
+(Thick lines are seed 2, thin lines seeds 0 and 1. The GRU line is exp 347, the delayed-only run,
+evaluated every 500 steps: chance until step 2,000, 76.2 % at 2,500, then a plateau; every stored
+delayed-only GRU run has that shape. The HSN lines from "cut + caps + A4" on are scored on
+averaged weights, which changes the curve's noise and not its end point: section 3b.)
 
 ## 1. What the drops are
 
@@ -211,7 +216,10 @@ It is noise of the last few optimiser steps, not of the solution. Replaying exp 
 run's evaluations and probes score; training is unchanged step for step. At the end of a run,
 after the learning-rate decay, the two coincide (exps 375 to 377: 85.9 / 86.5 / 86.5 % averaged,
 85.9 / 86.7 / 86.4 % for the training weights), so the average changes the curve, not the final
-score. The GRU has not been run with it yet (`p1_18_a6_ema_gru`, queued behind the work below).
+score. The GRU gains nothing from it either (`p1_18_a6_ema_gru`, delayed-only, 9,000 steps: 77.8 %
+on seed 0 with the average, exp 405, against 77.8 % without, exp 347; 78.4 % with and 76.7 %
+without on seed 2, exps 406 and 407, two separate runs), so the comparison below is not an
+artefact of how the HSN is scored.
 
 One change at a time on seed 2 (`p1_18_a6_wobble`, against exp 349's 84.0 %): a peak rate of
 1.5e-3 has no fall at all but learns more slowly and ends at 80.7 % (exp 373); a cosine schedule
@@ -229,16 +237,26 @@ Under full backpropagation the candidate norm of amendment A4 (`model.cand_norm=
 | 375 | cut + caps + A4, seed 0, averaged weights | 85.9% | 76.7% | 96.3% | 1,500 | 42.0% / 34.0% | partial |
 | 376 | cut + caps + A4, seed 1, averaged weights | 86.5% | 76.3% | 98.1% | 1,500 | 52.9% / 28.0% | partial |
 | 377 | cut + caps + A4, seed 2, averaged weights | 86.5% | 75.8% | 98.6% | 1,500 | 36.8% / 40.0% | partial |
+| 418 | cut + caps + A4, seed 3, averaged weights | 84.7% | 79.0% | 91.1% | 1,000 | 77.9% / 9.8% | binds keys |
+| 419 | cut + caps + A4, seed 4, averaged weights | 82.1% | 71.0% | 94.6% | 1,500 | 33.5% / 48.7% | partial |
+| 420 | cut + caps + A4, seed 5, averaged weights | 84.6% | 73.6% | 96.9% | 1,500 | 31.9% / 50.5% | partial |
 | 349 / 360 / 361 | cut + caps, without A4 | 84.0 / 81.2 / 79.0% | 70.7 / 65.8 / 66.6% | – | 4,000 to 4,500 | 15 to 25% | – |
 
-Three seeds: 86.3 % mean (85.9 to 86.5), 76.3 % on later queries, against 81.4 % and 67.7 %
-without A4 and the GRU's 79.3 % best run. No step skipped.
+Six seeds scored on averaged weights (exps 375 to 377, 418 to 420): 85.1 % mean (82.1 to 86.5),
+75.4 % on later queries (71.0 to 79.0), against 81.4 % and 67.7 % without A4 (three seeds) and
+76.7 to 79.3 % for the GRU's runs. Every one of the six is above every GRU run. No step skipped.
 
-**But every run sags mid-run.** After reaching 72 to 81 % by step 2,000, each falls 10 to 21
-points between steps 2,000 and 4,000 and then recovers (worst drawdown 14.0 / 10.9 / 21.3 /
-20.0 points for exps 372, 375, 376, 377). Seeds 1 and 2 drop back under 0.6 dev during it, so the
-speed bar is passed and then lost. Gradient norms stay ordinary throughout; this is not the burst
-of section 1.
+Over 27,000 steps (exp 416, seed 2, alone on the card) the same recipe ends at 90.6 % (later
+queries 82.8 %, first 99.4 %, swap followed 55.2 %), where the recipe without A4 ended at 90.0 %
+(exp 371): the candidate norm changes how fast the model gets there (0.6 dev at step 2,000
+against 3,500), not where a long run ends. With the average, the dev accuracy of exp 416 moves
+0.5 points between evaluations after step 3,000 (largest fall 1.1), against 1.9 (5.4) in exp 371.
+
+**But every run sags mid-run.** After reaching 72 to 92 % by steps 1,500 to 2,500, each falls
+and then recovers: worst drawdown 14.0 / 10.9 / 21.3 / 20.0 / 5.1 / 13.7 / 14.7 points for exps
+372, 375, 376, 377, 418, 419, 420, and 13.1 in the 27k run (91.7 % at step 2,500, 78.6 % at
+3,000). Seeds 1 and 2 drop back under 0.6 dev during it, so the speed bar is passed and then
+lost. Gradient norms stay ordinary throughout; this is not the burst of section 1.
 
 ## 3d. What the sag is: the router takes the value routes away
 
@@ -313,23 +331,36 @@ that sags (caps 0.003, lr 2.5e-3, A4, averaged weights):
 | --- | --- | --- | --- |
 | 1 | routes lost to the unit with the most slots | exps 396-398 (seed 1, 5k) | did not work: the taker is not the most-used unit; 65.6 / 70.2 / 69.9 % |
 | 2 | any established (input byte, unit) route lost; the unit that gained most | exps 399-401 (seed 1, 5k); 402-404 (seeds 0-2, 9k, stopped near step 4,000) | held once (90.3 % and 93.1 % at 5k, binds keys), then dips of 8 to 20 points on all three seeds: it slowed units that were picking up the filler's positions, never the taker |
-| 3 | a unit that serves the supervised positions (from the loss mask) above its own record on bytes whose established routes belong to other units | exps 413-415 (seeds 0-2, 5k) | no sag on any seed; slower on two |
+| 3 | a unit that serves the supervised positions (from the loss mask) above its own record on bytes whose established routes belong to other units | exps 413-415 (seeds 0-2, 5k); 421-423 (seeds 0-2, 9k) | the deep sag is gone on every seed; 89.5 % mean at 9k against 86.3 % |
 
-Version 3 at step 5,000 against the same configuration without the guard:
+Version 3 over the full 9,000 steps against the same configuration without the guard (averaged
+weights; the two differ in nothing else):
 
-| Seed | Guard v3: dev @ 5,000 | Worst drawdown | Swap follow / unchanged | Events | No guard (exps 375-377): dev @ 5,000 | Worst drawdown |
-| ---: | ---: | ---: | --- | ---: | ---: | ---: |
-| 0 | 88.3% (exp 413) | 6.8 pp | 88.9% / 3.3%, binds keys | 30 (from step 1,900) | 77.0% | 10.9 pp |
-| 1 | 81.6% (exp 414) | 3.1 pp | 67.5% / 14.4%, partial | 7 (from step 1,000) | 70.3% | 21.3 pp |
-| 2 | 82.5% (exp 415) | 0.0 pp | 72.8% / 13.6%, partial | 16 (from step 2,000) | 82.8% | 20.0 pp |
+| Seed | With the guard | Later | Worst drawdown | Swap follow / unchanged | Events | Without | Later | Worst drawdown |
+| ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 0 | 86.2% (exp 421) | 75.8% | 5.8 pp | 50.4% / 28.4%, partial | 40 | 85.9% (exp 375) | 76.7% | 10.9 pp |
+| 1 | 93.3% (exp 422) | 92.3% | 1.8 pp | 93.4% / 2.3%, **binds keys** | 62 | 86.5% (exp 376) | 76.3% | 21.3 pp |
+| 2 | 88.9% (exp 423) | 82.1% | 8.7 pp | 62.1% / 15.0%, partial | 44 | 86.5% (exp 377) | 75.8% | 20.0 pp |
+| mean | 89.5% | 83.4% | | | | 86.3% | 76.3% | |
 
-What the guard does not do: on seed 0 the reader's router rows were at the floor (1/64 of their
-step) by step 2,500 and the readings still showed its share creeping up, because the units that
-lose the route also un-learn it (their weight on the previous byte's address is pushed through
-zero, exps 375 and 376), which slowing the taker cannot stop; and on seeds 1 and 2 the first
-events came while the route was still forming, and those runs learned more slowly (55 % and 77 %
-at step 3,500). The `restore` option (rewinding the gaining unit's rows) was worse in the one run
-that tried it (exp 400: 77.9 %). The guard is opt-in and off by default.
+The first event comes at step 1,700 to 1,900 in each run, where the unguarded runs begin to sag;
+by the end exactly one unit per run (the one that serves the answer positions) is at the floor
+of its step scale and every other unit is untouched. The same guard stopped at step 5,000 (exps
+413 to 415): 88.3 / 81.6 / 82.5 % with worst drawdowns of 6.8 / 3.1 / 0.0 points, against 77.0 /
+70.3 / 82.8 % and 10.9 / 21.3 / 20.0 without.
+
+What the guard does not do. It reduces the sag, it does not remove every fall: seeds 0 and 2
+still slide 6 and 9 points late in the constant-rate phase (steps 5,000 to 7,000) before the
+decay lifts them. On seed 0 the reader's router rows were at the floor (1/64 of their step) by
+step 2,500 and the readings still showed its share creeping up, because the units that lose the
+route also un-learn it (their weight on the previous byte's address is pushed through zero, exps
+375 and 376), which slowing the taker cannot stop. An event that comes while the route is still
+forming slows that run (exps 414 and 415 at 5k: 55 % and 77 % at step 3,500 before catching up).
+The `restore` option (rewinding the gaining unit's rows) was worse in the one run that tried it
+(exp 400: 77.9 %). Runs are not bit-reproducible on this card and the variation between two runs
+of one configuration is several points (seed 1 with the second version: 90.3 % at step 5,000 in
+exp 399, a 20-point dip in exp 403), so three seeds are an indication, not a proof. The guard is
+opt-in and off by default.
 
 ## 4. The GPU pauses
 
@@ -393,32 +424,31 @@ compile of a run is unchanged.
 
 ## 5. What is not established
 
-- **Binding.** No run passes the frozen key-swap verdict (follow ≥ 50 %, unchanged ≤ 10 %). The
-  later-query gain over the key-blind level is 3 to 8 points. `route-check` on exps 346, 348 and
-  349 (`a5-fix/routecheck/`) reads the same on all three: on dev keys a query's route overlaps the
-  route at its fact's *key* position by 0.89 to 0.90 and the route at the fact's *value* position
-  by 0.19 to 0.32, against 0.14 to 0.25 for the other facts' value positions (train keys read the
-  same). The routes follow the current byte's address and not the previous byte's, so a value is
-  not written into its key's cells. That is the router's learning (P1.17's other half), not
-  stability.
+- **The sag is reduced, not removed.** With the guard, seeds 0 and 2 still slide 6 and 9 points
+  late in the constant-rate phase. The guard slows the unit that takes the value routes; the
+  units that lose them also un-learn them (their weight on the previous byte's address is pushed
+  through zero), and nothing here addresses that. A change to how the router is trained (the
+  selection gradient, or the competition between units) would be an amendment of its own.
+- **Seeds and repeats.** Six seeds without the guard, three with it, one run each; execution is
+  not bit-reproducible on this card and two runs of one configuration can differ by several
+  points. The guard on seeds 3 to 5 is `p1_18_a6_final_guard_seeds`.
+- **Binding.** Eight runs pass the frozen key-swap verdict (follow ≥ 50 %, unchanged ≤ 10 %);
+  most 9k runs are still "partial" (swap followed 32 to 62 %), and the runs that lose the value
+  route end with a query's route no longer overlapping its fact's (0.14 to 0.16).
 - **Why the caps help the cut.** 349 against 348 is one seed. The caps cut the router's step
   about tenfold and the cell's about twofold; which of the two matters was not separated.
-- **Speed.** The cut learns more slowly than full backpropagation (0.6 dev at 4,000 to 4,500
-  steps against 2,500). Cutting only the summary's two readers (368) is as smooth
-  (4.0-point worst drawdown) and a little faster in the middle of the run, but ends lower (76.3 %,
-  later 56.5 %). No arm here is both fast and smooth.
-- **Seeds and repeats.** Three seeds, one run each; execution is not bit-reproducible on this
-  card (exps 299 / 300), and no arm was repeated.
-- **The forward dynamics are unchanged.** The cell is still a bank of hard switches and still
-  sensitive to its state; the cut stops the optimiser from following those directions, it does not
-  make the cell smooth.
-- **Other tasks and the dense HSN** were not run with the cut. The comparison with the
-  Transformer and the GRU above is on the delayed task only, where the HSN arms trained on that
-  task alone and the 27k baselines on the five-task mix (the delayed-only Transformer is lower).
-- **Cost.** The routed HSN step is 0.099 s against 0.014 to 0.016 s for the GRU and the
-  Transformer, with 2.1 GB against 0.7 GB of GPU memory.
-- **The wobble.** Between evaluations the recipe's dev accuracy moves 1.8 to 3.0 points (largest
-  falls 1.2 to 5.4), against 0.4 for the GRU and 0.7 for the dense HSN; see section 3b.
+- **The forward dynamics are unchanged.** Without A4 the cell is still a bank of hard switches;
+  the cut stops the optimiser from following those directions, it does not make the cell smooth.
+- **Other tasks and the dense HSN** were not run with the cut, A4 or the guard. The comparison
+  with the Transformer and the GRU is on the delayed task only, where the HSN arms trained on
+  that task alone and the 27k baselines on the five-task mix (the delayed-only Transformer is
+  lower). The guard's reading of "which unit serves the supervised positions" has only been
+  tried where the supervised positions are a query's key.
+- **Long runs with the guard.** The 27k run with the guard is exp 417 (`p1_18_a6_final_27k`);
+  the 27k figures above are without it.
+- **Cost.** The routed HSN step is 0.100 s against 0.014 to 0.016 s for the GRU and the
+  Transformer, with 2.1 GB against 0.7 GB of GPU memory. The guard and the weight average add no
+  measurable step time (0.292 s with three arms on the card, with and without).
 
 ## 6. Reproduce
 
@@ -428,9 +458,23 @@ python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_seeds.yaml --mem-estim
 python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_screen.yaml --only "carry_anchored/s2"
 setsid nohup python -m hsn.experiments worker --max-concurrent 3 --require-clean \
     --exit-when-empty --telemetry-max-samples 20000 > worker.log 2>&1 &
-python scripts/gpu_phase_report.py --exp 346 --exp 360
+python scripts/gpu_phase_report.py --exp 346 --exp 360 --exp 416
+
+# the recipe with A4 and the weight average, and with the route guard (9,000 steps, seeds 0-5 / 0-2)
+python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_final_seeds.yaml --mem-estimate-mib 3000
+python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_ema.yaml --only "a4_ema99/*"
+python -m hsn.experiments enqueue configs/sweeps/p1_18_a6_final_27k.yaml      # 27k, alone on the card
 ```
 
-Checks on the branch tip: 1,111 CPU tests pass (144 device skips); the CUDA default-training
-golden, the compiled-window and the A5 CUDA tests pass (18); ruff, ruff-format and mypy clean.
-Every new key is left out of the configuration hash at its default.
+Read-only probes used above (`/home/joe/hsn-experiments/a5-fix/`): `wobble.py` (movement between
+evaluations), `probe/route_flip.py` (which unit serves which kind of position at each kept
+checkpoint), `probe/address_columns.py` (the scorer's address weights), `probe/freeze_probe.py`
+(a run resumed with the router held still), `guard_state.py` (the guard's events in a
+checkpoint), `plot_curves.py` (the figure).
+
+Checks on the branch tip: 1,162 CPU tests pass with the card hidden (145 device skips) and all
+92 CUDA-marked tests pass on the card (the default-training golden, the compiled window and the
+A5 tests among them); ruff, ruff-format and mypy clean. Every new key is left out of the
+configuration hash at its default. The suite used to depend on test order when the CUDA tests
+were skipped (a test file left `train.deterministic` switched on for the tests after it);
+`tests/conftest.py` now restores those switches after every test.
