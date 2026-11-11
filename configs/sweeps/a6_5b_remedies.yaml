@@ -10,6 +10,10 @@
 #   balance  train.lambda_b: the balance loss, mild (paper section 7)
 #   utility  train.lambda_u: the scorer regressed onto counterfactual probes (paper section 6);
 #            autograd window only (the split window does not cover the probes)
+#   routerlr train.router_lr_mult=0.1: the router's proposed step is about ten times its update
+#            cap, so its applied step is the cap whatever the rate; at a tenth of the rate the
+#            proposal sits at the cap and the schedule's decay reaches the router
+#   decay    the same with train.decay_fraction=0.7: the rate decays from step 2,700 on
 #   temp     a constant straight-through temperature: above 1 (softer), or below 1 (sharper: the
 #            selection gradient concentrates on the cells and units near their thresholds, and a
 #            decision with a wide margin stops being pushed)
@@ -102,3 +106,14 @@ arms:
     family: hsn
     overrides:
       - train.lambda_u=1.0
+  - name: split_routerlr
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.router_lr_mult=0.1
+  - name: split_decay
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.router_lr_mult=0.1
+      - train.decay_fraction=0.7

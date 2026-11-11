@@ -959,6 +959,8 @@ class Router(nn.Module):
         self.n_units = scorer.n_units
         self.age_max = scorer.age_max  # the refresh-probe threshold (model.age_max)
         self.lambda_cost = float(lambda_cost)
+        #: ``train.unit_credit``: "softmax" (P2.2) or "executed" (:meth:`set_unit_credit`).
+        self.unit_credit = "softmax"
         self.costs = costs
         self.cell_overhead = costs.cell_overhead
         self.shared_cost = costs.shared
@@ -1023,6 +1025,17 @@ class Router(nn.Module):
         with profiler.segment("scorer", tokens=n_tokens):
             logits: Tensor = self.scorer(feats)
         return logits
+
+    def set_unit_credit(self, mode: str) -> None:
+        """``train.unit_credit`` (opt-in; the hard values never change): which scores the
+        straight-through unit weight of a chosen unit differentiates. ``"softmax"``: the softmax
+        over the cell's units (P2.2), whose gradient lowers every other unit's score where the
+        chosen unit's weight is raised. ``"executed"``: the chosen unit's score only; the others
+        enter that softmax as constants, so a unit that did not run gets no gradient from the
+        slot. The soft warm-up and dense-fallback rows, where every unit runs, keep the softmax."""
+        if mode not in ("softmax", "executed"):
+            raise ValueError(f"unit_credit must be 'softmax' or 'executed', got {mode!r}")
+        self.unit_credit = mode
 
     def scores(self, logits: Tensor) -> Tensor:
         """``U − λ_cost · c`` per (cell, unit), fp32 ``[B, N, M]``."""
@@ -1610,7 +1623,12 @@ class Router(nn.Module):
         if gate is None:
             cell_mask, unit_weights = hard_mask, unit_hard
         else:
-            soft_units = torch.softmax(scores / tau, dim=-1)
+            if self.unit_credit == "executed" and gate != "soft":
+                # the chosen unit's score with its graph, the other units' as constants
+                live = unit_hard > 0.0
+                soft_units = torch.softmax(torch.where(live, scores, scores.detach()) / tau, dim=-1)
+            else:
+                soft_units = torch.softmax(scores / tau, dim=-1)
             if scored:
                 assert threshold is not None
                 soft_mask = torch.sigmoid((cell_scores - threshold[:, None]) / tau)

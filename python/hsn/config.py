@@ -598,6 +598,14 @@ class TrainConfig(_StrictModel):
     temperature_start: float = Field(default=1.0, gt=0.0)
     temperature_end: float = Field(default=1.0, gt=0.0)
     temperature_steps: int = Field(default=0, ge=0)
+    # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which scores the
+    # straight-through unit weight of an executed slot differentiates. "softmax" (the default,
+    # P2.2): the softmax over the cell's units, so raising the executed unit's weight lowers every
+    # other unit's score at that position, and a unit with most of the slots at a kind of position
+    # pushes the others down there. "executed": the executed unit's score alone (the other units'
+    # scores are constants of that softmax): a unit that did not run gets no gradient from the
+    # slot. Not adopted by any recipe: an amendment would have to do that.
+    unit_credit: Literal["softmax", "executed"] = "softmax"
     epsilon_start: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_end: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_steps: int = Field(default=0, ge=0)
@@ -1031,6 +1039,8 @@ class RunConfig(_StrictModel):
                 )
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
+            if self.train.unit_credit != "softmax":
+                raise ValueError("train.unit_credit is HSN-only")
             if self.train.route_guard.enabled:
                 raise ValueError("train.route_guard (A6) is HSN-only")
             if self.train.state_grad_clip is not None or self.train.state_grad_ratio is not None:
@@ -1341,6 +1351,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.route_guard",
     "hardware.window",
     "hardware.sweep_twin",
+    "train.unit_credit",
 )
 
 

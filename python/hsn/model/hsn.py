@@ -324,6 +324,7 @@ class HSN(nn.Module):
         feedback_detach: Collection[str] = (),
         state_grad_clip: float | None = None,
         state_grad_ratio: float | None = None,
+        unit_credit: str = "softmax",
     ) -> None:
         super().__init__()
         if state_grad_clip is not None and (
@@ -401,6 +402,7 @@ class HSN(nn.Module):
         self.cell.detach_state_read = "state" in self.feedback_detach  # A6
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
         self.router = Router.from_config(cfg, unroll=unroll, seed=seed)
+        self.router.set_unit_credit(unit_credit)  # train.unit_credit (opt-in)
         self.halting = HaltingHead(cfg)
         self.decoder = Decoder(cfg, seed=seed)
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
@@ -430,6 +432,7 @@ class HSN(nn.Module):
             feedback_detach=run.train.feedback_detach,
             state_grad_clip=run.train.state_grad_clip,
             state_grad_ratio=run.train.state_grad_ratio,
+            unit_credit=run.train.unit_credit,
         )
 
     def set_train_step(self, step: int) -> None:
