@@ -228,6 +228,7 @@ from hsn.train.probes import (
 )
 from hsn.train.route_guard import RouteGuard
 from hsn.train.schedules import SelectionSchedule
+from hsn.train.split import SplitWindow
 
 __all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer", "trailing_cut"]
 
@@ -413,6 +414,12 @@ class TBPTTTrainer(Trainer):
             )
             if isinstance(window, CompiledWindow):  # MPS without compile support: eager
                 self._compiled = window
+        # P2.10: the split window (hardware.window=split): the training windows run the forward
+        # sweep without autograd and one batched replay; evaluation, the statistics steps' term
+        # passes and the diagnostics keep the window above
+        self._split: SplitWindow | None = (
+            SplitWindow(model, cfg, self._compiled) if cfg.hardware.window == "split" else None
+        )
         self._cut_enabled = (
             cfg.data.align_docs and cfg.model.routing == "dense" and self._compiled is None
         )
@@ -802,7 +809,7 @@ class TBPTTTrainer(Trainer):
             stats_step = next_step % train.stats_every == 0 or next_step == steps
             # P2.8: every window runs the compiled window when there is one (a statistics step's
             # per-term gradient norms come from extra compiled passes, _compiled_term_norms)
-            window_fn = self._compiled
+            window_fn: Any = self._split if self._split is not None else self._compiled
             compiled_before = self._compiled.compile_seconds if self._compiled is not None else 0.0
             term_norms: dict[str, float] = {}
             self.optimizer.zero_grad(set_to_none=True)

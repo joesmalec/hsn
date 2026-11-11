@@ -126,6 +126,10 @@ Device = Literal["cuda", "mps", "cpu"]
 AutocastDtype = Literal["bf16", "fp16", "fp32"]
 MasterDtype = Literal["fp32", "fp64"]
 CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
+#: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
+#: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
+#: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut).
+WindowMode = Literal["autograd", "split"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
 
@@ -918,6 +922,7 @@ class HardwareConfig(_StrictModel):
     unified_memory: bool
     pinned_memory: bool
     compile_mode: CompileMode = "none"
+    window: WindowMode = "autograd"  # P2.10: autograd | split (hsn.train.split)
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1319,6 +1324,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.state_grad_ratio",
     "train.weight_ema",
     "train.route_guard",
+    "hardware.window",
 )
 
 

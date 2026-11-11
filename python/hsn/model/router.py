@@ -772,6 +772,10 @@ class Selection:
     explored: Tensor
     refreshed: Tensor
     dense_fallback: Tensor
+    #: P2.10 (the split window's tape): the detached straight-through threshold ``θ [B]`` of the
+    #: scored decision before the probes; ``None`` where no threshold exists (the unscored modes,
+    #: ``dense``). Never read by the round itself.
+    threshold: Tensor | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -1656,6 +1660,49 @@ class Router(nn.Module):
             dense_fallback=(
                 dense if dense is not None else torch.zeros(B, dtype=torch.bool, device=device)
             ),
+            threshold=threshold,
+        )
+
+    def finish_recorded(
+        self,
+        logits: Tensor,
+        cells: Tensor,
+        units: Tensor,
+        valid: Tensor,
+        threshold: Tensor,
+        *,
+        mode: SelectionMode,
+        gate: GateMode | None,
+        temperature: float = 1.0,
+    ) -> Selection:
+        """The :class:`Selection` of a decision that was already taken (P2.10, the split window's
+        replay): ``cells`` / ``units`` / ``valid`` (``[B, K]``) and the threshold ``θ [B]`` are the
+        recorded values of :meth:`select` on these rows, ``logits [B, N, M]`` the scorer's logits
+        recomputed with autograd. Nothing is decided again: the hard values (``alpha``, the masks,
+        the cost) follow the recorded slots exactly, and ``logits`` only supply the gradient path
+        of ``gate`` (:meth:`_finish`). No probes are flagged (``explored`` / ``refreshed`` are
+        the recording's) and no row is a dense fallback."""
+        B, _, _ = self._check_logits(logits)
+        if mode not in SCORED_MODES:
+            raise ValueError(f"finish_recorded needs a scored mode {SCORED_MODES}, got {mode!r}")
+        tau = self._check_gate_args(mode, gate, temperature, 0.0)
+        K = int(cells.shape[1])
+        device = logits.device
+        none = torch.zeros(B, K, dtype=torch.bool, device=device)
+        return self._finish(
+            logits,
+            self.scores(logits),
+            cells,
+            units,
+            valid,
+            mode=mode,
+            gate=gate,
+            tau=tau,
+            threshold=threshold,
+            log_prob=torch.zeros(B, dtype=torch.float32, device=device),
+            explored=none,
+            refreshed=none,
+            dense=None,
         )
 
     @staticmethod

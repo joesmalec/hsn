@@ -75,6 +75,7 @@ from torch import Tensor, nn
 
 from hsn import kernels
 from hsn.config import ModelConfig
+from hsn.kernels import native as native_ops
 from hsn.kernels.native import selection_mask
 from hsn.model.embeddings import init_weight_
 from hsn.model.graph import CellGraph
@@ -398,6 +399,46 @@ class PDGCell(nn.Module):
             "state": new_state,
         }
         return h_new, info
+
+    def replay_sparse(
+        self, u: Tensor, eps: Tensor, h_read: Tensor, sel: Selection
+    ) -> tuple[Tensor, Tensor]:
+        """The candidate and the gate of :meth:`step_sparse` without the state update (P2.10, the
+        split window's replay): ``(c, b)``, each ``[R, K, d]`` in ``h_read``'s dtype, for ``R``
+        independent rows (every position of a window at once). ``h_read [R, N, d]`` is the recorded
+        pre-round state, read as a constant (A6's ``state`` cut: the replay is only defined with
+        it); ``sel`` is the recorded decision with its gradient path
+        (:meth:`hsn.model.router.Router.finish_recorded`). The same operations as
+        :meth:`step_sparse` in the same order: messages, inputs, norm, gate, the unit bank's
+        grouped pass (one unit per pair, :meth:`UnitBank.forward_selected`), ``W_out``, the
+        candidate norm, ``tanh``. Only inside :meth:`window` (the edge weights and ``W1`` layout
+        are the window's)."""
+        if not self._in_window:
+            raise RuntimeError("PDGCell.replay_sparse is only available inside PDGCell.window()")
+        if self.disabled_cells:
+            raise ValueError("PDGCell.replay_sparse does not support model.disabled_cells")
+        R, _, d = (int(n) for n in h_read.shape)
+        K = sel.k
+        dtype = h_read.dtype
+        valid = sel.valid
+        cells = torch.where(valid, sel.cell_idx, torch.zeros_like(sel.cell_idx))
+        units = torch.where(valid, sel.unit_idx, torch.zeros_like(sel.unit_idx))
+        h_const = h_read.detach()
+        with self.graph.step():
+            m = native_ops.csr_messages(h_const, self.graph, self.V, cells, validate=False)
+            v_raw = native_ops.gather_concat(u, eps, h_const, m, cells)  # [R, K, 4d]
+            v = self.norm(v_raw)
+            b = torch.sigmoid(self.gate(v).to(dtype))
+            unit_out = native_ops.grouped_unit_mlp(
+                v.reshape(R * K, 4 * d), units.reshape(R * K), self.units
+            ).reshape(R, K, d)
+            if self.cand_norm_kind == "none":
+                mixed = sel.alpha.unsqueeze(-1) * unit_out
+                c = torch.tanh(self.W_out(mixed).to(dtype))
+            else:
+                pre = self.cand_norm(self.W_out(unit_out).to(dtype))
+                c = torch.tanh(sel.alpha.unsqueeze(-1).to(dtype) * pre)
+        return c, b
 
     # ----------------------------------------------------------------------------------------------
     # Accounting and validation

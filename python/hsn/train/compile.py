@@ -92,7 +92,14 @@ from torch import Tensor
 
 from hsn.device import DeviceContext
 from hsn.model.cell import WindowConsts
-from hsn.model.hsn import HSN, SELECTION_RECORD_KEYS, StepMode, _Controls, _stack_record
+from hsn.model.hsn import (
+    HSN,
+    SELECTION_RECORD_KEYS,
+    StepMode,
+    _Controls,
+    _Prologue,
+    _stack_record,
+)
 from hsn.model.state import CellGraphState
 
 __all__ = [
@@ -369,6 +376,116 @@ def _block(
     return out
 
 
+#: The per-position stacks of :func:`_tape_block` that are joined over a window (the final state
+#: aside): per-row values ``[B, n, …]`` and per-position batch statistics ``[n]``.
+TAPE_KEYS: tuple[str, ...] = (
+    "tape_h",
+    "tape_q",
+    "tape_age",
+    "tape_hsel",
+    "tape_theta",
+    "qs",
+    "sel_cell_idx",
+    "sel_unit_idx",
+    "sel_valid",
+    "explored",
+    "refreshed",
+    "state_abs_max",
+)
+
+
+def _tape_block(
+    model: HSN,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    pos: Tensor,
+    z_b: Tensor,
+    c_b: Tensor,
+    s_b: Tensor,
+    r_b: Tensor,
+    consts: WindowConsts,
+    mode: StepMode,
+    controls: _Controls,
+) -> dict[str, Tensor]:
+    """A block of consecutive positions of the split window's forward sweep (P2.10,
+    :mod:`hsn.train.split`): :func:`_block` without autograd and with a tape. Per position it
+    applies the column's reset itself, records the pre-round state (``tape_h [B, n, N, d]``,
+    ``tape_q [B, n, d]``, ``tape_age [B, n, N]``: what the position's scorer, cell and predictor
+    read), runs :meth:`HSN._position` (the capturable routed round) and records the decision
+    (``sel_cell_idx`` / ``sel_unit_idx`` / ``sel_valid`` ``[B, n, K]``, the straight-through
+    threshold ``tape_theta [B, n]``), the summary after the position (``qs``) and the updated
+    states of the selected slots (``tape_hsel [B, n, K, d]``, cell 0 on padded slots). The replay
+    recomputes everything else with autograd from these. Sparse hard-gate rounds without dense
+    fallback only (:func:`hsn.train.split.scope_error`)."""
+    state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
+    n = int(z_b.shape[1])
+    d = int(h.shape[-1])
+    h_pre: list[Tensor] = []
+    q_pre: list[Tensor] = []
+    age_pre: list[Tensor] = []
+    h_sel: list[Tensor] = []
+    thetas: list[Tensor] = []
+    qs: list[Tensor] = []
+    cells: list[Tensor] = []
+    units: list[Tensor] = []
+    valids: list[Tensor] = []
+    explored: list[Tensor] = []
+    refreshed: list[Tensor] = []
+    state_maxima: list[Tensor] = []
+    for i in range(n):
+        state = state.reset(r_b[:, i])
+        h_pre.append(state.h)
+        q_pre.append(state.q)
+        age_pre.append(state.age)
+        result = model._position(
+            state,
+            None,
+            z_b[:, i],
+            c_b[:, i],
+            s_b[:, i],
+            mode,
+            controls,
+            None,
+            False,
+            None,
+            static=True,
+            consts=consts,
+            dense_indices=None,
+        )
+        state = result.state
+        sel = result.selection
+        assert sel is not None and sel.threshold is not None
+        safe = sel.cell_idx.masked_fill(~sel.valid, 0)
+        h_sel.append(state.h.gather(1, safe[:, :, None].expand(-1, -1, d)))
+        thetas.append(sel.threshold)
+        qs.append(state.q)
+        cells.append(sel.cell_idx)
+        units.append(sel.unit_idx)
+        valids.append(sel.valid)
+        explored.append(sel.explored.any(dim=1).float().mean())
+        refreshed.append(sel.refreshed.float().sum(dim=1).mean())
+        state_maxima.append(state.h.abs().amax())
+    return {
+        "h": state.h,
+        "q": state.q,
+        "age": state.age.contiguous(),
+        "pos": state.pos.contiguous(),
+        "tape_h": torch.stack(h_pre, dim=1),
+        "tape_q": torch.stack(q_pre, dim=1),
+        "tape_age": torch.stack(age_pre, dim=1),
+        "tape_hsel": torch.stack(h_sel, dim=1),
+        "tape_theta": torch.stack(thetas, dim=1),
+        "qs": torch.stack(qs, dim=1),
+        "sel_cell_idx": torch.stack(cells, dim=1),
+        "sel_unit_idx": torch.stack(units, dim=1),
+        "sel_valid": torch.stack(valids, dim=1),
+        "explored": torch.stack(explored),
+        "refreshed": torch.stack(refreshed),
+        "state_abs_max": torch.stack(state_maxima),
+    }
+
+
 def _cat_record(parts: Sequence[Tensor]) -> Tensor:
     """Blocks of a :func:`hsn.model.hsn._stack_record` record joined over the window."""
     return torch.cat(list(parts), dim=1 if parts[0].ndim > 1 else 0)
@@ -394,6 +511,8 @@ class CompiledWindow:
         self._bucket_blocks: dict[int, Any] = {0: self._block}
         #: The capture variant's compiled blocks (their own code objects and recompile budgets).
         self._capture_blocks: dict[int, Any] = {}
+        #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`).
+        self._tape_block: Any = None
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
@@ -472,6 +591,41 @@ class CompiledWindow:
             self.compile_seconds += time.perf_counter() - started
             self._variants.add((*key, "warm") if key in self._variants else key)
         return out
+
+    def tape(self, pro: _Prologue, state: CellGraphState, reset: Tensor) -> dict[str, Tensor]:
+        """The split window's forward sweep (P2.10, :mod:`hsn.train.split`): the compiled
+        :func:`_tape_block` over the window, under ``torch.no_grad()`` in training mode. Returns
+        :func:`run_tape`'s tape, cloned out of CUDA-graph memory (the next replay overwrites
+        it). Counted in ``calls`` and, on the calls that compile or record, ``compile_seconds``
+        like any other variant."""
+        model = self.model
+        B, T = (int(n) for n in reset.shape)
+        key: tuple[object, ...] = (
+            B,
+            block_size(T),
+            model.training,
+            model._controls().gate,
+            torch.is_autocast_enabled(self.ctx.device.type),
+            "tape",
+        )
+        warm = (*key, "warm")
+        new = key not in self._variants or (self.cuda_graphs and warm not in self._variants)
+        started = time.perf_counter()
+        if self._tape_block is None:
+            self._tape_block = _compiler(self.mode, self.backend, self.ctx.device.type)(_tape_block)
+        if self.cuda_graphs:
+            torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
+        tape = run_tape(self._tape_block, model, pro, state, reset, block_size(T))
+        if self.cuda_graphs:  # the final state would be overwritten by the next replay
+            for name in ("h", "q", "age", "pos"):
+                tape[name] = tape[name].clone()
+        self.calls += 1
+        if new:
+            if self.cuda_graphs:
+                torch.cuda.synchronize(self.ctx.device)
+            self.compile_seconds += time.perf_counter() - started
+            self._variants.add(warm if key in self._variants else key)
+        return tape
 
     def _run(
         self,
@@ -567,6 +721,50 @@ class CompiledWindow:
             written=joined("cap_written") if capture else None,
             readouts=joined("readouts") if model.cfg.selected_readout else None,
         )
+
+
+def run_tape(
+    block: Callable[..., dict[str, Tensor]],
+    model: HSN,
+    pro: _Prologue,
+    state: CellGraphState,
+    reset: Tensor,
+    blk: int,
+) -> dict[str, Tensor]:
+    """The forward sweep of a split window (:func:`_tape_block` as ``block``, compiled or not)
+    over blocks of ``blk`` positions, without autograd: the joined tape (:data:`TAPE_KEYS`) and
+    the final state (``h``, ``q``, ``age``, ``pos``). The prologue's stacks are read detached."""
+    if torch.is_grad_enabled():
+        raise RuntimeError("the split window's forward sweep runs under torch.no_grad()")
+    T = int(reset.shape[1])
+    mode = model._window_mode()
+    controls = model._controls()
+    z, context, scalars = pro.z.detach(), pro.context.detach(), pro.scalars.detach()
+    h, q, age, pos = state.h, state.q, state.age, state.pos
+    blocks: list[dict[str, Tensor]] = []
+    with model.cell.window():
+        consts = model.cell.window_consts()
+        for start in range(0, T, blk):
+            cols = slice(start, start + blk)
+            out = block(
+                model,
+                h,
+                q,
+                age,
+                pos,
+                z[:, cols],
+                context[:, cols],
+                scalars[:, cols],
+                reset[:, cols],
+                consts,
+                mode,
+                controls,
+            )
+            h, q, age, pos = out["h"], out["q"], out["age"], out["pos"]
+            blocks.append(out)
+    tape = {key: _cat_record([b[key] for b in blocks]) for key in TAPE_KEYS}
+    tape.update(h=h, q=q, age=age, pos=pos)
+    return tape
 
 
 def _eager_window(model: HSN) -> Callable[..., WindowOut]:
