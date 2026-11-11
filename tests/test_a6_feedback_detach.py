@@ -398,7 +398,13 @@ def test_trainer_refuses_a_model_built_with_another_limit(tmp_path: Path) -> Non
 @pytest.mark.parametrize("routing", [(), ROUTED, A5])
 def test_state_grad_clip_changes_no_value_and_no_healthy_gradient(routing: tuple[str, ...]) -> None:
     """Forward values are the same, and with every row under the limit so is every gradient (to
-    the rounding of autograd's sums, whose order the extra node changes; nothing is scaled)."""
+    the rounding of autograd's sums, whose order the extra node changes; nothing is scaled).
+
+    The rounding of a sum is relative to its largest terms, not to each element: an element that
+    is small by cancellation carries the absolute error of the large ones (1e-15 of the largest
+    gradient with Linux's BLAS, more with macOS's Accelerate, where an elementwise 1e-11 failed).
+    The bound is therefore 1e-11 of the largest gradient of the window; a row the clip scaled
+    would differ by a fraction of its own size."""
     cfg = _cfg(*routing)
     full = _model(cfg)
     loose = _model(_cfg(*routing, "train.state_grad_clip=1e30"))
@@ -412,11 +418,13 @@ def test_state_grad_clip_changes_no_value_and_no_healthy_gradient(routing: tuple
         outs.append((logits.detach(), state, {n: p.grad for n, p in model.named_parameters()}))
     assert torch.equal(outs[0][0], outs[1][0])
     assert torch.equal(outs[0][1].h, outs[1][1].h) and torch.equal(outs[0][1].q, outs[1][1].q)
+    scale = max(float(g.abs().max()) for g in outs[0][2].values() if g is not None)
     for name, grad in outs[0][2].items():
         other = outs[1][2][name]
         assert (grad is None) == (other is None), name
         if grad is not None:
-            torch.testing.assert_close(grad, other, rtol=1e-11, atol=1e-13, msg=name)
+            worst = float((grad - other).abs().max())
+            assert worst <= 1e-11 * scale, f"{name}: differs by {worst:.3e} (scale {scale:.3e})"
     # evaluation records nothing: the clip is not in the graph at all
     with torch.no_grad():
         e_full = full.eval()(tokens, ctx, _start(full, tokens.shape[0]), reset)[0]

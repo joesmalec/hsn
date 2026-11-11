@@ -16,6 +16,7 @@ from hsn.experiments.spec import expand, load_spec
 from hsn.train import loop
 from p1_11_support import (  # noqa: F401
     db_path,
+    fake_repo,
     isolated,
     restore_determinism,
     tiny_manifest,
@@ -117,9 +118,9 @@ def test_sqlite_retains_monitor_and_decisions(
         assert snapshots[-1]["adaptive_lr"]["accepted_steps"] == 8
 
 
-def test_adaptive_sweep_is_paired_and_preserves_existing_recipe() -> None:
+def test_adaptive_sweep_is_paired_and_preserves_existing_recipe(tmp_path: Path) -> None:
     spec, _ = load_spec(REPO_ROOT / "configs/sweeps/p1_17_a5_adaptive.yaml")
-    arms = expand(spec)
+    arms = expand(spec, repo=fake_repo(tmp_path))  # arm ids where data/ is not built (CI)
     assert len(arms) == 8 and {a.config.seed for a in arms} == {0, 1}
     for arm in arms:
         assert arm.timing and arm.config.train.schedule == "wsd"
@@ -129,11 +130,16 @@ def test_adaptive_sweep_is_paired_and_preserves_existing_recipe() -> None:
         assert arm.config.train.lambda_u == 0
 
 
-def test_ablations_change_one_signal_and_share_the_full_controller_arm_identity() -> None:
+def test_ablations_change_one_signal_and_share_the_full_controller_arm_identity(
+    tmp_path: Path,
+) -> None:
+    repo = fake_repo(tmp_path)  # arm ids where data/ is not built (CI)
     base, _ = load_spec(REPO_ROOT / "configs/sweeps/p1_17_a5_adaptive.yaml")
-    controls = {a.config.seed: a for a in expand(base) if a.label.startswith("a5_adaptive/")}
+    controls = {
+        a.config.seed: a for a in expand(base, repo=repo) if a.label.startswith("a5_adaptive/")
+    }
     spec, _ = load_spec(REPO_ROOT / "configs/sweeps/p1_17_a5_adaptive_ablations.yaml")
-    arms = expand(spec)
+    arms = expand(spec, repo=repo)
     assert len(arms) == 10
     for arm in arms:
         reference = controls[arm.config.seed]

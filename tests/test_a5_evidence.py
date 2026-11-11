@@ -15,6 +15,7 @@ from hsn.experiments.routing import route_check
 from hsn.experiments.spec import expand, load_spec
 from p1_11_support import (  # noqa: F401
     db_path,
+    fake_repo,
     isolated,
     restore_determinism,
     tiny_manifest,
@@ -109,11 +110,12 @@ def test_completed_run_retains_probeable_checkpoints(tmp_path: Path, tiny_manife
         _restored(readonly, exp_id, run_dir, cpu=True, weights="dump", checkpoint_step=2)
 
 
-def test_beta2_stage_is_matched_and_retention_does_not_change_arm_ids() -> None:
+def test_beta2_stage_is_matched_and_retention_does_not_change_arm_ids(tmp_path: Path) -> None:
+    repo = fake_repo(tmp_path)  # arm ids where data/ is not built (CI)
     original, _ = load_spec(REPO_ROOT / "configs/sweeps/p1_17_a5.yaml")
     proposed, _ = load_spec(REPO_ROOT / "configs/sweeps/p1_17_a5_b095.yaml")
-    old = {a.label: a for a in expand(original)}
-    new = expand(proposed)
+    old = {a.label: a for a in expand(original, repo=repo)}
+    new = expand(proposed, repo=repo)
     assert len(new) == 4
     for arm in new:
         assert arm.timing
@@ -124,12 +126,12 @@ def test_beta2_stage_is_matched_and_retention_does_not_change_arm_ids() -> None:
     final_only = proposed.model_copy(
         update={"protocol": {**proposed.protocol, "checkpoint": "final", "keep_every": 0}}
     )
-    assert [a.arm_id for a in expand(final_only)] == [a.arm_id for a in new]
+    assert [a.arm_id for a in expand(final_only, repo=repo)] == [a.arm_id for a in new]
 
 
-def test_recovery_stage_has_independent_learning_rate_ablations() -> None:
+def test_recovery_stage_has_independent_learning_rate_ablations(tmp_path: Path) -> None:
     spec, _ = load_spec(REPO_ROOT / "configs/sweeps/p1_17_a5_recovery.yaml")
-    arms = expand(spec)
+    arms = expand(spec, repo=fake_repo(tmp_path))
     assert len(arms) == 8
     for arm in arms:
         assert arm.timing
