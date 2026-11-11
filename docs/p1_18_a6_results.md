@@ -300,6 +300,37 @@ held still from step 1,500 of exp 376 (`probe/freeze_probe.py`) the run stays at
 through step 2,750 and is at 74.9 % at 3,250, where the original is at 63.5 % by 3,000: most of
 the damage is the router's own movement, not all of it.
 
+## 3e. Acting on the takeover when it happens: `train.route_guard`
+
+A fixed setting moves the takeover; it does not remove it. The guard
+(`docs/amendments/A6_feedback_gradient.md`, "Related: `train.route_guard`") watches the routes
+during training, with no extra forward pass, and when an established route is being taken over
+while the training loss is no longer improving it halves the *applied* router step of the unit
+that is taking it, at whatever step that happens. Three versions were run on the configuration
+that sags (caps 0.003, lr 2.5e-3, A4, averaged weights):
+
+| Version | What counts as the event | Runs | Result |
+| --- | --- | --- | --- |
+| 1 | routes lost to the unit with the most slots | exps 396-398 (seed 1, 5k) | did not work: the taker is not the most-used unit; 65.6 / 70.2 / 69.9 % |
+| 2 | any established (input byte, unit) route lost; the unit that gained most | exps 399-401 (seed 1, 5k); 402-404 (seeds 0-2, 9k, stopped near step 4,000) | held once (90.3 % and 93.1 % at 5k, binds keys), then dips of 8 to 20 points on all three seeds: it slowed units that were picking up the filler's positions, never the taker |
+| 3 | a unit that serves the supervised positions (from the loss mask) above its own record on bytes whose established routes belong to other units | exps 413-415 (seeds 0-2, 5k) | no sag on any seed; slower on two |
+
+Version 3 at step 5,000 against the same configuration without the guard:
+
+| Seed | Guard v3: dev @ 5,000 | Worst drawdown | Swap follow / unchanged | Events | No guard (exps 375-377): dev @ 5,000 | Worst drawdown |
+| ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| 0 | 88.3% (exp 413) | 6.8 pp | 88.9% / 3.3%, binds keys | 30 (from step 1,900) | 77.0% | 10.9 pp |
+| 1 | 81.6% (exp 414) | 3.1 pp | 67.5% / 14.4%, partial | 7 (from step 1,000) | 70.3% | 21.3 pp |
+| 2 | 82.5% (exp 415) | 0.0 pp | 72.8% / 13.6%, partial | 16 (from step 2,000) | 82.8% | 20.0 pp |
+
+What the guard does not do: on seed 0 the reader's router rows were at the floor (1/64 of their
+step) by step 2,500 and the readings still showed its share creeping up, because the units that
+lose the route also un-learn it (their weight on the previous byte's address is pushed through
+zero, exps 375 and 376), which slowing the taker cannot stop; and on seeds 1 and 2 the first
+events came while the route was still forming, and those runs learned more slowly (55 % and 77 %
+at step 3,500). The `restore` option (rewinding the gaining unit's rows) was worse in the one run
+that tried it (exp 400: 77.9 %). The guard is opt-in and off by default.
+
 ## 4. The GPU pauses
 
 `scripts/gpu_phase_report.py` on exp 346's card time series (alone on the card, one sample per
