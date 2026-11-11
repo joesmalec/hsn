@@ -58,13 +58,14 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
-from torch import Tensor
+import torch.nn.functional as F
+from torch import Tensor, nn
 from torch.autograd.function import FunctionCtx, once_differentiable
 
 from hsn.config import FEEDBACK_PATHS, RunConfig
 from hsn.kernels import window as window_kernels
 from hsn.model.hsn import HSN, _Prologue
-from hsn.model.router import Selection
+from hsn.model.router import Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.train.compile import CompiledWindow, WindowOut, _tape_block, run_tape
 
@@ -223,6 +224,30 @@ class StateRecurrence(torch.autograd.Function):
         return dc, db, None, None
 
 
+def _scorer_logits(
+    scorer: Scorer, u: Tensor, eps: Tensor, h: Tensor, age: Tensor, scalars: Tensor
+) -> Tensor:
+    """The scorer's logits ``[R, N, M]`` of :meth:`Scorer._assemble`'s features without building
+    them: for the linear scorer the ``[R, N, 3d+8]`` feature tensor (``u`` and ``eps`` repeated
+    for every cell: 200 MB for a B32/T256 window) is only ever multiplied by one weight matrix,
+    so the product is taken per feature block and the row terms are added once per row. The same
+    sum in another order, in the state's dtype (as the caller's cast makes the assembled
+    product). Scorers this
+    does not cover (the MLP scorer, excluded features) take the assembled path."""
+    net = scorer.net
+    if not isinstance(net, nn.Linear) or scorer.exclude:
+        out: Tensor = scorer(scorer._assemble(u, eps, h, age, scalars))
+        return out
+    d = int(h.shape[-1])
+    weight = net.weight
+    row = F.linear(torch.cat([u, eps], dim=-1), weight[:, : 2 * d])  # [R, M]
+    tail = torch.cat([(age.to(u.dtype) / scorer.age_max)[:, :, None], scalars], dim=-1)
+    dtype = h.dtype  # the state's dtype: the partial products are summed in it, not in bf16
+    cells = F.linear(h, weight[:, 2 * d : 3 * d]).to(dtype)  # [R, N, M]
+    cells = cells + F.linear(tail, weight[:, 3 * d :], net.bias).to(dtype)
+    return cells + row.to(dtype)[:, None, :]
+
+
 def _readout_of_slots(chosen: Tensor, sel: Selection, gate: str | None, q: Tensor) -> Tensor:
     """:meth:`HSN._selected_readout`'s hard branch from the selected slots' updated states
     ``chosen [R, K, d]`` (the same operations; ``q [R, d]`` serves the dense-fallback rows, of
@@ -355,8 +380,9 @@ class SplitWindow:
         u_s = u.to(dtype)
         eps_s = (z - z_hat_value).to(dtype)  # A6 `eps`: z keeps its gradient, the prediction none
         # the scorer on detached features (A6 `router`), and the recorded decision's gradient path
-        feats = model.scorer._assemble(u_s.detach(), eps_s.detach(), h_pre, age_pre, scalars)
-        unit_logits = model.router(feats).to(dtype)  # [R, N, M]
+        unit_logits = _scorer_logits(
+            model.scorer, u_s.detach(), eps_s.detach(), h_pre, age_pre, scalars
+        ).to(dtype)  # [R, N, M]
         selection = model.router.finish_recorded(
             unit_logits,
             cells,

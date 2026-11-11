@@ -410,7 +410,7 @@ class PDGCell(nn.Module):
         it); ``sel`` is the recorded decision with its gradient path
         (:meth:`hsn.model.router.Router.finish_recorded`). The same operations as
         :meth:`step_sparse` in the same order: messages, inputs, norm, gate, the unit bank's
-        grouped pass (one unit per pair, :meth:`UnitBank.forward_selected`), ``W_out``, the
+        grouped pass (one unit per pair, :meth:`UnitBank.forward_grouped`), ``W_out``, the
         candidate norm, ``tanh``. Only inside :meth:`window` (the edge weights and ``W1`` layout
         are the window's)."""
         if not self._in_window:
@@ -424,13 +424,21 @@ class PDGCell(nn.Module):
         cells = torch.where(valid, sel.cell_idx, torch.zeros_like(sel.cell_idx))
         units = torch.where(valid, sel.unit_idx, torch.zeros_like(sel.unit_idx))
         h_const = h_read.detach()
-        with self.graph.step():
-            m = native_ops.csr_messages(h_const, self.graph, self.V, cells, validate=False)
+        graph = self.graph
+        D = graph.max_in_degree
+        with graph.step():
+            # the messages of CellGraph.messages_selected with V applied to the gathered sources
+            # only (the same rows of the same product): the state is a constant here, so nothing
+            # has to be scattered back over all N cells in the backward
+            index = graph._pad_src[cells].reshape(R, K * D, 1).expand(R, K * D, d)
+            sources = self.V(h_const.gather(1, index)).reshape(R, K, D, d)
+            edge_weights = graph._padded_weights_as(sources.dtype)[cells]  # [R, K, D_max]
+            m = (sources * edge_weights[..., None]).sum(dim=2)
             v_raw = native_ops.gather_concat(u, eps, h_const, m, cells)  # [R, K, 4d]
             v = self.norm(v_raw)
             b = torch.sigmoid(self.gate(v).to(dtype))
-            unit_out = native_ops.grouped_unit_mlp(
-                v.reshape(R * K, 4 * d), units.reshape(R * K), self.units
+            unit_out = self.units.forward_grouped(
+                v.reshape(R * K, 4 * d), units.reshape(R * K)
             ).reshape(R, K, d)
             if self.cand_norm_kind == "none":
                 mixed = sel.alpha.unsqueeze(-1) * unit_out
