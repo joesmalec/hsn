@@ -13,12 +13,13 @@ the delayed task, B32, compiled, unguarded: no spike guard, no rollback, every d
    direction. Cutting those reads out of the backward pass (`train.feedback_detach`, opt-in,
    forward unchanged) removes them on every seed (sections 1 to 3).
 2. *The accuracy.* With the cut, the candidate norm of amendment A4 trains (it diverged before)
-   and the recipe finishes above every GRU run on every one of six seeds (section 3c).
+   and the recipe finishes above the GRU: 83.9 % over nine runs, 87.2 % with the route guard,
+   against 76.7 to 79.3 % (sections 3c and 3e).
 3. *The sag.* That recipe still loses 5 to 21 points mid-run and recovers. The cause is a
    router unit taking over the positions where values are written, which undoes the key binding
    (section 3d). `train.route_guard` (opt-in) halves that unit's router step when the takeover
-   starts, at whatever step that is; on all six seeds the deep sag is gone and the final score
-   is higher (section 3e).
+   starts, at whatever step that is; eight of nine guarded runs have no fall of ten points or
+   more, against two of nine without it (section 3e).
 4. *The GPU pauses* were the diagnostics and probes running eager forwards, and Python's garbage
    collector; both are fixed (section 4).
 
@@ -32,13 +33,21 @@ the delayed task, B32, compiled, unguarded: no spike guard, no rollback, every d
 | GRU, delayed task (exps 154, 347, 204, 206, 405-407) | 76.7 to 79.3 % | 56.2 to 59.7 % | 0.5 to 1.3 pp |
 
 Means over the six seeds: 85.1 % without the guard and 89.0 % with it (higher on every seed, by
-0.3 to 10.9 points), against 79.3 % for the GRU's best run. Later queries, where the dev keys
-were never seen in training and a key-blind reader tops out at 62.3 %: 75.4 % and 83.5 %, against
-56 to 60 %. No step is skipped in any of these runs. With the guard the model reaches 0.6 dev at
-step 1,000 to 1,500 and stays above it (the GRU's speed bar is 2,500 to 3,000). Ten runs pass the
-frozen key-binding verdict, the first of this project: three of the six guarded 9k runs (exps
-422, 424, 425) and one of the six unguarded (exp 418), and six runs stopped at step 5,000 (exps
-384, 386, 389, 399, 401, 413); the others are "partial".
+0.3 to 10.9 points), against 79.3 % for the GRU's best run and 78.0 % for the mean of its seven.
+Execution is not bit-reproducible on this card, so seeds 0 to 2 were run a second time both ways:
+79.1 / 86.4 / 79.4 % without the guard (exps 433 to 435) and 85.1 / 78.5 / 87.3 % with it (exps
+430 to 432). **Over all nine runs each: 83.9 % without the guard (79.1 to 86.5) and 87.2 % with it
+(78.5 to 95.6); a fall of ten points or more in seven of nine runs without it and in one of nine
+with it.** Sixteen of the eighteen runs are above the GRU's best run; the exceptions are one
+unguarded run (79.1 %) and one guarded run (78.5 %, the one that sagged).
+
+Later queries, where the dev keys were never seen in training and a key-blind reader tops out at
+62.3 %: 73.3 % without the guard and 80.7 % with it (nine runs each), against 56 to 60 %. No step
+is skipped in any of these runs. The guarded runs reach 0.6 dev at step 1,000 to 2,500 (the
+GRU's speed bar is 2,500 to 3,000). Ten runs pass the frozen key-binding verdict, the first of
+this project: three of the nine guarded 9k runs (exps 422, 424, 425) and one of the nine
+unguarded (exp 418), and six runs stopped at step 5,000 (exps 384, 386, 389, 399, 401, 413); the
+others are "partial".
 
 Over 27,000 steps the recipe ends at 90.6 % with the guard and at 90.6 % without it (later
 queries 83.5 % and 82.8 %, exps 417 and 416), against 78.7 % for the GRU and 70.2 % for the
@@ -248,7 +257,9 @@ Under full backpropagation the candidate norm of amendment A4 (`model.cand_norm=
 
 Six seeds scored on averaged weights (exps 375 to 377, 418 to 420): 85.1 % mean (82.1 to 86.5),
 75.4 % on later queries (71.0 to 79.0), against 81.4 % and 67.7 % without A4 (three seeds) and
-76.7 to 79.3 % for the GRU's runs. Every one of the six is above every GRU run. No step skipped.
+76.7 to 79.3 % for the GRU's runs. A second run of seeds 0 to 2 (exps 433 to 435) ended at 79.1 /
+86.4 / 79.4 % (later 63.6 / 76.0 / 67.7 %), so over nine runs the mean is 83.9 % (79.1 to 86.5)
+and eight of the nine are above the GRU's best run. No step skipped.
 
 Over 27,000 steps (exp 416, seed 2, alone on the card) the same recipe ends at 90.6 % (later
 queries 82.8 %, first 99.4 %, swap followed 55.2 %), where the recipe without A4 ended at 90.0 %
@@ -258,8 +269,8 @@ against 3,500), not where a long run ends. With the average, the dev accuracy of
 
 **But every run sags mid-run.** After reaching 72 to 92 % by steps 1,500 to 2,500, each falls
 and then recovers: worst drawdown 14.0 / 10.9 / 21.3 / 20.0 / 5.1 / 13.7 / 14.7 points for exps
-372, 375, 376, 377, 418, 419, 420, and 13.1 in the 27k run (91.7 % at step 2,500, 78.6 % at
-3,000). Seeds 1 and 2 drop back under 0.6 dev during it, so the speed bar is passed and then
+372, 375, 376, 377, 418, 419, 420, 17.6 / 16.4 / 7.7 for the second runs of seeds 0 to 2, and
+13.1 in the 27k run (91.7 % at step 2,500, 78.6 % at 3,000). Seeds 1 and 2 drop back under 0.6 dev during it, so the speed bar is passed and then
 lost. Gradient norms stay ordinary throughout; this is not the burst of section 1.
 
 ## 3d. What the sag is: the router takes the value routes away
@@ -350,6 +361,20 @@ weights; the two differ in nothing else):
 | 5 | 85.3% (exp 426) | 75.3% | 6.0 pp | 58.4% / 20.1%, partial | 57 | 84.6% (exp 420) | 73.6% | 14.7 pp |
 | mean | 89.0% | 83.5% | | | | 85.1% | 75.4% | |
 
+**A second run of seeds 0 to 2, both ways** (the same configurations; execution is not
+bit-reproducible on this card):
+
+| Seed | With the guard, first / second run | Worst drawdown | Without, first / second run | Worst drawdown |
+| ---: | --- | --- | --- | --- |
+| 0 | 86.2% / 85.1% (exps 421, 430) | 5.8 / 4.8 pp | 85.9% / 79.1% (exps 375, 433) | 10.9 / 17.6 pp |
+| 1 | 93.3% / 78.5% (exps 422, 431) | 1.8 / 13.7 pp | 86.5% / 86.4% (exps 376, 434) | 21.3 / 16.4 pp |
+| 2 | 88.9% / 87.3% (exps 423, 432) | 8.7 / 3.9 pp | 86.5% / 79.4% (exps 377, 435) | 20.0 / 7.7 pp |
+
+Two runs of one configuration differ by up to 15 points, and the guard did not hold seed 1 the
+second time (a 13.7-point sag, 78.5 % at the end). Over the nine runs each way: 87.2 % with the
+guard and 83.9 % without; later queries 80.7 % and 73.3 %; a fall of ten points or more in one
+run of nine with the guard and in seven of nine without.
+
 The first event comes at step 1,400 to 2,100 in each run, where the unguarded runs begin to sag;
 by the end exactly one unit per run (the one that serves the answer positions) is at the floor
 of its step scale and every other unit is untouched. The same guard stopped at step 5,000 (exps
@@ -385,8 +410,9 @@ forming slows that run (exps 414 and 415 at 5k: 55 % and 77 % at step 3,500 befo
 The `restore` option (rewinding the gaining unit's rows) was worse in the one run that tried it
 (exp 400: 77.9 %). Runs are not bit-reproducible on this card and the variation between two runs
 of one configuration is several points (seed 1 with the second version: 90.3 % at step 5,000 in
-exp 399, a 20-point dip in exp 403), so six seeds with one run each are an indication, not a
-proof. The guard is opt-in and off by default.
+exp 399, a 20-point dip in exp 403; with this version 93.3 % and 78.5 %, exps 422 and 431), so
+the nine-run comparison above is an indication, not a proof. The guard is opt-in and off by
+default.
 
 ## 4. The GPU pauses
 
@@ -459,8 +485,10 @@ compile of a run is unchanged.
   units that lose them also un-learn them (their weight on the previous byte's address is pushed
   through zero), and nothing here addresses that. A change to how the router is trained (the
   selection gradient, or the competition between units) would be an amendment of its own.
-- **Seeds and repeats.** Six seeds with and without the guard, one run each; execution is not
-  bit-reproducible on this card and two runs of one configuration can differ by several points.
+- **Seeds and repeats.** Nine runs with and nine without the guard (six seeds, three of them
+  twice). Execution is not bit-reproducible on this card and two runs of one configuration differ
+  by up to 15 points, so the 3.3-point difference of the means rests on the count of sags (one of
+  nine against seven of nine) more than on any single run.
 - **Binding.** Ten runs pass the frozen key-swap verdict (follow ≥ 50 %, unchanged ≤ 10 %), three
   of the six guarded 9k runs among them; the others are "partial" (swap followed 32 to 62 %),
   and the runs that lose the value route end with a query's route no longer overlapping its

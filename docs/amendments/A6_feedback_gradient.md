@@ -10,11 +10,12 @@ worst drop during a run 2.2 / 6.8 / 4.5 points, no step skipped. The same recipe
 backpropagation (exps 343, 326, 346): 73.8 / 78.2 / 77.5 %, worst drop 12.0 / 4.8 / 36.9 points.
 
 **With the candidate norm of A4 on top** (`model.cand_norm=rms`, which diverged under full
-backpropagation and trains with the cut), six seeds end at 82.1 to 86.5 % (mean 85.1 %; exps 375
-to 377, 418 to 420), every one above every GRU run, with a mid-run sag of 5 to 21 points. With
-`train.route_guard` (below) the same six seeds end at 84.9 to 95.6 % (mean 89.0 %; exps 421 to
-426) with falls of 1.5 to 8.7 points. The tested recipe is therefore the cut, the anchored caps,
-A4, `train.weight_ema=0.99` and the route guard at its defaults; each part is opt-in.
+backpropagation and trains with the cut), nine runs on six seeds end at 79.1 to 86.5 % (mean
+83.9 %; exps 375 to 377, 418 to 420, 433 to 435), eight of them above the GRU's best run, and
+seven of them with a mid-run sag of ten points or more. With `train.route_guard` (below) nine
+runs on the same seeds end at 78.5 to 95.6 % (mean 87.2 %; exps 421 to 426, 430 to 432), one of
+them with such a sag. The tested recipe is therefore the cut, the anchored caps, A4,
+`train.weight_ema=0.99` and the route guard at its defaults; each part is opt-in.
 
 Two further keys of the same family, `train.state_grad_ratio` and `train.state_grad_clip`, are
 described at the end. They were tested and **do not remove the drops**; they are not part of the
@@ -218,8 +219,10 @@ constantly) are not events: an earlier version that counted them slowed the wron
 **Results** (9,000 steps, six seeds, against the same configuration without the guard): 86.2 /
 93.3 / 88.9 / 95.6 / 84.9 / 85.3 % against 85.9 / 86.5 / 86.5 / 84.7 / 82.1 / 84.6 %; worst
 drawdown 5.8 / 1.8 / 8.7 / 1.5 / 5.2 / 6.0 points against 10.9 / 21.3 / 20.0 / 5.1 / 13.7 / 14.7;
-three of the six pass the key-binding verdict against one. Over 27,000 steps (one seed) it
-removes the early sag and ends at the same score.
+three of the six pass the key-binding verdict against one. A second run of seeds 0 to 2: 85.1 /
+78.5 / 87.3 % against 79.1 / 86.4 / 79.4 % (the guarded seed 1 sagged 13.7 points that time).
+Over the nine runs each way: 87.2 % against 83.9 %, and a fall of ten points or more in one run
+against seven. Over 27,000 steps (one seed) it removes the early sag and ends at the same score.
 
 **Limits.** It needs a scorer with one output per unit (the linear scorer, or the two-layer
 scorer's second layer). A unit whose step has been halved to the floor no longer learns new
