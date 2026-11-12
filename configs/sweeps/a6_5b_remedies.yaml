@@ -261,6 +261,57 @@ arms:
       - train.aux_enabled=[balance]
       - train.unit_credit=executed
       - hardware.window=fused
+  # The two eight-slot arms at extended length (the user, 12 Nov: "longer runs to see how they do
+  # at extended training runs"): 27,000 and 54,000 steps, the schedule stretched with the run
+  # (warm-up 200, soft gates to step 1,000, decay over the last 20 %).
+  - name: fused_softwarm_k8_balance_executed_27k
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.unit_credit=executed
+      - hardware.window=fused
+      - train.steps=27000
+      - train.ckpt_every=27000
+    protocol:
+      steps: 27000
+  - name: fused_softwarm_k8_executed_27k
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.unit_credit=executed
+      - hardware.window=fused
+      - train.steps=27000
+      - train.ckpt_every=27000
+    protocol:
+      steps: 27000
+  - name: fused_softwarm_k8_balance_executed_54k
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.unit_credit=executed
+      - hardware.window=fused
+      - train.steps=54000
+      - train.ckpt_every=54000
+    protocol:
+      steps: 54000
+  - name: fused_softwarm_k8_executed_54k
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.unit_credit=executed
+      - hardware.window=fused
+      - train.steps=54000
+      - train.ckpt_every=54000
+    protocol:
+      steps: 54000
   - name: fused_balance_executed # the candidate fused_softwarm_balance_executed without the warm-up
     family: hsn
     overrides:
