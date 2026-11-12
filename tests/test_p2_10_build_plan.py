@@ -27,7 +27,8 @@ class BuildPlanTests(unittest.TestCase):
                 patch.dict(os.environ, {"CUDA_HOME": tmp}),
                 patch.object(build.shutil, "which") as which,
             ):
-                self.assertEqual(build.find_nvcc(), nvcc)
+                # resolved: a temporary directory may sit behind a symlink (/var on macOS)
+                self.assertEqual(build.find_nvcc().resolve(), nvcc.resolve())
                 which.assert_not_called()
 
     def test_broken_explicit_root_does_not_pick_another_toolkit(self):

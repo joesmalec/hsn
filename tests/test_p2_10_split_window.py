@@ -264,12 +264,26 @@ def test_split_gradients_without_selected_readout() -> None:
 
 
 def test_split_window_without_loss_positions_gives_the_same_none_set() -> None:
+    """A window without loss positions: the same set of absent gradients, and the present ones
+    equal. Without the task term the scorer's gradient is small and many of its entries are
+    near zero by cancellation, so they are compared against the tensor's own scale: 1e-8 of
+    its largest entry. On the development machine the two paths agree to 6e-16 of that scale;
+    GitHub's Ubuntu and macOS runners differ by up to 7e-10 of it on the scorer's weight (and
+    hold 1e-9 elementwise on every other parameter), which the elementwise tolerance alone
+    read as a failure at the near-zero entries."""
     cfg = _cfg(*RECIPE)
     ref, got, _, _ = _both(cfg, loss_positions=False)
     assert {n for n, g in ref.items() if g is None} == {n for n, g in got.items() if g is None}
     for name, want in ref.items():
         if want is not None:
-            torch.testing.assert_close(got[name], want, rtol=1e-9, atol=1e-12)
+            scale = float(want.abs().max())
+            torch.testing.assert_close(
+                got[name],
+                want,
+                rtol=1e-9,
+                atol=max(1e-12, 1e-8 * scale),
+                msg=lambda m, n=name: n + m,
+            )
 
 
 def test_recorded_decision_credits_the_unit_that_ran() -> None:
