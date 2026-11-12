@@ -422,6 +422,9 @@ class TBPTTTrainer(Trainer):
             if cfg.hardware.window in ("split", "fused")
             else None
         )
+        # a split run with a soft warm-up releases the warm-up window's recorded graphs at the
+        # switch (CompiledWindow.release): several GB that nothing reads again
+        self._warm_up_recorded = self._split is not None and cfg.train.soft_until_step > 0
         self._cut_enabled = (
             cfg.data.align_docs and cfg.model.routing == "dense" and self._compiled is None
         )
@@ -851,6 +854,10 @@ class TBPTTTrainer(Trainer):
                 fwd = batch if cut == window["doc"].shape[1] else _columns(batch, cut)
                 state = self._window_start(state)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
+                if self._warm_up_recorded and self._split is not None and self._split.splits_now():
+                    self._warm_up_recorded = False  # the first hard-gate step: once
+                    if self._compiled is not None:
+                        self._compiled.release()
                 probe = (
                     self._counterfactual_probe(train_ds, window, batch, state)
                     if self.counterfactual

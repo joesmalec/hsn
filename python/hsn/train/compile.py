@@ -81,6 +81,7 @@ gradients there (an inductor Metal fusion bug in torch 2.15).
 from __future__ import annotations
 
 import copy
+import gc
 import itertools
 import logging
 import time
@@ -949,6 +950,28 @@ class CompiledWindow:
             self.compile_seconds += time.perf_counter() - started
             self._variants.add((*key, "warm") if key in self._variants else key)
         return out
+
+    def release(self) -> None:
+        """Drop the recorded CUDA graphs of every compiled variant and return their memory pools
+        to the card (P2.10). A recorded graph keeps all of its intermediate tensors for as long
+        as it exists; the soft warm-up's window (every cell and unit, with autograd) holds
+        5.6 GB that way on the A6 recipe, and after the switch to the split window nothing calls
+        it again. The variants that are still needed (the forward sweep, evaluation) compile
+        from inductor's cache and record again on their next call, which counts as a compile
+        step. Without CUDA graphs there is nothing to release."""
+        if not self.cuda_graphs:
+            return
+        from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+
+        torch._dynamo.reset()
+        reset_cudagraph_trees()
+        self._block = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
+        self._bucket_blocks = {0: self._block}
+        self._capture_blocks = {}
+        self._tape_blocks = {}
+        self._variants.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def tape(
         self,

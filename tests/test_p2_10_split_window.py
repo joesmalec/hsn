@@ -561,6 +561,42 @@ def test_fused_sweep_tape_is_the_split_sweeps_in_fp32(extra: tuple[str, ...], re
     assert fused_twins and all(twin.merged for twin in fused_twins)  # the merged products ran
 
 
+@pytest.mark.cuda
+@pytest.mark.usefixtures("small_blocks", "_release_compiled_state")
+def test_release_drops_the_recorded_graphs_and_the_sweep_records_again() -> None:
+    """:meth:`CompiledWindow.release` (a split run's switch out of its soft warm-up): the
+    recorded CUDA graphs go, every variant counts as new again, and the sweep compiles and
+    records again with the same tape, bit for bit. (The memory it returns is measured on the
+    recipe: 7.2 GB reserved before the switch, 1.0 GB after;
+    ``evidence/P2.10/speed/s9/stage8-soft-fused.json``.)"""
+    from hsn.kernels import window as window_kernels
+    from hsn.train.compile import TAPE_KEYS
+
+    p28, cfg, model, compiled, (tokens, cx, state, reset) = _cuda_case()
+    if not window_kernels.available():
+        pytest.skip("window kernels not built (scripts/build_window_kernels.py)")
+    window_kernels.prepare(0)
+
+    def sweep() -> dict[str, Tensor]:
+        with torch.no_grad():
+            pro = model._window_prologue(
+                tokens, cx, state, reset, model._window_mode(), reset_first=True
+            )
+            for _ in range(3):  # warm-up, recording, replay
+                tape = compiled.tape(pro, state, reset, fused=True)
+            return {k: v.clone() for k, v in tape.items()}
+
+    first = sweep()
+    assert compiled._variants and compiled.cuda_graphs
+    seconds = compiled.compile_seconds
+    compiled.release()
+    assert not compiled._variants and not compiled._tape_blocks
+    again = sweep()
+    assert compiled.compile_seconds > seconds  # recorded again, counted as compile steps
+    for key in (*TAPE_KEYS, "h", "q", "age", "pos"):
+        assert torch.equal(first[key], again[key]), key
+
+
 def test_permute_rows_has_index_selects_value_and_gradient() -> None:
     """:func:`hsn.model.units.permute_rows` (the replay's two reorderings of the pairs): the
     value and the gradient of ``index_select`` with a permutation, bit for bit, also through a
