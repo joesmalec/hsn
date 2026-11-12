@@ -182,6 +182,13 @@ arms:
       - train.lambda_b=0.1
       - train.aux_enabled=[balance]
       - hardware.window=fused
+  - name: fused_softwarm_balance50 # the weight at which the balance push matches the task's
+    family: hsn # differential at a value position (evidence/P2.10/sag/softwarm/grad-*.txt)
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.5
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
   - name: split_softwarm_dense05 # dense-fallback rows: the split window (the fused one has none)
     family: hsn
     overrides:
