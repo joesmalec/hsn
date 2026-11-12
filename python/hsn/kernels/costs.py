@@ -24,6 +24,9 @@ is unambiguous. The **cost-model partition** of :func:`profile_dense_costs` is
   ``v`` and its RMSNorm (P1.5a), the gate ``b``, the mixing, ``W_out``, ``tanh`` and the gated
   update (two entries per
   position, before and after the unit pass; the chunk's "per-cell overhead (messages, gate)");
+  with ``model.ablate_shared_u`` the cell input is ``[ε; h_i; m_i]`` (3d), and the block records
+  the key (``"ablate_shared_u"``; absent in older profiles, which are the 4d cell's): a profile
+  is only read for a model with the same setting;
 * ``selected_cells``: the unit bank only (``UnitBank.forward_all``: every unit on every cell);
 * ``decode``: ``D([q_t; u_t])`` — once per position.
 
@@ -105,7 +108,9 @@ UNIFORM_SOURCE = "uniform placeholder (not profiled)"
 
 _BLOCK_INT_KEYS = ("n_cells", "n_units", "d", "hidden", "batch", "positions")
 _BLOCK_STR_KEYS = ("producer", "profile", "device", "dtype")
-_MODEL_OPTION_KEYS = ("key_address", "selected_readout")
+# ``ablate_shared_u`` narrows the cell input to 3d (the units' first layer, the gate, the norm):
+# a profile of the 4d cell is not a measurement of the ablated one, nor the reverse.
+_MODEL_OPTION_KEYS = ("key_address", "selected_readout", "ablate_shared_u")
 # Old profiles recorded d/H but omitted these cost-sensitive settings. Their reference defaults
 # are the only supported inference; a nondefault configuration must be measured again.
 _MODEL_COST_DEFAULTS: dict[str, str | int] = {
@@ -256,8 +261,8 @@ class CostTable:
         a non-finite value, segments with different ``tokens``, a block whose shapes disagree with
         the report, or ``n_units`` different from the profiled ``M`` (regenerate the profile).
         With ``cfg``, dimensions and cost-sensitive model settings must match. Missing legacy
-        settings imply only their original reference defaults (A5 off, context_dim = d); an
-        unrecorded nondefault setting requires a fresh measurement.
+        settings imply only their original reference defaults (A5 off, the 4d cell input,
+        context_dim = d); an unrecorded nondefault setting requires a fresh measurement.
         """
         if isinstance(n_units, bool) or not isinstance(n_units, int) or n_units < 1:
             raise ValueError(f"n_units must be an int >= 1, got {n_units!r}")
@@ -539,10 +544,10 @@ def profile_dense_costs(
                     B, N, d = state.batch_size, state.n_cells, state.width
                     h_prev = state.h
                     m = cell.graph.messages_dense(h_prev, cell.V)
-                    v = torch.cat(
-                        [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_prev, m],
-                        dim=-1,
-                    )
+                    blocks = [eps[:, None, :].expand(B, N, d), h_prev, m]
+                    if not cell.ablate_shared_u:  # the ablated cell input has no u: [B, N, 3d]
+                        blocks = [u[:, None, :].expand(B, N, d), *blocks]
+                    v = torch.cat(blocks, dim=-1)
                     v = cell.norm(v)  # P1.5a: the units and the gate read the normalised input
                     b = torch.sigmoid(cell.gate(v))
                 with profiler.segment("selected_cells", tokens=batch):
@@ -585,6 +590,7 @@ def profile_dense_costs(
         "hidden": cfg.hidden,
         "key_address": cfg.key_address,
         "selected_readout": cfg.selected_readout,
+        "ablate_shared_u": cfg.ablate_shared_u,
         **{name: getattr(cfg, name) for name in _MODEL_COST_DEFAULTS},
         "context_dim": cfg.context_dim,
         "batch": batch,
