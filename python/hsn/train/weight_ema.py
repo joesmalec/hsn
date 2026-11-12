@@ -36,6 +36,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from hsn.kernels import trainer as trainer_kernels
+
 __all__ = ["WARMUP", "WeightEMA", "install_averaged", "warmup_decay"]
 
 #: The warm-up's constant: ``d_n = min(decay, (1 + n) / (WARMUP + n))``.
@@ -76,7 +78,10 @@ class WeightEMA:
         if self.installed or self._backup is not None:
             raise RuntimeError("train.weight_ema: the model holds the averaged weights")
         weight = 1.0 - warmup_decay(self.decay, self.updates)
-        torch._foreach_lerp_(self._shadow, [p.detach() for p in self._params], weight)
+        params = [p.detach() for p in self._params]
+        # P2.10b: one kernel launch for fp32 weights on CUDA (the same lerp, bit for bit)
+        if not trainer_kernels.lerp(self._shadow, params, weight):
+            torch._foreach_lerp_(self._shadow, params, weight)
         self.updates += 1
 
     # scoring ---------------------------------------------------------------------------------
