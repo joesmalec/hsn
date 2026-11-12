@@ -344,6 +344,9 @@ class SplitWindow:
         self.fused = cfg.hardware.window == "fused"
         #: ``hardware.sweep_twin``: the compiled sweep runs the pre-cast twin of the model.
         self.twin = cfg.hardware.sweep_twin
+        #: P2.10b: what the fused sweep folds into its two kernels (``None``: the default,
+        #: :data:`hsn.train.compile.SWEEP_FOLD`; ``0``: the sweep of P2.10, for comparisons).
+        self.fold: int | None = None
         #: The replay reads a selected cell's score at the unit the sweep ran
         #: (:meth:`~hsn.model.router.Router.finish_recorded`); False is the first version's
         #: ``amax`` of the recomputed scores, kept for the measurement in the write-up.
@@ -454,6 +457,7 @@ class SplitWindow:
                     twin=self.twin,
                     dense_rows=dense_rows,
                     dense_indices=dense_indices,
+                    fold=self.fold,
                 )
             else:
                 tape = run_tape(

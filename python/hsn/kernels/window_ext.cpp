@@ -68,8 +68,10 @@ CUfunction function(const std::string& name) {
     functions.emplace(name, fn);
     return fn;
 }
+// `views` (P2.10b): the indices of tensors that may be strided views; the kernel gets the address
+// of their first element and the wrapper passes it their strides.
 HsnWinArgs pack(const std::vector<Tensor>& tensors, const std::vector<int64_t>& ints,
-    const std::vector<double>& floats, int& device) {
+    const std::vector<double>& floats, int& device, const std::vector<int64_t>& views = {}) {
     TORCH_CHECK(!tensors.empty() && tensors.size() <= HSN_WIN_POINTERS
         && ints.size() <= HSN_WIN_INTS && floats.size() <= HSN_WIN_FLOATS,
         "HSN window kernels: launch descriptor overflow");
@@ -77,7 +79,9 @@ HsnWinArgs pack(const std::vector<Tensor>& tensors, const std::vector<int64_t>& 
     device = tensors[0].get_device();
     for (size_t k = 0; k < tensors.size(); ++k) {
         const auto& t = tensors[k];
-        TORCH_CHECK(t.is_cuda() && t.get_device() == device && t.is_contiguous(),
+        bool view = false;
+        for (const auto index : views) view = view || static_cast<size_t>(index) == k;
+        TORCH_CHECK(t.is_cuda() && t.get_device() == device && (view || t.is_contiguous()),
             "HSN window kernels: tensor ", k, " must be a contiguous CUDA tensor on one device");
         args.p[k] = t.data_ptr();
     }
@@ -105,6 +109,17 @@ void launch(const std::string& name, int64_t grid, int64_t block, int64_t shared
     HsnWinArgs args = pack(tensors, ints, floats, device);
     const c10::cuda::CUDAGuard guard(device);
     // An autograd worker thread may have the device selected without a current driver context.
+    C10_CUDA_CHECK(c10::cuda::SetDevice(device, /*force=*/true));
+    const auto stream = static_cast<CUstream>(at::cuda::getCurrentCUDAStream(device).stream());
+    launch_one(function(name), args, grid, block, shared, stream);
+}
+// launch() for a kernel that reads some of its tensors as strided views (pack).
+void launch_views(const std::string& name, int64_t grid, int64_t block, int64_t shared,
+    const std::vector<Tensor>& tensors, const std::vector<int64_t>& views,
+    const std::vector<int64_t>& ints, const std::vector<double>& floats) {
+    int device = 0;
+    HsnWinArgs args = pack(tensors, ints, floats, device, views);
+    const c10::cuda::CUDAGuard guard(device);
     C10_CUDA_CHECK(c10::cuda::SetDevice(device, /*force=*/true));
     const auto stream = static_cast<CUstream>(at::cuda::getCurrentCUDAStream(device).stream());
     launch_one(function(name), args, grid, block, shared, stream);
@@ -202,5 +217,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("prepare", &prepare);
     m.def("launch", &launch);
     m.def("loop", &loop);
+    m.def("launch_views", &launch_views);
     m.def("launch_table", &launch_table);
 }
