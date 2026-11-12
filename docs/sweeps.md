@@ -383,8 +383,20 @@ training window as a forward sweep without autograd plus one batched replay. It 
 `ste` gate from step 0; a configuration outside its scope is refused when it is loaded, so at `expand` and
 `enqueue` (`hsn.config.split_window_scope_error` names what is missing). `train.p_dense`, `train.lambda_b` and the cost term are
 inside it; `train.epsilon_*` and `train.lambda_u` are not. Build its two kernels once per checkout with
-`scripts/build_window_kernels.py`; without them the run is correct and slow. `fused` is an experiment that is
-slower than `split`. Example: `configs/sweeps/p2_10_split_seeds.yaml`.
+`scripts/build_window_kernels.py`; without them the run is correct and slow. `fused` is the split window with a
+fused forward sweep (CUDA, a compiled window and the built kernels): 46 ms per step on this recipe against 56 ms
+for `split` and 101 ms for the autograd window. A soft warm-up (`train.soft_until_step`) is inside the scope of
+both: its steps run the autograd window, the split or fused window takes over at the first hard-gate step (such
+an arm holds the warm-up's 7 GB to its end, so reserve it with `--mem-estimate-mib 7200`). Examples: `configs/sweeps/p2_10_split_seeds.yaml`, its same-day controls
+`p2_10_autograd_seeds.yaml`, and `p2_10_split_own_sweep_seeds.yaml` (`hardware.sweep_twin=false`: the sweep on
+the model's own compiled blocks, about 11 ms per step slower).
+
+Several split arms share the card well under NVIDIA MPS (six arms: 1.76 times the throughput of one arm alone;
+without MPS concurrent arms gain nothing). Start the daemon with a private `CUDA_MPS_PIPE_DIRECTORY`, start the
+worker with the same variable, and pass `--mem-estimate-mib` at `enqueue` (1750 for a split arm, 2200 for an
+autograd arm of this recipe): the worker's own estimate is the peak of an arm run alone, which under MPS
+reserves more than an arm holds. `docs/p2_10_split_window.md`, "Several arms on one card", has the numbers and
+the commands.
 
 Compiled artifacts persist between arms: the worker gives every child `TORCHINDUCTOR_CACHE_DIR`, by default
 `<db dir>/inductor-cache` (inductor's own default is under `/tmp`). Arms that differ only in learning rate, seed
