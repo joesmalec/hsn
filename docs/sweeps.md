@@ -385,7 +385,8 @@ training window as a forward sweep without autograd plus one batched replay. It 
 inside it; `train.epsilon_*` and `train.lambda_u` are not. Build its two kernels once per checkout with
 `scripts/build_window_kernels.py`; without them the run is correct and slow. `fused` is the split window with a
 fused forward sweep (CUDA, a compiled window and the built kernels): 46 ms per step on this recipe against 56 ms
-for `split` and 101 ms for the autograd window. A soft warm-up (`train.soft_until_step`) is inside the scope of
+for `split` and 101 ms for the autograd window (40, 52 and 95 ms since P2.10b, `docs/p2_10b_fused_speed.md`:
+the same build script, no key). A soft warm-up (`train.soft_until_step`) is inside the scope of
 both: its steps run the autograd window, the split or fused window takes over at the first hard-gate step (such
 an arm holds the warm-up's 7 GB to its end, so reserve it with `--mem-estimate-mib 7200`). Examples: `configs/sweeps/p2_10_split_seeds.yaml`, its same-day controls
 `p2_10_autograd_seeds.yaml`, and `p2_10_split_own_sweep_seeds.yaml` (`hardware.sweep_twin=false`: the sweep on

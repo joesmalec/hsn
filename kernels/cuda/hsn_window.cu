@@ -24,6 +24,27 @@ __device__ __forceinline__ int quot(int e, int d, int shift) {
 __device__ __forceinline__ int rem(int e, int d, int shift) {
     return shift >= 0 ? e & (d - 1) : e % d;
 }
+/* bf16 and f32 (P2.10b: the sweep's glue kernels read the matrix products' outputs and write
+ * their inputs in the products' dtype, where a cast kernel stood before). A bf16 value is the
+ * upper half of the f32 of the same value, so the cast up is exact; the cast down rounds to
+ * nearest, ties to even, as torch's and the compiler's do (a NaN stays a quiet NaN). */
+__device__ __forceinline__ float bf16_to_float(uint16_t h) {
+    return __uint_as_float(static_cast<uint32_t>(h) << 16);
+}
+__device__ __forceinline__ uint16_t float_to_bf16(float x) {
+    const uint32_t u = __float_as_uint(x);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return static_cast<uint16_t>((u >> 16) | 0x0040u);
+    return static_cast<uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+/* Element `index` of a buffer of f32 (`half` false) or bf16 values, as an f32. */
+__device__ __forceinline__ float load_value(const void* p, int64_t index, bool half) {
+    return half ? bf16_to_float(static_cast<const uint16_t*>(p)[index])
+                : static_cast<const float*>(p)[index];
+}
+__device__ __forceinline__ void store_value(void* p, int64_t index, bool half, float value) {
+    if (half) static_cast<uint16_t*>(p)[index] = float_to_bf16(value);
+    else static_cast<float*>(p)[index] = value;
+}
 }  // namespace
 
 /* The backward state recurrence of a split window (hsn.train.split, module docstring).
@@ -518,6 +539,10 @@ extern "C" __global__ void hsn_win_cell_back(HsnWinArgs a) {
  *   i: 0 B, 1 N, 2 M, 3 K, 4 age_max, 5 probes, 6 t, 7 n_out, 8 n_age.
  *      (A plain call is t = 0, n_out = n_age = 1; the sweep passes its tape and the position.)
  *   f: 0 lambda_cost, 1 cell_overhead, 2 shared_cost, 3 limit (= budget * (1 + slack)).
+ * P2.10b, the folded sweep (zero in the calls above): the logits are read where the scorer's
+ * matrix product left them.
+ *   i: 9 W, the logits' row width when they are the first M columns of a wider product
+ *        [B N, W] (0: W = M); 10 that product is bf16 (read as f32: exact).
  * Shared: (4 N + M + 4 K + 1 + 3 ceil(N / 32)) words. The steps are the router's, in its order
  * and with its tie rules:
  *   score_i = max_j (logit_ij - lambda * cost_j), unit_i the first maximiser;
@@ -536,7 +561,10 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
     const int t = a.i[6], n_out = a.i[7], n_age = a.i[8];
     const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     const float lambda = a.f[0], overhead = a.f[1], shared_cost = a.f[2], limit = a.f[3];
-    const float* logits = fptr(a, 0) + static_cast<int64_t>(row) * N * M;
+    const int width = a.i[9] > 0 ? a.i[9] : M;  // the row width of the logits' matrix
+    const bool logits_half = a.i[10] != 0;
+    const void* scored = a.p[0];
+    const int64_t scored_row = static_cast<int64_t>(row) * N * width;  // the row's first cell
     const int64_t* age =
         static_cast<const int64_t*>(a.p[1]) + (static_cast<int64_t>(row) * n_age + t) * N;
     const float* cost = fptr(a, 2);
@@ -567,7 +595,11 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
     if (lanes) {
         const int j = tid & (M - 1);
         float s = -INFINITY;
-        if (tid < N * M) s = lambda > 0.0f ? logits[tid] - lambda * cost[j] : logits[tid];
+        if (tid < N * M) {
+            const float logit =
+                load_value(scored, scored_row + (tid >> m_shift) * width + j, logits_half);
+            s = lambda > 0.0f ? logit - lambda * cost[j] : logit;
+        }
         int arg = j;
         for (int w = 1; w < M; w <<= 1) {  // the first maximiser among the cell's lanes
             const float so = __shfl_xor_sync(0xffffffff, s, w);
@@ -582,11 +614,13 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
             unit[tid >> m_shift] = arg;
         }
     } else if (tid < N) {
-        const float* r = logits + tid * M;
-        float best = lambda > 0.0f ? r[0] - lambda * cost[0] : r[0];
+        const int64_t r = scored_row + tid * width;
+        const float first = load_value(scored, r, logits_half);
+        float best = lambda > 0.0f ? first - lambda * cost[0] : first;
         int arg = 0;
         for (int j = 1; j < M; ++j) {
-            const float s = lambda > 0.0f ? r[j] - lambda * cost[j] : r[j];
+            const float logit = load_value(scored, r + j, logits_half);
+            const float s = lambda > 0.0f ? logit - lambda * cost[j] : logit;
             if (s > best) {
                 best = s;
                 arg = j;
@@ -717,6 +751,16 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
  *      9 has_reset, 10 has_pos, 11 has_post.   f: 0 cand_eps.
  *      (A plain call is t = t_out = 0, n_state = n_slot = 1 with separate outputs; the sweep
  *      passes its tape, reads record t and writes record t + 1 of the same buffers.)
+ * P2.10b, the folded sweep (all zero in the calls above): the kernel reads the matrix products'
+ * outputs as they are and writes the next position's input of the first product.
+ *   i: 12 y is bf16; 13 the gate is bf16; 14 the gate's row stride in elements when its d
+ *        columns sit in a wider matrix [B K, stride] (0: d); 15 write p17; 16 p17 is bf16;
+ *        17 d_z, the width of z; 18 z is bf16; 19 d_c, the width of the context; 20 the
+ *        context is bf16.
+ *   p: 17 x [n_slot, B, d_z + d + d_c] (f32 or bf16), 18 z [B, n_slot, d_z],
+ *      19 context [B, n_slot, d_c]: with t + 1 < n_slot the row x[t + 1, row] becomes
+ *      [z; q; context] of position t + 1, q being the summary that position reads (q' after
+ *      the reset), each value rounded to the buffer's dtype (the cast of the assembled row).
  * Shared: (2 K + 1 + N + K ceil(d / 32) + 2 K d) words.
  *   c = tanh(rms(y) * cand_w)   (or tanh(y));   b = 1 / (1 + exp(-gate))
  *   h'[cell] = (1 - b) h[cell] + b c  on the valid slots;   q' = q + sum_k (h' - h)[k] / N
@@ -736,8 +780,12 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
     const int64_t s_in = static_cast<int64_t>(row) * n_state + t;
     const int64_t s_out = static_cast<int64_t>(row) * n_state + t_out;
     const int64_t rec = static_cast<int64_t>(row) * n_slot + t;
-    const float* y = fptr(a, 0) + static_cast<int64_t>(row) * K * d;
-    const float* gate = fptr(a, 1) + static_cast<int64_t>(row) * K * d;
+    const bool y_half = a.i[12] != 0, gate_half = a.i[13] != 0;
+    const int gate_stride = a.i[14] > 0 ? a.i[14] : d;
+    const void* y = a.p[0];
+    const int64_t y_row = static_cast<int64_t>(row) * K * d;
+    const void* gate = a.p[1];
+    const int64_t gate_row = static_cast<int64_t>(row) * K * gate_stride;
     const float* h = fptr(a, 2) + s_in * N * d;
     const float* q = fptr(a, 3) + s_in * d;
     const int64_t* age = static_cast<const int64_t*>(a.p[4]) + s_in * N;
@@ -765,7 +813,7 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
     if (lanes) {
         float sq = 0.0f;
         if (tid < K * d) {
-            ye = y[tid];
+            ye = load_value(y, y_row + tid, y_half);
             sq = ye * ye;
         }
         for (int w = 16; w > 0; w >>= 1) sq += __shfl_xor_sync(0xffffffff, sq, w);
@@ -783,7 +831,10 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
             if (lanes) {
                 for (int w = 0; w < parts; ++w) sum += part[tid * parts + w];
             } else {
-                for (int x = 0; x < d; ++x) sum += y[tid * d + x] * y[tid * d + x];
+                for (int x = 0; x < d; ++x) {
+                    const float yv = load_value(y, y_row + tid * d + x, y_half);
+                    sum += yv * yv;
+                }
             }
             inv = rsqrtf(sum / static_cast<float>(d) + cand_eps);
         }
@@ -801,10 +852,11 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
         float value = 0.0f, change = 0.0f;
         if (n >= 0) {
             const float old = h[n * d + x];
-            const float yv = lanes ? ye : y[e];
+            const float yv = lanes ? ye : load_value(y, y_row + e, y_half);
             const float pre = cand_norm ? yv * scale[k] * cand_w[x] : yv;
             const float c = tanhf(pre);
-            const float b = 1.0f / (1.0f + expf(-gate[e]));
+            const float gv = load_value(gate, gate_row + k * gate_stride + x, gate_half);
+            const float b = 1.0f / (1.0f + expf(-gv));
             value = (1.0f - b) * old + b * c;
             change = value - old;
         }
@@ -812,12 +864,26 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
         delta[e] = change;
     }
     __syncthreads();
+    const bool next_input = a.i[15] != 0 && t + 1 < n_slot, x_half = a.i[16] != 0;
+    const int d_z = a.i[17], d_c = a.i[19];
+    const int64_t next_row = (static_cast<int64_t>(t + 1) * a.i[0] + row) * (d_z + d + d_c);
     for (int x = tid; x < d; x += nt) {
         float sum = 0.0f;
         for (int k = 0; k < K; ++k) sum += delta[k * d + x];
         const float after = q[x] + sum / static_cast<float>(N);
         if (has_post) fout(a, 16)[rec * d + x] = after;
         q_next[x] = clear ? 0.0f : after;
+        if (next_input)  // the summary in the next position's input of the first product
+            store_value(a.p[17], next_row + d_z + x, x_half, clear ? 0.0f : after);
+    }
+    if (next_input) {  // and that position's z and context around it
+        const int64_t from = static_cast<int64_t>(row) * n_slot + t + 1;
+        const bool z_half = a.i[18] != 0, c_half = a.i[20] != 0;
+        for (int e = tid; e < d_z; e += nt)
+            store_value(a.p[17], next_row + e, x_half, load_value(a.p[18], from * d_z + e, z_half));
+        for (int e = tid; e < d_c; e += nt)
+            store_value(a.p[17], next_row + d_z + d + e, x_half,
+                load_value(a.p[19], from * d_c + e, c_half));
     }
     for (int n = tid; n < N; n += nt) age_next[n] = (clear || slot_of[n] >= 0) ? 0 : age[n] + 1;
     if (has_pos && tid == 0)
@@ -853,3 +919,6 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
     __syncthreads();
     if (tid == 0) *h_max = __int_as_float(*top);
 }
+
+/* The trainer's per-step passes (P2.10b) share this fatbin and its launcher. */
+#include "hsn_trainer.cu"

@@ -471,6 +471,52 @@ class PDGCell(nn.Module):
             y = self.W_out(unit_out.reshape(B, K, d)).to(state.dtype)
         return gate, y
 
+    def sparse_products_raw(
+        self,
+        u: Tensor,
+        eps: Tensor,
+        state: CellGraphState,
+        cells: Tensor,
+        units: Tensor,
+        valid: Tensor,
+        consts: WindowConsts,
+        *,
+        vh: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """:meth:`sparse_products` with its two outputs as the matrix products leave them
+        (P2.10b, the folded sweep): ``(gate, y)`` in the products' dtype, ``gate [B·K, d]`` the
+        rider columns of the first layer's output (a strided view of the wider product) and
+        ``y [B, K, d]``. The casts to the state dtype that :meth:`sparse_products` ends with are
+        exact and the end-of-round kernel makes them as it reads
+        (:func:`hsn.kernels.window.update_fold`). The merged first layer only
+        (``consts.w1_gate``, with ``vh``): the same calls in the same order as
+        :meth:`sparse_products` on it."""
+        if self.disabled_cells:
+            raise ValueError("PDGCell.sparse_products_raw does not support model.disabled_cells")
+        if consts.w1_gate is None or consts.b1_gate is None or consts.w2_flat is None:
+            raise ValueError("PDGCell.sparse_products_raw needs the merged first layer")
+        B, _, d = (int(n) for n in state.h.shape)
+        K = int(cells.shape[1])
+        native = kernels.ops()
+        cells = torch.where(valid, cells, torch.zeros_like(cells))
+        units = torch.where(valid, units, torch.zeros_like(units))
+        with self.graph.step():
+            h_read = state.h
+            m = self.graph.messages_selected(
+                h_read, self.V, cells, weights=consts.edge_weights, validate=False, vh=vh
+            )
+            v = self.norm(native.gather_concat(u, eps, h_read, m, cells))
+            unit_out, rider = self.units.forward_static_chosen(
+                v.reshape(B * K, 4 * d),
+                units.reshape(B * K),
+                w1_flat=consts.w1_gate,
+                w2_flat=consts.w2_flat,
+                b1_flat=consts.b1_gate,
+            )
+            assert rider is not None
+            y: Tensor = self.W_out(unit_out.reshape(B, K, d))
+        return rider, y
+
     def replay_sparse(
         self, u: Tensor, eps: Tensor, h_read: Tensor, sel: Selection
     ) -> tuple[Tensor, Tensor]:

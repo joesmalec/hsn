@@ -25,8 +25,17 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from build_kernels import PTX, SASS, find_nvcc  # noqa: E402
 
-DEVICE_SOURCES = ("kernels/cuda/hsn_window.cu", "kernels/include/hsn_window_launch.h")
-HOST_SOURCES = ("python/hsn/kernels/window_ext.cpp", "kernels/include/hsn_window_launch.h")
+DEVICE_SOURCES = (
+    "kernels/cuda/hsn_window.cu",
+    "kernels/cuda/hsn_trainer.cu",  # P2.10b: included by hsn_window.cu
+    "kernels/include/hsn_window_launch.h",
+    "kernels/include/hsn_trainer_launch.h",
+)
+HOST_SOURCES = (
+    "python/hsn/kernels/window_ext.cpp",
+    "kernels/include/hsn_window_launch.h",
+    "kernels/include/hsn_trainer_launch.h",
+)
 
 
 def _sha(path: Path) -> str:
