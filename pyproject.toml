@@ -18,7 +18,9 @@ dependencies = [
 hsn = "hsn.runner:main" # P0.8: hsn run | rerun | package
 
 [project.optional-dependencies]
+chat = ["textual>=7.5,<8"]
 dev = [
+    "textual>=7.5,<8",
     "pytest",
     "pytest-cov",
     "ruff==0.17.3",
