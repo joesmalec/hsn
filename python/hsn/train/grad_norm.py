@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 from hsn.config import GradNormPrecision
+from hsn.kernels import trainer as trainer_kernels
 
 
 def _wide(gradient: Tensor) -> Tensor:
@@ -59,6 +60,10 @@ def clip_grad_norm_(
     if max_norm / (value + 1e-6) >= 1.0:  # the coefficient clamps to exactly 1: nothing changes
         return total
     coefficient = (max_norm / (total + 1e-6)).clamp(max=1.0)
+    # P2.10b: fp32 gradients on CUDA are scaled by one kernel launch (the float64 product and
+    # its rounding to fp32 per element, as below)
+    if trainer_kernels.scale64(gradients, coefficient):
+        return total
     for gradient, wide in zip(gradients, wides, strict=True):
         # Do not cast coefficient to the original dtype before multiplying.
         product = wide.mul_(coefficient.to(wide.device))

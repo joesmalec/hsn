@@ -84,6 +84,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from hsn.kernels import trainer as trainer_kernels
 from hsn.model.cell import PDGCell
 from hsn.model.router import Selection
 from hsn.model.units import UnitBank
@@ -91,6 +92,7 @@ from hsn.model.units import UnitBank
 __all__ = [
     "LazyAdamW",
     "active_units_from_indices",
+    "active_units_packed",
     "build_lazy_adamw",
     "cell_parameters",
     "find_unit_bank",
@@ -121,6 +123,23 @@ def active_units_from_indices(
     the mask back together with a range check: a valid slot whose index lies outside
     ``[0, n_units)`` raises ``IndexError`` instead of being dropped.
     """
+    packed = active_units_packed(unit_idx, valid, n_units, dense_rows=dense_rows).cpu()
+    if not bool(packed[-1]):
+        raise IndexError(f"unit_idx has a valid slot outside [0, {n_units})")
+    return packed[:-1]
+
+
+def active_units_packed(
+    unit_idx: Tensor,
+    valid: Tensor,
+    n_units: int,
+    *,
+    dense_rows: Tensor | None = None,
+) -> Tensor:
+    """:func:`active_units_from_indices` before its device-to-host transfer: bool
+    ``[n_units + 1]`` on the indices' device, the mask followed by the range check (False when a
+    valid slot's index lies outside ``[0, n_units)``). For a caller that reads it together with
+    other values in one transfer (P2.10b, the trainer's window statistics)."""
     if not isinstance(unit_idx, Tensor) or unit_idx.dtype not in _INDEX_DTYPES:
         got = unit_idx.dtype if isinstance(unit_idx, Tensor) else type(unit_idx).__name__
         raise TypeError(f"unit_idx must be an int64 or int32 tensor, got {got}")
@@ -147,10 +166,7 @@ def active_units_from_indices(
     in_range = (flat.any(dim=1) == valid.reshape(-1)).all()
     if dense_rows is not None:
         mask = mask | dense_rows.any().to(mask.device)
-    packed = torch.cat([mask, in_range.reshape(1)]).cpu()
-    if not bool(packed[-1]):
-        raise IndexError(f"unit_idx has a valid slot outside [0, {n_units})")
-    return packed[:-1]
+    return torch.cat([mask, in_range.reshape(1)])
 
 
 # --------------------------------------------------------------------------------------------------
@@ -180,10 +196,18 @@ class LazyAdamW(torch.optim.Optimizer):
     multi-tensor ops (:meth:`_dense_steps`): the same operations per element as the
     single-tensor step (:meth:`_dense_step`, kept as the reference), bit for bit, without one
     Python round trip per tensor and operation. ``foreach = False`` restores the per-tensor loop.
+
+    P2.10b: on a CUDA device with the trainer kernels built (:mod:`hsn.kernels.trainer`), a
+    group's fp32 tensors take their step in one kernel launch: the ordinary tensors at one step
+    count (:meth:`_dense_steps`' operations) and the unit tensors that share their per-unit step
+    counts (:meth:`_unit_step`'s). The values are those of the PyTorch paths bit for bit, which
+    stay as the reference and run everywhere else. ``fused = False`` restores them.
     """
 
     #: Step the ordinary tensors of a group through the multi-tensor ops (class docstring).
     foreach: bool = True
+    #: Step through the trainer kernels where they can run (class docstring).
+    fused: bool = True
 
     def __init__(
         self,
@@ -383,6 +407,9 @@ class LazyAdamW(torch.optim.Optimizer):
             lazy = "n_units" in group
             # the group's ordinary tensors by (step count, device, dtype): one multi-tensor step
             together: dict[tuple[int, torch.device, torch.dtype], list[list[Tensor]]] = {}
+            # P2.10b: the group's unit tensors that one kernel launch can step, by their per-unit
+            # step counts: (parameter, gradient, state) each
+            units: dict[tuple[int, ...], list[tuple[Tensor, Tensor, dict[str, Any]]]] = {}
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
@@ -393,7 +420,10 @@ class LazyAdamW(torch.optim.Optimizer):
                 if not state:
                     self._init_state(p, state, group)
                 if lazy:
-                    self._unit_step(p, grad, state, group, active_cpu, masks, scalars)
+                    if self.fused and p.dtype == torch.float32 and trainer_kernels.ready(p.device):
+                        units.setdefault(tuple(state["step"].tolist()), []).append((p, grad, state))
+                    else:
+                        self._unit_step(p, grad, state, group, active_cpu, masks, scalars)
                 elif not self.foreach:
                     self._dense_step(p, grad, state, group)
                 else:
@@ -405,8 +435,28 @@ class LazyAdamW(torch.optim.Optimizer):
                         lists, (p, grad, state["exp_avg"], state["exp_avg_sq"]), strict=True
                     ):
                         members.append(tensor)
-            for (step, _, _), (params, grads, exp_avgs, exp_avg_sqs) in together.items():
-                self._dense_steps(params, grads, exp_avgs, exp_avg_sqs, step, group)
+            for (step, _, dtype), (params, grads, exp_avgs, exp_avg_sqs) in together.items():
+                if not (
+                    self.fused
+                    and dtype == torch.float32
+                    and trainer_kernels.adamw(
+                        params,
+                        grads,
+                        exp_avgs,
+                        exp_avg_sqs,
+                        lr=group["lr"],
+                        beta1=group["betas"][0],
+                        beta2=group["betas"][1],
+                        eps=group["eps"],
+                        weight_decay=group["weight_decay"],
+                        step=step,
+                    )
+                ):
+                    self._dense_steps(params, grads, exp_avgs, exp_avg_sqs, step, group)
+            for entries in units.values():
+                if not self._unit_steps_fused(entries, group, active_cpu):
+                    for p, grad, state in entries:
+                        self._unit_step(p, grad, state, group, active_cpu, masks, scalars)
 
     @staticmethod
     def _dense_steps(
@@ -453,6 +503,71 @@ class LazyAdamW(torch.optim.Optimizer):
         bias_correction2_sqrt = bias_correction2**0.5
         denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
         p.addcdiv_(exp_avg, denom, value=-step_size)
+
+    @staticmethod
+    def _unit_bias_terms(
+        step_cpu: Tensor, active_cpu: Tensor, group: dict[str, Any], dtype: torch.dtype
+    ) -> tuple[Tensor, Tensor]:
+        """``(step_size, bias_correction2_sqrt)`` of a unit tensor whose per-unit step counts
+        (already advanced) are ``step_cpu``: ``[M]`` in ``dtype`` on the CPU, 0 and 1 for the
+        inactive units. The per-unit bias corrections in float64 on the host, like torch's
+        Python-float ones."""
+        lr, (beta1, beta2) = group["lr"], group["betas"]
+        steps = step_cpu.to(torch.float64)
+        bias_correction1 = 1 - torch.pow(beta1, steps)
+        bias_correction2 = 1 - torch.pow(beta2, steps)
+        zero = torch.zeros((), dtype=torch.float64)
+        one = torch.ones((), dtype=torch.float64)
+        step_size = torch.where(active_cpu, lr / bias_correction1, zero).to(dtype)
+        bias_correction2_sqrt = torch.where(active_cpu, bias_correction2.pow(0.5), one).to(dtype)
+        return step_size, bias_correction2_sqrt
+
+    @classmethod
+    def _unit_steps_fused(
+        cls,
+        entries: list[tuple[Tensor, Tensor, dict[str, Any]]],
+        group: dict[str, Any],
+        active_cpu: Tensor | None,
+    ) -> bool:
+        """:meth:`_unit_step` for the unit tensors ``entries`` (parameter, gradient, state) of
+        one group that hold the same per-unit step counts, as one kernel launch
+        (:func:`hsn.kernels.trainer.adamw_units`): the same coefficients per unit, from the
+        same host arithmetic, and the same operations per element. False, with nothing
+        changed, when the kernels cannot take the tensors: the caller runs :meth:`_unit_step`."""
+        n_units = int(group["n_units"])
+        lr, (beta1, beta2) = group["lr"], group["betas"]
+        weight_decay = group["weight_decay"]
+        steps = [state["step"] for _, _, state in entries]
+        if any(tuple(step.shape) != (n_units,) for step in steps):
+            return False  # _unit_step raises on it
+        if active_cpu is None:
+            active_cpu = torch.ones(n_units, dtype=torch.bool)
+        advance = active_cpu.to(torch.int64)
+        step_size, bias_correction2_sqrt = cls._unit_bias_terms(
+            steps[0] + advance, active_cpu, group, torch.float32
+        )
+        active = active_cpu.tolist()
+        launched = trainer_kernels.adamw_units(
+            [p for p, _, _ in entries],
+            [grad for _, grad, _ in entries],
+            [state["exp_avg"] for _, _, state in entries],
+            [state["exp_avg_sq"] for _, _, state in entries],
+            n_units=n_units,
+            active=active,
+            # _unit_step's coef(on, off) tensors: the constant of the unit's branch
+            decay=[1 - lr * weight_decay if on else 1.0 for on in active],
+            lerp_weight=[1 - beta1 if on else 0.0 for on in active],
+            beta2_factor=[beta2 if on else 1.0 for on in active],
+            bias_correction2_sqrt=bias_correction2_sqrt.tolist(),
+            step_size=step_size.tolist(),
+            beta2=beta2,
+            eps=group["eps"],
+            weight_decay=weight_decay,
+        )
+        if launched:
+            for step in steps:
+                step.add_(advance)
+        return launched
 
     @staticmethod
     def _unit_step(
@@ -503,16 +618,11 @@ class LazyAdamW(torch.optim.Optimizer):
             p.mul_(coef(1 - lr * weight_decay, 1.0))
         exp_avg.lerp_(g, coef(1 - beta1, 0.0))
         exp_avg_sq.mul_(coef(beta2, 1.0)).addcmul_(g, g, value=1 - beta2)
-        # per-unit bias corrections in float64 on the host, like torch's Python-float ones
-        steps = step_cpu.to(torch.float64)
-        bias_correction1 = 1 - torch.pow(beta1, steps)
-        bias_correction2 = 1 - torch.pow(beta2, steps)
-        zero = torch.zeros((), dtype=torch.float64)
-        one = torch.ones((), dtype=torch.float64)
-        step_size = torch.where(active_cpu, lr / bias_correction1, zero).to(dtype).to(device)
-        bias_correction2_sqrt = (
-            torch.where(active_cpu, bias_correction2.pow(0.5), one).to(dtype).to(device)
+        host_step_size, host_bias_correction2_sqrt = LazyAdamW._unit_bias_terms(
+            step_cpu, active_cpu, group, dtype
         )
+        step_size = host_step_size.to(device)
+        bias_correction2_sqrt = host_bias_correction2_sqrt.to(device)
         denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt.view(view)).add_(eps)
         p.addcdiv_(exp_avg.mul(step_size.view(view)), denom, value=-1.0)
 

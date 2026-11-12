@@ -140,6 +140,7 @@ __all__ = [
     "graph_loss",
     "pred_loss",
     "prediction_terms",
+    "terms_total",
     "total_and_parts",
     "utility_loss",
     "variance_floor",
@@ -395,9 +396,11 @@ def assemble_terms(
     return terms
 
 
-def total_and_parts(terms: Mapping[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
-    """``(total, parts)`` of λ-weighted term tensors: ``total`` is their sum in the given order
-    starting from ``task`` (a 0-dim tensor with the graph), ``parts`` every term as a float."""
+def terms_total(terms: Mapping[str, Tensor]) -> Tensor:
+    """The sum of λ-weighted term tensors in the given order starting from ``task`` (a 0-dim
+    tensor with the graph): :func:`total_and_parts` without the host reads of the parts (P2.10b:
+    the HSN trainer reads them with the window's other statistics, after the backward pass is
+    under way)."""
     if not isinstance(terms, Mapping) or "task" not in terms:
         raise ValueError("total_and_parts: terms must be a mapping that holds the 'task' term")
     for name, value in terms.items():
@@ -407,6 +410,13 @@ def total_and_parts(terms: Mapping[str, Tensor]) -> tuple[Tensor, dict[str, floa
     for name, value in terms.items():
         if name != "task":
             total = total + value
+    return total
+
+
+def total_and_parts(terms: Mapping[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
+    """``(total, parts)`` of λ-weighted term tensors: ``total`` is their sum in the given order
+    starting from ``task`` (a 0-dim tensor with the graph), ``parts`` every term as a float."""
+    total = terms_total(terms)
     parts = {name: float(value.detach()) for name, value in terms.items()}
     return total, parts
 

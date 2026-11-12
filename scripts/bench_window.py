@@ -299,7 +299,9 @@ def phases(args: argparse.Namespace) -> dict[str, Any]:
             )
             t1 = lap("prologue", t0)
             with torch.no_grad():
-                tape = split.compiled.tape(pro, state, batch["reset"], fused=split.fused)
+                tape = split.compiled.tape(
+                    pro, state, batch["reset"], fused=split.fused, fold=split.fold
+                )
             t2 = lap("sweep", t1)
             logits, _, info = split._replay(pro, tape, batch["reset"], B, T)
             t3 = lap("replay_forward", t2)

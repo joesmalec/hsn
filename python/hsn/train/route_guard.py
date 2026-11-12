@@ -144,6 +144,19 @@ class RouteGuard:
         self.events: list[dict[str, Any]] = []
         self.last: dict[str, Any] | None = None
         self._old: list[Tensor] | None = None
+        # P2.10b: whether some unit's step is scaled, read from the device once per change of
+        # `scale` (its tensor and version counter) instead of twice per optimiser step
+        self._scaling_of: tuple[Tensor, int] | None = None
+        self._scaling = False
+
+    def _scaled(self) -> bool:
+        """``bool((self.scale < 1.0).any())``, without a device read while ``scale`` is
+        unchanged."""
+        seen = self._scaling_of
+        if seen is None or seen[0] is not self.scale or seen[1] != self.scale._version:
+            self._scaling = bool((self.scale < 1.0).any())
+            self._scaling_of = (self.scale, self.scale._version)
+        return self._scaling
 
     # every window ----------------------------------------------------------------------------
 
@@ -170,7 +183,7 @@ class RouteGuard:
     @torch.no_grad()
     def capture(self) -> None:
         """Before the optimiser step: the unit rows, while some unit's step is being scaled."""
-        if bool((self.scale < 1.0).any()):
+        if self._scaled():
             if self._old is None:
                 self._old = [p.detach().clone() for p in self.params]
             else:
@@ -180,7 +193,7 @@ class RouteGuard:
     def apply(self) -> None:
         """After the optimiser step and the caps: ``old + scale[u] * (new - old)`` on unit
         ``u``'s rows."""
-        if self._old is not None and bool((self.scale < 1.0).any()):
+        if self._old is not None and self._scaled():
             for p, old in zip(self.params, self._old, strict=True):
                 scale = self.scale.view(-1, *([1] * (p.ndim - 1)))
                 p.copy_(old + scale * (p - old))

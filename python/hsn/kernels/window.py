@@ -468,6 +468,71 @@ def _select_tape_fake(
     return None
 
 
+@torch.library.custom_op(
+    "hsn::window_select_fold",
+    mutates_args=("cells", "units", "valid", "theta", "refreshed"),
+    device_types="cuda",
+)
+def select_fold_op(
+    scored: Tensor,
+    age: Tensor,
+    cost: Tensor,
+    cells: Tensor,
+    units: Tensor,
+    valid: Tensor,
+    theta: Tensor,
+    refreshed: Tensor,
+    t: int,
+    n_units: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> None:
+    """:func:`select_tape_op` on the scorer's matrix product as it is (P2.10b, the folded
+    sweep): ``scored [B * N, W]`` in fp32 or bf16 holds the logits in its first ``n_units``
+    columns, which the kernel reads in place: no slice copy, no cast. Contiguous tensors on one
+    prepared CUDA device."""
+    rows, width = int(scored.shape[0]), int(scored.shape[1])
+    B = int(cells.shape[0])
+    N = rows // B
+    n, k = int(cells.shape[1]), int(cells.shape[2])
+    half = scored.dtype == torch.bfloat16
+    _extension().launch(
+        "hsn_win_select",
+        B,
+        _SELECT_THREADS,
+        _select_shared(N, n_units, k),
+        [scored, age, cost, cells, units, valid, theta, refreshed],
+        [B, N, n_units, k, age_max, int(probes), t, n, int(age.shape[1]), width, int(half)],
+        [lambda_cost, cell_overhead, shared_cost, limit],
+    )
+
+
+@select_fold_op.register_fake
+def _select_fold_fake(
+    scored: Tensor,
+    age: Tensor,
+    cost: Tensor,
+    cells: Tensor,
+    units: Tensor,
+    valid: Tensor,
+    theta: Tensor,
+    refreshed: Tensor,
+    t: int,
+    n_units: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> None:
+    return None
+
+
 def select_unsupported(n_cells: int, k: int, n_units: int = 1) -> str | None:
     """Why :func:`select` cannot take a model of this shape (``None``: it can)."""
     if n_cells > _SELECT_THREADS:
@@ -671,6 +736,115 @@ def _update_tape_fake(
     return None
 
 
+@torch.library.custom_op(
+    "hsn::window_update_fold",
+    mutates_args=("tape_h", "tape_q", "tape_age", "tape_hsel", "h_max", "qs", "x"),
+    device_types="cuda",
+)
+def update_fold_op(
+    y: Tensor,
+    gate: Tensor,
+    tape_h: Tensor,
+    tape_q: Tensor,
+    tape_age: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    cand_w: Tensor,
+    reset: Tensor,
+    tape_hsel: Tensor,
+    h_max: Tensor,
+    qs: Tensor,
+    x: Tensor,
+    z: Tensor,
+    context: Tensor,
+    t: int,
+    cand_norm: bool,
+    cand_eps: float,
+) -> None:
+    """:func:`update_tape_op` on the round's matrix products as they are (P2.10b, the folded
+    sweep): ``y [B, K, d]`` (``W_out``'s output) and ``gate [B * K, d]`` (the gate's
+    pre-activation: the rider columns of the first layer's output, a strided view of the wider
+    product) in fp32 or bf16, read without a cast or a copy. The kernel also writes the next
+    position's input of the first product: ``x [n, B, d_z + d + d_c]`` (fp32 or bf16) holds
+    that input for every position of the block, and record ``t + 1`` (when there is one)
+    becomes ``[z; q; context]`` of position ``t + 1`` from ``z [B, n, d_z]``, ``context
+    [B, n, d_c]`` and ``q`` after the round and the next reset, each value rounded to ``x``'s
+    dtype (the cast of the assembled row). Tensors on one prepared CUDA device, contiguous
+    except ``gate``."""
+    B, n_state, N, d = (int(n) for n in tape_h.shape)
+    n, K = int(cells.shape[1]), int(cells.shape[2])
+    d_z, d_c = int(z.shape[2]), int(context.shape[2])
+    if tuple(x.shape) != (n, B, d_z + d + d_c):
+        raise ValueError(f"x must be [n, B, d_z + d + d_c], got {tuple(x.shape)}")
+    ints = [B, N, d, K, int(cand_norm), t, n_state, n, t + 1, int(t + 1 < n), 0, 1]
+    ints += [
+        int(y.dtype == torch.bfloat16),
+        int(gate.dtype == torch.bfloat16),
+        int(gate.stride(0)),
+        1,
+        int(x.dtype == torch.bfloat16),
+        d_z,
+        int(z.dtype == torch.bfloat16),
+        d_c,
+        int(context.dtype == torch.bfloat16),
+    ]
+    _extension().launch_views(
+        "hsn_win_cell_update",
+        B,
+        _UPDATE_THREADS,
+        _update_shared(N, d, K),
+        [
+            y,
+            gate,
+            tape_h,
+            tape_q,
+            tape_age,
+            tape_age,
+            cells,
+            valid,
+            cand_w,
+            tape_h,
+            tape_q,
+            tape_age,
+            tape_age,
+            tape_hsel,
+            h_max,
+            reset,
+            qs,
+            x,
+            z,
+            context,
+        ],  # fmt: skip
+        [1],  # the gate is a view
+        ints,
+        [cand_eps],
+    )
+
+
+@update_fold_op.register_fake
+def _update_fold_fake(
+    y: Tensor,
+    gate: Tensor,
+    tape_h: Tensor,
+    tape_q: Tensor,
+    tape_age: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    cand_w: Tensor,
+    reset: Tensor,
+    tape_hsel: Tensor,
+    h_max: Tensor,
+    qs: Tensor,
+    x: Tensor,
+    z: Tensor,
+    context: Tensor,
+    t: int,
+    cand_norm: bool,
+    cand_eps: float,
+) -> None:
+    return None
+
+
 def cell_update_unsupported(n_cells: int, d: int, k: int) -> str | None:
     """Why :func:`cell_update` cannot take a model of this shape (``None``: it can)."""
     if k > _UPDATE_THREADS:
@@ -838,3 +1012,88 @@ def cell_round(
         float(cast(nn.RMSNorm, cell.cand_norm).eps or 0.0) if cand_norm else 0.0,
     )
     return CellGraphState._make(h=h_new, q=q_new, age=age_new, pos=state.pos + 1), h_sel
+
+
+def select_fold(
+    scored: Tensor,
+    tape_age: Tensor,
+    cost_table: Tensor,
+    cells: Tensor,
+    units: Tensor,
+    valid: Tensor,
+    theta: Tensor,
+    refreshed: Tensor,
+    *,
+    t: int,
+    n_units: int,
+    age_max: int,
+    probes: bool,
+    lambda_cost: float,
+    cell_overhead: float,
+    shared_cost: float,
+    limit: float,
+) -> None:
+    """:func:`select_tape` from the scorer's matrix product ``scored [B * N, W]`` as it is
+    (:func:`select_fold_op`)."""
+    select_fold_op(
+        scored,
+        tape_age,
+        cost_table.to(torch.float32).contiguous(),
+        cells,
+        units,
+        valid,
+        theta,
+        refreshed,
+        t,
+        n_units,
+        age_max,
+        probes,
+        lambda_cost,
+        cell_overhead,
+        shared_cost,
+        limit,
+    )
+
+
+def update_fold(
+    cell: PDGCell,
+    y: Tensor,
+    gate: Tensor,
+    tape_h: Tensor,
+    tape_q: Tensor,
+    tape_age: Tensor,
+    cells: Tensor,
+    valid: Tensor,
+    reset: Tensor,
+    tape_hsel: Tensor,
+    h_max: Tensor,
+    qs: Tensor,
+    x: Tensor,
+    z: Tensor,
+    context: Tensor,
+    *,
+    t: int,
+) -> None:
+    """:func:`update_tape` from the round's matrix products as they are, with the next
+    position's input of the first product written into ``x`` (:func:`update_fold_op`)."""
+    cand_norm = cell.cand_norm_kind != "none"
+    update_fold_op(
+        y,
+        gate,
+        tape_h,
+        tape_q,
+        tape_age,
+        cells,
+        valid,
+        cell.cand_norm.weight if cand_norm else cell.norm.weight,
+        reset,
+        tape_hsel,
+        h_max,
+        qs,
+        x,
+        z,
+        context,
+        t,
+        cand_norm,
+        float(cast(nn.RMSNorm, cell.cand_norm).eps or 0.0) if cand_norm else 0.0,
+    )
