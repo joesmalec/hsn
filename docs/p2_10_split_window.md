@@ -40,6 +40,12 @@ after the other; `evidence/P2.10/final/`): autograd 97.8 ms, split 54.3 ms (1.80
 divides by, so against it the day's ratios are about 3 % high; the split and fused step times
 did not move.
 
+**Follow-up, 12 Nov** (P2.10b, `docs/p2_10b_fused_speed.md`): with the trainer's work after
+`backward()` as a few kernel launches and seven small kernels per position folded into the
+sweep's two glue kernels, the fused step is 40.5 ms (44.7 ms for this document's code in the
+same session), the split window 52.2 ms and the autograd window 94.8 ms. The values are the
+same, bit for bit where the card allows the comparison.
+
 ## Why the per-op kernels could not win
 
 A compiled autograd window issues about 31,700 GPU kernels per step (`profiles/rtx3060_L1.json`):

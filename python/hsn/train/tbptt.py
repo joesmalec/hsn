@@ -13,10 +13,12 @@ window loop::
                  extras = auxiliary_terms(info, cfg, model.cell.graph)       (P2.4)
                  terms  = assemble_terms({"logits": logits, **info}, batch, cfg, extras)
                  terms  = _routing_terms(terms, info)                         (P2.2 REINFORCE)
-                 total, parts = total_and_parts(terms)
+                 total = terms_total(terms)
                  grad_norm_report(model, terms) on the first window of a stats step
                  backward (scaled under fp16)
-    per step:    unscale; grad_norm per group; clip to train.grad_clip; optimiser step (with the
+                 the window's statistics, issued on the device, not read yet    (P2.10b)
+    per step:    unscale; grad_norm per group; clip to train.grad_clip; read the windows'
+                 statistics (one transfer per window); optimiser step (with the
                  units the step's windows executed, P2.6); scheduler step; model.update_target();
                  log parts and statistics
 
@@ -46,7 +48,13 @@ window loop::
   from ``info`` (``state_abs_max`` over the step,
   ``eps_mean`` = mean |ε| and ``alpha_entropy``, means over windows and over the positions each
   window computes: a window cut by P1.10d excludes its all-padding tail) and the global gradient
-  norm before clipping. Every ``train.stats_every`` steps (and at the last step) the record
+  norm before clipping. P2.10b: what a record reads from a window's device tensors (the terms,
+  these statistics, the accuracy count, the active units) is issued as two small tensors once
+  the window's backward pass is under way and read after the gradient norm, which waits for the
+  backward pass anyway (:meth:`TBPTTTrainer._window_statistics`): the same values, without a
+  dozen waits for the device while the card is idle before the backward pass. With a gradient
+  hook or a profiler the read stays ahead of the optimiser segment.
+  Every ``train.stats_every`` steps (and at the last step) the record
   also carries ``grad_norm/<group>``, the pre-clip norm per parameter group, one group per top-level
   submodule of the model (``byte_emb``, ``ctx_emb``, ``encoder``, ``predictor``, ``shared``,
   ``cell``, ``router``, ``decoder``; a group without gradients, such as ``halting`` while
