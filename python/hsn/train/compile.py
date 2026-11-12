@@ -393,6 +393,12 @@ SWEEP_CAST_PREFIXES: tuple[str, ...] = (
 )
 
 
+#: The cast parameters a sweep on merged layouts still reads itself (:class:`SweepTwin`): the
+#: unit bank's second bias (:meth:`~hsn.model.units.UnitBank.forward_static_chosen`) and
+#: ``W_out``. Every other one is read through a layout.
+MERGED_READS: tuple[str, ...] = ("cell.units.b2", "cell.W_out.")
+
+
 class SweepTwin:
     """The model the split window's forward sweep runs (P2.10): a structural copy of the HSN
     whose autocast-cast weights (:data:`SWEEP_CAST_PREFIXES`) are held in the autocast dtype and
@@ -420,7 +426,11 @@ class SweepTwin:
       as ``d`` more outputs (:class:`~hsn.model.cell.WindowConsts`).
 
     Four matmuls per position fewer; the values agree with the separate products to rounding
-    (other matmul shapes)."""
+    (other matmul shapes).
+
+    P2.10b: with the merged layouts the sweep reads a cast weight of its own only where no
+    layout stands for it (:data:`MERGED_READS`), so only those are refreshed; the others hold
+    NaN, so that a read of one cannot pass for a value."""
 
     def __init__(self, model: HSN, dtype: torch.dtype, *, fused: bool = False) -> None:
         self.model = model
@@ -431,7 +441,8 @@ class SweepTwin:
         twin.requires_grad_(False)
         self.twin = twin
         self._cast: list[tuple[Tensor, Tensor]] = []
-        self._shared: list[tuple[nn.Module, str, str]] = []  # (twin owner, leaf, dotted name)
+        # the tensors the twin shares with the model: (twin owner, model owner, leaf)
+        self._shared: list[tuple[nn.Module, nn.Module, str]] = []
         masters = dict(model.named_parameters())
         for name in [n for n, _ in twin.named_parameters()]:
             owner_name, _, leaf = name.rpartition(".")
@@ -440,16 +451,19 @@ class SweepTwin:
             if source.dtype != dtype and name.startswith(SWEEP_CAST_PREFIXES):
                 target = nn.Parameter(source.detach().to(dtype), requires_grad=False)
                 owner._parameters[leaf] = target
-                self._cast.append((source, target))
+                if self.merged and not name.startswith(MERGED_READS):
+                    target.fill_(float("nan"))  # read through a merged layout, never itself
+                else:
+                    self._cast.append((source, target))
             else:
                 owner._parameters[leaf] = source
-                self._shared.append((owner, leaf, name))
-        self._buffers: list[tuple[nn.Module, str, str]] = []
+                self._shared.append((owner, model.get_submodule(owner_name), leaf))
+        self._buffers: list[tuple[nn.Module, nn.Module, str]] = []
         for name, buffer in model.named_buffers():
             owner_name, _, leaf = name.rpartition(".")
             owner = twin.get_submodule(owner_name)
             owner._buffers[leaf] = buffer
-            self._buffers.append((owner, leaf, name))
+            self._buffers.append((owner, model.get_submodule(owner_name), leaf))
         cell = model.cell
         units = cell.units
         device = next(model.parameters()).device
@@ -506,14 +520,14 @@ class SweepTwin:
             twin.train(model.training)
         for source, target in self._cast:
             target.copy_(source)
-        masters = dict(model.named_parameters())
-        for owner, leaf, name in self._shared:
-            if owner._parameters[leaf] is not masters[name]:
-                owner._parameters[leaf] = masters[name]
-        buffers = dict(model.named_buffers())
-        for owner, leaf, name in self._buffers:
-            if owner._buffers[leaf] is not buffers[name]:
-                owner._buffers[leaf] = buffers[name]
+        # (P2.10b: the model's owning modules are held from construction, as the twin's
+        # structure is; walking the model's tree by name every window cost 0.1 ms)
+        for owner, master, leaf in self._shared:
+            if owner._parameters[leaf] is not master._parameters[leaf]:
+                owner._parameters[leaf] = master._parameters[leaf]
+        for owner, master, leaf in self._buffers:
+            if owner._buffers[leaf] is not master._buffers[leaf]:
+                owner._buffers[leaf] = master._buffers[leaf]
         consts = model.cell.window_consts()
         twin.cell.get_buffer("sweep_edge").copy_(consts.edge_weights)
         cell, units = model.cell, model.cell.units
