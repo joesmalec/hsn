@@ -269,14 +269,84 @@ def test_p1_1_count_params_script_prints_appendix_c() -> None:
     assert missing.returncode == 2 and "does_not_exist.yaml" in missing.stderr
 
 
-def test_p1_1_rejects_unsupported() -> None:
-    ablated = ModelConfig(ablate_shared_u=True)
-    for call in (expected_param_count, macs_per_token, activations_per_token):
-        with pytest.raises(ValueError, match="ablate_shared_u"):
-            call(ablated)
-    with pytest.raises(ValueError, match="ablate_shared_u"):
-        memory_plan(ablated, 4, 256)
+def test_p1_1_counts_the_shared_u_ablation() -> None:
+    """``model.ablate_shared_u`` (P2.13's "remove shared path": remove ``u`` from ``v``): the cell
+    input is ``[ε; h_i; m_i]`` of width ``3d``, and the closed forms count the three rows that
+    read it (units, gate, cell_norm) at that width; everything else, the scorer's ``3d + 8``
+    features and the shared activations (``u`` is still computed) are unchanged."""
+    base, ablated = ModelConfig(), ModelConfig(ablate_shared_u=True)
+    assert base.cell_input_width == 256 and ablated.cell_input_width == 192
+    assert "cell_input_width" not in ablated.model_dump()  # derived, never dumped or hashed
+    full, cut = expected_param_count(base), expected_param_count(ablated)
+    assert list(cut) == list(full)  # the Appendix C.1 rows, in order
+    assert {row for row in full if full[row] != cut[row]} == {
+        "units",
+        "gate",
+        "cell_norm",
+        "total",
+    }
+    assert cut["units"] == 8 * (192 * 512 + 512 + 512 * 64 + 64) == 1_053_184
+    assert cut["gate"] == 192 * 64 + 64 == 12_352
+    assert cut["cell_norm"] == 192
+    # one d less of input: M·d·H unit weights, d·d gate weights and d gains fewer
+    assert full["total"] - cut["total"] == 8 * 64 * 512 + 64 * 64 + 64 == 266_304
+    assert cut["total"] == 1_554_313
+    no_norm = ModelConfig(ablate_shared_u=True, cell_norm="none")
+    assert expected_param_count(no_norm)["cell_norm"] == 0
 
+    macs = macs_per_token(ablated)
+    unit = cut["units"] // 8
+    assert unit == 131_648
+    assert macs["per_cell"] == unit + 4_096 + 4 * 4_096 + 12_352 == 164_480
+    assert macs["shared"] == macs_per_token(base)["shared"] == 461_248  # S still runs
+    assert macs["scorer"] == macs_per_token(base)["scorer"] == 51_456  # 3d + 8 features, with u
+    assert macs["sparse_total"] == 461_248 + 4 * 164_480 + 51_456 == 1_170_624
+    assert macs["dense_total"] == 461_248 + 32 * 164_480 + 51_456 == 5_776_064
+
+    acts = activations_per_token(ablated)
+    assert acts == {"shared": 2_560, "per_cell": 192 + 512 + 192}  # v is 3d wide; u is saved
+    plan, ref = memory_plan(ablated, 4, 256), memory_plan(base, 4, 256)
+    assert plan.train_state_bytes == TRAIN_STATE_BYTES_PER_PARAM * 1_554_313
+    assert plan.rec_state_bytes == ref.rec_state_bytes  # the state is unchanged
+    assert plan.saved_sparse_bytes == 4 * 256 * (2_560 + 4 * 896) * 2
+    assert plan.saved_dense_bytes == 4 * 256 * (2_560 + 32 * 896) * 2
+    assert ref.saved_sparse_bytes - plan.saved_sparse_bytes == 4 * 256 * 4 * 64 * 2
+
+    # the tiny gradcheck configuration and the script's tables
+    tiny = load_config(TINY, overrides=["model.ablate_shared_u=true"]).model
+    d, h, m_units = tiny.d, tiny.hidden, tiny.n_units
+    tiny_full = expected_param_count(load_config(TINY).model)
+    assert tiny_full["total"] - expected_param_count(tiny)["total"] == m_units * d * h + d * d + d
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--config",
+            "configs/ref_a1.yaml",
+            "model.ablate_shared_u=true",
+        ],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    for figure in (
+        "Ablation model.ablate_shared_u: the cell input is [ε; h_i; m_i] of width 192",
+        "| Capability units F(1)–F(8) | 8 × (192 → 512 → 64) | 1,053,184 |",
+        "| Gate B | 192 → 64 | 12,352 |",
+        "| Cell input RMSNorm gain (amendment A1) | 192 | 192 |",
+        "| Router scorer, linear | 200 → 8 | 1,608 |",
+        "| **Total** |  | **1,554,313** |",
+        "| **Sparse total, K = 4** | **1,170,624** | 100 % |",
+        "| 4 × 256 × (2,560 + 4 × 896) × 2 |",
+        "Per-cell saved activations 896 = v (192) + unit hidden (512) + c, b, h (192).",
+        "Shared activations 2,560 = z, ẑ, ε, u (256) + 4 hidden layers (2,048) + logits (256).",
+    ):
+        assert figure in run.stdout, figure
+
+
+def test_p1_1_rejects_unsupported() -> None:
     m = ModelConfig()
     for batch, unroll, value_bytes in ((0, 256, 2), (4, 0, 2), (4, 256, 0)):
         with pytest.raises(ValueError, match=">= 1"):

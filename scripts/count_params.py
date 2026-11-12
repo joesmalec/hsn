@@ -68,17 +68,24 @@ def _scorer_shape(m: ModelConfig, d_in: int) -> str:
 
 
 def configuration_line(m: ModelConfig) -> str:
-    return (
+    line = (
         f"Configuration: V={m.vocab_size}, d={m.d}, N={m.n_cells}, M={m.n_units}, "
         f"K={m.k_select}, R={m.r_max}, D_g={m.in_degree}, H={m.hidden}, "
         f"{m.n_context} context symbols of width {m.context_dim}."
     )
+    if m.ablate_shared_u:  # the ablation's line only: the default output is Appendix C's
+        line += (
+            f" Ablation model.ablate_shared_u: the cell input is [ε; h_i; m_i] of width "
+            f"{m.cell_input_width} (u removed from v)."
+        )
+    return line
 
 
 def parameter_table(m: ModelConfig) -> str:
     """C.1 Parameters."""
     p = expected_param_count(m)
     d, h, v = m.d, m.hidden, m.vocab_size
+    v_in = m.cell_input_width  # the cell input: 4d, or 3d with model.ablate_shared_u
     scorer_in = 3 * d + SCORER_SCALAR_FEATURES  # [u; ε; h_i] + eight scalars (Appendix H.2)
     rows = [
         ("Byte embedding", f"{v} × {d}", _n(p["byte_emb"])),
@@ -88,13 +95,13 @@ def parameter_table(m: ModelConfig) -> str:
         ("Shared transform S", f"{2 * d + m.context_dim} → {h} → {d}", _n(p["shared"])),
         (
             f"Capability units F(1)–F({m.n_units})",
-            f"{m.n_units} × ({4 * d} → {h} → {d})",
+            f"{m.n_units} × ({v_in} → {h} → {d})",
             _n(p["units"]),
         ),
         ("Output projection W_out", f"{d} × {d}", _n(p["w_out"])),
         ("Message projection V", f"{d} × {d}", _n(p["v_msg"])),
-        ("Gate B", f"{4 * d} → {d}", _n(p["gate"])),
-        ("Cell input RMSNorm gain (amendment A1)", f"{4 * d}", _n(p["cell_norm"])),
+        ("Gate B", f"{v_in} → {d}", _n(p["gate"])),
+        ("Cell input RMSNorm gain (amendment A1)", f"{v_in}", _n(p["cell_norm"])),
         # P1.13 (amendment A4): the candidate's RMSNorm gain, a row only when model.cand_norm=rms
         *(
             [("Candidate RMSNorm gain (amendment A4)", f"{d}", _n(p["cand_norm"]))]
@@ -197,8 +204,8 @@ def memory_table(m: ModelConfig, batch: int, unroll: int, value_bytes: int) -> s
         ),
     ]
     footnotes = (
-        f"Per-cell saved activations {_n(acts['per_cell'])} = v ({4 * m.d}) + unit hidden "
-        f"({_n(m.hidden)}) + c, b, h ({3 * m.d}). Shared activations {_n(acts['shared'])} = "
+        f"Per-cell saved activations {_n(acts['per_cell'])} = v ({m.cell_input_width}) + unit "
+        f"hidden ({_n(m.hidden)}) + c, b, h ({3 * m.d}). Shared activations {_n(acts['shared'])} = "
         f"z, ẑ, ε, u ({4 * m.d}) + 4 hidden layers ({_n(4 * m.hidden)}) + logits "
         f"({m.vocab_size})."
     )
