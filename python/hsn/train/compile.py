@@ -1148,7 +1148,19 @@ def run_tape(
     # as the step's gate, whose gradient path (the soft unit weights and cell mask) the replay
     # rebuilds from the recorded slots. Nothing here would read it.
     controls = model._controls()._replace(gate=None)
-    z, context, scalars = pro.z.detach(), pro.context.detach(), pro.scalars.detach()
+    n_blocks = T // blk
+
+    def by_block(x: Tensor) -> Tensor:
+        # [B, T, ...] -> [T / blk, B, blk, ...], one dense copy per window. A block's inputs
+        # are then dense tensors: a CUDA-graph replay copies a strided input by the byte
+        # extent it spans (torch._inductor.output_code.copy_strided_storage_), and a column
+        # slice of a window spans nearly the whole window, 195 MB per step over 16 blocks.
+        return x.reshape(x.shape[0], n_blocks, blk, *x.shape[2:]).transpose(0, 1).contiguous()
+
+    z_blocks = by_block(pro.z.detach())
+    context_blocks = by_block(pro.context.detach())
+    scalar_blocks = by_block(pro.scalars.detach())
+    reset_blocks = by_block(reset)
     h, q, age, pos = state.h, state.q, state.age, state.pos
     blocks: list[dict[str, Tensor]] = []
     with model.cell.window():
@@ -1159,18 +1171,17 @@ def run_tape(
             runner = twin.twin
         else:
             consts = model.cell.window_consts()
-        for start in range(0, T, blk):
-            cols = slice(start, start + blk)
+        for index in range(n_blocks):
             out = block(
                 runner,
                 h,
                 q,
                 age,
                 pos,
-                z[:, cols],
-                context[:, cols],
-                scalars[:, cols],
-                reset[:, cols],
+                z_blocks[index],
+                context_blocks[index],
+                scalar_blocks[index],
+                reset_blocks[index],
                 consts,
                 mode,
                 controls,
