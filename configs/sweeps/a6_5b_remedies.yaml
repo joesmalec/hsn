@@ -66,7 +66,7 @@ rules:
   verdicts:
     reads_state_v3: {preset: reads_state_v3}
     binds_keys: {preset: binds_keys}
-seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 arms:
   - name: split_dense10
     family: hsn
@@ -240,6 +240,26 @@ arms:
       - model.k_select=8
       - train.lambda_b=0.02
       - train.aux_enabled=[balance]
+      - hardware.window=fused
+  # Amendment A7's deciding experiment 1 (docs/amendments/A7_unit_credit.md): what is left with
+  # executed credit is a shortage of slots at the value positions once a second unit competes
+  # for them (section 3c of the follow-up), and eight slots had no fall in seven runs with the
+  # default credit. Both arms use the opt-in candidate train.unit_credit=executed.
+  - name: fused_softwarm_k8_executed
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.unit_credit=executed
+      - hardware.window=fused
+  - name: fused_softwarm_k8_balance_executed
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.unit_credit=executed
       - hardware.window=fused
   - name: fused_balance_executed # the candidate fused_softwarm_balance_executed without the warm-up
     family: hsn
