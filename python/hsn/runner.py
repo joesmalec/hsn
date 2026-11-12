@@ -50,6 +50,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.baselines.gru import GRUBaseline
+from hsn.baselines.mamba import MambaBaseline
 from hsn.baselines.transformer import TransformerBaseline
 from hsn.config import RunConfig, config_hash, load_config, write_run_manifest
 from hsn.data.dataset import ByteDataset
@@ -113,6 +114,7 @@ PowerChoice = Literal["none", "profile"]
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "gru": GRUBaseline,
     "transformer": TransformerBaseline,
+    "selective_ssm": MambaBaseline,  # the paper's selective-memory control (plan P2.13)
     "hsn": HSN.from_config,  # P1.9: the dense predictive cell (P1.5) trained by TBPTTTrainer (P1.7)
 }
 

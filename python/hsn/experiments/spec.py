@@ -106,8 +106,8 @@ __all__ = [
     "slug",
 ]
 
-FAMILIES = ("hsn", "gru", "transformer")
-Family = Literal["hsn", "gru", "transformer"]
+FAMILIES = ("hsn", "gru", "transformer", "selective_ssm")
+Family = Literal["hsn", "gru", "transformer", "selective_ssm"]
 # P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
 # computes; P1.16: neither do the kept mid-run checkpoints (keep_every, keep_last)
 EXECUTION_ONLY = frozenset(

@@ -919,11 +919,35 @@ class TransformerBaselineConfig(_StrictModel):
         return self
 
 
+class SelectiveSSMBaselineConfig(_StrictModel):
+    """``baseline.selective_ssm.*``: the Mamba-style selective state-space model (the paper's
+    "selective recurrent memory" control, plan P2.13; :mod:`hsn.baselines.mamba`).
+
+    Defaults are a ≈2M-parameter setting for the reference data: 1,887,744 parameters as measured
+    by ``MambaBaseline.param_report``.
+    """
+
+    d_model: int = Field(default=256, ge=1)  # residual width
+    n_layers: int = Field(default=4, ge=1)  # Mamba blocks
+    d_state: int = Field(default=16, ge=1)  # state per channel of the selective scan
+    d_conv: int = Field(default=4, ge=1)  # taps of the causal depthwise convolution
+    expand: int = Field(default=2, ge=1)  # inner width = expand × d_model
+    dt_rank: int | None = Field(default=None, ge=1)  # rank of the step-size path; None = d_model/16
+
+
 class BaselineConfig(_StrictModel):
     """``baseline.*``: sizes of the P0.5 baselines (``model_name`` selects which one runs)."""
 
     gru: GRUBaselineConfig = GRUBaselineConfig()
     transformer: TransformerBaselineConfig = TransformerBaselineConfig()
+    selective_ssm: SelectiveSSMBaselineConfig = SelectiveSSMBaselineConfig()
+    # The HSN's fixed byte codes (amendment A5, ``model.key_address``) as a baseline input: the
+    # codes of the current and of the previous byte, frozen, through one learned projection
+    # (:mod:`hsn.baselines.address`). Opt-in; a control for how much of the HSN's score on keys it
+    # never trained on comes from that fixed code. ``address_dim`` 64 is the recipe's ``model.d``,
+    # which with the same seed gives the HSN's own code table.
+    address_input: bool = False
+    address_dim: int = Field(default=64, ge=1)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1048,6 +1072,11 @@ class RunConfig(_StrictModel):
                     f"hardware.window={self.hardware.window!r} is not available for this "
                     f"configuration: {reason}"
                 )
+        if self.baseline.address_input and self.model_name == "hsn":
+            raise ValueError(
+                "baseline.address_input is an input of the baselines; the HSN's own address "
+                "features are model.key_address"
+            )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
@@ -1380,6 +1409,9 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "hardware.sweep_twin",
     "train.unit_credit",
     "train.ste_scope",
+    "baseline.selective_ssm",
+    "baseline.address_input",
+    "baseline.address_dim",
 )
 
 

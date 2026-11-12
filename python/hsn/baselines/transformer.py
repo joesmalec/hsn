@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from hsn.baselines.address import AddressInput
 from hsn.config import RunConfig
 
 __all__ = ["TransformerBaseline"]
@@ -76,6 +77,8 @@ class TransformerBaseline(nn.Module):
         self.tok_emb = nn.Embedding(self.vocab_size, self.d_model)
         self.ctx_emb = nn.Embedding(self.n_context, self.d_model)
         self.pos_emb = nn.Embedding(self.window, self.d_model)
+        # baseline.address_input: the HSN's fixed byte codes as an input (a control, off by default)
+        self.address = AddressInput(cfg, self.d_model) if cfg.baseline.address_input else None
         self.drop = nn.Dropout(spec.dropout)
         self.blocks = nn.ModuleList(
             _Block(self.d_model, self.n_heads, spec.ffn_hidden, spec.dropout)
@@ -123,7 +126,10 @@ class TransformerBaseline(nn.Module):
         if state is not None:
             raise ValueError(f"TransformerBaseline carries no state, got {type(state).__name__}")
         positions = torch.arange(T, device=tokens.device)
-        x = self.drop(self.tok_emb(tokens) + self.ctx_emb(context) + self.pos_emb(positions))
+        x = self.tok_emb(tokens) + self.ctx_emb(context) + self.pos_emb(positions)
+        if self.address is not None:
+            x = x + self.address(tokens, reset)
+        x = self.drop(x)
         mask = self.attention_mask(reset)
         for block in self.blocks:
             x = block(x, mask)
@@ -136,6 +142,7 @@ class TransformerBaseline(nn.Module):
             "byte_emb": _count(self.tok_emb),
             "ctx_emb": _count(self.ctx_emb),
             "pos_emb": _count(self.pos_emb),
+            **({"address": _count(self.address)} if self.address is not None else {}),
             "blocks": _count(self.blocks),
             "norm": _count(self.norm),
             "head": _count(self.head),
