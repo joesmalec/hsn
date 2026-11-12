@@ -207,6 +207,17 @@ arms:
     overrides:
       - train.soft_until_step=2000
       - hardware.window=fused
+  # The linear scorer ranks a unit's cells by one weight on the current byte's address and one on
+  # the previous byte's, at every position: a run binds keys only while two units share the work
+  # (one ranks the query's cells by a_cur, the other the value's cells by a_prev; measured on
+  # the kept checkpoints, evidence/P2.10/sag/softwarm/). The plan's two-layer scorer (Appendix
+  # C.2) can switch between the two rankings inside one unit.
+  - name: fused_softwarm_mlp
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.scorer=mlp
+      - hardware.window=fused
   - name: split_softwarm_dense05 # dense-fallback rows: the split window (the fused one has none)
     family: hsn
     overrides:
