@@ -3808,7 +3808,7 @@ reference configuration (Appendix C). Thresholds are **not** config: they live i
 | `halt_threshold` | float = 0.5 | inference halting threshold |
 | `predictor_target` | `fixed_embedding` \| `ema_encoder` | P1.6 |
 | `disabled_cells` | list[int] = [] | test hook |
-| `ablate_shared_u` | bool = false | ablation: remove u from v |
+| `ablate_shared_u` | bool = false | ablation: remove u from v (the cell input is `[ε; h_i; m_i]`, width 3d, for the cell-input norm, the unit MLPs and the gate; the scorer and the decoder still read u) |
 | `state_schema_version` | int = 1 | bumped on any state layout change |
 
 ### A.2 `data.*`

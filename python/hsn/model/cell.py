@@ -51,9 +51,20 @@ not written, add nothing to ``q`` and get no gradient. When every cell is select
 is carried through unchanged, with no gradient into the discarded candidate). In sparse mode a
 selected disabled cell is dropped from the valid slots: it is not written and keeps ageing, while
 ``Selection.cost`` still charges it (the router chose it).
-``model.ablate_shared_u`` (remove ``u`` from ``v``) is not implemented here: the P1.1 closed forms
-fix ``v`` at width ``4d`` and
-refuse to count the ablation, so this module refuses to build it rather than guess its shapes.
+
+``model.ablate_shared_u`` (opt-in; the "remove shared path" ablation of paper §12 and of the P2.13
+matrix, Appendix A.1: "remove u from v"): the cell input is ``v_i = [ε_t ; h[i, t, r−1] ; m_i]`` in
+``R^{3d}`` (:attr:`PDGCell.in_dim`), so the cell-input norm (gain of width ``3d``), every unit MLP
+(``3d → H → d``) and the gate ``B`` (``3d → d``) are built at that width and nothing a cell computes
+depends on ``u_t``. The rounds keep their signatures (``u`` is still passed and checked, and not
+read); ``m``, ``W_out``, the candidate norm, the gated update and the state are unchanged, and so is
+everything outside the cell that reads ``u`` (the scorer's features, the decoder ``D([q; u; r])``,
+the halting head): the ablation removes the shared path from the *cells*, one change, not the
+shared transform ``S`` from the model. It holds on every path: the dense and the masked round
+(:meth:`PDGCell.step_dense`), the sparse round eager and static (:meth:`PDGCell.step_sparse`,
+``gather_concat`` with ``u=None``), and the split and fused windows (:meth:`PDGCell.replay_sparse`,
+:meth:`PDGCell.sparse_products`). With the key off (default) every shape and every operation is the
+4d cell's, bit for bit.
 
 The dense round reads only the ``state`` it is given and returns the new ``h``; writing the state
 (the summary ``q``, ages, position) is :class:`~hsn.model.hsn.HSN`'s job through the P1.3
@@ -143,21 +154,19 @@ class PDGCell(nn.Module):
 
     def __init__(self, cfg: ModelConfig, *, seed: int) -> None:
         super().__init__()
-        if cfg.ablate_shared_u:
-            raise NotImplementedError(
-                "model.ablate_shared_u=true is not implemented in P1.5: the P1.1 closed forms fix "
-                "the "
-                "cell input v = [u; eps; h_i; m_i] at width 4d and refuse to count the ablation "
-                "(hsn.train.memory_plan); the ablation's shapes are defined with the P2.13 matrix"
-            )
         d = cfg.d
         self.d = d
         self.n_cells = cfg.n_cells
         self.n_units = cfg.n_units
         self.seed = seed
+        #: ``model.ablate_shared_u`` (module docstring): the cell input is ``[eps; h_i; m_i]``.
+        self.ablate_shared_u = cfg.ablate_shared_u
+        #: Width of the cell input ``v`` (the norm, the units and the gate): ``4d``, or ``3d``
+        #: without ``u`` (``model.ablate_shared_u``).
+        self.in_dim = cfg.cell_input_width
         self.V = nn.Linear(d, d, bias=False)
         self.W_out = nn.Linear(d, d, bias=False)
-        self.gate = nn.Linear(4 * d, d)
+        self.gate = nn.Linear(self.in_dim, d)
         for linear in (self.V, self.W_out, self.gate):
             init_weight_(linear.weight, cfg.state_init)
         # P1.5a (amendment A1): the gate starts near retention, sigmoid(-3) = 0.047 by default,
@@ -167,7 +176,7 @@ class PDGCell(nn.Module):
         # of width 4d, the Appendix C.1 row ``cell_norm``); Identity when model.cell_norm = none.
         self.cell_norm = cfg.cell_norm
         self.norm: nn.Module = (
-            nn.RMSNorm(4 * d, eps=1e-6) if cfg.cell_norm == "rms" else nn.Identity()
+            nn.RMSNorm(self.in_dim, eps=1e-6) if cfg.cell_norm == "rms" else nn.Identity()
         )
         # P1.13 (amendment A4): RMSNorm over W_out(.) before the candidate's tanh (a learned gain of
         # width d, the Appendix C.1 row ``cand_norm``; its ones init draws no random numbers);
@@ -264,9 +273,13 @@ class PDGCell(nn.Module):
             # A6: what the round reads of the state (the carry below keeps the state itself)
             h_read = h_prev.detach() if self.detach_state_read else h_prev
             m = self.graph.messages_dense(h_read, self.V, weights=weights)  # [B, N, d]
-            v_raw = torch.cat(
-                [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_read, m], dim=-1
-            )  # [B, N, 4d]
+            if self.ablate_shared_u:  # the cell input without the shared path's u: [B, N, 3d]
+                v_raw = torch.cat([eps[:, None, :].expand(B, N, d), h_read, m], dim=-1)
+            else:
+                v_raw = torch.cat(
+                    [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_read, m],
+                    dim=-1,
+                )  # [B, N, 4d]
             v = self.norm(v_raw)  # P1.5a: what the units and the gate read
             unit_out = self.units.forward_all(v, w1_flat=w1_flat)  # [B, N, M, d] ([M, B·N, d])
             mixed = _mix(alpha, unit_out)  # Σ_j α_ij F_j(v_i)
@@ -350,6 +363,8 @@ class PDGCell(nn.Module):
         units = torch.where(valid, sel.unit_idx, torch.zeros_like(sel.unit_idx))
         weights = None if consts is None else consts.edge_weights
         w1_flat = None if consts is None else consts.w1_flat
+        in_dim = self.in_dim
+        u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
         with self.graph.step():
             with profiler_segment(profiler, "messages", B):
                 h_prev = state.h
@@ -361,13 +376,13 @@ class PDGCell(nn.Module):
                     )
                 else:
                     m = native.csr_messages(h_read, self.graph, self.V, cells)  # [B, K, d]
-                v_raw = native.gather_concat(u, eps, h_read, m, cells)  # [B, K, 4d]
+                v_raw = native.gather_concat(u_read, eps, h_read, m, cells)  # [B, K, 4d]
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
                 if static:  # P2.8: every unit on the pairs, then a gather (no histogram)
                     unit_out = native.grouped_unit_mlp(
-                        v.reshape(B * K, 4 * d),
+                        v.reshape(B * K, in_dim),
                         units.reshape(B * K),
                         self.units,
                         static=True,
@@ -375,7 +390,7 @@ class PDGCell(nn.Module):
                     ).reshape(B, K, d)
                 else:
                     unit_out = native.grouped_unit_mlp(
-                        v.reshape(B * K, 4 * d), units.reshape(B * K), self.units
+                        v.reshape(B * K, in_dim), units.reshape(B * K), self.units
                     ).reshape(B, K, d)
             # The second per-cell entry of a position carries no tokens (profile_dense_costs does
             # the same), so the segment's tokens stay one count per position.
@@ -391,7 +406,8 @@ class PDGCell(nn.Module):
                 new_state = native.gated_delta_update(
                     state, cells, c, b, valid, validate=not static
                 )
-        h_old = v_raw[..., 2 * d : 3 * d]  # the gathered h[cell] slice of the raw v
+        # the gathered h[cell] slice of the raw v, its last block but one ([2d, 3d) of the 4d v)
+        h_old = v_raw[..., in_dim - 2 * d : in_dim - d]
         if self.detach_state_read:  # A6: the returned slots keep the carry's gradient
             h_old = h_prev.gather(1, cells.unsqueeze(-1).expand(B, K, d))
         h_new = torch.where(valid.unsqueeze(-1), (1 - b) * h_old + b * c, h_old).to(state.dtype)
@@ -450,8 +466,9 @@ class PDGCell(nn.Module):
                 m = self.graph.messages_selected(
                     h_read, self.V, cells, weights=consts.edge_weights, validate=False, vh=vh
                 )
-            v = self.norm(native.gather_concat(u, eps, h_read, m, cells))
-            flat = v.reshape(B * K, 4 * d)
+            u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
+            v = self.norm(native.gather_concat(u_read, eps, h_read, m, cells))
+            flat = v.reshape(B * K, self.in_dim)
             w2_flat = consts.w2_flat if consts.w2_flat is not None else self.units._w2_flat()
             if consts.w1_gate is not None and consts.b1_gate is not None:
                 unit_out, rider = self.units.forward_static_chosen(
@@ -505,9 +522,10 @@ class PDGCell(nn.Module):
             m = self.graph.messages_selected(
                 h_read, self.V, cells, weights=consts.edge_weights, validate=False, vh=vh
             )
-            v = self.norm(native.gather_concat(u, eps, h_read, m, cells))
+            u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
+            v = self.norm(native.gather_concat(u_read, eps, h_read, m, cells))
             unit_out, rider = self.units.forward_static_chosen(
-                v.reshape(B * K, 4 * d),
+                v.reshape(B * K, self.in_dim),
                 units.reshape(B * K),
                 w1_flat=consts.w1_gate,
                 w2_flat=consts.w2_flat,
@@ -551,11 +569,12 @@ class PDGCell(nn.Module):
             sources = self.V(h_const.gather(1, index)).reshape(R, K, D, d)
             edge_weights = graph._padded_weights_as(sources.dtype)[cells]  # [R, K, D_max]
             m = (sources * edge_weights[..., None]).sum(dim=2)
-            v_raw = native_ops.gather_concat(u, eps, h_const, m, cells)  # [R, K, 4d]
+            u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
+            v_raw = native_ops.gather_concat(u_read, eps, h_const, m, cells)  # [R, K, 4d]
             v = self.norm(v_raw)
             b = torch.sigmoid(self.gate(v).to(dtype))
             unit_out = self.units.forward_grouped(
-                v.reshape(R * K, 4 * d), units.reshape(R * K)
+                v.reshape(R * K, self.in_dim), units.reshape(R * K)
             ).reshape(R, K, d)
             if self.cand_norm_kind == "none":
                 mixed = sel.alpha.unsqueeze(-1) * unit_out
@@ -575,10 +594,13 @@ class PDGCell(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def extra_repr(self) -> str:
-        return (
+        text = (
             f"d={self.d}, n_cells={self.n_cells}, n_units={self.n_units}, seed={self.seed}, "
             f"disabled_cells={list(self.disabled_cells)}"
         )
+        if self.ablate_shared_u:  # only when set: the default repr is the P1.5 one
+            text += ", ablate_shared_u=True"
+        return text
 
     def _check_inputs(
         self, u: Tensor, eps: Tensor, state: CellGraphState, alpha: Tensor

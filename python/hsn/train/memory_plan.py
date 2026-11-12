@@ -17,9 +17,13 @@ Conventions (plan P1.1, Appendix C, Appendix H):
   ``model.scorer_features.exclude`` zeroes features without removing them, so it changes no count.
 * The per-token shared activation count is ``4d + 4H + V`` = 2,560 for the reference configuration,
   not the paper's 2,816 (Appendix H.1); MiB means 2^20 bytes.
-* The closed forms fix the cell input ``v = [u; ε; h_i; m_i]`` at width ``4d``, so a configuration
-  with ``model.ablate_shared_u`` raises instead of being counted with a guessed width (errors over
-  silence); P1.5 defines that ablation's shapes.
+* The cell input ``v = [u; ε; h_i; m_i]`` has width ``4d``. With ``model.ablate_shared_u`` (the
+  "remove shared path" ablation of the P2.13 matrix, :mod:`hsn.model.cell`) it is ``[ε; h_i; m_i]``
+  of width ``3d`` (:attr:`hsn.config.ModelConfig.cell_input_width`), and the three rows that read
+  it are counted at that width: the units (``M × (3d → H → d)``), the gate ``B`` (``3d → d``) and
+  the ``cell_norm`` gain (``3d``); a cell then saves ``3d`` values for ``v``. ``u`` is still
+  computed and still read by the scorer and the decoder, so every other row, the scorer's ``3d +
+  8`` features and the shared activations are unchanged.
 * Learned edge weights ``a_ij`` are not in Appendix C and are not counted here (P1.4).
 """
 
@@ -75,15 +79,6 @@ class MemoryPlan:
     total_dense: int  # train_state + rec_state + saved_dense + overhead
 
 
-def _check_supported(m: ModelConfig) -> None:
-    """Raise for configurations the closed forms do not model."""
-    if m.ablate_shared_u:
-        raise ValueError(
-            "model.ablate_shared_u=true is not covered by the P1.1 closed forms, which fix the "
-            "cell input v = [u; eps; h_i; m_i] at width 4d; P1.5 defines the ablation's shapes"
-        )
-
-
 def _mlp(d_in: int, hidden: int, d_out: int) -> int:
     """Parameters of a two-layer MLP ``d_in -> hidden -> d_out`` with both biases."""
     return d_in * hidden + hidden + hidden * d_out + d_out
@@ -108,21 +103,23 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
     ``cell_norm=none``), ``cand_norm`` (the P1.13 RMSNorm gain of width d before the candidate's
     tanh, amendment A4; 0 unless ``cand_norm=rms``), ``total``. The reference configuration gives
     1,820,617 (1,820,361 before amendment A1, which added the 256-parameter ``cell_norm`` row;
-    1,820,681 with ``cand_norm=rms``).
+    1,820,681 with ``cand_norm=rms``). With ``model.ablate_shared_u`` the cell input is ``3d``
+    wide, so ``units``, ``gate`` and ``cell_norm`` read ``3d`` in place of ``4d`` (1,554,313 for
+    the reference configuration: 262,144 + 4,096 + 64 fewer).
     """
-    _check_supported(m)
     d, h, v = m.d, m.hidden, m.vocab_size
+    v_in = m.cell_input_width  # 4d: [u; eps; h_i; m_i]; 3d with model.ablate_shared_u
     rows = {
         "byte_emb": v * d,
         "ctx_emb": m.n_context * m.context_dim,
         "encoder": _mlp(d, h, d),
         "predictor": _mlp(d, h, d),
         "shared": _mlp(2 * d + m.context_dim, h, d),
-        "units": m.n_units * _mlp(4 * d, h, d),
+        "units": m.n_units * _mlp(v_in, h, d),
         "w_out": d * d,
         "v_msg": d * d,
-        "gate": 4 * d * d + d,
-        "cell_norm": 4 * d if m.cell_norm == "rms" else 0,  # P1.5a: the RMSNorm gain
+        "gate": v_in * d + d,
+        "cell_norm": v_in if m.cell_norm == "rms" else 0,  # P1.5a: the RMSNorm gain
         "cand_norm": d if m.cand_norm == "rms" else 0,  # P1.13 (amendment A4)
         "scorer": _scorer_params(m),
         "halting": 2 * d + 1,
@@ -164,12 +161,12 @@ def activations_per_token(m: ModelConfig) -> dict[str, int]:
 
     ``shared`` = z, ẑ, ε, u (4d) + the four MLP hidden layers of E, P, S, D (4H) + logits (V):
     2,560 for the reference configuration (Appendix H.1). ``per_cell`` = v (4d) + unit hidden (H)
-    + c, b, h (3d): 960.
+    + c, b, h (3d): 960. With ``model.ablate_shared_u`` ``v`` is ``3d`` wide (896); ``u`` stays
+    in ``shared`` (the scorer and the decoder read it).
     """
-    _check_supported(m)
     return {
         "shared": (5 if m.selected_readout else 4) * m.d + 4 * m.hidden + m.vocab_size,
-        "per_cell": 4 * m.d + m.hidden + 3 * m.d,
+        "per_cell": m.cell_input_width + m.hidden + 3 * m.d,
     }
 
 

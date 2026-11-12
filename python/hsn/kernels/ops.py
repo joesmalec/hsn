@@ -317,10 +317,12 @@ def _compute_dtype(t: Tensor) -> torch.dtype:
     return t.dtype
 
 
-def gather_concat(u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor) -> Tensor:
+def gather_concat(u: Tensor | None, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor) -> Tensor:
     from hsn.kernels import native
 
-    if not _supported(h):
+    # u=None (model.ablate_shared_u) is the 3d cell input [eps; h; m]: the P2.9 gather kernel's
+    # ABI is [B, K, 4d] with u, so that input keeps the native path.
+    if u is None or not _supported(h):
         return native.gather_concat(u, eps, h, m, cell_idx)
     if u.dtype != h.dtype or eps.dtype != h.dtype:
         raise ValueError("u, eps and h must have the same state dtype")
@@ -344,7 +346,14 @@ def grouped_unit_mlp(
     # reduced precision. The raw ABI keeps fp32 intermediates, which can exceed
     # native's gradient tolerance at model-sized pair counts. Preserve native's
     # mixed-precision contract until a matching autocast kernel is specified.
-    if not _supported(v) or bank.activation_name != "gelu" or torch.is_autocast_enabled("cuda"):
+    # The raw ABI fixes the unit input at [P, 4d] and W1 at [M, 4d, H]: a bank of another input
+    # width (model.ablate_shared_u: 3d) keeps the native path.
+    if (
+        not _supported(v)
+        or bank.activation_name != "gelu"
+        or torch.is_autocast_enabled("cuda")
+        or bank.in_dim != 4 * bank.d
+    ):
         return native.grouped_unit_mlp(v, unit_idx, bank, static=static, w1_flat=w1_flat)
     if not static:
         lo, hi = int(unit_idx.min()), int(unit_idx.max())

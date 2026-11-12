@@ -110,7 +110,7 @@ def _check_bool(name: str, x: object, shape: tuple[int, ...], device: torch.devi
 # --------------------------------------------------------------------------------------------------
 
 
-def gather_concat(u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor) -> Tensor:
+def gather_concat(u: Tensor | None, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor) -> Tensor:
     """``v [B, K, 4d] = [u ; ε ; h[cell_idx] ; m]`` for the selected cells.
 
     ``u``, ``eps`` are ``[B, d]`` in the dtype of ``h [B, N, d]`` (the state dtype); ``m [B, K, d]``
@@ -119,6 +119,9 @@ def gather_concat(u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor
     ``gather`` (deterministic on every backend; its backward is an index scatter-add). No device
     synchronisation: out-of-range indices are the backend's error (cpu and cuda raise), see the
     module docstring.
+
+    ``u=None`` is the cell input of ``model.ablate_shared_u`` (:mod:`hsn.model.cell`): ``v
+    [B, K, 3d] = [ε ; h[cell_idx] ; m]``, the same operations without the first block.
     """
     h_t = _check_tensor("h", h)
     if h_t.dim() != 3 or min(h_t.shape) < 1 or not h_t.is_floating_point():
@@ -128,7 +131,7 @@ def gather_concat(u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor
         )
     B, _, d = (int(n) for n in h_t.shape)
     device = h_t.device
-    for name, x in (("u", u), ("eps", eps)):
+    for name, x in (("eps", eps),) if u is None else (("u", u), ("eps", eps)):
         vec = _check_floating(name, x, (B, d), device)
         if vec.dtype != h_t.dtype:
             raise ValueError(f"{name} must have dtype {h_t.dtype} like h, got {vec.dtype}")
@@ -141,6 +144,8 @@ def gather_concat(u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor
     K = int(idx.shape[1])
     msg = _check_floating("m", m, (B, K, d), device)
     h_sel = h_t.gather(1, idx.unsqueeze(-1).expand(B, K, d))
+    if u is None:  # model.ablate_shared_u: the cell input without the shared path's u
+        return torch.cat([eps.unsqueeze(1).expand(B, K, d), h_sel, msg.to(h_t.dtype)], dim=-1)
     return torch.cat(
         [
             u.unsqueeze(1).expand(B, K, d),
@@ -163,7 +168,8 @@ def grouped_unit_mlp(
     """``out [P, d]``: ``out[p] = F_{unit_idx[p]}(v[p])`` through the P1.2 grouped pass
     (:meth:`UnitBank.forward_selected`, which sorts the pairs by unit, runs one matmul pair per
     present unit and restores the order; values outside ``[0, M)`` raise ``IndexError`` there).
-    ``v`` is ``[P, 4d]``; ``unit_idx [P]`` int64 (or int32). The output has the autocast dtype under
+    ``v`` is ``[P, 4d]`` (the bank's ``in_dim``); ``unit_idx [P]`` int64 (or int32). The output
+    has the autocast dtype under
     autocast and ``v``'s dtype otherwise. ``static=True`` (P2.8, the capturable round) runs
     :meth:`UnitBank.forward_static` instead (every unit on the pairs, then a gather: static
     shapes, no host-side histogram, indices not checked), with the window's ``w1_flat`` when

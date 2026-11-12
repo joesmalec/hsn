@@ -155,6 +155,12 @@ def install_variant(
             f"variant {variant!r} with A5 is unsupported: use variant pdg and the "
             "key_address / selected_readout flags for the independent A5 ablations"
         )
+    if model.cfg.ablate_shared_u:
+        raise ValueError(
+            f"variant {variant!r} with model.ablate_shared_u=true is refused: the variants' "
+            "cell inputs, offsets and parameter reports are written for the 4d input "
+            "[u; eps; h_i; m_i]; use variant pdg"
+        )
     if model.cfg.cand_norm != "none":  # P1.13 hook (agreed with the coordinator, 7 Nov 2026)
         raise ValueError(
             f"variant {variant!r} with model.cand_norm={model.cfg.cand_norm} is refused: the "

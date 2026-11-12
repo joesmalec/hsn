@@ -197,6 +197,11 @@ _THREADS = 256
 def cell_round_error(cell: PDGCell) -> str | None:
     """Why the fused cell round cannot run this cell, or ``None`` when it can."""
     d = cell.d
+    if cell.ablate_shared_u:
+        return (
+            "model.ablate_shared_u: the fused round builds the 4d cell input [u; eps; h; m] in "
+            "its kernel (the fused window does not use it: its products are PDGCell's own)"
+        )
     if not available():
         return "the window kernels are not built (scripts/build_window_kernels.py)"
     if cell.cell_norm != "rms":

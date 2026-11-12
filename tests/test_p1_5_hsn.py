@@ -130,6 +130,7 @@ def _dims(cfg: RunConfig, model: HSN) -> dict[str, Any]:
         "edge_norm": m.edge_norm,
         "cell_norm": m.cell_norm,  # P1.5a: RMSNorm on the cell input, or none
         "cand_norm": m.cand_norm,  # P1.13: RMSNorm before the candidate's tanh, or none
+        "ablate_shared_u": m.ablate_shared_u,  # the cell input without u (test_ablate_shared_u)
         "disabled": set(m.disabled_cells),
         "indptr": graph.indptr.tolist(),
         "indices": graph.indices.tolist(),
@@ -264,7 +265,8 @@ def _ref_step(
 
     v, c_out, b_out, h_new, unit_out = [], [], [], [], []
     for i in range(N):
-        v_raw = u + eps + h[i] + m[i]
+        # the cell input [u; eps; h_i; m_i], or [eps; h_i; m_i] with model.ablate_shared_u
+        v_raw = (eps + h[i] + m[i]) if dims["ablate_shared_u"] else (u + eps + h[i] + m[i])
         # P1.5a: the units and the gate read the normalised input; the gated update reads h[i]
         v_i = _rmsnorm(v_raw, p["cell.norm.weight"]) if dims["cell_norm"] == "rms" else v_raw
         outs = [_unit(p, j, v_i) for j in range(M)]
@@ -649,8 +651,10 @@ def test_p1_5_shapes(device_type: str) -> None:
         model.step(x, c, state, mode="sparse")
     with pytest.raises(ValueError, match="mode"):
         model.step(x, c, state, mode="soft")  # type: ignore[arg-type]
-    with pytest.raises(NotImplementedError, match="ablate_shared_u"):
-        HSN.from_config(load_config(TINY, overrides=["model.ablate_shared_u=true"]))
+    # the "remove shared path" ablation builds, with the 3d cell input (test_ablate_shared_u.py)
+    ablated = HSN.from_config(load_config(TINY, overrides=["model.ablate_shared_u=true"]))
+    assert ablated.cell.in_dim == 3 * cfg.model.d == ablated.cell.gate.in_features
+    assert model.cell.in_dim == 4 * cfg.model.d and not model.cell.ablate_shared_u
     with pytest.raises(ValueError, match="scorer_features.exclude"):
         HSN.from_config(load_config(TINY, overrides=["model.scorer_features.exclude=[eps, nope]"]))
     with pytest.raises(TypeError):

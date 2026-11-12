@@ -740,6 +740,11 @@ def _expand_one(
             f"arm {entry.name}: A5 requires variant pdg; variant {variant} may replace its "
             "scorer, cell, or readout. Ablate A5 with key_address / selected_readout flags"
         )
+    if cfg.model.ablate_shared_u and variant not in ("pdg", "none"):
+        raise SpecError(
+            f"arm {entry.name}: model.ablate_shared_u requires variant pdg; variant {variant} "
+            "is written for the 4d cell input [u; eps; h_i; m_i]"
+        )
     if cfg.hardware.compile_mode != "none" and variant not in ("pdg", "none"):
         raise SpecError(
             f"arm {entry.name}: variant {variant} with hardware.compile_mode="
