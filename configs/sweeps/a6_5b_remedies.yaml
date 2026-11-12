@@ -162,6 +162,38 @@ arms:
     family: hsn
     overrides:
       - hardware.window=fused
+  # The soft warm-up with one more mechanism (11 Nov, after the six native_softwarm runs): the
+  # warm-up runs that plateau near 75 % do not bind keys, and their routes show the unit that
+  # reads the query keys taking the value positions slowly after the switch (seed 2: 53 % of
+  # the value slots at step 1,500, 99 % at step 5,000), where the runs that bind keys keep a
+  # second unit on about half of them. The balance loss and the dense fallback are the
+  # paper's mechanisms against a unit's growing share; executed credit is the opt-in candidate.
+  - name: fused_softwarm_balance
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_softwarm_balance10
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.1
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: split_softwarm_dense05 # dense-fallback rows: the split window (the fused one has none)
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.p_dense=0.05
+      - hardware.window=split
+  - name: fused_softwarm_executed # NOT a paper mechanism: the opt-in candidate train.unit_credit
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.unit_credit=executed
+      - hardware.window=fused
   - name: split_temp050
     family: hsn
     overrides:
