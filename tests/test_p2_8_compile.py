@@ -427,17 +427,32 @@ def test_p2_8_fp64_and_grad_accum_refused() -> None:
 
 
 @pytest.mark.usefixtures("small_blocks")
-def test_p2_8_capture_runs_eager() -> None:
-    """``capture=True`` is a diagnostic of the eager forward: the compiled window refuses it and
-    the model's own forward still captures after a compiled window ran."""
-    model = _model(_cfg(), training=False)
+@pytest.mark.parametrize("routing", ["dense", "topk"])
+def test_p2_8_capture_is_a_no_grad_variant(routing: str) -> None:
+    """``capture=True`` is the diagnostic window: refused with gradients (a training window
+    returns no per-position states), and without them the compiled window returns the eager
+    forward's cell states, gates and written masks to rounding. The model's own forward still
+    captures after a compiled window ran, and a plain compiled window is unchanged by it."""
+    overrides = [] if routing == "dense" else ["model.routing=topk", "train.gate_mode=ste"]
+    model = _model(_cfg(*overrides), training=False)
     window = _window(model, _ctx(), backend="aot_eager")
     tokens, cx, state, reset = _inputs(model)
-    window(tokens, cx, state, reset)
+    plain = window(tokens, cx, state, reset)
     with pytest.raises(ValueError, match="capture"):
         window(tokens, cx, state, reset, capture=True)
-    _, _, info = model(tokens, cx, state, reset, capture=True)
-    assert info["cell_states"].shape == (B, T, model.cfg.n_cells, model.cfg.d)
+    with torch.no_grad():
+        _, _, eager = model(tokens, cx, state, reset, capture=True)
+        logits, final, info = window(tokens, cx, state, reset, capture=True)
+        again = window(tokens, cx, state, reset)
+    assert eager["cell_states"].shape == (B, T, model.cfg.n_cells, model.cfg.d)
+    torch.testing.assert_close(info["cell_states"], eager["cell_states"], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        info["cell_gates"], eager["cell_gates"], rtol=1e-5, atol=1e-6, equal_nan=True
+    )
+    assert torch.equal(info["cell_written"], eager["cell_written"])
+    torch.testing.assert_close(logits, plain[0].detach(), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(again[0], logits, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(final.h, plain[1].h.detach(), rtol=1e-5, atol=1e-6)
 
 
 def test_p2_8_mps_falls_back_with_notice(caplog: pytest.LogCaptureFixture) -> None:

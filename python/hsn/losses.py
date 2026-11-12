@@ -123,9 +123,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from hsn.config import AUX_TERMS, PredictorTarget, RunConfig
+from hsn.config import AUX_TERMS, GradNormPrecision, PredictorTarget, RunConfig
 from hsn.model.graph import CellGraph
 from hsn.model.router import Selection
+from hsn.train.grad_norm import norm_float64
 
 __all__ = [
     "TERM_GRAD_NORM_PREFIX",
@@ -606,6 +607,7 @@ def grad_norm_report(
     *,
     scale: float = 1.0,
     retain_graph: bool = True,
+    precision: GradNormPrecision = "native",
 ) -> dict[str, float]:
     """``{"term_grad_norm/<term>": ‖∂term/∂θ‖₂}`` over the trainable parameters of ``model`` for
     every 0-dim term tensor in ``parts`` (module docstring). Each norm is taken with
@@ -636,6 +638,9 @@ def grad_norm_report(
             continue
         scaled = term * scale if scale != 1.0 else term
         grads = torch.autograd.grad(scaled, params, retain_graph=retain_graph, allow_unused=True)
+        if precision == "float64":
+            report[key] = float(norm_float64([g for g in grads if g is not None])) / scale
+            continue
         norms = [torch.linalg.vector_norm(g.detach().float()) for g in grads if g is not None]
         if not norms:
             report[key] = 0.0

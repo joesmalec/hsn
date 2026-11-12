@@ -182,6 +182,7 @@ from hsn.device import (
     synchronize,
 )
 from hsn.eval.evaluate import DEFAULT_METRICS, Metric, PositionGroups, evaluate_windows
+from hsn.train.adaptive import AdaptiveLR
 from hsn.train.amp import autocast_ctx, autocast_name, make_grad_scaler
 from hsn.train.checkpoint import (
     capture_rng_state,
@@ -191,8 +192,10 @@ from hsn.train.checkpoint import (
     save_checkpoint,
 )
 from hsn.train.divergence import StepSnapshot, persistent_buffers, write_dump
+from hsn.train.grad_norm import clip_grad_norm_
 from hsn.train.lazy_adam import build_lazy_adamw, cell_parameters
 from hsn.train.rollback import RollbackPolicy, SnapshotRing
+from hsn.train.weight_ema import WeightEMA
 
 __all__ = [
     "NONFINITE_MAX_CONSECUTIVE",
@@ -261,6 +264,26 @@ def spike_decision(
         return False, None
     median = statistics.median(recent)
     return bool(grad_norm > factor * median), float(median)
+
+
+def slow_burst_decision(
+    grad_norm: float, history: Collection[float], factor: float, window: int, lag: int
+) -> tuple[bool, float | None]:
+    """Detect sustained growth against an older median that cannot follow the same ramp.
+
+    Include the candidate in the recent window, but never in the applied history until accepted.
+    Requiring the candidate itself to exceed the old reference lets a healthy step recover after
+    a skip. Both windows must be full; ``lag`` counts applied steps between their endpoints.
+    """
+    if window < 1 or lag < 1:
+        raise ValueError("slow-burst window and lag must be positive")
+    values = [*history, grad_norm]
+    if len(values) < window + lag:
+        return False, None
+    baseline = float(statistics.median(values[-(window + lag) : -lag]))
+    recent = float(statistics.median(values[-window:]))
+    threshold = factor * baseline
+    return bool(recent > threshold and grad_norm > threshold), baseline
 
 
 def _skipped_counter(extra: Mapping[str, Any], key: str, path: str) -> int:
@@ -601,11 +624,29 @@ class Trainer:
                 type(self.model).__name__,
             )
         self.optimizer = self._make_optimizer()
+        from hsn.train.update_limit import UpdateLimiter
+
+        self.update_limiter = (
+            UpdateLimiter(model, train.update_limit) if train.update_limit.groups else None
+        )
+        from hsn.train.gradient_growth import GradientGrowth
+
+        self.gradient_growth = (
+            GradientGrowth(model, train.gradient_growth) if train.gradient_growth.enabled else None
+        )
         # P1.16: the rollback (train.rollback_*; None: off) and its learning-rate cut, which the
         # scheduler's factor reads (no cut until a rollback sets one)
         self.rollback: RollbackPolicy | None = RollbackPolicy.from_config(train)
         self._lr_cut_until = 0
         self._lr_cut_mult = 1.0
+        self.adaptive_lr = (
+            AdaptiveLR(
+                train.adaptive_lr, {g["adaptive_group"] for g in self.optimizer.param_groups}
+            )
+            if train.adaptive_lr.enabled
+            else None
+        )
+        self._adaptive_monitor: ByteDataset | None = None
         self.scheduler = self._make_scheduler()
         self.scaler = make_grad_scaler(ctx)
         if self.rollback is not None and self.scaler is not None:
@@ -625,13 +666,20 @@ class Trainer:
         # of applied finite norms its median reads; every skipped step with its reason
         self.spike_factor: float | None = train.spike_factor
         self.spike_window = train.spike_window
+        self.slow_burst_factor = train.slow_burst_factor
+        self.slow_burst_window = train.slow_burst_window
+        self._spike_history_limit = self.spike_window + (
+            self.slow_burst_window if self.slow_burst_factor is not None else 0
+        )
         if self.spike_factor is not None and self.scaler is not None:
             raise NotImplementedError(
                 f"train.spike_factor={self.spike_factor} under an fp16 GradScaler: the scaler "
                 "skips steps itself and the spike guard is not defined there"
             )
         self.skipped_spike = 0
-        self._spike_history: collections.deque[float] = collections.deque(maxlen=self.spike_window)
+        self._spike_history: collections.deque[float] = collections.deque(
+            maxlen=self._spike_history_limit
+        )
         self.skipped_steps: list[dict[str, Any]] = []
         # P1.15: the divergence dump (train.divergence_dump; hsn.train.divergence): the current
         # step's snapshot, the written dump's summary, notes the harness adds to it, and a hook
@@ -640,8 +688,17 @@ class Trainer:
         self.divergence_dump: bool = train.divergence_dump
         self._step_snapshot: StepSnapshot | None = None
         self.divergence: dict[str, Any] | None = None
+        self.divergences: list[dict[str, Any]] = []
+        self._diagnostic_update: tuple[Path, list[tuple[str, Tensor, Tensor]]] | None = None
         self.dump_notes: dict[str, Any] = {}
         self.grad_hook: Callable[[Trainer], None] | None = None
+        # Diagnostic observers run after every parameter projection, before EMA/scheduler.
+        self.update_post_hooks: list[Callable[[Trainer], None]] = []
+        # A6: the moving average of the weights that evaluate() scores (train.weight_ema; None:
+        # off). Built after the model moved to its device; training never reads it.
+        self.weight_ema: WeightEMA | None = (
+            WeightEMA(model, train.weight_ema) if train.weight_ema is not None else None
+        )
         self._loader_state: dict[str, Any] | None = None
         self._carried_state: Any = None
         # P1.11: parallel streams of evaluate() (None = train.batch); a harness setting, not config
@@ -656,6 +713,43 @@ class Trainer:
     # construction ----------------------------------------------------------------------------
 
     def _make_optimizer(self) -> torch.optim.Optimizer:
+        optimizer = self._make_base_optimizer()
+        train = self.cfg.train
+        if train.router_lr_mult == train.readout_lr_mult == 1.0 and not train.adaptive_lr.enabled:
+            return optimizer
+        # Split the existing groups before any state or scheduler exists. This preserves the
+        # cell's overrides, lazy unit metadata and ndim-based decay rules for both optimisers.
+        by_id: dict[int, str] = {}
+        multipliers = {"router": train.router_lr_mult, "decoder": train.readout_lr_mult}
+        for name, mult in multipliers.items():
+            if mult != 1.0 or train.adaptive_lr.enabled:
+                module = getattr(self.model, name, None)
+                if not isinstance(module, nn.Module):
+                    if mult != 1.0:
+                        raise ValueError(f"learning-rate multiplier requires HSN.{name}")
+                    continue
+                by_id.update((id(p), name) for p in module.parameters())
+        grouped: dict[str, list[dict[str, Any]]] = {"shared": [], "router": [], "decoder": []}
+        for group in optimizer.param_groups:
+            buckets: dict[str, list[nn.Parameter]] = {}
+            for p in group["params"]:
+                buckets.setdefault(by_id.get(id(p), "shared"), []).append(p)
+            for name, params in buckets.items():
+                grouped[name].append(
+                    {
+                        **group,
+                        "params": params,
+                        "lr": group["lr"] * multipliers.get(name, 1.0),
+                        **({"adaptive_group": name} if train.adaptive_lr.enabled else {}),
+                    }
+                )
+        optimizer.param_groups.clear()
+        for groups in grouped.values():
+            for group in groups:
+                optimizer.add_param_group(group)
+        return optimizer
+
+    def _make_base_optimizer(self) -> torch.optim.Optimizer:
         train = self.cfg.train
         if train.optimizer == "lazy_adamw":  # P2.6: the unit bank's tensors in unit groups
             return build_lazy_adamw(
@@ -733,7 +827,132 @@ class Trainer:
                 value *= self._lr_cut_mult
             return value
 
-        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, cut)
+        if self.adaptive_lr is None:
+            return torch.optim.lr_scheduler.LambdaLR(self.optimizer, cut)
+
+        def adaptive_factor(group: str) -> Callable[[int], float]:
+            def rate(step: int) -> float:
+                assert self.adaptive_lr is not None
+                return cut(step) * self.adaptive_lr.scale(group)
+
+            return rate
+
+        return torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            [adaptive_factor(g["adaptive_group"]) for g in self.optimizer.param_groups],
+        )
+
+    def _prepare_adaptive_monitor(self, train_ds: ByteDataset) -> None:
+        if self.adaptive_lr is None:
+            return
+        # A dev monitor would make the controller itself a validation-trained component.
+        if not len(train_ds) or any(e.meta.get("split") != "train" for e in train_ds.examples):
+            raise ValueError("adaptive_lr requires a nonempty, explicitly TRAIN-labelled dataset")
+        from hsn.experiments.data_selection import cap_dataset
+
+        groups = {(e.meta["task"], e.meta["variant"]) for e in train_ds.examples}
+        monitor = cap_dataset(
+            train_ds, max(len(groups), self.cfg.train.adaptive_lr.monitor_docs), seed=self.cfg.seed
+        )
+        if not any(e.loss_mask.any() for e in monitor.examples):
+            raise ValueError("adaptive_lr training monitor has no supervised positions")
+        self.adaptive_lr.bind_monitor(monitor.fingerprint)
+        self._adaptive_monitor = monitor
+
+    def _adaptive_monitor_loss(self) -> float:
+        assert self._adaptive_monitor is not None
+        # Fresh loader/state and restored RNG: monitoring must not change the training stream,
+        # carried state, previous byte, target encoder or subsequent stochastic updates.
+        rng = capture_rng_state()
+        try:
+            seed_everything((self.cfg.seed ^ 0xA5AD) % (2**32))
+            result = evaluate_windows(
+                self._eval_model(),
+                self._loader(self._adaptive_monitor, shuffle=False, epochs=1),
+                DEFAULT_METRICS,
+                device=self.ctx.device,
+                autocast=autocast_ctx(self.ctx),
+            )
+            return float(result["loss"])
+        finally:
+            restore_rng_state(rng)
+
+    def _adaptive_before_step(self, skipped: bool) -> list[tuple[Tensor, Tensor, str]]:
+        if self.adaptive_lr is None or skipped or not self.adaptive_lr.due:
+            return []
+        return [
+            (p, p.detach().clone(), group["adaptive_group"])
+            for group in self.optimizer.param_groups
+            for p in group["params"]
+        ]
+
+    def _limit_before_step(self, skipped: bool) -> None:
+        if self.update_limiter is not None and not skipped:
+            self.update_limiter.capture()
+
+    def _limit_after_step(self, applied: bool) -> None:
+        if self.update_limiter is not None and applied:
+            self.update_limiter.apply()
+            step = self.step + 1
+            if step % self.cfg.train.stats_every == 0 or step == self.cfg.train.steps:
+                logger.info(
+                    "update_limit step %d %s", step, json.dumps(self.update_limiter.state_dict())
+                )
+
+    def _growth_raw_norms(self) -> Tensor | None:
+        return (
+            self.gradient_growth.raw_norms(precision=self.cfg.train.grad_norm_precision)
+            if self.gradient_growth is not None
+            else None
+        )
+
+    def _growth_before_step(self, skipped: bool, norm: float, groups: Tensor | None) -> None:
+        controller = self.gradient_growth
+        if controller is not None and not skipped and math.isfinite(norm):
+            assert groups is not None
+            controller.observe(self.step + 1, norm, groups.detach().cpu().tolist())
+            controller.capture()
+
+    def _growth_after_step(self, applied: bool) -> None:
+        if self.gradient_growth is not None and applied:
+            observation = self.gradient_growth.apply()
+            if observation is not None:
+                logger.info("gradient_growth %s", json.dumps(observation))
+
+    def _adaptive_after_step(
+        self, applied: bool, grad_norm: float, before: list[tuple[Tensor, Tensor, str]]
+    ) -> None:
+        controller = self.adaptive_lr
+        if controller is None:
+            return
+        step = self.step + 1
+        if not applied:
+            controller.guard(step, "optimizer_step_skipped")
+            logger.info("adaptive_lr %s", json.dumps(controller.state.observations[-1]))
+            return
+        if not controller.accepted(grad_norm):
+            return
+        delta: dict[str, list[Tensor]] = {}
+        weight: dict[str, list[Tensor]] = {}
+        with torch.no_grad():
+            for p, previous, group in before:
+                delta.setdefault(group, []).append(
+                    (p.detach().float() - previous.float()).square().sum()
+                )
+                weight.setdefault(group, []).append(p.detach().float().square().sum())
+            updates = {
+                group: float(
+                    (
+                        torch.stack(delta[group]).sum()
+                        / torch.stack(weight[group]).sum().clamp_min(1e-24)
+                    ).sqrt()
+                )
+                for group in delta
+            }
+        observation = controller.observe(
+            step, self._adaptive_monitor_loss(), updates, warmup=step <= self.cfg.train.warmup_steps
+        )
+        logger.info("adaptive_lr %s", json.dumps(observation))
 
     def _segment(self, name: str, tokens: int = 0) -> AbstractContextManager[object]:
         if self.profiler is None:
@@ -784,6 +1003,17 @@ class Trainer:
         if factor is None:
             return False
         skip, median = spike_decision(grad_norm, self._spike_history, factor, self.spike_window)
+        guard = "spike"
+        if not skip and self.slow_burst_factor is not None:
+            skip, median = slow_burst_decision(
+                grad_norm,
+                self._spike_history,
+                self.slow_burst_factor,
+                self.spike_window,
+                self.slow_burst_window,
+            )
+            if skip:
+                guard, factor = "slow_burst", self.slow_burst_factor
         if not skip:
             self._skip_streak = 0
             self._spike_history.append(float(grad_norm))
@@ -791,21 +1021,23 @@ class Trainer:
         self._on_skip(step, "spike", grad_norm)  # the dump, before the zeroing
         self.optimizer.zero_grad(set_to_none=True)
         if self._can_roll_back():  # P1.16: a rollback, not a skip
-            self._roll_back(step, "spike", grad_norm, median)
+            self._roll_back(step, "spike", grad_norm, median, guard=guard)
             return True
         self.skipped_spike += 1
         self._skip_streak += 1
         self.skipped_steps.append(
             {"step": step, "reason": "spike", "grad_norm": float(grad_norm), "median": median}
         )
+        if guard == "slow_burst":
+            self.skipped_steps[-1]["guard"] = guard
         logger.warning(
-            "step %d: gradient norm %.4g is %.3g times the median %.4g of the last %d applied "
-            "steps (train.spike_factor %g); optimizer step skipped (%d spikes skipped so far)",
+            "step %d: gradient norm %.4g is %.3g times the median %.4g "
+            "(%s factor %g); optimizer step skipped (%d spikes skipped so far)",
             step,
             grad_norm,
             grad_norm / median if median else math.inf,
             median,
-            len(self._spike_history),
+            guard,
             factor,
             self.skipped_spike,
         )
@@ -824,16 +1056,31 @@ class Trainer:
         if self.rollback is None:
             raise RuntimeError("take_rollback_snapshot without a rollback policy")
         if self._ring is None:
-            self._ring = SnapshotRing(self.model, self.optimizer)
+            # A two-slot ring can already be inside a slow ramp by the time it is detected.
+            # Retain enough snapshots to reach before the detector's older reference window.
+            capacity = 2
+            if self.slow_burst_factor is not None:
+                capacity += math.ceil(self._spike_history_limit / self.rollback.every)
+            self._ring = SnapshotRing(self.model, self.optimizer, capacity=capacity)
         self._ring.take(self.step, self._spike_history)
 
-    def _roll_back(self, step: int, kind: str, grad_norm: float, median: float | None) -> None:
+    def _roll_back(
+        self,
+        step: int,
+        kind: str,
+        grad_norm: float,
+        median: float | None,
+        *,
+        guard: str | None = None,
+    ) -> None:
         """The rollback of ``step`` (module docstring, "Rollback"): raises at the limit, else
         restores the older snapshot in place, sets the learning-rate cut and the windows the loader
         discards before the next step, and records the event."""
         policy = self.rollback
         assert policy is not None and self._ring is not None
         what = "non-finite gradient norm" if kind == "nonfinite" else "gradient spike"
+        if guard == "slow_burst":
+            what = "slow gradient burst"
         if len(self.rollbacks) >= policy.max_rollbacks:
             raise RuntimeError(
                 f"step {step}: a {what} would be rollback {len(self.rollbacks) + 1}, above "
@@ -841,8 +1088,14 @@ class Trainer:
                 "rolling back: stopping "
                 f"({ROLLBACK_LIMIT})"
             )
-        snap = self._ring.restore()
-        self._spike_history = collections.deque(snap.spike_history, maxlen=self.spike_window)
+        target = None
+        if policy.selection == "guard_horizon":
+            horizon = self._spike_history_limit if guard == "slow_burst" else policy.every
+            target = step - horizon
+        snap = self._ring.restore(at_or_before=target)
+        self._spike_history = collections.deque(
+            snap.spike_history, maxlen=self._spike_history_limit
+        )
         self._skip_streak = 0
         if policy.lr_steps:
             self._lr_cut_until = step + policy.lr_steps
@@ -850,7 +1103,7 @@ class Trainer:
         windows = policy.skip * self.cfg.train.grad_accum
         self._rollback_windows = windows
         norm: float | str = float(grad_norm) if math.isfinite(grad_norm) else repr(grad_norm)
-        event = {
+        event: dict[str, Any] = {
             "step": int(step),
             "kind": kind,
             "grad_norm": norm,
@@ -870,6 +1123,15 @@ class Trainer:
                 "restored_step": int(snap.step),
             }
         )
+        if guard == "slow_burst":
+            event["guard"] = guard
+            self.skipped_steps[-1]["guard"] = guard
+        if target is not None:
+            event.update(
+                selection=policy.selection,
+                target_step=target,
+                horizon_available=snap.step <= target,
+            )
         logger.warning(
             "step %d: %s (gradient norm %s); rolled back to the snapshot of step %d (%d steps "
             "undone), %d windows discarded, fresh documents%s (rollback %d of at most %d)",
@@ -946,12 +1208,37 @@ class Trainer:
         if self.rollback is not None:  # P1.16: the events and the learning-rate cut
             out["rollbacks"] = [dict(r) for r in c["rollbacks"]]
             out["rollback_lr_cut"] = [int(c["lr_cut"][0]), float(c["lr_cut"][1])]
+        if self.adaptive_lr is not None:
+            out["adaptive_lr"] = c["adaptive_lr"]
+        if self.update_limiter is not None:
+            out["update_limit"] = c["update_limit"]
+        if self.gradient_growth is not None:
+            out["gradient_growth"] = c["gradient_growth"]
+        if c.get("divergences"):
+            out["divergences"] = c["divergences"]
         return out
 
     def _restore_guard(self, extra: Mapping[str, Any], path: str) -> None:
         """The guard's counts from a checkpoint's ``extra``: 0 when written before the guard;
         a malformed count, or more consecutive skips than skips, raises. P1.15: the spike guard's
         count and history (absent: 0 and empty; a malformed history raises)."""
+        self.divergences = [dict(e) for e in extra.get("divergences", [])]
+        self.divergence = self.divergences[0] if self.divergences else None
+        if self.adaptive_lr is not None:
+            raw = extra.get("adaptive_lr")
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}: adaptive_lr checkpoint state is missing")
+            self.adaptive_lr.load_state_dict(raw)
+        if self.update_limiter is not None:
+            raw = extra.get("update_limit")
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}: update_limit checkpoint state is missing")
+            self.update_limiter.load_checkpoint_state(raw)
+        if self.gradient_growth is not None:
+            raw = extra.get("gradient_growth")
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}: gradient_growth checkpoint state is missing")
+            self.gradient_growth.load_state_dict(raw)
         skipped = _skipped_counter(extra, "skipped_nonfinite", path)
         streak = _skipped_counter(extra, "skipped_nonfinite_streak", path)
         spikes = 0
@@ -961,11 +1248,12 @@ class Trainer:
             raw = extra.get("spike_history", [])
             if (
                 not isinstance(raw, list)
-                or len(raw) > self.spike_window
+                or len(raw) > self._spike_history_limit
                 or not all(isinstance(x, float) and math.isfinite(x) and x >= 0.0 for x in raw)
             ):
                 raise ValueError(
-                    f"{path}: spike_history must be a list of at most {self.spike_window} finite "
+                    f"{path}: spike_history must be a list of at most "
+                    f"{self._spike_history_limit} finite "
                     "non-negative floats"
                 )
             history = list(raw)
@@ -976,7 +1264,7 @@ class Trainer:
             )
         self.skipped_nonfinite = skipped
         self.skipped_spike = spikes
-        self._spike_history = collections.deque(history, maxlen=self.spike_window)
+        self._spike_history = collections.deque(history, maxlen=self._spike_history_limit)
         self._skip_streak = streak
         if self.rollback is not None:  # P1.16 (absent: written without the rollback)
             events = extra.get("rollbacks", [])
@@ -1082,8 +1370,10 @@ class Trainer:
             )
         if steps < self.step:
             raise ValueError(f"steps={steps} is before the current step {self.step}")
+        self._refuse_installed_average()
         self._refuse_test(train_ds, False)
         self._refuse_test(dev_ds, False)
+        self._prepare_adaptive_monitor(train_ds)
         report = self.model.param_report()
         for key in ("active", "stored", "trainable"):
             if key not in report:
@@ -1163,16 +1453,41 @@ class Trainer:
                     self.scaler.unscale_(self.optimizer)
                 if self.grad_hook is not None:  # P1.15: the replay's raw gradients
                     self.grad_hook(self)
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
+                growth_norms = self._growth_raw_norms()
+                grad_norm = float(
+                    clip_grad_norm_(params, max_norm, precision=train.grad_norm_precision)
+                )
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15
                     skipped = self._guard_spike(grad_norm, self.step + 1)
+                self._capture_healthy(self.step + 1, grad_norm, skipped)
+                before = self._adaptive_before_step(skipped)
+                self._limit_before_step(skipped)
+                self._growth_before_step(skipped, grad_norm, growth_norms)
+                applied = not skipped
                 if self.scaler is not None:
+                    scale_before = (
+                        self.scaler.get_scale()
+                        if self.adaptive_lr is not None
+                        or self.update_limiter is not None
+                        or self.gradient_growth is not None
+                        else None
+                    )
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    if scale_before is not None:
+                        applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step()
+                self._limit_after_step(applied)
+                self._growth_after_step(applied)
+                if applied:
+                    for hook in self.update_post_hooks:
+                        hook(self)
+                self._record_captured_update(applied)
+                self._average_weights(applied)
+                self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
             self.step += 1
             self._rollback_after_step(loader, skipped)  # P1.16
@@ -1264,11 +1579,14 @@ class Trainer:
         metrics: Mapping[str, Metric] | None = None,
         *,
         allow_test: bool = False,
+        averaged: bool = True,
     ) -> dict[str, Any]:
         """Metrics over every document of ``ds`` (one pass, no gradients), overall and per task.
 
         Per-task entries live under ``"per_group"`` keyed ``"<task>/<variant>"``. The test split
-        raises unless ``allow_test`` (gate scripts only).
+        raises unless ``allow_test`` (gate scripts only). With ``train.weight_ema`` the averaged
+        weights are scored (A6); ``averaged=False`` scores the training weights instead (without
+        the key the two are the same model).
         """
         self._refuse_test(ds, allow_test)
         if len(ds) == 0:
@@ -1282,7 +1600,10 @@ class Trainer:
                 names.append(group)
             ids.append(names.index(group))
         loader = self._loader(ds, shuffle=False, epochs=1, batch=self.eval_batch)
-        with self._segment("evaluate"):
+        # A6: with train.weight_ema the averaged weights are scored (the training weights are
+        # back, bit for bit, when the block ends)
+        weights = self._averaged_weights() if averaged else contextlib.nullcontext()
+        with self._segment("evaluate"), weights:
             result = evaluate_windows(
                 self._eval_model(),
                 loader,
@@ -1300,6 +1621,59 @@ class Trainer:
         """What :meth:`evaluate` runs over the windows: the model itself (P2.8: the HSN trainer
         hands its compiled window when it has one)."""
         return self.model
+
+    # the averaged weights (A6, train.weight_ema) -----------------------------------------------
+
+    def _average_weights(self, applied: bool) -> None:
+        """One step of the weight average after an applied optimiser step (and its projections
+        and the target encoder's step); a skipped step moved no weight."""
+        if applied and self.weight_ema is not None:
+            self.weight_ema.update()
+
+    def _averaged_weights(self) -> AbstractContextManager[None]:
+        """The block :meth:`evaluate` runs in: the averaged weights with ``train.weight_ema``,
+        else (or once they are installed) the model as it is."""
+        if self.weight_ema is None:
+            return contextlib.nullcontext()
+        return self.weight_ema.averaged()
+
+    def install_averaged_weights(self) -> bool:
+        """The end of a run with ``train.weight_ema``: the averaged weights become the model's,
+        so that everything scored after it (diagnostics, probes, :meth:`evaluate`) reads the model
+        the run's evaluations scored. One way: :meth:`fit` refuses afterwards (resume a
+        checkpoint, which holds the training weights, to train on). False with the key off."""
+        if self.weight_ema is None:
+            return False
+        self.weight_ema.install()
+        return True
+
+    def load_for_evaluation(self, path: str | Path) -> dict[str, Any]:
+        """Load a checkpoint's weights into the model for scoring only (the harness's re-score of
+        a failed run): with ``train.weight_ema`` its averaged weights, and :meth:`evaluate` then
+        scores the model as it is. The optimiser and the trainer's counters are not touched."""
+        loaded = load_checkpoint(path, self.model, averaged=True)
+        if self.weight_ema is not None:
+            if loaded["extra"].get("weight_ema") is None:
+                raise ValueError(f"{path} holds no averaged weights (train.weight_ema)")
+            self.weight_ema.installed = True
+        return loaded
+
+    def _refuse_installed_average(self) -> None:
+        if self.weight_ema is not None and self.weight_ema.installed:
+            raise RuntimeError(
+                "train.weight_ema: the model holds the averaged weights (install_averaged_weights "
+                "or load_for_evaluation); resume a checkpoint to train on"
+            )
+
+    def _ema_extra(self) -> dict[str, Any]:
+        """The average for a checkpoint's ``extra`` (absent with the key off)."""
+        if self.weight_ema is None:
+            return {}
+        return {"weight_ema": self.weight_ema.state_dict()}
+
+    def _restore_ema(self, extra: Mapping[str, Any], path: str) -> None:
+        if self.weight_ema is not None:
+            self.weight_ema.load_state_dict(extra.get("weight_ema"), path)
 
     # checkpoints -----------------------------------------------------------------------------
 
@@ -1331,6 +1705,7 @@ class Trainer:
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "carried_state": _map_state(detach_state(state), lambda t: t.cpu()),
             **self._guard_extra(counters),  # P1.12
+            **self._ema_extra(),  # A6
         }
 
     def _counters(self) -> dict[str, Any]:
@@ -1342,6 +1717,22 @@ class Trainer:
             "spike_history": [float(x) for x in self._spike_history],
             "rollbacks": [dict(r) for r in self.rollbacks],  # P1.16
             "lr_cut": (self._lr_cut_until, self._lr_cut_mult),
+            "divergences": [dict(e) for e in self.divergences],
+            **(
+                {"adaptive_lr": self.adaptive_lr.state_dict()}
+                if self.adaptive_lr is not None
+                else {}
+            ),
+            **(
+                {"update_limit": self.update_limiter.checkpoint_state()}
+                if self.update_limiter is not None
+                else {}
+            ),
+            **(
+                {"gradient_growth": self.gradient_growth.state_dict()}
+                if self.gradient_growth is not None
+                else {}
+            ),
         }
 
     def _snapshot_state(self, state: Any) -> Any:
@@ -1350,8 +1741,12 @@ class Trainer:
 
     def _take_snapshot(self, loader: StreamLoader, state: Any) -> StepSnapshot | None:
         """P1.15: the step snapshot (:mod:`hsn.train.divergence`) while a dump may still be
-        written, else None (the dump off, already written, or an fp16 scaler: no guard)."""
-        if not self.divergence_dump or self.divergence is not None or self.scaler is not None:
+        written, else None (the dump off, event cap reached, or an fp16 scaler: no guard)."""
+        if (
+            not self.divergence_dump
+            or len(self.divergences) >= self.cfg.train.divergence_max_dumps
+            or self.scaler is not None
+        ):
             return None
         return StepSnapshot(
             step=self.step,
@@ -1366,9 +1761,54 @@ class Trainer:
         """P1.15: called by a guard that skips ``step``, before it zeroes the gradients: the
         divergence dump of the first such step (:func:`hsn.train.divergence.write_dump`)."""
         snapshot = self._step_snapshot
-        if snapshot is None or self.divergence is not None:
+        if snapshot is None or len(self.divergences) >= self.cfg.train.divergence_max_dumps:
             return
         write_dump(self, snapshot, step=step, kind=kind, grad_norm=grad_norm)
+
+    def _capture_healthy(self, step: int, grad_norm: float, skipped: bool) -> None:
+        """Optional bounded pre-update references; only finite, guard-accepted windows qualify."""
+        every = self.cfg.train.divergence_healthy_every
+        snapshot = self._step_snapshot
+        if not every or step % every or skipped or snapshot is None or not math.isfinite(grad_norm):
+            return
+        summary = write_dump(self, snapshot, step=step, kind="healthy", grad_norm=grad_norm)
+        if "error" not in summary:
+            self._diagnostic_update = (
+                Path(summary["path"]).with_suffix(".json"),
+                [
+                    (name, p, p.detach().clone())
+                    for name, p in self.model.named_parameters()
+                    if p.requires_grad
+                ],
+            )
+            keep = self.cfg.train.divergence_healthy_keep
+            try:
+                for old in sorted(Path(self.run_dir).glob("healthy_*.pt"))[:-keep]:
+                    old.unlink(missing_ok=True)
+                    old.with_suffix(".json").unlink(missing_ok=True)
+            except OSError as exc:
+                logger.error("healthy reference cleanup failed: %s", exc)
+
+    def _record_captured_update(self, applied: bool) -> None:
+        """Actual optimizer displacement on sampled healthy windows, separate from gradients."""
+        saved, self._diagnostic_update = self._diagnostic_update, None
+        if saved is None:
+            return
+        path, before = saved
+        try:
+            report = json.loads(path.read_text())
+            report["optimizer_update_applied"] = applied
+            report["parameter_updates"] = {
+                name: {
+                    "norm": float((p.detach() - old).float().norm()),
+                    "relative_to_before": float((p.detach() - old).float().norm())
+                    / max(float(old.float().norm()), 1e-12),
+                }
+                for name, p, old in before
+            }
+            path.write_text(json.dumps(report, allow_nan=False, indent=1) + "\n")
+        except (OSError, ValueError) as exc:
+            logger.error("healthy update measurement failed: %s", exc)
 
     def resume(self, path: str | Path) -> int:
         """Load a checkpoint written by :meth:`save` for this configuration; returns its step."""
@@ -1388,6 +1828,7 @@ class Trainer:
             raise ValueError(f"{path} has no loader state")
         self._loader_state = dict(loaded["loader_state"])
         self._restore_guard(extra, str(path))  # P1.12
+        self._restore_ema(extra, str(path))  # A6
         device = self.ctx.device
         self._carried_state = _map_state(extra.get("carried_state"), lambda t: t.to(device))
         self.step = int(loaded["step"])

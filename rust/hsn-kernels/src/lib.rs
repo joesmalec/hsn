@@ -1,8 +1,8 @@
 //! `hsn-kernels`: the `Backend` trait, the CPU oracle, and the CUDA / Metal hosts that load the
 //! compiled kernel binaries (P2.9-P2.12, P5.2).
 //!
-//! Cargo features: `cpu` (default), `cuda`, `metal`. The GPU features are empty for now and must
-//! stay off by default; feature unification across the workspace must never turn them on silently.
+//! Cargo features: `cpu` (default), `cuda`, `metal`. GPU features stay off by default;
+//! feature unification across the workspace must never turn them on silently.
 //!
 //! P2.9 adds the specification of the four HSN ops ([`spec`], mirroring the C header
 //! `kernels/include/hsn_ops.h` and `python/hsn/kernels/spec.py`), the pure-Rust CPU oracle
@@ -13,10 +13,14 @@
 //! `dtype`), and an [`Error`] whose [`Error::status`] is the ABI's return code.
 
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod spec;
 pub mod vectors;
 
 pub use cpu::CpuBackend;
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBackend;
 pub use spec::{
     CellDims, CsrMessages, CsrMessagesBwd, GatedDeltaUpdate, GatedDeltaUpdateBwd, GatherConcat,
     GatherConcatBwd, GroupedUnitMlpBwd, GroupedUnitMlpFwd, UnitDims,
@@ -207,6 +211,17 @@ pub trait Backend {
 mod tests {
     #[test]
     fn test_p0_1_default_backend_is_cpu() {
-        assert_eq!(super::backend_names(), ["cpu"]);
+        let expected = [
+            ("cpu", cfg!(feature = "cpu")),
+            ("cuda", cfg!(feature = "cuda")),
+            ("metal", cfg!(feature = "metal")),
+        ];
+        assert_eq!(
+            super::backend_names(),
+            expected
+                .into_iter()
+                .filter_map(|(name, enabled)| enabled.then_some(name))
+                .collect::<Vec<_>>()
+        );
     }
 }

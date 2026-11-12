@@ -186,7 +186,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from hsn.config import RunConfig
+from hsn.config import GradNormPrecision, RunConfig
 from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, memory_stats, reset_peak, synchronize
 from hsn.eval.evaluate import Metric
@@ -214,6 +214,7 @@ from hsn.train.checkpoint import (
     unpack_cell_state,
 )
 from hsn.train.compile import CompiledWindow, compile_window
+from hsn.train.grad_norm import clip_grad_norm_, norm_float64
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
 from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
 from hsn.train.probes import (
@@ -225,7 +226,9 @@ from hsn.train.probes import (
     utility_predictions,
     window_split,
 )
+from hsn.train.route_guard import RouteGuard
 from hsn.train.schedules import SelectionSchedule
+from hsn.train.split import SplitWindow
 
 __all__ = ["STAT_KEYS", "TBPTTStepRecord", "TBPTTTrainer", "trailing_cut"]
 
@@ -365,12 +368,40 @@ class TBPTTTrainer(Trainer):
                 f"the model's selection schedule {model.schedule} is not the configuration's "
                 f"{expected}; build the model with HSN.from_config(cfg)"
             )
+        detach = tuple(sorted(cfg.train.feedback_detach))
+        if tuple(sorted(model.feedback_detach)) != detach:  # A6: one source of truth
+            raise ValueError(
+                f"the model's feedback_detach {list(model.feedback_detach)} is not the "
+                f"configuration's train.feedback_detach {list(cfg.train.feedback_detach)}; build "
+                "the model with HSN.from_config(cfg)"
+            )
+        if (model.state_grad_clip, model.state_grad_ratio) != (
+            cfg.train.state_grad_clip,
+            cfg.train.state_grad_ratio,
+        ):  # A6
+            raise ValueError(
+                f"the model's state_grad_clip {model.state_grad_clip} / state_grad_ratio "
+                f"{model.state_grad_ratio} are not the configuration's "
+                f"{cfg.train.state_grad_clip} / {cfg.train.state_grad_ratio}; build the model "
+                "with HSN.from_config(cfg)"
+            )
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0
         # A5's previous byte belongs to the stream, not CellGraphState's versioned layout.
         self._prev_tokens: Tensor | None = None
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
+        # A6: the route-takeover guard (train.route_guard; None: off)
+        self.route_guard: RouteGuard | None = (
+            RouteGuard(
+                model.router,
+                cfg.train.route_guard,
+                n_units=cfg.model.n_units,
+                vocab=cfg.model.vocab_size,
+            )
+            if cfg.train.route_guard.enabled
+            else None
+        )
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
         # P1.10d: the trailing-padding cut (exact in math under dense routing only, to rounding in
         # floats since P1.10a; module docstring)
@@ -383,6 +414,17 @@ class TBPTTTrainer(Trainer):
             )
             if isinstance(window, CompiledWindow):  # MPS without compile support: eager
                 self._compiled = window
+        # P2.10: the split window (hardware.window=split): the training windows run the forward
+        # sweep without autograd and one batched replay; evaluation, the statistics steps' term
+        # passes and the diagnostics keep the window above
+        self._split: SplitWindow | None = (
+            SplitWindow(model, cfg, self._compiled)
+            if cfg.hardware.window in ("split", "fused")
+            else None
+        )
+        # a split run with a soft warm-up releases the warm-up window's recorded graphs at the
+        # switch (CompiledWindow.release): several GB that nothing reads again
+        self._warm_up_recorded = self._split is not None and cfg.train.soft_until_step > 0
         self._cut_enabled = (
             cfg.data.align_docs and cfg.model.routing == "dense" and self._compiled is None
         )
@@ -505,13 +547,24 @@ class TBPTTTrainer(Trainer):
         live = [name for name in order if terms[name].requires_grad]
         # the terms without a gradient path report 0.0 and need no pass
         report = grad_norm_report(
-            self.model, {name: terms[name] for name in order if name not in live}, scale=scale
+            self.model,
+            {name: terms[name] for name in order if name not in live},
+            scale=scale,
+            precision=cfg.train.grad_norm_precision,
         )
         for index, name in enumerate(live):
             if index > 0:
                 terms = objective()
             single = {name: terms[name]}
-            report.update(grad_norm_report(self.model, single, scale=scale, retain_graph=False))
+            report.update(
+                grad_norm_report(
+                    self.model,
+                    single,
+                    scale=scale,
+                    retain_graph=False,
+                    precision=cfg.train.grad_norm_precision,
+                )
+            )
         torch.set_rng_state(rng)
         prefix = TERM_GRAD_NORM_PREFIX
         return {f"{prefix}{name}": report[f"{prefix}{name}"] for name in order}
@@ -640,11 +693,18 @@ class TBPTTTrainer(Trainer):
         return groups
 
     @staticmethod
-    def _group_grad_norms(groups: Mapping[str, Sequence[nn.Parameter]]) -> dict[str, float]:
+    def _group_grad_norms(
+        groups: Mapping[str, Sequence[nn.Parameter]], *, precision: GradNormPrecision = "native"
+    ) -> dict[str, float]:
         """``grad_norm/<group>``: the L2 norm of the group's gradients (after unscaling, before
         clipping); groups whose parameters carry no gradient are left out."""
         norms: dict[str, float] = {}
         for name, params in groups.items():
+            if precision == "float64":
+                present = [p.grad for p in params if p.grad is not None]
+                if present:
+                    norms[f"grad_norm/{name}"] = float(norm_float64(present))
+                continue
             grads = [p.grad.detach().float() for p in params if p.grad is not None]
             if not grads:
                 continue
@@ -681,8 +741,10 @@ class TBPTTTrainer(Trainer):
             )
         if steps < self.step:
             raise ValueError(f"steps={steps} is before the current step {self.step}")
+        self._refuse_installed_average()
         self._refuse_test(train_ds, False)
         self._refuse_test(dev_ds, False)
+        self._prepare_adaptive_monitor(train_ds)
         report = self.hsn.param_report()
         if "total_trainable" not in report:
             raise KeyError(f"param_report() lacks 'total_trainable': {sorted(report)}")
@@ -752,7 +814,7 @@ class TBPTTTrainer(Trainer):
             stats_step = next_step % train.stats_every == 0 or next_step == steps
             # P2.8: every window runs the compiled window when there is one (a statistics step's
             # per-term gradient norms come from extra compiled passes, _compiled_term_norms)
-            window_fn = self._compiled
+            window_fn: Any = self._split if self._split is not None else self._compiled
             compiled_before = self._compiled.compile_seconds if self._compiled is not None else 0.0
             term_norms: dict[str, float] = {}
             self.optimizer.zero_grad(set_to_none=True)
@@ -792,6 +854,10 @@ class TBPTTTrainer(Trainer):
                 fwd = batch if cut == window["doc"].shape[1] else _columns(batch, cut)
                 state = self._window_start(state)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
+                if self._warm_up_recorded and self._split is not None and self._split.splits_now():
+                    self._warm_up_recorded = False  # the first hard-gate step: once
+                    if self._compiled is not None:
+                        self._compiled.release()
                 probe = (
                     self._counterfactual_probe(train_ds, window, batch, state)
                     if self.counterfactual
@@ -804,7 +870,14 @@ class TBPTTTrainer(Trainer):
                 # reset can be missing; a check against that same CPU mask would be the same
                 # expression. (On an accelerator forward cannot check them without the copy.)
                 reset_columns = window["reset"][:, :cut].any(dim=0).nonzero().flatten().tolist()
-                if stats_step and window_index == 0 and window_fn is not None:
+                # P2.10: a split window's terms sit on one eager autograd graph, which takes the
+                # retained per-term backwards itself (no extra pass of the autograd window, and
+                # no compile of it in a split run). The steps of a soft warm-up are the
+                # compiled autograd window's, in a split run as in any other.
+                own_graph = self._compiled is None or (
+                    self._split is not None and self._split.splits_now()
+                )
+                if stats_step and window_index == 0 and not own_graph:
                     term_norms = self._compiled_term_norms(
                         fwd, state, reset_columns, probe, reference_cost
                     )  # P2.8: before the window's own forward pass, from the same start state
@@ -820,6 +893,8 @@ class TBPTTTrainer(Trainer):
                 window_active = self._window_active_units(info)
                 if window_active is not None:
                     active = window_active if active is None else active | window_active
+                if self.route_guard is not None:  # A6: slots per (input byte, unit)
+                    self.route_guard.observe(fwd["tokens"], fwd["loss_mask"], info)
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
                 loss_mask = fwd["loss_mask"]
@@ -837,9 +912,11 @@ class TBPTTTrainer(Trainer):
                     )
                     terms = {**terms, "task": terms["task"] * task_weight}
                 total, parts = total_and_parts(terms)
-                if stats_step and window_index == 0 and window_fn is None:  # P2.4: one window
+                if stats_step and window_index == 0 and own_graph:  # P2.4: one window
                     scale = self.scaler.get_scale() if self.scaler is not None else 1.0
-                    term_norms = grad_norm_report(self.model, terms, scale=scale)
+                    term_norms = grad_norm_report(
+                        self.model, terms, scale=scale, precision=train.grad_norm_precision
+                    )
                 window_tokens = int((window["doc"] >= 0).sum())
                 tokens_in_step += window_tokens
                 step_parameter_sum += self._window_parameter_sum(info, fwd, window_tokens, report)
@@ -870,23 +947,41 @@ class TBPTTTrainer(Trainer):
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
-                group_norms = self._group_grad_norms(groups) if stats_step else {}
+                group_norms = (
+                    self._group_grad_norms(groups, precision=train.grad_norm_precision)
+                    if stats_step
+                    else {}
+                )
                 if self.grad_hook is not None:  # P1.15: the replay's raw gradients
                     self.grad_hook(self)
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm))
+                growth_norms = self._growth_raw_norms()
+                grad_norm = float(
+                    clip_grad_norm_(params, max_norm, precision=train.grad_norm_precision)
+                )
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15
                     skipped = self._guard_spike(grad_norm, next_step)
+                self._capture_healthy(next_step, grad_norm, skipped)
+                before = self._adaptive_before_step(skipped)
+                self._limit_before_step(skipped)
+                self._growth_before_step(skipped, grad_norm, growth_norms)
+                if self.route_guard is not None and not skipped:
+                    self.route_guard.capture()
                 step_kwargs: dict[str, Any] = {}
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
                 applied = not skipped
                 if self.scaler is not None:
                     # A scaler suppresses optimizer.step itself on overflow. Only an EMA target
-                    # needs this check; fixed targets add no extra device synchronisation.
+                    # or adaptive controller needs this check; defaults add no synchronisation.
                     scale_before = (
-                        self.scaler.get_scale() if self.hsn.ema_target is not None else None
+                        self.scaler.get_scale()
+                        if self.hsn.ema_target is not None
+                        or self.adaptive_lr is not None
+                        or self.update_limiter is not None
+                        or self.gradient_growth is not None
+                        else None
                     )
                     self.scaler.step(self.optimizer, **step_kwargs)
                     self.scaler.update()
@@ -894,9 +989,19 @@ class TBPTTTrainer(Trainer):
                         applied = applied and self.scaler.get_scale() >= scale_before
                 elif not skipped:
                     self.optimizer.step(**step_kwargs)
-                self.scheduler.step()
+                self._limit_after_step(applied)
+                self._growth_after_step(applied)
+                if self.route_guard is not None and applied:
+                    self.route_guard.apply()  # A6: the router's step at the guard's scale
+                if applied:
+                    for hook in self.update_post_hooks:
+                        hook(self)
+                self._record_captured_update(applied)
                 if applied:
                     self.hsn.update_target()
+                self._average_weights(applied)  # A6 (train.weight_ema)
+                self._adaptive_after_step(applied, grad_norm, before)
+                self.scheduler.step()
             self.step = next_step
             if self._rollback_windows is not None:
                 # The rollback discards the current documents; the next stream starts at BOS.
@@ -909,6 +1014,23 @@ class TBPTTTrainer(Trainer):
             dependency_total += probe_counts["probe_dependency_total"]
             mean_total = total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
+            if self.route_guard is not None:
+                self.route_guard.note_loss(mean_loss)
+            if (
+                self.route_guard is not None
+                and self.step % self.cfg.train.route_guard.interval == 0
+            ):
+                event = self.route_guard.check(self.step)
+                if event is not None:
+                    logger.warning(
+                        "route guard at step %d: %.0f %% of the other units' established routes "
+                        "lost to unit %d; its router step scale %.4g -> %.4g",
+                        self.step,
+                        100 * event["lost"],
+                        event["unit"],
+                        event["scale_before"],
+                        event["scale"],
+                    )
             accuracy = float(correct) / n_loss if n_loss else float("nan")
             if self.scaler is None and not math.isfinite(mean_total) and not skipped:
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
@@ -1024,6 +1146,14 @@ class TBPTTTrainer(Trainer):
                 self._compiled.compile_seconds if self._compiled is not None else 0.0
             ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
+            **(
+                {
+                    "route_guard_events": float(len(self.route_guard.events)),
+                    "route_guard_scale": float(self.route_guard.scale.min()),
+                }
+                if self.route_guard is not None
+                else {}
+            ),
             **self._spike_measured(),  # P1.15
             **self._rollback_measured(),  # P1.16
             **(
@@ -1090,6 +1220,12 @@ class TBPTTTrainer(Trainer):
                 else {}
             ),
             **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
+            **self._ema_extra(),  # A6: the averaged weights (train.weight_ema)
+            **(
+                {"route_guard": self.route_guard.state_dict()}
+                if self.route_guard is not None
+                else {}
+            ),
         }
 
     def _counters(self) -> dict[str, Any]:
@@ -1169,6 +1305,9 @@ class TBPTTTrainer(Trainer):
         self.windows_since_resync = counters["since_resync"]
         self.resyncs = counters["resyncs"]
         self._restore_guard(extra, str(path))  # P1.12
+        self._restore_ema(extra, str(path))  # A6
+        if self.route_guard is not None:
+            self.route_guard.load_state_dict(extra.get("route_guard"), str(path))
         if "reinforce_baseline" in extra:
             baseline = extra["reinforce_baseline"]
             if baseline is not None and (

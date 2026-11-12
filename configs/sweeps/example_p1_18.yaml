@@ -1,0 +1,42 @@
+# Example sweep for P1.18's recipe (docs/sweeps.md, "Recipes"): the standard HSN recipe file of 11 Nov 2026,
+# configs/experiments/hsn_recipe_a6.yaml (amendment A6 with the route guard), and the same without the guard.
+# Expand-only: it shows the keys and is checked by the committed-spec test; it registers no experiment of the
+# plan. With this protocol the two arms are the arms of the nine-run comparison in docs/p1_18_a6_results.md
+# (the same arm ids): hsn_recipe is exps 421-426 and 430-432, no_guard is exps 375-377, 418-420 and 433-435.
+#
+#   python -m hsn.experiments expand configs/sweeps/example_p1_18.yaml
+
+name: example_p1_18
+description: the A6 HSN recipe (feedback cut, caps, weight average, route guard) and the same without the guard
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_a6.yaml # exps 421-426's recipe: routed d=64 + A4 + A5, lr 2.5e-3, beta2 0.95
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead # a CUDA arm pins it (P1.11); 0.100 s per step alone on the card
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained # the final checkpoint stays (route-check and the probes read it)
+  keep_every: 500 # a mid-run checkpoint every 500 steps (execution-only: no arm id changes)
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [0, 1, 2, 3, 4, 5]
+arms:
+  - name: hsn_recipe # the recipe as it is: the arms of exps 421-426
+    family: hsn
+  - name: no_guard # the comparison of the results: the arms of exps 375-377 and 418-420
+    family: hsn
+    overrides:
+      - train.route_guard.enabled=false

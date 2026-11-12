@@ -19,8 +19,18 @@ hsn = "hsn.runner:main" # P0.8: hsn run | rerun | package
 
 [project.optional-dependencies]
 chat = ["textual>=7.5,<8"]
-dev = ["textual>=7.5,<8", "pytest", "pytest-cov", "ruff==0.17.3", "mypy", "pre-commit", "maturin>=1.9.4,<2", "types-PyYAML"]
-cuda = ["pynvml"]
+dev = [
+    "textual>=7.5,<8",
+    "pytest",
+    "pytest-cov",
+    "ruff==0.17.3",
+    "mypy",
+    "pre-commit",
+    "maturin>=1.9.4,<2",
+    "types-PyYAML",
+    "pytest-xdist>=3.8.0",
+]
+cuda = ["nvidia-ml-py", "ninja", "setuptools"]
 viz = ["matplotlib"]
 
 [build-system]

@@ -76,7 +76,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from hsn.config import REPO_ROOT, RunConfig, config_hash, load_config
 from hsn.experiments.rules import (
@@ -120,6 +120,8 @@ EXECUTION_ONLY = frozenset(
         "step_time_approval",
         "keep_every",
         "keep_last",
+        "diagnostics",
+        "gc_freeze",
     }
 )
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -160,8 +162,27 @@ class _Strict(BaseModel):
 class _TrainParams(_Strict):
     steps: int | None = Field(default=None, ge=1)  # None: train.steps (the schedule horizon)
     eval_batch: int | None = Field(default=None, ge=1)  # None: train.batch
-    checkpoint: Literal["final", "none"] = "final"
+    # retained also keeps intermediate evidence after success, including the best evaluated
+    # checkpoint. This is storage policy only; final metrics still come from the final weights.
+    checkpoint: Literal["final", "retained", "none"] = "final"
+    # The switch of the in-training diagnostics (10 Nov 2026; execution-only: the training is the
+    # same with or without them, so the arm keeps its id). False: no diagnostic sample is taken
+    # during training whatever diag_every, diag_dense_every, diag_windows and diag_stability say
+    # (no hooks, no state window, nothing compiled for them); the record's ``diagnostics`` is
+    # empty and ``diagnostics_enabled`` false. Evaluations, kept checkpoints, the end-of-run state
+    # statistics and the probes are not diagnostics in this sense and still run. A rule that reads
+    # a ``diag:`` value then has nothing to read, which expansion refuses (errors over silence).
+    diagnostics: bool = True
+    # Execution-only: freeze the garbage collector's long-lived objects once the compiled graphs
+    # are warm (hsn.experiments.protocols). A compiled run holds about a million tracked objects;
+    # every full collector pass walked them for 0.3 s with the card idle, some ten times a
+    # thousand steps. False: the collector is left alone.
+    gc_freeze: bool = True
     diag_window_docs: int = Field(default=4, ge=1)  # documents of the diagnostics window
+    diag_stability: bool = False
+    diag_sensitivity_epsilon: float = Field(default=1e-3, gt=0, allow_inf_nan=False)
+    diag_sensitivity_position: int = Field(default=64, ge=0)
+    diag_sensitivity_horizon: int = Field(default=8, ge=1)
     # P1.14, the step-time guard (hsn.experiments.steptime): the limit on the median step time,
     # and the approval note ("<who, when>") an arm above the 0.5 s rule (or an eager CUDA HSN arm)
     # needs at enqueue; both execution-only
@@ -238,22 +259,95 @@ class DryRunParams(_TrainParams):
     record: dict[str, Any] = Field(default_factory=dict)  # merged into the synthetic record
 
 
+class CheckpointCaptureParams(_Strict):
+    """Replay a recorded prefix on disposable weights, capturing selected pre-update states."""
+
+    steps: tuple[int, ...]
+    trace: str = Field(min_length=1)
+    trace_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rtol: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    atol: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+
+    @field_validator("steps")
+    @classmethod
+    def _steps(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value or value != tuple(sorted(set(value))) or value[0] < 1:
+            raise ValueError("capture steps must be positive, unique and increasing")
+        return value
+
+
+class SpikeDiagnosticParams(_TrainParams):
+    """Bounded investigations; capture advances disposable copies only, never production."""
+
+    name: Literal["spike_diagnostic"]
+    steps: Literal[1] = 1
+    checkpoint: Literal["none"] = "none"
+    parent_exp: int = Field(ge=1)
+    dump: str = Field(min_length=1)
+    dump_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stage: Literal["reproduce", "isolate", "trace", "update", "compare", "capture"]
+    capture: CheckpointCaptureParams | None = None
+    modes: tuple[Literal["eager", "compiled"], ...] = ("eager",)
+    repeats: int = Field(default=2, ge=2, le=4)
+    deterministic: bool = True
+    target_doc: int | None = Field(default=None, ge=0)
+    monitor_docs: int = Field(default=32, ge=1)
+    timeout_s: int = Field(default=300, ge=10, le=1200)
+    reference_checkpoint: str | None = None
+    reference_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    reference_mode: Literal["next_window", "same_window_weights"] = "next_window"
+    reference_selectors: tuple[str, ...] = ()
+    requires: tuple[str, ...] = ()  # earlier labels in this sweep; all must have succeeded
+
+    @model_validator(mode="after")
+    def _capture(self) -> SpikeDiagnosticParams:
+        if self.reference_selectors and (
+            self.reference_checkpoint is None or self.reference_mode != "same_window_weights"
+        ):
+            raise ValueError("reference selectors require same_window_weights and a checkpoint")
+        if any(not selector.strip() for selector in self.reference_selectors) or len(
+            set(self.reference_selectors)
+        ) != len(self.reference_selectors):
+            raise ValueError("reference selectors must be nonempty and unique")
+        if (self.stage == "capture") != (self.capture is not None):
+            raise ValueError("capture settings are required only for the capture stage")
+        if self.capture is not None and (
+            len(self.modes) != 1
+            or self.reference_checkpoint is not None
+            or self.target_doc is not None
+        ):
+            raise ValueError(
+                "capture uses one original mode without reference/document interventions"
+            )
+        return self
+
+    @field_validator("modes")
+    @classmethod
+    def _modes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or len(set(value)) != len(value):
+            raise ValueError("modes must be nonempty and unique")
+        return value
+
+
 ProtocolParams = Annotated[
-    ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams, Field(discriminator="name")
+    ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams,
+    Field(discriminator="name"),
 ]
 PROTOCOL_PARAMS: dict[str, type[_TrainParams]] = {
     "reads_state": ReadsStateParams,
     "train_eval": TrainEvalParams,
     "overfit": OverfitParams,
     "dry_run": DryRunParams,
+    "spike_diagnostic": SpikeDiagnosticParams,
 }
-PROTOCOL_VERSION = {"reads_state": 1, "train_eval": 1, "overfit": 1, "dry_run": 1}
+PROTOCOL_VERSION = {name: 1 for name in PROTOCOL_PARAMS}
 #: P1.16: the training protocols also write ``partial`` (a failed arm's re-scored kept checkpoint)
 PROTOCOL_SOURCES: dict[str, tuple[str, ...]] = {
     "reads_state": ("trained", "probe", "final", "partial"),
     "train_eval": ("trained", "final", "partial"),
     "overfit": ("overfit", "final"),
     "dry_run": ("trained", "probe", "probe_v2", "probe_v3", "overfit", "final", "partial"),
+    "spike_diagnostic": (),
 }
 
 
@@ -271,7 +365,7 @@ def protocol_sources(params: Any) -> tuple[str, ...]:
 
 def protocol_params(
     raw: Mapping[str, Any],
-) -> ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams:
+) -> ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams:
     name = raw.get("name")
     if name not in PROTOCOL_PARAMS:
         raise SpecError(f"protocol name must be one of {sorted(PROTOCOL_PARAMS)}, got {name!r}")
@@ -279,7 +373,10 @@ def protocol_params(
         params = PROTOCOL_PARAMS[str(name)].model_validate(dict(raw))
     except ValidationError as exc:
         raise SpecError(f"protocol {name}: {exc}") from exc
-    assert isinstance(params, (ReadsStateParams, TrainEvalParams, OverfitParams, DryRunParams))
+    assert isinstance(
+        params,
+        (ReadsStateParams, TrainEvalParams, OverfitParams, DryRunParams, SpikeDiagnosticParams),
+    )
     return params
 
 
@@ -381,7 +478,9 @@ class Arm:
     config_path: str
     overrides: list[str]
     config: RunConfig
-    protocol: ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams
+    protocol: (
+        ReadsStateParams | TrainEvalParams | OverfitParams | DryRunParams | SpikeDiagnosticParams
+    )
     timing: bool
     constants: dict[str, Any]
     data_hash: str
@@ -440,7 +539,16 @@ def config_view(cfg: RunConfig) -> dict[str, Any]:
 
 #: P1.14: protocol keys that enter the arm id only when they differ from these values, so that every
 #: arm from before them keeps its id
-IDENTITY_DEFAULTS: dict[str, Any] = {"diag_dense_every": 0, "diag_windows": []}
+IDENTITY_DEFAULTS: dict[str, Any] = {
+    "diag_stability": False,
+    "diag_sensitivity_epsilon": 1e-3,
+    "diag_sensitivity_position": 64,
+    "diag_sensitivity_horizon": 8,
+    "diag_dense_every": 0,
+    "diag_windows": [],
+    "capture": None,
+    "reference_selectors": [],
+}
 
 
 def arm_identity(
@@ -530,9 +638,13 @@ def _variant(arm: ArmSpec, family: str) -> tuple[str, dict[str, Any]]:
         raise SpecError(f"arm {arm.name}: {exc}") from exc
 
 
-def expand(spec: SweepSpec, *, repo: Path = REPO_ROOT) -> list[Arm]:
+def expand(
+    spec: SweepSpec, *, repo: Path = REPO_ROOT, diagnostics: bool | None = None
+) -> list[Arm]:
     """Every arm of ``spec`` in a deterministic order (module docstring); raises
-    :class:`SpecError`."""
+    :class:`SpecError`. ``diagnostics`` overrides the protocol's switch of the in-training
+    diagnostics for every training arm (``enqueue --diagnostics on|off``; ``None``: as the spec
+    says). The switch is execution-only, so the arms and their ids are the same either way."""
     try:
         rules = parse_rules(spec.rules)
     except ValueError as exc:
@@ -545,7 +657,9 @@ def expand(spec: SweepSpec, *, repo: Path = REPO_ROOT) -> list[Arm]:
         for point in points:
             assignment = dict(zip(grid_keys, point, strict=True))
             for seed in entry.seeds if entry.seeds is not None else spec.seeds:
-                arm = _expand_one(spec, entry, assignment, seed, rules, repo, len(arms))
+                arm = _expand_one(
+                    spec, entry, assignment, seed, rules, repo, len(arms), diagnostics
+                )
                 if arm.label in labels:
                     raise SpecError(f"duplicate arm label {arm.label!r}")
                 labels.add(arm.label)
@@ -573,6 +687,7 @@ def _expand_one(
     rules: RuleSet,
     repo: Path,
     position: int,
+    diagnostics: bool | None = None,
 ) -> Arm:
     label = f"{entry.name}{_grid_label(assignment)}/s{seed}"
     config_overrides = dict(assignment)
@@ -637,6 +752,13 @@ def _expand_one(
     protocol = protocol_params(
         dict(entry.protocol) if other else {**spec.protocol, **entry.protocol}
     )
+    if diagnostics is not None and hasattr(protocol, "diagnostics"):
+        protocol = protocol.model_copy(update={"diagnostics": diagnostics})
+    timing = entry.timing if entry.timing is not None else spec.timing
+    if isinstance(protocol, SpikeDiagnosticParams) and (family != "hsn" or not timing):
+        raise SpecError(
+            "spike_diagnostic requires family hsn and timing: true (exclusive execution)"
+        )
     if protocol.name == "reads_state" and family == "hsn" and cfg.model.routing == "random":
         raise SpecError(
             f"arm {entry.name}: routing=random with reads_state: its evaluation draws batch-shaped "
@@ -668,14 +790,17 @@ def _expand_one(
                 "diag_windows": tuple((lo, hi) for lo, hi in windows),
             }
         )
+    # The diagnostics switch (execution-only: the identity above is the sampled arm's) leaves the
+    # rules nothing to read at a diagnostic step, and check_rules says so
+    sampled = bool(getattr(protocol, "diagnostics", True))
     cadence = Cadence.of(
         steps,
         cfg.train.eval_every,
-        diag_every,
+        diag_every if sampled else 0,
         protocol_sources(protocol),
         protocol.name,
-        dense_every=dense,
-        windows=windows,
+        dense_every=dense if sampled else 0,
+        windows=windows if sampled else [],
     )
     try:
         check_rules(rules, cadence, constants, family)
@@ -707,7 +832,7 @@ def _expand_one(
         overrides=overrides,
         config=cfg,
         protocol=protocol,
-        timing=entry.timing if entry.timing is not None else spec.timing,
+        timing=timing,
         constants=constants,
         data_hash=data,
         arm_id=arm_id,

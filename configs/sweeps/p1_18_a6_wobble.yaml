@@ -1,0 +1,63 @@
+# A6, the eval-to-eval wobble (10 Nov 2026). The recipe of exps 349/360/361/371 (every feedback
+# read cut, anchored update caps) no longer collapses, but between evaluations its dev accuracy
+# moves 1.8 to 3.0 points (largest falls 1.2 to 5.4), against 0.4 for the GRU and 0.7 for the
+# dense HSN. In the 27k run the wobble halves once the learning rate decays. These arms change one
+# thing each on seed 2 (reference: exp 349): the candidate norm (an unsaturated candidate is a
+# smoother function of the weights), the peak learning rate, and the schedule.
+name: p1_18_a6_wobble
+description: "A6 carry_anchored: what reduces the eval-to-eval wobble (seed 2, against exp 349)"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_b095.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+    - model.routing=topk
+    - model.cand_norm=none
+    - model.key_address=true
+    - model.selected_readout=true
+    - train.optimizer=lazy_adamw
+    - train.gate_mode=ste
+    - train.lr=2.5e-3
+    - train.betas=[0.9,0.95]
+    - train.probe_horizon=null
+    - train.spike_factor=null
+    - train.rollback_every=null
+    - train.grad_norm_precision=float64
+    - train.feedback_detach=[summary,eps,state,router]
+    - 'train.update_limit.groups={memory: {selectors: ["cell.*"], max_ratio: 0.003}, routing: {selectors: ["router.*"], max_ratio: 0.003}}'
+    - train.update_limit.norm_floor=1e-12
+    - 'train.update_limit.norm_growth_limits={routing: 1.0}'
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [2]
+arms:
+  - name: a4
+    family: hsn
+    overrides:
+      - model.cand_norm=rms
+  - name: lr15
+    family: hsn
+    overrides:
+      - train.lr=1.5e-3
+  - name: cosine
+    family: hsn
+    overrides:
+      - train.schedule=cosine
+      - train.decay_fraction=null

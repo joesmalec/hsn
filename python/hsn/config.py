@@ -58,7 +58,7 @@ from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 from pathlib import Path
-from typing import Any, Literal, Self, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -112,6 +112,10 @@ Split = Literal["train", "dev", "test"]
 Variant = Literal["in_range", "out_of_range"]  # P0.4 dependency-length variants
 Optimizer = Literal["adamw", "lazy_adamw"]
 Precision = Literal["bf16", "fp16", "fp32", "fp64"]
+GradNormPrecision = Literal["native", "float64"]
+#: A6: the state's feedback reads a backward pass can leave out (``train.feedback_detach``).
+FeedbackPath = Literal["summary", "eps", "state", "router"]
+FEEDBACK_PATHS: tuple[str, ...] = ("summary", "eps", "state", "router")
 GateMode = Literal["soft", "ste", "reinforce"]
 ActivationCheckpoint = Literal["none", "per_round", "per_window"]
 StreamPolicy = Literal["lru", "utility_lru", "pinned"]
@@ -122,6 +126,12 @@ Device = Literal["cuda", "mps", "cpu"]
 AutocastDtype = Literal["bf16", "fp16", "fp32"]
 MasterDtype = Literal["fp32", "fp64"]
 CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
+#: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
+#: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
+#: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut); ``fused`` is ``split``
+#: with the sweep's cell round as one fused CUDA op (:mod:`hsn.kernels.window`): experimental,
+#: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
+WindowMode = Literal["autograd", "split", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
 
@@ -224,6 +234,15 @@ class ModelConfig(_StrictModel):
     # Amendment A5: independently ablatable, routed HSN only; fixed codes have width d.
     key_address: bool = False
     selected_readout: bool = False
+    # A5 extension (docs/amendments/A5_key_address.md, "The address columns' start"; opt-in): the
+    # scorer's two address columns (a_cur, a_prev) start at this value for every unit instead of
+    # the small random init of the other columns, so that from the first step a route follows the
+    # codes of the current and the previous byte. They stay ordinary trainable weights. None
+    # (default): the random init. Needs key_address and the linear scorer.
+    address_init: float | None = Field(default=None, allow_inf_nan=False)
+    # Training-only joint dropout of q/u at the decoder; selected cells remain readable.
+    # A5 extension: docs/amendments/A5_stability_readout.md. Zero uses the original decoder.
+    decoder_shortcut_dropout: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
     fixed_route: list[int] = []  # cells for routing = fixed
     budget: float = Field(default=1.0, ge=0.0)  # B_t as a fraction of the dense step cost
     lambda_cost: float = Field(default=0.0, ge=0.0)  # lambda_cost in score = U - lambda * c
@@ -245,6 +264,12 @@ class ModelConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        if self.decoder_shortcut_dropout and not self.selected_readout:
+            raise ValueError("model.decoder_shortcut_dropout requires model.selected_readout")
+        if self.address_init is not None and not (self.key_address and self.scorer == "linear"):
+            raise ValueError(
+                "model.address_init requires model.key_address=true and model.scorer=linear"
+            )
         if self.routing == "dense" and (self.key_address or self.selected_readout):
             raise ValueError(
                 "model.key_address and model.selected_readout require routed HSN; "
@@ -320,6 +345,129 @@ class DataConfig(_StrictModel):
 # --------------------------------------------------------------------------------------------------
 
 
+class AdaptiveLRConfig(_StrictModel):
+    """Training-only feedback controller; disabled preserves existing training and hashes."""
+
+    enabled: bool = False
+    interval: int = Field(default=100, ge=1)
+    monitor_docs: int = Field(default=32, ge=1)
+    patience: int = Field(default=2, ge=1)
+    cooldown: int = Field(default=2, ge=0)
+    threshold: float = Field(default=0.01, gt=0.0, lt=1.0, allow_inf_nan=False)
+    reduce_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
+    increase_factor: float = Field(default=1.1, gt=1.0, allow_inf_nan=False)
+    min_scale: float = Field(default=0.03125, gt=0.0, le=1.0, allow_inf_nan=False)
+    max_scale: float = Field(default=1.0, ge=1.0, allow_inf_nan=False)
+    grad_growth: float = Field(default=3.0, gt=1.0, allow_inf_nan=False)
+    max_update_ratio: float = Field(default=0.01, gt=0.0, allow_inf_nan=False)
+    router_max_update_ratio: float = Field(default=0.005, gt=0.0, allow_inf_nan=False)
+    readout_max_update_ratio: float = Field(default=0.005, gt=0.0, allow_inf_nan=False)
+    trial_windows: int = Field(default=2, ge=1)
+    # Independent controller ablations; emergency guard/rollback cuts remain active.
+    loss_cuts: bool = True
+    gradient_cuts: bool = True
+    update_cuts: bool = True
+    trial_increases: bool = True
+
+
+class RouteGuardConfig(_StrictModel):
+    """``train.route_guard`` (A6, opt-in; :mod:`hsn.train.route_guard`): when an established
+    route (a router unit's share of an input byte's positions) is being taken over by another
+    unit, halve the gaining unit's applied router step, at whatever step it happens. Disabled
+    preserves existing training and hashes."""
+
+    enabled: bool = False
+    # applied optimiser steps between two readings of the per-(input byte, unit) slot counts
+    interval: int = Field(default=100, ge=1)
+    # the event: the quarter of the input bytes whose established routes lost most have lost
+    # this share of them on average
+    lost_fraction: float = Field(default=0.1, gt=0.0, lt=1.0, allow_inf_nan=False)
+    # a byte with fewer slots than this in an interval is left out of the reading
+    min_slots: int = Field(default=100, ge=1)
+    # a route (byte, unit) is established once the unit has held this share of the byte's slots
+    # at `persistence` consecutive readings
+    specialised: float = Field(default=0.25, gt=0.0, le=1.0, allow_inf_nan=False)
+    persistence: int = Field(default=3, ge=1)
+    # ... and only while training is no longer improving: the interval's mean training loss is
+    # above the lowest interval mean so far by this fraction (units sorting the positions out
+    # while the loss falls is learning, not a takeover)
+    loss_rise: float = Field(default=0.02, ge=0.0, allow_inf_nan=False)
+    # no event while the established routes hold less than this share of all slots
+    min_usage: float = Field(default=0.001, ge=0.0, lt=1.0, allow_inf_nan=False)
+    # the response: the step scale of the gaining unit's scorer rows is multiplied by this,
+    # down to min_scale
+    reduce_factor: float = Field(default=0.5, gt=0.0, lt=1.0, allow_inf_nan=False)
+    min_scale: float = Field(default=0.015625, gt=0.0, le=1.0, allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_removed_restore(cls, data: Any) -> Any:
+        """``restore`` (also rewind the gaining unit's rows one reading) existed on 10 and 11 Nov
+        2026 and was removed after exp 400 (77.9 % at step 5,000 against 90.3 % without it). A
+        stored configuration that has it switched off still loads and hashes as it did
+        (:func:`_hash_view`); one that has it on cannot be run by this code."""
+        if isinstance(data, Mapping) and "restore" in data:
+            if data["restore"] not in (False, None):
+                raise ValueError(
+                    "train.route_guard.restore was removed (exp 400: worse than the guard "
+                    "alone); the runs that used it are at commit adeb660"
+                )
+            data = {k: v for k, v in data.items() if k != "restore"}
+        return data
+
+
+class UpdateLimitGroup(_StrictModel):
+    """One joint L2 trust region, selected by model parameter-name globs."""
+
+    selectors: list[str] = Field(min_length=1)
+    max_ratio: float = Field(gt=0.0, allow_inf_nan=False)
+
+
+class UpdateLimitConfig(_StrictModel):
+    """Cap proposed optimizer displacement; empty groups disable all work and state."""
+
+    groups: dict[str, UpdateLimitGroup] = {}
+    norm_floor: float = Field(default=1e-12, gt=0.0, allow_inf_nan=False)
+    # For these groups, cap the radius's reference norm at this multiple of its initial norm.
+    # Empty preserves the original current-weight-relative projection and checkpoint format.
+    norm_growth_limits: dict[str, Annotated[float, Field(ge=1.0, allow_inf_nan=False)]] = {}
+
+    @model_validator(mode="after")
+    def _check_norm_growth_limits(self) -> Self:
+        if set(self.norm_growth_limits) - set(self.groups):
+            raise ValueError("update_limit.norm_growth_limits must name configured groups")
+        return self
+
+
+class GradientGrowthConfig(_StrictModel):
+    """Selective, reversible update damping from sustained pre-clip gradient growth."""
+
+    enabled: bool = False
+    groups: dict[str, list[str]] = {}  # disjoint parameter-name globs, chosen by the experiment
+    window: int = Field(default=100, ge=1)
+    reference_lag: int = Field(default=500, ge=1)
+    interval: int = Field(default=100, ge=1)  # observations per accepted finite samples
+    growth_threshold: float = Field(default=1.5, gt=1.0, allow_inf_nan=False)
+    global_growth_threshold: float = Field(default=1.25, gt=1.0, allow_inf_nan=False)
+    min_share: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+    share_power: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    response_power: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    recovery_threshold: float = Field(default=1.1, ge=1.0, allow_inf_nan=False)
+    recovery_rate: float = Field(default=0.1, gt=0.0, le=1.0, allow_inf_nan=False)
+    min_scale: float = Field(default=0.25, gt=0.0, le=1.0, allow_inf_nan=False)
+    norm_floor: float = Field(default=1e-12, gt=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _check_growth(self) -> Self:
+        if self.reference_lag < self.window:
+            raise ValueError("gradient_growth.reference_lag must be >= window")
+        if self.recovery_threshold >= self.growth_threshold:
+            raise ValueError("gradient_growth.recovery_threshold must be below growth_threshold")
+        if self.enabled and (not self.groups or any(not v for v in self.groups.values())):
+            raise ValueError("gradient_growth.enabled requires nonempty parameter selectors")
+        return self
+
+
 class TrainConfig(_StrictModel):
     """Appendix A.3 ``train.*`` including loss weights and the one-at-a-time auxiliary rule."""
 
@@ -339,6 +487,14 @@ class TrainConfig(_StrictModel):
     # and, on its tensors of ndim >= 2, weight decay cell_weight_decay (None = weight_decay)
     cell_lr_mult: float = Field(default=1.0, gt=0.0)
     cell_weight_decay: float | None = Field(default=None, ge=0.0)
+    # A5 stability: HSN.router and the whole HSN.decoder get independent learning rates.
+    # Defaults preserve the existing optimiser groups and checkpoint layout.
+    router_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    readout_lr_mult: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    adaptive_lr: AdaptiveLRConfig = AdaptiveLRConfig()
+    update_limit: UpdateLimitConfig = UpdateLimitConfig()
+    gradient_growth: GradientGrowthConfig = GradientGrowthConfig()
+    route_guard: RouteGuardConfig = RouteGuardConfig()  # A6, opt-in; hash-omitted at its default
     # --- end P1.13 ---
     # --- P1.15: the gradient-spike guard (python/hsn/train/loop.py). None: off (today's training).
     # Skip a step whose global gradient norm (before clipping) exceeds spike_factor x the median of
@@ -351,9 +507,16 @@ class TrainConfig(_StrictModel):
     # user's request, 8 Nov).
     spike_factor: float | None = Field(default=None, gt=1.0)
     spike_window: int = Field(default=100, ge=1)
+    # Compare the recent spike_window median with the median slow_burst_window applied steps
+    # earlier, as well as checking the current norm. Requires spike_factor; None disables it.
+    slow_burst_factor: float | None = Field(default=None, gt=1.0, allow_inf_nan=False)
+    slow_burst_window: int = Field(default=250, ge=1)
     # write a dump of the pre-step state at the first step a guard skips (non-finite, or a spike
     # with spike_factor set), for a deterministic replay (python/hsn/train/divergence.py)
     divergence_dump: bool = True
+    divergence_max_dumps: int = Field(default=1, ge=1, le=32)
+    divergence_healthy_every: int = Field(default=0, ge=0)
+    divergence_healthy_keep: int = Field(default=2, ge=1, le=8)
     # --- end P1.15 ---
     # --- P1.16: rollback on a guard trigger (python/hsn/train/rollback.py). None: off (today's
     # training). Every rollback_every steps the trainer keeps an in-memory snapshot of the
@@ -369,6 +532,9 @@ class TrainConfig(_StrictModel):
     rollback_lr_mult: float = Field(default=1.0, gt=0.0, le=1.0)
     rollback_lr_steps: int = Field(default=0, ge=0)
     rollback_max: int = Field(default=5, ge=1)
+    # oldest preserves the original recovery; guard_horizon uses the newest snapshot at or
+    # before the trigger's reference horizon (cadence for sharp/nonfinite, full slow history).
+    rollback_selection: Literal["oldest", "guard_horizon"] = "oldest"
     # --- end P1.16 ---
     unroll: int = Field(default=256, ge=1)  # TBPTT window
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
@@ -376,6 +542,41 @@ class TrainConfig(_StrictModel):
     grad_accum: int = Field(default=1, ge=1)
     precision: Precision = "bf16"  # autocast dtype (fp64 only for gradcheck)
     grad_clip: float = Field(default=1.0, ge=0.0)  # global norm clip
+    # Opt-in wide norm reduction AND scaling; native preserves historical clipping bitwise.
+    # MPS uses CPU float64. True NaN/Inf gradients still reach the existing nonfinite guard.
+    grad_norm_precision: GradNormPrecision = "native"
+    # A6 (docs/amendments/A6_feedback_gradient.md; opt-in, forward values unchanged): the feedback
+    # reads of the recurrent state that are constants in the backward pass. "summary": S reads
+    # q[t-1]; "eps": the cell and the scorer read eps = z - P(q[t-1]) (L_pred keeps its gradient
+    # into P and q); "state": a cell reads its own h and its neighbours' messages; "router": the
+    # scorer's features (u, eps, h). With all four the backward recurrence is the gated carry
+    # (1 - b) alone, which cannot amplify a gradient. Empty (default): full BPTT, as before.
+    feedback_detach: list[FeedbackPath] = []
+    # A6 (same amendment; opt-in): the per-row limit on the gradient a position passes back into
+    # the recurrent state. At every position each row's dL/dq is scaled to at most this norm and
+    # its dL/dh to at most state_grad_clip / sqrt(n_cells) (the share a summary gradient gives the
+    # cells). A row under the limit keeps its gradient unscaled, so a healthy window is plain
+    # backpropagation through time; a row whose gradient blows up at a write no longer replaces
+    # the batch's. None (default): off. Calibrated at B32 on the delayed task: healthy rows stay
+    # below 0.16 in h (2.95 in q) from step 3,000 to 8,500 of exp 346. Tested (exps 354, 355): it
+    # did not prevent collapses; not part of the recommended recipe (docs/p1_18_a6_results.md).
+    state_grad_clip: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    # A6 (opt-in): the same limit without a scale. At every position a row's dL/dq (and its dL/dh)
+    # is at most this multiple of the batch's typical live row there (the 90th percentile of the
+    # rows that carry a gradient at that position). On exp 346's checkpoints from step 500 to
+    # 8,500 a limit of 3.0 acts on 0 % to 0.9 % of the live row-positions, at most one document
+    # per window (the isolated ones at 9x to 21x), at every stage of a run, which one absolute
+    # number cannot do (healthy rows grow twentyfold). May be combined with state_grad_clip: the
+    # smaller limit applies. None (default): off. Tested (exp 364): it did not remove the drops.
+    state_grad_ratio: float | None = Field(default=None, gt=1.0, allow_inf_nan=False)
+    # A6 (opt-in; hsn.train.weight_ema): the decay of an exponential moving average of the weights,
+    # updated after every applied optimiser step (with a warm-up, so the average follows the
+    # weights closely early in a run). Training itself is unchanged, step for step; evaluations
+    # during the run, the final evaluation, the trained-state diagnostics and the probes score the
+    # averaged weights. A checkpoint's "model" stays the training weights and its
+    # extra["weight_ema"] carries the average (load_checkpoint(..., averaged=True) reads it). Any
+    # model. None (default): off, every score is of the training weights as before.
+    weight_ema: float | None = Field(default=None, gt=0.0, lt=1.0, allow_inf_nan=False)
     steps: int = Field(default=1000, ge=1)  # schedule
     eval_every: int = Field(default=100, ge=1)
     ckpt_every: int = Field(default=500, ge=1)
@@ -397,6 +598,24 @@ class TrainConfig(_StrictModel):
     temperature_start: float = Field(default=1.0, gt=0.0)
     temperature_end: float = Field(default=1.0, gt=0.0)
     temperature_steps: int = Field(default=0, ge=0)
+    # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which scores the
+    # straight-through unit weight of an executed slot differentiates. "softmax" (the default,
+    # P2.2): the softmax over the cell's units, so raising the executed unit's weight lowers every
+    # other unit's score at that position, and a unit with most of the slots at a kind of position
+    # pushes the others down there. "executed": the executed unit's score alone (the other units'
+    # scores are constants of that softmax): a unit that did not run gets no gradient from the
+    # slot. Not adopted by any recipe: an amendment would have to do that.
+    unit_credit: Literal["softmax", "executed"] = "softmax"
+    # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
+    # straight-through gradient of a routed training window can reach. "selected" (the default):
+    # the sparse round computes the selected cells with their chosen unit only, so a cell or a
+    # unit that was not selected gets no gradient: the router is told how useful its choice was,
+    # never how useful another one would have been. "all": the training window runs the masked
+    # round, the model's own reference for the sparse one (every cell computes its candidate
+    # with the selection's unit weights over every unit; only the selected cells are written), so
+    # the cell mask's and the unit weights' straight-through gradient covers every cell and
+    # unit. Costs the dense step's time. Not adopted by any recipe.
+    ste_scope: Literal["selected", "all"] = "selected"
     epsilon_start: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_end: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_steps: int = Field(default=0, ge=0)
@@ -437,6 +656,23 @@ class TrainConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
+        if self.gradient_growth.enabled and (
+            self.adaptive_lr.enabled
+            or self.rollback_every is not None
+            or self.spike_factor is not None
+        ):
+            raise ValueError(
+                "gradient_growth requires adaptive_lr, rollback and finite spike skipping off"
+            )
+        if (
+            self.adaptive_lr.enabled
+            and self.rollback_every is not None
+            and (self.rollback_lr_steps != 0 or self.rollback_lr_mult != 1.0)
+        ):
+            raise ValueError(
+                "adaptive_lr owns persistent recovery cuts: use rollback_lr_steps=0 and "
+                "rollback_lr_mult=1 with adaptive_lr.enabled"
+            )
         # --- P2.2: a schedule whose end value can never be reached is refused, not ignored ---
         for what in ("temperature", "epsilon"):
             start, end = getattr(self, f"{what}_start"), getattr(self, f"{what}_end")
@@ -495,6 +731,10 @@ class TrainConfig(_StrictModel):
                 "but train.spike_factor is not set; drop it or set the factor"
             )
         # --- end P1.15 ---
+        if self.slow_burst_factor is not None and self.spike_factor is None:
+            raise ValueError("train.slow_burst_factor requires train.spike_factor")
+        if self.slow_burst_factor is None and self.slow_burst_window != 250:
+            raise ValueError("train.slow_burst_window requires train.slow_burst_factor")
         # --- P1.16: the rollback's other keys are read only with rollback_every set ---
         if self.rollback_every is None:
             ignored = [
@@ -502,12 +742,25 @@ class TrainConfig(_StrictModel):
                 for key in ROLLBACK_KEYS[1:]
                 if getattr(self, key) != type(self).model_fields[key].default
             ]
+            if self.rollback_selection != "oldest":
+                ignored.append(f"train.rollback_selection={self.rollback_selection}")
             if ignored:
                 raise ValueError(
                     f"{', '.join(ignored)} are read by the rollback only (P1.16), but "
                     "train.rollback_every is not set; drop them or set the cadence"
                 )
         # --- end P1.16 ---
+        if len(set(self.feedback_detach)) != len(self.feedback_detach):
+            raise ValueError(
+                f"train.feedback_detach={self.feedback_detach} names a path twice; known: "
+                f"{list(FEEDBACK_PATHS)}"
+            )
+        if self.weight_ema is not None and self.rollback_every is not None:
+            raise ValueError(
+                f"train.weight_ema={self.weight_ema} with train.rollback_every="
+                f"{self.rollback_every}: the rollback's snapshots do not hold the averaged "
+                "weights; use one of them"
+            )
         return self
 
 
@@ -689,6 +942,12 @@ class HardwareConfig(_StrictModel):
     unified_memory: bool
     pinned_memory: bool
     compile_mode: CompileMode = "none"
+    window: WindowMode = "autograd"  # P2.10: autograd | split | fused (hsn.train.split)
+    # P2.10: the split window's forward sweep runs a twin of the model with its autocast weights
+    # cast once per window (hsn.train.compile.SweepTwin; the values of eager autocast). False runs
+    # the model's own compiled blocks, which cast at every position and whose fused arithmetic
+    # rounds as the autograd window's does: about 11 ms per step slower, kept to compare the two.
+    sweep_twin: bool = True
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -771,12 +1030,34 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
+        # --- P2.10: the split window is only defined inside its scope ---
+        if self.hardware.window != "autograd":
+            reason = split_window_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.window={self.hardware.window!r} is not available for this "
+                    f"configuration: {reason}"
+                )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
+            if self.train.router_lr_mult != 1.0 or self.train.readout_lr_mult != 1.0:
+                raise ValueError("train.router_lr_mult and train.readout_lr_mult are HSN-only")
             if self.model.key_address or self.model.selected_readout:
                 raise ValueError(
                     "model.key_address and model.selected_readout are HSN-only A5 features"
+                )
+            if self.train.feedback_detach:
+                raise ValueError("train.feedback_detach (A6) is HSN-only")
+            if self.train.unit_credit != "softmax":
+                raise ValueError("train.unit_credit is HSN-only")
+            if self.train.ste_scope != "selected":
+                raise ValueError("train.ste_scope is HSN-only")
+            if self.train.route_guard.enabled:
+                raise ValueError("train.route_guard (A6) is HSN-only")
+            if self.train.state_grad_clip is not None or self.train.state_grad_ratio is not None:
+                raise ValueError(
+                    "train.state_grad_clip and train.state_grad_ratio (A6) are HSN-only"
                 )
             if self.train.cell_lr_mult != 1.0:
                 ignored.append(f"train.cell_lr_mult={self.train.cell_lr_mult}")
@@ -792,6 +1073,12 @@ class RunConfig(_StrictModel):
         # --- end P1.13 ---
         # --- P2.2: routing controls that would be silently ignored are refused ---
         routing, train = self.model.routing, self.train
+        if routing in ("dense", "random", "fixed") and train.router_lr_mult != 1.0:
+            raise ValueError(
+                "train.router_lr_mult requires learned routing (topk or greedy_budget)"
+            )
+        if routing in ("dense", "random", "fixed") and train.route_guard.enabled:
+            raise ValueError("train.route_guard requires learned routing (topk or greedy_budget)")
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
         if train.gate_mode == "reinforce" and routing != "topk":
             raise ValueError(
@@ -1050,7 +1337,75 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     *tuple(f"train.{key}" for key in ROLLBACK_KEYS),
     "model.key_address",
     "model.selected_readout",
+    "train.router_lr_mult",
+    "train.readout_lr_mult",
+    "train.slow_burst_factor",
+    "train.slow_burst_window",
+    "train.adaptive_lr",
+    "train.adaptive_lr.loss_cuts",
+    "train.adaptive_lr.gradient_cuts",
+    "train.adaptive_lr.update_cuts",
+    "train.adaptive_lr.trial_increases",
+    "train.divergence_max_dumps",
+    "train.divergence_healthy_every",
+    "train.divergence_healthy_keep",
+    "train.rollback_selection",
+    "train.update_limit",
+    "train.update_limit.norm_growth_limits",
+    "model.decoder_shortcut_dropout",
+    "train.gradient_growth",
+    "train.grad_norm_precision",
+    "train.feedback_detach",
+    "train.state_grad_clip",
+    "model.address_init",
+    "train.state_grad_ratio",
+    "train.weight_ema",
+    "train.route_guard",
+    "hardware.window",
+    "hardware.sweep_twin",
+    "train.unit_credit",
+    "train.ste_scope",
 )
+
+
+def split_window_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
+    ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is only
+    defined where the heavy backward work is local to its position (the full A6 feedback cut)
+    and for the routed hard-gate round it replays. A soft warm-up (``train.soft_until_step``)
+    is inside the scope: its steps run every cell with autograd, which is the autograd window's
+    work, so they take that window and the split window takes over at the first hard-gate step
+    (:meth:`hsn.train.split.SplitWindow.splits_now`)."""
+    model, train = cfg.model, cfg.train
+    if cfg.model_name != "hsn":
+        return f"model_name={cfg.model_name!r} is not the HSN"
+    if model.routing != "topk":
+        return f"model.routing={model.routing!r}: the split window needs topk"
+    if train.gate_mode != "ste":
+        return f"train.gate_mode={train.gate_mode!r}: the split window needs ste"
+    if train.ste_scope != "selected":
+        return f"train.ste_scope={train.ste_scope!r}: the masked round runs every cell"
+    missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
+    if missing:
+        return (
+            f"train.feedback_detach lacks {missing}: without the full feedback cut the heavy "
+            "backward work is not local to its position"
+        )
+    if train.epsilon_start > 0.0 or train.epsilon_end > 0.0:
+        return "train.epsilon_*: exploration draws are not replayed"
+    if train.lambda_u > 0.0:
+        return "train.lambda_u > 0: the counterfactual probes are untested with the split window"
+    if train.state_grad_clip is not None or train.state_grad_ratio is not None:
+        return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
+    if model.disabled_cells:
+        return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
+    if model.r_max != 1:
+        return f"model.r_max={model.r_max}: one round per position only"
+    if train.precision == "fp16":
+        return "train.precision=fp16 scales the loss (GradScaler)"
+    if train.grad_accum != 1:
+        return f"train.grad_accum={train.grad_accum}: one window per step only"
+    return None
 
 
 def _hash_view(cfg: RunConfig) -> dict[str, Any]:
@@ -1058,12 +1413,29 @@ def _hash_view(cfg: RunConfig) -> dict[str, Any]:
     the :data:`HASH_OMIT_AT_DEFAULT` keys that hold their default."""
     dump = cfg.model_dump(mode="json")
     for dotted in HASH_OMIT_AT_DEFAULT:
-        section, key = dotted.split(".")
-        schema = RunConfig.model_fields[section].annotation
-        assert isinstance(schema, type) and issubclass(schema, BaseModel)
-        default = schema.model_fields[key].default
-        if dump[section][key] == default:
-            del dump[section][key]
+        parts = dotted.split(".")
+        node = dump
+        schema: type[BaseModel] = RunConfig
+        for part in parts[:-1]:
+            if part not in node:  # an enclosing default object was already omitted
+                break
+            node = node[part]
+            nested = schema.model_fields[part].annotation
+            assert isinstance(nested, type) and issubclass(nested, BaseModel)
+            schema = nested
+        else:
+            key = parts[-1]
+            default = schema.model_fields[key].default
+            if isinstance(default, BaseModel):
+                default = default.model_dump(mode="json")
+            if node[key] == default:
+                del node[key]
+    guard = dump.get("train", {}).get("route_guard")
+    if guard is not None:
+        # the block was hashed with this key while the option existed (RouteGuardConfig); it
+        # stays in the view so that the guarded runs of 10 and 11 Nov 2026 keep their hashes
+        # and their kept checkpoints resume
+        guard["restore"] = False
     return dump
 
 

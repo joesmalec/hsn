@@ -32,7 +32,9 @@ P1.16 added:
   routing follows the key;
 - `probe-rerun --weights dump` (a failed run's divergence dump) and `--key-alphabet train` (a diagnostic remap of
   the dev keys), and `replay --continue-steps` with a remedy;
-- [the HSN recipe file](#recipes) `configs/experiments/hsn_recipe_b095.yaml` (AdamW β2 0.95);
+- [the HSN recipe files](#recipes): `configs/experiments/hsn_recipe_a6.yaml` (the standard recipe since 11 Nov:
+  the routed HSN with amendment A6 and the route guard) and `hsn_recipe_b095.yaml` (AdamW β2 0.95, the specs
+  before it);
 - [the preset](#rules) `memory_writes_run` (the written gates' 90th percentile and the cell's update ratio, each in
   some window of the run), calibrated on the stored runs;
 - a first open's switch to WAL retries "database is locked".
@@ -49,6 +51,39 @@ setsid nohup python -m hsn.experiments worker > ~/hsn-experiments/worker.log 2>&
 python -m hsn.experiments status                                            # queue, running, recent
 python -m hsn.experiments report --sweep example_reads_state                # one row per seed group
 ```
+
+Adaptive runs publish controller observations to `status` between dev evaluations, with effective
+rates for the next update, the latest decision and the last actual rate change. `dev @ step` identifies
+the evaluation behind a displayed dev score. Full signal histories remain in each result's
+`adaptive_lr` block. `python -m hsn.experiments controller-report --exp N [--exp M ...] [--out FILE]`
+reads warning follow-through and strictly matched ablation comparisons without loading a model or
+writing to SQLite. See [controller reporting and ablations](a5_implementation.md#live-reporting-and-signal-ablations).
+
+For a spike investigation, prepare an ordered diagnostic spec without changing the database:
+
+```bash
+python scripts/prepare_spike_queue.py --db ~/hsn-experiments/experiments.sqlite \
+  --parent 241 --target-doc 15751 --compare 235 --compare 239 --compare 233 --compare 234 \
+  --out ~/hsn-experiments/a5-stability/spike-queue.yaml
+python -m hsn.experiments enqueue ~/hsn-experiments/a5-stability/spike-queue.yaml
+```
+
+Enqueue and resume only in the explicitly owned compute turn. The spec inherits each parent's
+configuration and seed, pins source hashes, marks every job exclusive (`timing: true`), and chains
+prerequisite labels. `spike_diagnostic` runs strictly in insertion order. An exception, failed
+repeatability/instrumentation check, cancellation or timeout pauses the queue; dependent jobs do
+not silently continue. Results are diagnostic records, with no fabricated final dev score.
+
+A worker configured with `--turn-file ~/hsn-handoff/run-turns.json --turn-owner A5` requires an
+active, unreleased claim for that owner. It starts a bounded job only if its full timeout plus
+30 seconds fits the turn. It signals a timed-out diagnostic, then kills its owned process group
+after ten seconds if needed. A turn's last fifteen seconds are reserved for draining. Missing,
+malformed, expired or another owner's claim blocks launches. Replace an idle existing worker to
+enable these options; do not start a second one. Pending jobs may remain paused between turns;
+coordinate them with any external idle guard before handing compute to another session.
+
+See [spike diagnostics](a5_implementation.md#investigating-spikes-before-further-training) for
+capture settings, numerical checks and limits on interpreting these results.
 
 **Database location:** `~/hsn-experiments/experiments.sqlite`, here `/home/joe/hsn-experiments/`. Override it
 with `--db` or `$HSN_EXPERIMENTS_DB`.
@@ -340,6 +375,29 @@ loudly; once P2.8 is merged, requeue it. Each record holds the compile mode, whe
 P2.8's `compile_seconds` (training steps) and `window_compile_seconds` (every compiled variant, evaluation
 included).
 
+**Split window.** `hardware.window` is an override of the same kind (P2.10, `docs/p2_10_split_window.md`):
+`autograd` (the default: omitted from the configuration hash, so existing arm ids do not move) or `split`, the
+training window as a forward sweep without autograd plus one batched replay. It computes the same gradients
+(float64: to 1e-9; bf16: to rounding, so a run is not bit-reproducible against an `autograd` run) at about
+0.056 s per step instead of 0.100 on the A6 recipe. It needs the full A6 feedback cut, `routing: topk` and the
+`ste` gate from step 0; a configuration outside its scope is refused when it is loaded, so at `expand` and
+`enqueue` (`hsn.config.split_window_scope_error` names what is missing). `train.p_dense`, `train.lambda_b` and the cost term are
+inside it; `train.epsilon_*` and `train.lambda_u` are not. Build its two kernels once per checkout with
+`scripts/build_window_kernels.py`; without them the run is correct and slow. `fused` is the split window with a
+fused forward sweep (CUDA, a compiled window and the built kernels): 46 ms per step on this recipe against 56 ms
+for `split` and 101 ms for the autograd window. A soft warm-up (`train.soft_until_step`) is inside the scope of
+both: its steps run the autograd window, the split or fused window takes over at the first hard-gate step (such
+an arm holds the warm-up's 7 GB to its end, so reserve it with `--mem-estimate-mib 7200`). Examples: `configs/sweeps/p2_10_split_seeds.yaml`, its same-day controls
+`p2_10_autograd_seeds.yaml`, and `p2_10_split_own_sweep_seeds.yaml` (`hardware.sweep_twin=false`: the sweep on
+the model's own compiled blocks, about 11 ms per step slower).
+
+Several split arms share the card well under NVIDIA MPS (six arms: 1.76 times the throughput of one arm alone;
+without MPS concurrent arms gain nothing). Start the daemon with a private `CUDA_MPS_PIPE_DIRECTORY`, start the
+worker with the same variable, and pass `--mem-estimate-mib` at `enqueue` (1750 for a split arm, 2200 for an
+autograd arm of this recipe): the worker's own estimate is the peak of an arm run alone, which under MPS
+reserves more than an arm holds. `docs/p2_10_split_window.md`, "Several arms on one card", has the numbers and
+the commands.
+
 Compiled artifacts persist between arms: the worker gives every child `TORCHINDUCTOR_CACHE_DIR`, by default
 `<db dir>/inductor-cache` (inductor's own default is under `/tmp`). Arms that differ only in learning rate, seed
 or schedule share one compiled graph. The first arm of each memory key runs alone, so it compiles cold and fills
@@ -584,13 +642,30 @@ and `keep_last` (2), both execution-only:
   its hash and the training are unchanged);
 - after each step the newest `keep_last` of those stay, and so does the newest one before the run's first guard
   event (a skipped or rolled-back step), which is never pruned;
-- a run that finishes deletes them (its final checkpoint follows `checkpoint`).
+- with the default `checkpoint: final`, a run that finishes deletes them;
+- `checkpoint: retained` keeps them after completion and also pins the checkpoint with the best
+  dev accuracy at its exact saved step, even if the guard never fires. Set `keep_every` to the
+  evaluation cadence to capture every evaluated peak. `keep_last` bounds the recent checkpoints;
+  the best and the pre-guard checkpoint are additional pins. The result records
+  `retained_checkpoints` and `best_checkpoint` separately; final scores and verdicts still use the
+  final weights. `checkpoint: none` still deletes all checkpoints after completion.
+
+Both `probe-rerun` and `route-check` accept `--checkpoint-step N` to read one retained checkpoint.
+It must exist in that experiment's run directory; a missing step is an error, never a fallback to
+the final weights. Earlier weights are not compared with stored final probes, and the diagnostic
+does not overwrite the experiment's results. `--checkpoint-step` cannot be combined with
+`probe-rerun --weights dump`.
 
 When a run fails on a guard (`nonfinite`, `spike`, `rollback`), the newest checkpoint on disk before the first
 guard event (before the failure if there was none) is loaded into the model and evaluated (with the split), its
 state statistics and the protocol version's probes (summaries) are taken, and the record gets `partial`:
 `from_step`, `checkpoint`, `reason`, `final` (the `final` keys of that evaluation), `trained`, `probes` and
 `seconds`. A failure while re-scoring is kept as `partial.error`.
+
+The newest saved checkpoint is assessed separately as `latest_saved`, with the same fields. This
+shows recent progress even if recovery started much earlier. It is diagnostic only: the run stays
+failed, the primary final score stays NULL, and the conservative `partial` verdict is unchanged.
+The failure column labels both checkpoint steps. Neither checkpoint is certified healthy by age.
 
 Every verdict of such a record reads `failed: <reason> @ <step> (from step X: <the rule on the kept
 checkpoint>)`: still a failure, never a pass and never a finding. Rules can read the kept checkpoint directly with
@@ -643,9 +718,29 @@ so that "follows trained keys" and "follows keys never seen" can be told apart. 
 
 ### Recipes
 
-New HSN specs start from `configs/experiments/hsn_recipe_b095.yaml` (P1.16, the user's decision of 8 Nov): HSN
-d=64 + A4 (`model.cand_norm=rms`), delayed/in_range, B32, WSD 0.2 over 9,000 steps at lr 2e-3, warm-up 200, clip
-1.0, the spike guard at 1e4 and **AdamW β2 0.95**.
+**New HSN specs start from `configs/experiments/hsn_recipe_a6.yaml`** (P1.18, the user's decision of 11 Nov):
+the routed HSN of amendment A5 (top-K routing, key addresses, selected-cell readout; d=64 + A4), delayed/in_range,
+B32, WSD 0.2 over 9,000 steps at lr 2.5e-3, warm-up 200, clip 1.0, AdamW β2 0.95, with amendment A6's four parts:
+the feedback cut (`train.feedback_detach`), exp 346's update caps (`train.update_limit`), the weight average
+(`train.weight_ema=0.99`) and the route guard (`train.route_guard.enabled=true`). No spike guard and no rollback.
+
+```yaml
+base:
+  config: configs/experiments/hsn_recipe_a6.yaml
+  overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead]
+```
+
+- With these two overrides it resolves to the configuration of exps 421 to 426, so its arms have their arm ids;
+  with `train.route_guard.enabled=false` they are the arms of exps 375 to 377 and 418 to 420
+  (`configs/sweeps/example_p1_18.yaml`, `tests/test_p1_18_recipe.py`).
+- Nine runs at 9,000 steps: 87.2 % dev on held-out keys (78.5 to 95.6) and a fall of ten points or more in one
+  run, against 83.9 % and seven runs without the guard and 76.7 to 79.3 % for gru_2m
+  (`docs/p1_18_a6_results.md`). The sag is reduced, not removed; only the delayed task was run.
+- Every part is opt-in in the code: no default changed, and the earlier recipe file is as it was.
+
+**The earlier recipe**, `configs/experiments/hsn_recipe_b095.yaml` (P1.16, the user's decision of 8 Nov), is the
+base of every spec before 11 Nov: the dense HSN d=64 + A4 (`model.cand_norm=rms`), delayed/in_range, B32, WSD 0.2
+over 9,000 steps at lr 2e-3, warm-up 200, clip 1.0, the spike guard at 1e4 and **AdamW β2 0.95**.
 
 ```yaml
 base:
@@ -878,3 +973,143 @@ The protocol reproduces the verdicts of four audit runs:
 Final dev accuracy must fall within ±0.03 of each reference. The bridge also has a compiled twin
 (`hardware.compile_mode=reduce-overhead`), checked against the same rule once P2.8 is merged. The results and
 the time per experiment are in the P1.11 pull request.
+
+### Training measurement views and observational logging (10 November)
+
+Install optional analytical views into an existing database:
+
+```bash
+python -m hsn.experiments.measurements --db ~/hsn-experiments/experiments.sqlite
+```
+
+This transaction only replaces the named views. It leaves schema version 2, experiment identities,
+raw JSON records, statuses, and queue contents intact, so older workers remain compatible. Views
+include future records automatically. `training_measurements` exposes task scope, data hash,
+final overall/delayed/later accuracy, binding results, peak memory, and evaluation drawdown.
+A failed run's partial score remains separate from the NULL final score. Drawdowns are in
+percentage points and reflect only saved evaluation times; a single observation gives NULL.
+Overall, delayed-task, and later-query drawdowns have separate columns.
+
+```sql
+SELECT exp_id, status, tasks_json, final_delayed_accuracy,
+       max_delayed_drawdown_pp, final_later_accuracy, binding_verdict
+FROM training_measurements WHERE exp_id >= 325;
+SELECT * FROM training_diagnostics WHERE exp_id = 343 ORDER BY step;
+SELECT * FROM training_gpu_samples WHERE exp_id = 343 ORDER BY sampled_at_unix;
+```
+
+`training_evaluations` and `training_steps` expose recorded time series. The diagnostic view keeps
+`diagnostics_json` for less common existing fields. Missing old measurements remain NULL, and
+old runs have no fabricated GPU samples. Raw records with invalid JSON are marked invalid in the
+summary and omitted from JSON time-series views. These are analytical views, not indexed copies;
+large whole-history queries may be slower than querying a small selection of experiments.
+
+Opt-in protocol settings (unchanged defaults are omitted from arm identity):
+
+```yaml
+protocol:
+  diag_stability: true
+  diag_every: 250
+  diag_sensitivity_epsilon: 0.001
+  diag_sensitivity_position: 64
+  diag_sensitivity_horizon: 8
+```
+
+At sampled accepted updates, after any projections, `stability/route_churn` measures the fraction
+of valid positions whose selected cell set changed since the prior observation on the same fixed
+diagnostic window. Slot order and invalid padding do not count. The reference step is saved;
+the first observation and the first observation after restarting the observer have NULL churn.
+The sensitivity fields measure one fixed-direction perturbation of h, preserving q's offset
+from mean(h), over a configurable horizon. Rows containing resets/padding in that horizon are
+excluded and the eligible count is saved. The model mode and RNG are restored, and no training
+state, gradient, or optimizer update is changed. Diagnostics use eager execution without autocast;
+the gain is not a Jacobian spectral norm or a replay of the compiled training backward. Diagnostic
+time is charged to existing diagnostic overhead. Latest observations also appear in
+`experiments.progress_json.stability` with their sample step; old dev scores retain `dev_step`.
+
+Worker `--telemetry-max-samples 3600 --poll 1` enables a bounded series of device utilization,
+device VRAM, and owned process VRAM, stored in `card_json.telemetry`. Samples have timestamps and
+last-reported training steps; the latter are approximate alignment. Missing readings are NULL.
+Old samples are discarded on reaching the cap and `telemetry_dropped` reports the count. The
+actual intervals can exceed the poll time (for example while CPU interference is sampled).
+Device utilization includes other processes, and samples cannot identify subsecond dips,
+allocator reservation, host RAM, kernel bottlenecks, or energy. Adopted workers report incomplete
+watch history. Default workers collect no series.
+
+### A6 keys, compiled diagnostics and the phase report (10 November)
+
+**Recipe keys** (`docs/amendments/A6_feedback_gradient.md`, results in `docs/p1_18_a6_results.md`;
+all opt-in, omitted from arm identity at their defaults, forward values unchanged):
+
+```yaml
+- train.feedback_detach=[summary,eps,state,router]        # the tested recipe: feedback reads held constant in the backward
+- model.cand_norm=rms                                     # A4; with the cut it trains (it diverged under full backpropagation)
+- train.weight_ema=0.99                                   # evaluations and probes score a moving average of the weights
+- train.route_guard.enabled=true                          # halve the gaining router unit's step when an established route is taken over
+# tested, not sufficient or diagnostic only (kept because their runs are in the database):
+- train.state_grad_ratio=3.0                              # per-row limit on the state gradient, relative to the batch's typical row
+- train.state_grad_clip=4.0                               # the same as an absolute number (dL/dq; dL/dh: / sqrt(N))
+- model.address_init=1.0                                  # start value of the scorer's two address columns (A5)
+```
+
+The recipe that held on three seeds is the cut with exp 346's anchored update caps
+(`configs/sweeps/p1_18_a6_seeds.yaml`, arm `carry_anchored`). With A4 it learns faster and ends
+higher but sags mid-run (`p1_18_a6_ema`, arm `a4_ema99`); the route guard is for that
+(`p1_18_a6_final_seeds`, `p1_18_a6_final_guard_seeds`). All of it together is the standard recipe
+file since 11 Nov, `configs/experiments/hsn_recipe_a6.yaml` ([Recipes](#recipes)).
+
+A `train.weight_ema` run's record carries `weight_ema` and `training_weights_final`; its
+checkpoints hold the training weights in `model` and the average in `extra["weight_ema"]`
+(`load_checkpoint(path, model, averaged=True)` for evaluation; `probe-check`, `probe-rerun`,
+`route-check` and `split-backfill` read the average). A guarded run's record carries `route_guard`
+(the events and every unit's final step scale).
+
+**Diagnostics and probes under a compiled trainer.** The state window of every diagnostic sample
+used to run the eager routed forward and a batched GPU SVD (1.3 s per pass on `profile:rtx3060`
+with the card near 18 %; two passes per sample with an update limiter), and the three end-of-run
+probes ran eager too (85 s). Both now replay compiled graphs:
+
+- the state window runs the compiled window's diagnostic variant (`CompiledWindow(...,
+  capture=True)`, no gradients), compiled once in `Diagnostics.attach` before training
+  (`phases.diagnostics_warm_s`); the participation ratio comes from the Gram matrix;
+- the probes pad each batch to the evaluation window's shape and replay it
+  (`hsn.experiments.probe.PaddedWindow`; the record's `probe_execution` says `compiled`).
+
+Values agree with the eager ones to rounding (the answers of a probe are argmaxes; a near-tie can
+differ). An eager trainer (`hardware.compile_mode=none`) is unchanged. `diag_stability` still
+perturbs the state inside an eager forward and keeps its cost.
+
+**Switching the diagnostics off, and the collector.** Two execution-only protocol keys (the arm
+id and the training are the same either way):
+
+```yaml
+protocol:
+  diagnostics: false   # default true; no diagnostic sample during training, whatever the cadence keys say
+  gc_freeze: false     # default true; see below
+```
+
+`python -m hsn.experiments enqueue SPEC --diagnostics off` (or `on`) overrides the spec for the
+arms it queues. With the diagnostics off nothing is attached to the optimiser and nothing is
+compiled for them; the record's `diagnostics` is empty and `diagnostics_enabled` false; the
+evaluations, the kept checkpoints, the end-of-run state statistics (`trained_state`) and the
+probes still run. A rule that reads a `diag:` value has nothing to read then, and expansion
+refuses the arm.
+
+`gc_freeze` (compiled runs only): after every evaluation the harness calls `gc.collect()` and
+`gc.freeze()`, and `gc.unfreeze()` when the fit ends. A compiled run holds about a million objects
+the collector tracks; each full pass walked them for 0.3 s with the card idle, about ten times per
+thousand steps, which showed as half-second dips to 0 % utilisation. Frozen, a pass takes 1 to
+2 ms. The record's `gc_freezes` counts them.
+
+**Phases.** Every training record carries `phases`: wall-clock intervals (`[unix start, seconds]`)
+of each evaluation, diagnostic sample (`[step, unix start, seconds]`) and checkpoint write, and the
+start and end of the `setup`, `fit` and `probing` stages. With the worker's card time series
+(`--telemetry-max-samples`), each utilisation sample can be attributed:
+
+```bash
+python scripts/gpu_phase_report.py --exp 346 --exp 364      # per phase: samples, mean %, share below 50 %
+```
+
+A run without `phases` (before 10 November) is split by its reported step against the diagnostic
+and evaluation cadences, labelled as an estimate. Device utilisation counts every process on the
+card: use a timing arm for a clean trace.

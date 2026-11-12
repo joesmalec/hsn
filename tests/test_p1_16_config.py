@@ -53,6 +53,34 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         *tuple(f"train.{k}" for k in ROLLBACK_KEYS),
         "model.key_address",
         "model.selected_readout",
+        "train.router_lr_mult",
+        "train.readout_lr_mult",
+        "train.slow_burst_factor",
+        "train.slow_burst_window",
+        "train.adaptive_lr",
+        "train.adaptive_lr.loss_cuts",
+        "train.adaptive_lr.gradient_cuts",
+        "train.adaptive_lr.update_cuts",
+        "train.adaptive_lr.trial_increases",
+        "train.divergence_max_dumps",
+        "train.divergence_healthy_every",
+        "train.divergence_healthy_keep",
+        "train.rollback_selection",
+        "train.update_limit",
+        "train.update_limit.norm_growth_limits",
+        "model.decoder_shortcut_dropout",
+        "train.gradient_growth",
+        "train.grad_norm_precision",
+        "train.feedback_detach",
+        "train.state_grad_clip",
+        "model.address_init",
+        "train.state_grad_ratio",
+        "train.weight_ema",
+        "train.route_guard",
+        "hardware.window",  # P2.10
+        "hardware.sweep_twin",
+        "train.unit_credit",
+        "train.ste_scope",
     )
 
 
@@ -75,6 +103,7 @@ def test_p1_16_rollback_key_set_changes_hash() -> None:
         "train.rollback_lr_mult=0.5",
         "train.rollback_lr_steps=200",
         "train.rollback_max=3",
+        "train.rollback_selection=guard_horizon",
     ],
 )
 def test_p1_16_rollback_keys_refused_without_every(override: str) -> None:

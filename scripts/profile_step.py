@@ -37,9 +37,12 @@ What the file holds:
   to link). The innermost HSN frame (a file of the package, :func:`in_package`; not torch's
   files under a ``.venv`` inside a checkout named ``hsn``) that names one gives the segment
   (:func:`classify_frames`:
-  ``units.py`` → ``selected_cells``; the cell, graph, native ops and state updates →
+  ``units.py`` and CUDA MLP operators → ``selected_cells``; the cell, graph, other kernel ops
+  and state updates →
   ``messages``, the P2.5 partition; the router → ``scorer``; E, P, S and the embeddings →
-  ``shared_path``; the decoder → ``decode``). ``unattributed`` reports what no rule matched.
+  ``shared_path``; the decoder → ``decode``). HSN's exported device symbols identify custom
+  kernels directly when compiled driver launches lack Python stacks. ``unattributed`` reports
+  what no rule matched.
   ``bytes`` are the step's allocator peak and reserve (P0.6); they are not separable per segment
   inside one window, and DRAM traffic is not measured (Nsight Compute would be needed).
 * ``decision`` (the last key, and the last line printed): ``L2 justified: yes|no — <segment> is
@@ -91,6 +94,7 @@ import argparse
 import collections
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -114,6 +118,7 @@ import hsn  # noqa: E402
 from hsn.config import RunConfig, config_hash, load_config  # noqa: E402
 from hsn.device import memory_stats, reset_peak, resolve, seed_everything, synchronize  # noqa: E402
 from hsn.model.hsn import HSN  # noqa: E402
+from hsn.profiler import attribution as stack_attribution  # noqa: E402
 from hsn.profiler import metal_trace  # noqa: E402
 from hsn.profiler.launches import HOST_LAUNCH_CALLS  # noqa: E402
 from hsn.runner import build_model, load_datasets, make_trainer  # noqa: E402
@@ -331,42 +336,13 @@ def percentile(xs: list[float], q: float) -> float:
 #: first; a worktree sharing another checkout's ``.venv`` gets that checkout's through ``hsn.pth``
 #: when something imported ``hsn`` before)
 PACKAGE_ROOT = str(Path(hsn.__path__[0])).replace("\\", "/") + "/"
-#: and as ``torch.profiler(with_stack=True)`` names them: it strips each file's ``sys.path`` entry
-#: (``torch.profiler.python_tracer._prefix_regex``), the package's parent
-PACKAGE_RELATIVE = "hsn/"
 
 
 def in_package(path: str) -> bool:
     """Whether a frame's file is in the hsn package. Not any path through a directory named
     ``hsn``: the repo's ``.venv`` lies under one when the checkout is named ``hsn``, and torch has
     files named like HSN's (``autograd/graph.py``, ``fx/graph.py``)."""
-    norm = path.replace("\\", "/")
-    return norm.startswith(PACKAGE_ROOT) or norm.startswith(PACKAGE_RELATIVE)
-
-
-def _hsn_frames(frames: list[tuple[str, int, str]]) -> list[tuple[str, str]]:
-    """``(file name, function)`` of the frames inside the ``hsn`` package, outermost first."""
-    out = []
-    for path, _, fn in frames:
-        norm = path.replace("\\", "/")
-        if in_package(norm):
-            out.append((Path(norm).name, fn))
-    return out
-
-
-#: The functions of hsn.py by the segment of the work they do themselves (the model's own glue).
-_HSN_FUNCTIONS = {
-    "_position": "shared_path",
-    "_window_prologue": "shared_path",
-    "_shared_path": "shared_path",
-    "_score": "scorer",
-    "_select": "scorer",
-    "_update": "messages",
-    "_sparse_round": "messages",
-    "_masked_round": "messages",
-    "_write_dense": "messages",
-    "_cell_dense": "messages",
-}
+    return stack_attribution.in_package(path, PACKAGE_ROOT)
 
 
 def classify_frames(frames: list[tuple[str, int, str]]) -> str | None:
@@ -375,27 +351,7 @@ def classify_frames(frames: list[tuple[str, int, str]]) -> str | None:
     called from the cell is ``selected_cells``, the cell's own ops ``messages``, the P2.5
     partition), except that ``E`` / ``P`` / ``S`` / ``D``'s MLP code serves the router too (a
     ``model.scorer=mlp`` scorer) and the decoder in the epilogue."""
-    files = _hsn_frames(frames)
-    if not files:
-        return None
-    names = {name for name, _ in files}
-    for name, fn in reversed(files):  # innermost first
-        match name:
-            case "units.py":
-                return "selected_cells"
-            case "cell.py" | "graph.py" | "native.py" | "state.py":
-                return "messages"
-            case "router.py":
-                return "scorer"
-            case "losses.py":
-                return "loss"
-            case "encoder.py" | "embeddings.py":
-                if "router.py" in names:
-                    return "scorer"
-                return "decode" if "_window_epilogue" in {f for _, f in files} else "shared_path"
-            case "hsn.py" if fn in _HSN_FUNCTIONS:
-                return _HSN_FUNCTIONS[fn]
-    return "other"
+    return stack_attribution.classify_frames(frames, PACKAGE_ROOT)
 
 
 def frames_of_stack_traces(stack_traces: list[str]) -> list[tuple[str, int, str]]:
@@ -573,6 +529,8 @@ def attribute(events: list[Any], provenance: Provenance) -> dict[str, Any]:
         return f"(no host) {device_name[:50]}"
 
     def segment_of(host: Any | None, device_name: str) -> dict[str, float] | None:
+        if custom := stack_attribution.classify_cuda_kernel(device_name):
+            return {custom: 1.0}
         traces = triton_traces(device_name)
         if traces is not None:  # a compiled Triton kernel
             return split(traces)
@@ -652,6 +610,19 @@ def count_launches(events: list[Any]) -> tuple[int, int, float]:
 # --------------------------------------------------------------------------------------------------
 
 
+def ungraphed_window(window: compile_mod.CompiledWindow) -> compile_mod.CompiledWindow:
+    """Compile every attribution block/bucket without CUDA Graph capture."""
+
+    def backend(graph: Any, inputs: Any) -> Any:
+        from torch._inductor import compile as compile_inductor
+
+        return compile_inductor(graph, inputs, options={"triton.cudagraphs": False})
+
+    # A backend callable applies to both the initial block and future shape buckets.
+    # Replacing _block alone leaves the bucket cache pointing at a graph-captured block.
+    return compile_mod.CompiledWindow(window.model, window.ctx, window.mode, backend)
+
+
 def profile_cuda(
     args: argparse.Namespace,
     trainer: TBPTTTrainer,
@@ -674,14 +645,7 @@ def profile_cuda(
     if args.level == "L1":
         window = trainer._compiled
         assert window is not None
-        plain = compile_mod.CompiledWindow(model, ctx, window.mode, window.backend)
-        plain.cuda_graphs = False
-        plain._block = torch.compile(
-            compile_mod._own_code(compile_mod._block),
-            mode="default",
-            fullgraph=True,
-            dynamic=False,
-        )
+        plain = ungraphed_window(window)
         trainer._compiled = plain
         # the graph window is done (timing and counts are taken): release its CUDA Graph pools,
         # or the plain window's activations come on top of them (B32 did not fit in 12 GB)
@@ -1277,6 +1241,7 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--profile", required=True)
     ap.add_argument("--level", choices=("L0", "L1"), required=True)
+    ap.add_argument("--kernel-backend", choices=("native", "cuda"), default="native")
     ap.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--tag", default="")
     ap.add_argument("--steps", type=int, default=20)
@@ -1310,6 +1275,12 @@ def main() -> None:
         help="MPS: serialised dispatches per Metal System Trace chunk",
     )
     args = ap.parse_args()
+    if args.kernel_backend == "cuda":
+        from hsn import kernels
+
+        kernels.set_backend("cuda")
+        # Keep L2 evidence distinct from the committed L1 baseline.
+        args.tag = f"{args.tag}_cuda".strip("_")
     if args.level == "L1":
         import torch._functorch.config as functorch_config
         import torch._inductor.config as inductor_config
@@ -1323,6 +1294,10 @@ def main() -> None:
     seen = [gpu_processes()]
     cpu_seen = [cpu_processes()] if sys.platform == "darwin" else []
     cfg, ctx, model, trainer, train_ds, dev_ds = build(args)
+    if args.kernel_backend == "cuda":
+        if ctx.device.type != "cuda":
+            raise RuntimeError("--kernel-backend cuda requires a CUDA profile")
+        kernels.prepare_cuda(ctx.device.index or 0)
     if ctx.device.type not in ("cuda", "mps"):
         raise RuntimeError(
             "profile_step.py profiles a device queue: CUDA (torch.profiler kernel events) or MPS "
@@ -1429,9 +1404,18 @@ def main() -> None:
         )
     result: dict[str, Any] = {
         "level": args.level,
+        "kernel_backend": args.kernel_backend,
         "profile": args.profile,
         "tag": args.tag,
         "git_revision": git_revision(),
+        "dirty_diff_sha256": hashlib.sha256(
+            subprocess.check_output(["git", "diff", "HEAD", "--"], cwd=REPO)
+        ).hexdigest(),
+        "cuda_build": (
+            json.loads((REPO / "build/cuda_build.json").read_text())
+            if args.kernel_backend == "cuda"
+            else None
+        ),
         "torch": torch.__version__,
         "config": args.config,
         "overrides": args.override,
@@ -1470,7 +1454,12 @@ def main() -> None:
         "serving_step": serve,
         "segments": segments,
         "attribution": {
-            "method": method + "segment from the HSN frames of the stack",
+            "method": method
+            + (
+                "segment from the HSN frames of the stack"
+                if mps
+                else "segment from HSN device symbols or the HSN frames of the stack"
+            ),
             "kernels_total": attribution["kernels_total"],
             "unattributed_kernels": attribution["unattributed_kernels"],
             "unattributed_device_ms": round(attribution["unattributed_device_us"] / 1e3, 3),

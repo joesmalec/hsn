@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from cards import CUDA_PROFILE
+from hsn import kernels
 from hsn.config import RunConfig, config_hash, load_config, load_hardware_profile
 from hsn.data.dataset import ByteDataset, collate_windows
 from hsn.data.synthetic import BOS, TaskSpec, generate, load_dataset_spec
@@ -66,7 +67,9 @@ def _model(cfg: RunConfig) -> HSN:
 @pytest.fixture(autouse=True)
 def _restore_runtime() -> Iterator[None]:
     deterministic = torch.are_deterministic_algorithms_enabled()
+    backend = kernels.current_backend()
     yield
+    kernels.set_backend(backend)
     set_deterministic(deterministic)
     torch._dynamo.reset()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
@@ -493,12 +496,15 @@ def test_p1_17_a5_serving_carries_previous_byte_and_resets(mode: str) -> None:
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("kernel_backend", ["native", "cuda"])
 def test_p1_17_a5_compiled_cuda_matches_eager(
-    training: bool, monkeypatch: pytest.MonkeyPatch
+    training: bool, kernel_backend: kernels.Backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CUDA Graph warm-up, capture and replay of A5, with a carried byte and two blocks."""
+    """Both compiled kernel backends match native A5 with carried bytes and two blocks."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device on this machine")
+    if kernel_backend == "cuda" and os.environ.get("HSN_REQUIRE_CUDA") != "1":
+        pytest.skip("custom kernels require HSN_REQUIRE_CUDA=1 under the idle guard")
     monkeypatch.setattr(compile_mod, "MAX_BLOCK", 4)
     cfg = _cfg("model.key_address=true", "model.selected_readout=true")
     model = _model(cfg)
@@ -512,8 +518,12 @@ def test_p1_17_a5_compiled_cuda_matches_eager(
     reset.zero_()
     reset[0, 4] = True
     previous = torch.tensor([112, 75], device=ctx.device)
-    compiled = compile_window(model, ctx, "reduce-overhead", backend="inductor")
+    kernels.set_backend("native")
     reference = model(tokens, context, state, reset, prev_tokens=previous)
+    if kernel_backend == "cuda":
+        kernels.prepare_cuda(ctx.device.index or 0)
+    kernels.set_backend(kernel_backend)
+    compiled = compile_window(model, ctx, "reduce-overhead", backend="inductor")
     for _ in range(3):
         actual = compiled(tokens, context, state, reset, prev_tokens=previous)
     torch.testing.assert_close(actual[0], reference[0], atol=1.5e-5, rtol=1.5e-5)
@@ -534,3 +544,46 @@ def test_p1_17_a5_compiled_cuda_matches_eager(
             else:
                 assert got is not None
                 torch.testing.assert_close(got, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_address_init_starts_routes_on_the_byte_codes() -> None:
+    """``model.address_init`` sets the scorer's two address columns for every unit (trainable as
+    before), changes no other parameter, and makes the first routes follow ``a_cur + a_prev``."""
+    base, on = (
+        _cfg("model.key_address=true"),
+        _cfg("model.key_address=true", "model.address_init=1.0"),
+    )
+    assert base.model.address_init is None and config_hash(on) != config_hash(base)
+    from hsn.config import canonical_json
+
+    assert "address_init" not in canonical_json(base)
+    seed_everything(0)
+    plain = HSN.from_config(base)
+    seed_everything(0)
+    model = HSN.from_config(on)
+    weight = model.scorer.net.weight
+    assert weight.requires_grad and torch.equal(weight[:, -2:], torch.ones(base.model.n_units, 2))
+    for (name, a), (_, b) in zip(plain.named_parameters(), model.named_parameters(), strict=True):
+        if name == "router.scorer.net.weight":
+            assert torch.equal(a[:, :-2], b[:, :-2])
+        else:
+            assert torch.equal(a, b), name
+    B, K = 5, base.model.k_select
+    g = torch.Generator().manual_seed(3)
+    tokens = torch.randint(0, 256, (B,), generator=g)
+    previous = torch.randint(0, 256, (B,), generator=g)
+    out = model.eval().step(
+        tokens, torch.zeros(B, dtype=torch.int64), model.init_state(B), prev_tokens=previous
+    )
+    # a fresh state is a document start: the previous byte the scorer sees there is BOS
+    start = torch.full_like(previous, BOS)
+    address = model.scorer.address_features(tokens, start).sum(-1)  # [B, N]: a_cur + a_prev
+    expected = address.topk(K, dim=1).indices.sort(dim=1).values
+    assert out.selection is not None
+    assert torch.equal(out.selection.cell_idx.sort(dim=1).values, expected)
+    for bad in (
+        ("model.address_init=1.0",),
+        ("model.key_address=true", "model.scorer=mlp", "model.address_init=1.0"),
+    ):
+        with pytest.raises(ValueError, match="address_init"):
+            _cfg(*bad)

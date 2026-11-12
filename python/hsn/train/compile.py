@@ -80,19 +80,30 @@ gradients there (an inductor Metal fusion bug in torch 2.15).
 
 from __future__ import annotations
 
+import copy
+import gc
 import itertools
 import logging
 import time
 import types
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from hsn.device import DeviceContext
+from hsn.kernels import window as window_kernels
 from hsn.model.cell import WindowConsts
-from hsn.model.hsn import HSN, SELECTION_RECORD_KEYS, StepMode, _Controls, _stack_record
+from hsn.model.hsn import (
+    HSN,
+    SELECTION_RECORD_KEYS,
+    StepMode,
+    _Controls,
+    _Prologue,
+    _stack_record,
+)
+from hsn.model.router import BUDGET_SLACK
 from hsn.model.state import CellGraphState
 
 __all__ = [
@@ -284,6 +295,7 @@ def _block(
     consts: WindowConsts,
     mode: StepMode,
     controls: _Controls,
+    capture: bool = False,
 ) -> dict[str, Tensor]:
     """A block of consecutive positions (the compile unit): :meth:`HSN._position` at every column
     of ``z_b`` / ``c_b`` / ``s_b`` (``[B, n, …]``) with the column's reset ``r_b[:, i]``, the
@@ -291,7 +303,8 @@ def _block(
     ``(pos [B, n], pos_after [B, n])``: its ages are ``age`` at the block's first position (the
     window's start age in the first block, zeros after) and zeros afterwards, made here, so that
     no tensor is passed twice (dynamo specialises on aliased inputs). Returns the final state and
-    the block's per-position stacks."""
+    the block's per-position stacks; with ``capture`` (a diagnostic, no-grad window) also the
+    per-position cell states, gates and written masks of :meth:`HSN.forward`'s ``capture``."""
     state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
     n = int(z_b.shape[1])
     z_hats: list[Tensor] = []
@@ -302,6 +315,9 @@ def _block(
     logit_steps: list[Tensor] = []
     records: list[dict[str, Tensor]] = []
     readouts: list[Tensor] = []
+    hs: list[Tensor] = []
+    gates: list[Tensor] = []
+    written: list[Tensor] = []
     zero_age = torch.zeros_like(age) if dense_in is not None else None
     for i in range(n):
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
@@ -318,13 +334,18 @@ def _block(
             mode,
             controls,
             dense_rows,
-            False,
+            capture,
             counters,
             static=True,
             consts=consts,
             dense_indices=dense_indices,
         )
         state = result.state
+        if capture:
+            assert result.gate is not None and result.written is not None
+            hs.append(state.h.detach())
+            gates.append(result.gate)
+            written.append(result.written)
         if model.cfg.selected_readout:
             readouts.append(model._selected_readout(state, result.selection, controls.gate, mode))
         z_hats.append(result.z_hat)
@@ -352,7 +373,474 @@ def _block(
             out["sel_" + key] = _stack_record([r[key] for r in records])
     if readouts:
         out["readouts"] = torch.stack(readouts, dim=1)
+    if capture:
+        out["cap_h"] = torch.stack(hs, dim=1)
+        out["cap_gate"] = torch.stack(gates, dim=1)
+        out["cap_written"] = torch.stack(written, dim=1)
     return out
+
+
+#: The parameters autocast casts at every use (the linears of P, S, the scorer, V, the gate,
+#: W_out and the unit bank): the ones a :class:`SweepTwin` holds pre-cast.
+SWEEP_CAST_PREFIXES: tuple[str, ...] = (
+    "predictor.",
+    "shared.",
+    "router.",
+    "cell.V.",
+    "cell.gate.",
+    "cell.W_out.",
+    "cell.units.",
+)
+
+
+class SweepTwin:
+    """The model the split window's forward sweep runs (P2.10): a structural copy of the HSN
+    whose autocast-cast weights (:data:`SWEEP_CAST_PREFIXES`) are held in the autocast dtype and
+    refreshed once per window, and whose other parameters and buffers are the model's own
+    tensors. A compiled block of the model itself casts every such weight at every position
+    (under autograd it has to: the gradients of a window are summed in the fp32 masters) and
+    receives the window's ``W1`` layout as a call argument, which a CUDA graph copies into its
+    input buffer at every block; the sweep needs neither. The twin's values are the model's:
+    the same casts, made once (``tests/kernels/test_p2_10_window.py``). ``sweep_edge`` and
+    ``sweep_w1_flat`` are the window constants as buffers of the twin, so a compiled block reads
+    them at static addresses.
+
+    ``fused`` (``hardware.window=fused``) adds the layouts of the fused sweep
+    (:func:`_fused_tape_block`): ``sweep_w2_flat``, ``W2`` laid out for its second layer
+    (:meth:`~hsn.model.units.UnitBank.forward_static_chosen`), and, when the model's shape
+    allows (:func:`sweep_merge_error`), the merged matrix products: maps that read the same
+    input share one matmul, with the same operands (a map that reads part of the input has
+    zeros elsewhere, which add nothing):
+
+    * ``sweep_front_w1/b1/w2/b2``: ``S`` and ``P`` as one two-layer map of ``[z; q; ctx]``
+      (``P`` reads ``q`` only; the second layer is block-diagonal);
+    * ``sweep_score_w/b``: the scorer's linear with ``V`` as ``d`` more outputs (``V`` reads
+      the state columns of the scorer's features);
+    * ``sweep_w1_gate`` / ``sweep_b1_gate``: the unit bank's first layer with the gate's linear
+      as ``d`` more outputs (:class:`~hsn.model.cell.WindowConsts`).
+
+    Four matmuls per position fewer; the values agree with the separate products to rounding
+    (other matmul shapes)."""
+
+    def __init__(self, model: HSN, dtype: torch.dtype, *, fused: bool = False) -> None:
+        self.model = model
+        self.dtype = dtype
+        self.fused = fused
+        self.merged = fused and sweep_merge_error(model) is None
+        twin = copy.deepcopy(model)
+        twin.requires_grad_(False)
+        self.twin = twin
+        self._cast: list[tuple[Tensor, Tensor]] = []
+        self._shared: list[tuple[nn.Module, str, str]] = []  # (twin owner, leaf, dotted name)
+        masters = dict(model.named_parameters())
+        for name in [n for n, _ in twin.named_parameters()]:
+            owner_name, _, leaf = name.rpartition(".")
+            owner = twin.get_submodule(owner_name)
+            source = masters[name]
+            if source.dtype != dtype and name.startswith(SWEEP_CAST_PREFIXES):
+                target = nn.Parameter(source.detach().to(dtype), requires_grad=False)
+                owner._parameters[leaf] = target
+                self._cast.append((source, target))
+            else:
+                owner._parameters[leaf] = source
+                self._shared.append((owner, leaf, name))
+        self._buffers: list[tuple[nn.Module, str, str]] = []
+        for name, buffer in model.named_buffers():
+            owner_name, _, leaf = name.rpartition(".")
+            owner = twin.get_submodule(owner_name)
+            owner._buffers[leaf] = buffer
+            self._buffers.append((owner, leaf, name))
+        cell = model.cell
+        units = cell.units
+        device = next(model.parameters()).device
+        twin.cell.register_buffer(
+            "sweep_edge",
+            torch.zeros(cell.n_cells, cell.graph.max_in_degree, dtype=dtype, device=device),
+            persistent=False,
+        )
+        twin.cell.units.register_buffer(
+            "sweep_w1_flat",
+            torch.zeros(units.in_dim, units.n_units * units.hidden, dtype=dtype, device=device),
+            persistent=False,
+        )
+        if fused:
+            twin.cell.units.register_buffer(
+                "sweep_w2_flat",
+                torch.zeros(units.hidden, units.n_units * units.d, dtype=dtype, device=device),
+                persistent=False,
+            )
+        if self.merged:
+            pred, shared = model.predictor, model.shared
+            net = cast(nn.Linear, model.router.scorer.net)
+            hidden = shared.hidden + pred.hidden
+            wide = units.n_units * units.hidden + cell.d
+
+            def zeros(*shape: int) -> Tensor:
+                return torch.zeros(*shape, dtype=dtype, device=device)
+
+            twin.register_buffer("sweep_front_w1", zeros(shared.in_dim, hidden), persistent=False)
+            twin.register_buffer("sweep_front_b1", zeros(hidden), persistent=False)
+            twin.register_buffer(
+                "sweep_front_w2", zeros(hidden, shared.out_dim + pred.out_dim), persistent=False
+            )
+            twin.register_buffer(
+                "sweep_front_b2", zeros(shared.out_dim + pred.out_dim), persistent=False
+            )
+            twin.register_buffer(
+                "sweep_score_w", zeros(net.in_features, net.out_features + cell.d), persistent=False
+            )
+            twin.register_buffer(
+                "sweep_score_b", zeros(net.out_features + cell.d), persistent=False
+            )
+            twin.cell.units.register_buffer(
+                "sweep_w1_gate", zeros(units.in_dim, wide), persistent=False
+            )
+            twin.cell.units.register_buffer("sweep_b1_gate", zeros(wide), persistent=False)
+
+    def refresh(self) -> None:
+        """Bring the twin up to the model: the cast weights and the window constants are copied
+        (inside the model's ``cell.window()``, without autograd), the shared tensors re-bound if
+        the model replaced one, the mode followed."""
+        model, twin = self.model, self.twin
+        if twin.training != model.training:
+            twin.train(model.training)
+        for source, target in self._cast:
+            target.copy_(source)
+        masters = dict(model.named_parameters())
+        for owner, leaf, name in self._shared:
+            if owner._parameters[leaf] is not masters[name]:
+                owner._parameters[leaf] = masters[name]
+        buffers = dict(model.named_buffers())
+        for owner, leaf, name in self._buffers:
+            if owner._buffers[leaf] is not buffers[name]:
+                owner._buffers[leaf] = buffers[name]
+        consts = model.cell.window_consts()
+        twin.cell.get_buffer("sweep_edge").copy_(consts.edge_weights)
+        cell, units = model.cell, model.cell.units
+        if self.fused:
+            twin.cell.units.get_buffer("sweep_w2_flat").copy_(units._w2_flat())
+        if not self.merged:
+            twin.cell.units.get_buffer("sweep_w1_flat").copy_(consts.w1_flat)
+            return
+        # the merged layouts (class docstring): the blocks that are zero stay zero
+        pred, shared = model.predictor, model.shared
+        net = cast(nn.Linear, model.router.scorer.net)
+        d, hs, du = pred.in_dim, shared.hidden, shared.out_dim
+        w1 = twin.get_buffer("sweep_front_w1")
+        w1[:, :hs].copy_(shared.fc1.weight.t())
+        w1[d : 2 * d, hs:].copy_(pred.fc1.weight.t())  # P reads q, the middle block of [z; q; ctx]
+        b1 = twin.get_buffer("sweep_front_b1")
+        b1[:hs].copy_(shared.fc1.bias)
+        b1[hs:].copy_(pred.fc1.bias)
+        w2 = twin.get_buffer("sweep_front_w2")
+        w2[:hs, :du].copy_(shared.fc2.weight.t())
+        w2[hs:, du:].copy_(pred.fc2.weight.t())
+        b2 = twin.get_buffer("sweep_front_b2")
+        b2[:du].copy_(shared.fc2.bias)
+        b2[du:].copy_(pred.fc2.bias)
+        m = int(net.out_features)
+        score_w = twin.get_buffer("sweep_score_w")
+        score_w[:, :m].copy_(net.weight.t())
+        score_w[2 * d : 3 * d, m:].copy_(cell.V.weight.t())  # the features are [u; eps; h; ...]
+        twin.get_buffer("sweep_score_b")[:m].copy_(net.bias)
+        mh = units.n_units * units.hidden
+        w1_gate = twin.cell.units.get_buffer("sweep_w1_gate")
+        w1_gate[:, :mh].copy_(consts.w1_flat)
+        w1_gate[:, mh:].copy_(cell.gate.weight.t())
+        b1_gate = twin.cell.units.get_buffer("sweep_b1_gate")
+        b1_gate[:mh].copy_(units.b1.reshape(mh))
+        b1_gate[mh:].copy_(cell.gate.bias)
+
+
+def sweep_merge_error(model: HSN) -> str | None:
+    """Why the fused sweep keeps its matrix products separate for this model (``None``: it
+    merges them, :class:`SweepTwin`). The merged layouts assume the reference shapes: ``S`` and
+    ``P`` two-layer maps with one activation, ``P`` reading the ``q`` block of ``S``'s input, a
+    linear scorer over ``[u; eps; h; ...]`` without excluded features, ``V`` without a bias and
+    a gate that reads the unit bank's input."""
+    pred, shared, cell = model.predictor, model.shared, model.cell
+    scorer = model.router.scorer
+    d = int(model.cfg.d)
+    if type(pred.act) is not type(shared.act) or pred.activation_name != shared.activation_name:
+        return "the predictor and the shared transform use different activations"
+    if pred.in_dim != d or shared.in_dim < 2 * d:
+        return "the predictor does not read the q block of the shared transform's input"
+    if scorer.kind != "linear" or not isinstance(scorer.net, nn.Linear) or scorer.exclude:
+        return "the scorer is not a plain linear map of its features"
+    if scorer.net.bias is None or scorer.net.in_features < 3 * d:
+        return "the scorer's features do not hold the cell states at [2d, 3d)"
+    if cell.V.bias is not None or cell.V.in_features != d:
+        return "the message projection has a bias"
+    if not isinstance(cell.gate, nn.Linear) or cell.gate.in_features != cell.units.in_dim:
+        return "the gate does not read the unit bank's input"
+    if cell.gate.bias is None:
+        return "the gate has no bias"
+    return None
+
+
+def _fused_tape_block(
+    model: HSN,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    pos: Tensor,
+    z_b: Tensor,
+    c_b: Tensor,
+    s_b: Tensor,
+    r_b: Tensor,
+    consts: WindowConsts,
+    controls: _Controls,
+) -> dict[str, Tensor]:
+    """:func:`_tape_block` with the fused glue (P2.10, ``hardware.window=fused``). The matrix
+    products of a position are :meth:`HSN._position`'s own (the shared path, the scorer, and the
+    round's through :meth:`~hsn.model.cell.PDGCell.sparse_products`); what lies between them is
+    two kernels that write the block's tape in place:
+
+    * the decision (:func:`hsn.kernels.window.select_tape`: the router's top-K, budget prefix,
+      threshold and refresh probes with its tie rules) into record ``i`` of the decision tape;
+    * the end of the round (:func:`hsn.kernels.window.update_tape`: candidate, gated update,
+      summary, ages) from record ``i`` of the state tape into record ``i + 1``, with the next
+      position's reset applied, so that record ``i`` is always the pre-round state a position
+      reads and the block's last record is the state it returns.
+
+    No tensor is made per position for the state or the tape, and nothing is stacked. On a
+    :class:`SweepTwin` with merged layouts, maps that read the same input share a matmul: ``S``
+    with ``P``, the scorer with ``V``, the gate with the unit bank's first layer. No autograd,
+    no exploration, no dense-fallback rows (the caller's scope)."""
+    router = model.router
+    B, n = int(z_b.shape[0]), int(z_b.shape[1])
+    N, d = int(h.shape[1]), int(h.shape[2])
+    K = int(model.cfg.k_select)
+    front_w1 = model._buffers.get("sweep_front_w1")
+    front_b1 = model._buffers.get("sweep_front_b1")
+    front_w2 = model._buffers.get("sweep_front_w2")
+    front_b2 = model._buffers.get("sweep_front_b2")
+    score_w = model._buffers.get("sweep_score_w")
+    score_b = model._buffers.get("sweep_score_b")
+    d_u = int(model.shared.out_dim)
+    n_units = int(model.cell.units.n_units)
+    reset = r_b.contiguous()
+    first = reset[:, 0]
+    tape_h = h.new_empty((B, n + 1, N, d))
+    tape_q = q.new_empty((B, n + 1, d))
+    tape_age = age.new_empty((B, n + 1, N))
+    tape_h[:, 0] = h.masked_fill(first[:, None, None], 0)
+    tape_q[:, 0] = q.masked_fill(first[:, None], 0)
+    tape_age[:, 0] = age.masked_fill(first[:, None], 0)
+    cells = age.new_empty((B, n, K))
+    units = age.new_empty((B, n, K))
+    valid = age.new_empty((B, n, K), dtype=torch.bool)
+    refreshed = age.new_empty((B, n, K), dtype=torch.bool)
+    theta = h.new_empty((B, n))
+    h_sel = h.new_empty((B, n, K, d))
+    h_max = h.new_empty((B, n))
+    qs = q.new_empty((B, n, d))
+    limit = float(model.cfg.budget) * (1.0 + BUDGET_SLACK)
+    for i in range(n):
+        h_i, q_i, age_i = tape_h[:, i], tape_q[:, i], tape_age[:, i]
+        z_t = z_b[:, i]
+        x = torch.cat([z_t, q_i, c_b[:, i]], dim=-1)
+        if front_w1 is not None and front_b1 is not None:
+            assert front_w2 is not None and front_b2 is not None
+            hidden = model.shared.act(torch.addmm(front_b1, x, front_w1))
+            both = torch.addmm(front_b2, hidden, front_w2)
+            u, z_hat = both[:, :d_u], both[:, d_u:]
+        else:
+            z_hat = model.predictor(q_i)
+            u = model.shared(x)
+        u_s, eps_s = u.to(h.dtype), (z_t - z_hat).to(h.dtype)
+        feats = model.scorer._assemble(u_s, eps_s, h_i, age_i, s_b[:, i])
+        vh: Tensor | None = None
+        if score_w is not None and score_b is not None:
+            scored = torch.addmm(score_b, feats.reshape(B * N, -1), score_w)
+            logits = scored[:, :n_units].reshape(B, N, n_units).to(h.dtype)
+            vh = scored[:, n_units:].reshape(B, N, d)
+        else:
+            logits = router(feats).to(h.dtype)
+        window_kernels.select_tape(
+            logits,
+            tape_age,
+            router.cost_table,
+            cells,
+            units,
+            valid,
+            theta,
+            refreshed,
+            t=i,
+            age_max=int(router.age_max),
+            probes=controls.probes,
+            lambda_cost=float(router.lambda_cost),
+            cell_overhead=float(router.cell_overhead),
+            shared_cost=float(router.shared_cost),
+            limit=limit,
+        )
+        state_i = CellGraphState._make(h=h_i, q=q_i, age=age_i, pos=pos)
+        gate, y = model.cell.sparse_products(
+            u_s, eps_s, state_i, cells[:, i], units[:, i], valid[:, i], consts, vh=vh
+        )
+        window_kernels.update_tape(
+            model.cell, y, gate, tape_h, tape_q, tape_age, cells, valid, reset, h_sel, h_max, qs,
+            t=i,
+        )  # fmt: skip
+    # the position counter: positions since the row's last reset in the block, or pos + n
+    steps = torch.arange(1, n + 1, device=pos.device, dtype=pos.dtype)
+    last = (reset.to(pos.dtype) * steps).amax(dim=1)
+    return {
+        "h": tape_h[:, n].contiguous(),
+        "q": tape_q[:, n].contiguous(),
+        "age": tape_age[:, n].contiguous(),
+        "pos": torch.where(last > 0, n + 1 - last, pos + n),
+        "tape_h": tape_h[:, :n],
+        "tape_q": tape_q[:, :n],
+        "tape_age": tape_age[:, :n],
+        "tape_hsel": h_sel,
+        "tape_theta": theta,
+        "qs": qs,
+        "sel_cell_idx": cells,
+        "sel_unit_idx": units,
+        "sel_valid": valid,
+        "explored": theta.new_zeros(n),
+        "refreshed": refreshed.float().sum(dim=2).mean(dim=0),
+        "state_abs_max": h_max.amax(dim=0),
+    }
+
+
+#: The per-position stacks of :func:`_tape_block` that are joined over a window (the final state
+#: aside): per-row values ``[B, n, …]`` and per-position batch statistics ``[n]``.
+TAPE_KEYS: tuple[str, ...] = (
+    "tape_h",
+    "tape_q",
+    "tape_age",
+    "tape_hsel",
+    "tape_theta",
+    "qs",
+    "sel_cell_idx",
+    "sel_unit_idx",
+    "sel_valid",
+    "explored",
+    "refreshed",
+    "state_abs_max",
+)
+
+
+def _tape_block(
+    model: HSN,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    pos: Tensor,
+    z_b: Tensor,
+    c_b: Tensor,
+    s_b: Tensor,
+    r_b: Tensor,
+    consts: WindowConsts | None,
+    mode: StepMode,
+    controls: _Controls,
+    fused: bool = False,
+    dense_rows: Tensor | None = None,
+    dense_indices: Tensor | None = None,
+) -> dict[str, Tensor]:
+    """A block of consecutive positions of the split window's forward sweep (P2.10,
+    :mod:`hsn.train.split`): :func:`_block` without autograd and with a tape. Per position it
+    applies the column's reset itself, records the pre-round state (``tape_h [B, n, N, d]``,
+    ``tape_q [B, n, d]``, ``tape_age [B, n, N]``: what the position's scorer, cell and predictor
+    read), runs :meth:`HSN._position` (the capturable routed round) and records the decision
+    (``sel_cell_idx`` / ``sel_unit_idx`` / ``sel_valid`` ``[B, n, K]``, the straight-through
+    threshold ``tape_theta [B, n]``), the summary after the position (``qs``) and the updated
+    states of the selected slots (``tape_hsel [B, n, K, d]``, cell 0 on padded slots). The replay
+    recomputes everything else with autograd from these. Sparse hard-gate rounds
+    (:func:`hsn.train.split.scope_error`); the rows of ``dense_rows`` (P2.2's dense fallback,
+    with ``dense_indices`` as in :func:`_block`) run the dense round, as in any window. ``fused``
+    (``hardware.window=fused``, no dense rows) is :func:`_fused_tape_block`: the same tape with
+    the glue between the matrix products as two kernels that write it in place.
+    ``consts=None``: ``model`` is a :class:`SweepTwin`'s twin and the window constants are its
+    buffers."""
+    if consts is None:
+        bank = model.cell.units
+        w1_gate = bank._buffers.get("sweep_w1_gate") if fused else None
+        if w1_gate is not None:  # a fused twin with merged products: W1 is its first columns
+            consts = WindowConsts(
+                edge_weights=model.cell.get_buffer("sweep_edge"),
+                w1_flat=w1_gate[:, : bank.n_units * bank.hidden],
+                w2_flat=bank.get_buffer("sweep_w2_flat"),
+                w1_gate=w1_gate,
+                b1_gate=bank.get_buffer("sweep_b1_gate"),
+            )
+        else:
+            consts = WindowConsts(
+                edge_weights=model.cell.get_buffer("sweep_edge"),
+                w1_flat=bank.get_buffer("sweep_w1_flat"),
+                w2_flat=bank._buffers.get("sweep_w2_flat") if fused else None,
+            )
+    if fused:
+        return _fused_tape_block(model, h, q, age, pos, z_b, c_b, s_b, r_b, consts, controls)
+    state = CellGraphState._make(h=h, q=q, age=age, pos=pos)
+    n = int(z_b.shape[1])
+    d = int(h.shape[-1])
+    h_pre: list[Tensor] = []
+    q_pre: list[Tensor] = []
+    age_pre: list[Tensor] = []
+    h_sel: list[Tensor] = []
+    thetas: list[Tensor] = []
+    qs: list[Tensor] = []
+    cells: list[Tensor] = []
+    units: list[Tensor] = []
+    valids: list[Tensor] = []
+    explored: list[Tensor] = []
+    refreshed: list[Tensor] = []
+    state_maxima: list[Tensor] = []
+    for i in range(n):
+        state = state.reset(r_b[:, i])
+        h_pre.append(state.h)
+        q_pre.append(state.q)
+        age_pre.append(state.age)
+        result = model._position(
+            state,
+            None,
+            z_b[:, i],
+            c_b[:, i],
+            s_b[:, i],
+            mode,
+            controls,
+            dense_rows,
+            False,
+            None,
+            static=True,
+            consts=consts,
+            dense_indices=dense_indices,
+        )
+        state = result.state
+        assert result.selection is not None
+        sel = result.selection
+        safe = sel.cell_idx.masked_fill(~sel.valid, 0)
+        h_sel.append(state.h.gather(1, safe[:, :, None].expand(-1, -1, d)))
+        assert sel.threshold is not None
+        thetas.append(sel.threshold)
+        qs.append(state.q)
+        cells.append(sel.cell_idx)
+        units.append(sel.unit_idx)
+        valids.append(sel.valid)
+        explored.append(sel.explored.any(dim=1).float().mean())
+        refreshed.append(sel.refreshed.float().sum(dim=1).mean())
+        state_maxima.append(state.h.abs().amax())
+    return {
+        "h": state.h,
+        "q": state.q,
+        "age": state.age.contiguous(),
+        "pos": state.pos.contiguous(),
+        "tape_h": torch.stack(h_pre, dim=1),
+        "tape_q": torch.stack(q_pre, dim=1),
+        "tape_age": torch.stack(age_pre, dim=1),
+        "tape_hsel": torch.stack(h_sel, dim=1),
+        "tape_theta": torch.stack(thetas, dim=1),
+        "qs": torch.stack(qs, dim=1),
+        "sel_cell_idx": torch.stack(cells, dim=1),
+        "sel_unit_idx": torch.stack(units, dim=1),
+        "sel_valid": torch.stack(valids, dim=1),
+        "explored": torch.stack(explored),
+        "refreshed": torch.stack(refreshed),
+        "state_abs_max": torch.stack(state_maxima),
+    }
 
 
 def _cat_record(parts: Sequence[Tensor]) -> Tensor:
@@ -362,11 +850,13 @@ def _cat_record(parts: Sequence[Tensor]) -> Tensor:
 
 class CompiledWindow:
     """The compiled training window (:func:`compile_window`): called like
-    :meth:`HSN.forward` (``tokens``, ``ctx``, ``state``, ``reset``; ``capture`` refused,
-    ``reset_columns`` validated and otherwise unused, since every block resets as tensor ops) and
-    returning the same ``(logits, state, info)``. ``compile_seconds`` accumulates the wall time of
-    the calls that compiled or recorded (the first call of each new variant), ``calls`` counts
-    calls."""
+    :meth:`HSN.forward` (``tokens``, ``ctx``, ``state``, ``reset``; ``reset_columns`` validated
+    and otherwise unused, since every block resets as tensor ops) and returning the same
+    ``(logits, state, info)``. ``capture=True`` is the diagnostic window (the per-position cell
+    states, gates and written masks of :meth:`HSN.forward`): its own compiled variant, without
+    gradients only (a training window never captures). ``compile_seconds`` accumulates the wall
+    time of the calls that compiled or recorded (the first call of each new variant), ``calls``
+    counts calls."""
 
     def __init__(self, model: HSN, ctx: DeviceContext, mode: CompileMode, backend: Backend) -> None:
         self.model = model
@@ -376,15 +866,23 @@ class CompiledWindow:
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
         self._block = _compiler(mode, backend, ctx.device.type)(_block)
         self._bucket_blocks: dict[int, Any] = {0: self._block}
+        #: The capture variant's compiled blocks (their own code objects and recompile budgets).
+        self._capture_blocks: dict[int, Any] = {}
+        #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
+        #: compiled function for the native round and one for the fused round.
+        self._tape_blocks: dict[tuple[bool, bool, int], Any] = {}
+        self._sweep_twins: dict[tuple[torch.dtype, bool], SweepTwin] = {}
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
 
-    def variant(self, B: int, T: int, dense_bucket: int) -> tuple[object, ...]:
+    def variant(
+        self, B: int, T: int, dense_bucket: int, capture: bool = False
+    ) -> tuple[object, ...]:
         """What selects a compiled graph: batch, block, grad mode, training mode, gate, autocast
-        and the padded dense-fallback batch size."""
+        and the padded dense-fallback batch size (and the diagnostic capture)."""
         model = self.model
-        return (
+        key: tuple[object, ...] = (
             B,
             block_size(T),
             torch.is_grad_enabled(),
@@ -393,10 +891,11 @@ class CompiledWindow:
             torch.is_autocast_enabled(self.ctx.device.type),
             dense_bucket,
         )
+        return (*key, "capture") if capture else key
 
-    def is_new_variant(self, B: int, T: int, dense_bucket: int) -> bool:
+    def is_new_variant(self, B: int, T: int, dense_bucket: int, capture: bool = False) -> bool:
         """True when the next call with these properties compiles (or records) a graph."""
-        key = self.variant(B, T, dense_bucket)
+        key = self.variant(B, T, dense_bucket, capture)
         warm = (*key, "warm")
         if self.cuda_graphs:  # CUDA Graph trees warm up once, then record on the second call
             return key not in self._variants or warm not in self._variants
@@ -414,10 +913,12 @@ class CompiledWindow:
         prev_tokens: Tensor | None = None,
     ) -> WindowOut:
         model = self.model
-        if capture:
+        if not isinstance(capture, bool):
+            raise TypeError(f"capture must be a bool, got {capture!r}")
+        if capture and torch.is_grad_enabled():
             raise ValueError(
-                "capture=True runs eager: call the model's forward (the compiled window returns "
-                "no per-position states)"
+                "capture=True is the diagnostic window: call it under torch.no_grad() (a "
+                "training window returns no per-position states), or call the model's forward"
             )
         B, T = model._check_window_inputs(tokens, ctx, state, reset)
         if reset_columns is not None:
@@ -427,11 +928,20 @@ class CompiledWindow:
         dense_indices = model._dense_indices(dense_rows, bucket=True)
         dense_bucket = 0 if dense_indices is None else int(dense_indices.numel())
         controls = model._controls()
-        key = self.variant(B, T, dense_bucket)
-        new = self.is_new_variant(B, T, dense_bucket)
+        key = self.variant(B, T, dense_bucket, capture)
+        new = self.is_new_variant(B, T, dense_bucket, capture)
         started = time.perf_counter()
         out = self._run(
-            tokens, ctx, state, reset, mode, controls, dense_rows, prev_tokens, dense_indices
+            tokens,
+            ctx,
+            state,
+            reset,
+            mode,
+            controls,
+            dense_rows,
+            prev_tokens,
+            dense_indices,
+            capture=capture,
         )
         self.calls += 1
         if new:
@@ -440,6 +950,105 @@ class CompiledWindow:
             self.compile_seconds += time.perf_counter() - started
             self._variants.add((*key, "warm") if key in self._variants else key)
         return out
+
+    def release(self) -> None:
+        """Drop the recorded CUDA graphs of every compiled variant and return their memory pools
+        to the card (P2.10). A recorded graph keeps all of its intermediate tensors for as long
+        as it exists; the soft warm-up's window (every cell and unit, with autograd) holds
+        5.6 GB that way on the A6 recipe, and after the switch to the split window nothing calls
+        it again. The variants that are still needed (the forward sweep, evaluation) compile
+        from inductor's cache and record again on their next call, which counts as a compile
+        step. Without CUDA graphs there is nothing to release."""
+        if not self.cuda_graphs:
+            return
+        from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+
+        torch._dynamo.reset()
+        reset_cudagraph_trees()
+        self._block = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
+        self._bucket_blocks = {0: self._block}
+        self._capture_blocks = {}
+        self._tape_blocks = {}
+        self._variants.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def tape(
+        self,
+        pro: _Prologue,
+        state: CellGraphState,
+        reset: Tensor,
+        *,
+        fused: bool = False,
+        twin: bool = True,
+        dense_rows: Tensor | None = None,
+        dense_indices: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """The split window's forward sweep (P2.10, :mod:`hsn.train.split`): the compiled
+        :func:`_tape_block` over the window, under ``torch.no_grad()`` in training mode. Returns
+        :func:`run_tape`'s tape, cloned out of CUDA-graph memory (the next replay overwrites
+        it). Counted in ``calls`` and, on the calls that compile or record, ``compile_seconds``
+        like any other variant. The sweep runs a :class:`SweepTwin` (``twin=False``: the model
+        itself, for the tests; the fused sweep then keeps its matrix products separate)."""
+        model = self.model
+        B, T = (int(n) for n in reset.shape)
+        use_twin = twin
+        bucket = 0 if dense_indices is None else int(dense_indices.numel())
+        key: tuple[object, ...] = (
+            B,
+            block_size(T),
+            model.training,
+            model._controls().gate,
+            torch.is_autocast_enabled(self.ctx.device.type),
+            "tape-fused" if fused else "tape",
+            use_twin,
+            bucket,
+        )
+        warm = (*key, "warm")
+        new = key not in self._variants or (self.cuda_graphs and warm not in self._variants)
+        started = time.perf_counter()
+        # as the autograd window: one compiled function per padded dense-fallback batch size
+        slot = (fused, use_twin, bucket)
+        if slot not in self._tape_blocks:
+            self._tape_blocks[slot] = _compiler(self.mode, self.backend, self.ctx.device.type)(
+                _tape_block
+            )
+        sweep: SweepTwin | None = None
+        if use_twin:
+            # the dtype autocast casts to in this call (the masters' own without autocast)
+            device_type = self.ctx.device.type
+            dtype = (
+                torch.get_autocast_dtype(device_type)
+                if torch.is_autocast_enabled(device_type)
+                else next(model.parameters()).dtype
+            )
+            if (dtype, fused) not in self._sweep_twins:
+                self._sweep_twins[dtype, fused] = SweepTwin(model, dtype, fused=fused)
+            sweep = self._sweep_twins[dtype, fused]
+        if self.cuda_graphs:
+            torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
+        tape = run_tape(
+            self._tape_blocks[slot],
+            model,
+            pro,
+            state,
+            reset,
+            block_size(T),
+            fused=fused,
+            twin=sweep,
+            dense_rows=dense_rows,
+            dense_indices=dense_indices,
+        )
+        if self.cuda_graphs:  # the final state would be overwritten by the next replay
+            for name in ("h", "q", "age", "pos"):
+                tape[name] = tape[name].clone()
+        self.calls += 1
+        if new:
+            if self.cuda_graphs:
+                torch.cuda.synchronize(self.ctx.device)
+            self.compile_seconds += time.perf_counter() - started
+            self._variants.add(warm if key in self._variants else key)
+        return tape
 
     def _run(
         self,
@@ -452,6 +1061,8 @@ class CompiledWindow:
         dense_rows: Tensor | None,
         prev_tokens: Tensor | None = None,
         dense_indices: Tensor | None = None,
+        *,
+        capture: bool = False,
     ) -> WindowOut:
         model = self.model
         T = int(tokens.shape[1])
@@ -472,13 +1083,12 @@ class CompiledWindow:
             q = q.detach().requires_grad_(True)
         blocks: list[dict[str, Tensor]] = []
         bucket = 0 if dense_indices is None else int(dense_indices.numel())
-        if bucket not in self._bucket_blocks:
+        table = self._capture_blocks if capture else self._bucket_blocks
+        if bucket not in table:
             # Each shape bucket has its own Dynamo code object/recompile budget. A B32 window
             # needs at most six fallback shapes, independent of which row IDs were drawn.
-            self._bucket_blocks[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(
-                _block
-            )
-        block = self._bucket_blocks[bucket]
+            table[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
+        block = table[bucket]
         with model.cell.window():
             consts = model.cell.window_consts()
             for start in range(0, T, blk):
@@ -503,6 +1113,7 @@ class CompiledWindow:
                     consts,
                     mode,
                     controls,
+                    capture,
                 )
                 h, q, age, pos = out["h"], out["q"], out["age"], out["pos"]
                 blocks.append(out)
@@ -525,14 +1136,87 @@ class CompiledWindow:
             epss=joined("eps"),
             us=joined("u"),
             qs=joined("qs"),
-            hs=None,
+            hs=joined("cap_h") if capture else None,
             state_abs_max=torch.cat([b["state_abs_max"] for b in blocks]),
             unit_logits=joined("unit_logits_d"),
             routed=routed,
-            gates=None,
-            written=None,
+            gates=joined("cap_gate") if capture else None,
+            written=joined("cap_written") if capture else None,
             readouts=joined("readouts") if model.cfg.selected_readout else None,
         )
+
+
+def run_tape(
+    block: Callable[..., dict[str, Tensor]],
+    model: HSN,
+    pro: _Prologue,
+    state: CellGraphState,
+    reset: Tensor,
+    blk: int,
+    *,
+    fused: bool = False,
+    twin: SweepTwin | None = None,
+    dense_rows: Tensor | None = None,
+    dense_indices: Tensor | None = None,
+) -> dict[str, Tensor]:
+    """The forward sweep of a split window (:func:`_tape_block` as ``block``, compiled or not)
+    over blocks of ``blk`` positions, without autograd: the joined tape (:data:`TAPE_KEYS`) and
+    the final state (``h``, ``q``, ``age``, ``pos``). The prologue's stacks are read detached.
+    With a ``twin`` the blocks run the twin (refreshed here) and read its window constants."""
+    if torch.is_grad_enabled():
+        raise RuntimeError("the split window's forward sweep runs under torch.no_grad()")
+    T = int(reset.shape[1])
+    mode = model._window_mode()
+    # The sweep takes the hard decision only (gate=None): the same slots, threshold and probes
+    # as the step's gate, whose gradient path (the soft unit weights and cell mask) the replay
+    # rebuilds from the recorded slots. Nothing here would read it.
+    controls = model._controls()._replace(gate=None)
+    n_blocks = T // blk
+
+    def by_block(x: Tensor) -> Tensor:
+        # [B, T, ...] -> [T / blk, B, blk, ...], one dense copy per window. A block's inputs
+        # are then dense tensors: a CUDA-graph replay copies a strided input by the byte
+        # extent it spans (torch._inductor.output_code.copy_strided_storage_), and a column
+        # slice of a window spans nearly the whole window, 195 MB per step over 16 blocks.
+        return x.reshape(x.shape[0], n_blocks, blk, *x.shape[2:]).transpose(0, 1).contiguous()
+
+    z_blocks = by_block(pro.z.detach())
+    context_blocks = by_block(pro.context.detach())
+    scalar_blocks = by_block(pro.scalars.detach())
+    reset_blocks = by_block(reset)
+    h, q, age, pos = state.h, state.q, state.age, state.pos
+    blocks: list[dict[str, Tensor]] = []
+    with model.cell.window():
+        consts: WindowConsts | None = None
+        runner = model
+        if twin is not None:
+            twin.refresh()
+            runner = twin.twin
+        else:
+            consts = model.cell.window_consts()
+        for index in range(n_blocks):
+            out = block(
+                runner,
+                h,
+                q,
+                age,
+                pos,
+                z_blocks[index],
+                context_blocks[index],
+                scalar_blocks[index],
+                reset_blocks[index],
+                consts,
+                mode,
+                controls,
+                fused,
+                dense_rows,
+                dense_indices,
+            )
+            h, q, age, pos = out["h"], out["q"], out["age"], out["pos"]
+            blocks.append(out)
+    tape = {key: _cat_record([b[key] for b in blocks]) for key in TAPE_KEYS}
+    tape.update(h=h, q=q, age=age, pos=pos)
+    return tape
 
 
 def _eager_window(model: HSN) -> Callable[..., WindowOut]:

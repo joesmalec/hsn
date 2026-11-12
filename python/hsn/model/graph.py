@@ -294,17 +294,20 @@ class CellGraph(nn.Module):
         *,
         weights: Tensor | None = None,
         validate: bool = True,
+        vh: Tensor | None = None,
     ) -> Tensor:
         """``m [B, K, d]`` for the cells ``cell_idx [B, K]`` only (int64, in ``[0, N)``; repeats
         are allowed). ``V`` is still applied once to all ``N`` cells — any cell may be a source —
         and only the selected rows gather. The range check synchronises with the device once per
         call; ``validate=False`` (P2.8, the capturable round, whose indices come from
         :meth:`Router.select`) skips it and keeps the shape, dtype and device checks. ``weights``
-        as in :meth:`messages_dense`."""
+        as in :meth:`messages_dense`. ``vh`` (P2.10, the forward sweep) is ``V(h_prev)``
+        ``[B, N, d]`` already computed by the caller (in a matmul it shares with the scorer);
+        ``V`` is then not applied here."""
         B, _, d = self._check_h(h_prev)
         K = self._check_cell_idx(cell_idx, B, check_values=validate)
         D = self._max_in_degree
-        Vh: Tensor = V(h_prev)  # [B, N, d]
+        Vh: Tensor = V(h_prev) if vh is None else vh  # [B, N, d]
         padded = self._padded_weights_as(Vh.dtype) if weights is None else weights.to(Vh.dtype)
         weights_sel = padded[cell_idx]  # [B, K, D_max]
         source_idx = self._pad_src[cell_idx].reshape(B, K * D, 1).expand(B, K * D, d)

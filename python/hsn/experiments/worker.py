@@ -39,6 +39,8 @@ compiles alone and fills the shared inductor cache (``TORCHINDUCTOR_CACHE_DIR``,
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
 import signal
@@ -86,6 +88,31 @@ class WorkerOptions:
     inductor_cache: Path | None = (
         None  # None: $TORCHINDUCTOR_CACHE_DIR, else <db dir>/inductor-cache
     )
+    turn_file: Path | None = None
+    turn_owner: str | None = None
+    telemetry_max_samples: int = 0  # opt-in, bounded per-run card time series
+
+
+def turn_remaining(path: Path | None, owner: str | None, now: float) -> float:
+    """Fail closed on a missing/expired/unclaimed compute turn. No clock-only handoff."""
+    if path is None:
+        return math.inf
+    try:
+        turn = json.loads(path.read_text())
+        start, end = parse_time(turn.get("start")), parse_time(turn.get("end"))
+        if (
+            not owner
+            or turn.get("owner") != owner
+            or turn.get("status") != "active"
+            or turn.get("released_at") is not None
+            or start is None
+            or end is None
+            or not start.timestamp() <= now < end.timestamp()
+        ):
+            return 0.0
+        return end.timestamp() - now
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0
 
 
 @dataclass
@@ -98,6 +125,31 @@ class _Watch:
     first: float = field(default_factory=time.time)
     last: float = field(default_factory=time.time)
     flushed: float = 0.0
+    telemetry: list[dict[str, Any]] = field(default_factory=list)
+    telemetry_dropped: int = 0
+
+    def sample_telemetry(
+        self,
+        reading: machine_module.GpuReading,
+        progress: dict[str, Any],
+        process_mib: float | None,
+        limit: int,
+    ) -> None:
+        available = reading.ok and reading.present
+        self.telemetry.append(
+            {
+                "time": reading.time,
+                "step": progress.get("step"),
+                "phase": progress.get("phase", "training_or_setup"),
+                "utilization_pct": reading.utilization_pct if available else None,
+                "device_memory_mib": reading.used_mib if available else None,
+                "process_memory_mib": process_mib if available else None,
+            }
+        )
+        if len(self.telemetry) > limit:
+            excess = len(self.telemetry) - limit
+            del self.telemetry[:excess]
+            self.telemetry_dropped += excess
 
     def card(self, adopted: bool) -> dict[str, Any]:
         return {
@@ -109,6 +161,11 @@ class _Watch:
             "foreign_cpu": list(self.cpu_foreign.values()),
             "own_with": sorted(self.own_with),
             "watch_incomplete": adopted,
+            **(
+                {"telemetry": self.telemetry, "telemetry_dropped": self.telemetry_dropped}
+                if self.telemetry
+                else {}
+            ),
         }
 
     def status(self) -> str:
@@ -154,6 +211,10 @@ class Worker:
         self.db = db
         self.root = Path(root)
         self.opt = options
+        if options.telemetry_max_samples < 0:
+            raise ValueError("telemetry_max_samples must be nonnegative")
+        if (options.turn_file is None) != (options.turn_owner is None):
+            raise ValueError("turn_file and turn_owner must be supplied together")
         self.machine = machine
         self.python = python
         self.log = log
@@ -173,6 +234,7 @@ class Worker:
         self.stopping = False
         self.last_wait = ""
         self.arms: dict[str, dict[str, Any]] = {}
+        self.deadlines_sent: dict[int, tuple[int, float]] = {}  # pgid -> (exp_id, signal time)
 
     # lifecycle -------------------------------------------------------------------------------
 
@@ -203,10 +265,63 @@ class Worker:
         return 0
 
     def poll(self) -> None:
+        self.enforce_deadlines()
         self.reap()
         self.recover()
         card = self.observe()
         self.launch(card)
+
+    def enforce_deadlines(self) -> None:
+        """Independent watchdog: timeout signal, then kill the owned group after ten seconds."""
+        now = time.time()
+        remaining = turn_remaining(self.opt.turn_file, self.opt.turn_owner, now)
+        for exp in self.db.running(host=self.host):
+            if int(exp["exp_id"]) not in self.children and int(exp["exp_id"]) not in self.adopted:
+                continue
+            protocol = loads(exp.get("protocol_json")) or {}
+            if protocol.get("name") != "spike_diagnostic" or exp["pid"] is None:
+                continue
+            start = parse_time(exp["started_at"] or exp["claimed_at"])
+            if start is None:
+                continue
+            expired = now >= start.timestamp() + float(protocol["timeout_s"])
+            if not expired and remaining > 15:
+                continue
+            pid, pgid = int(exp["pid"]), int(exp["pgid"] or exp["pid"])
+            if pgid in self.deadlines_sent:
+                continue
+            if self.machine.pid_alive(pid, exp["pid_start"]):
+                self.db.set_paused(True)
+                try:
+                    os.kill(pid, signal.SIGALRM)
+                except ProcessLookupError:
+                    pass
+                self.deadlines_sent[pgid] = (int(exp["exp_id"]), now)
+                self.log(f"exp {exp['exp_id']}: diagnostic deadline; queue paused")
+        # The child's own alarm may have recorded failure between polls. Its compiler children
+        # can still own CUDA after the parent exits, so include those finishing groups as well.
+        for pgid, exp_id in self.own_pgids.items():
+            if pgid in self.deadlines_sent:
+                continue
+            exp = self.db.experiment(exp_id)
+            protocol = loads(exp.get("protocol_json")) or {}
+            if protocol.get("name") != "spike_diagnostic" or exp["status"] != "failed":
+                continue
+            if "TimeoutError" in (exp.get("error") or ""):
+                self.db.set_paused(True)
+                self.deadlines_sent[pgid] = (exp_id, now)
+        if self.deadlines_sent:
+            alive = set(self.machine.process_groups().values())
+            for pgid, (exp_id, sent) in list(self.deadlines_sent.items()):
+                if pgid not in alive:
+                    del self.deadlines_sent[pgid]
+                elif now - sent >= 10:
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    dbm.mark_failed(self.db, exp_id, "diagnostic timeout: process group killed")
+                    del self.deadlines_sent[pgid]
 
     # reap and recover ------------------------------------------------------------------------
 
@@ -238,6 +353,12 @@ class Worker:
                     "UPDATE experiments SET exit_code = ? WHERE exp_id = ?", (code, exp_id)
                 )
             self._flush(exp_id, final=True)
+            protocol = loads(exp.get("protocol_json")) or {}
+            if (
+                protocol.get("name") == "spike_diagnostic"
+                and self.db.experiment(exp_id)["status"] != "done"
+            ):
+                self.db.set_paused(True)
 
     def recover(self) -> list[int]:
         """Mark this host's running rows with no live process failed; returns their ids."""
@@ -268,6 +389,8 @@ class Worker:
                 expect_pid=None if pid is None else int(pid),
             )
             if self.db.experiment(exp_id)["status"] == "failed":
+                if (loads(row.get("protocol_json")) or {}).get("name") == "spike_diagnostic":
+                    self.db.set_paused(True)
                 gone.append(exp_id)
                 self.log(f"exp {exp_id}: {why}" + (f"; requeued as exp {new}" if new else ""))
                 self._flush(exp_id, final=True)
@@ -337,6 +460,14 @@ class Worker:
             w = self.watch[exp_id]
             w.samples += 1
             w.last = now
+            if self.opt.telemetry_max_samples > 0:
+                progress = loads(r["progress_json"]) or {}
+                w.sample_telemetry(
+                    reading,
+                    progress,
+                    by_group.get(int(r["pgid"]), 0.0) if r["pgid"] is not None else None,
+                    self.opt.telemetry_max_samples,
+                )
             if r["pgid"] is not None:
                 w.peak_mib = max(w.peak_mib, by_group.get(int(r["pgid"]), 0.0))
             for p in foreign:
@@ -401,6 +532,12 @@ class Worker:
         decision_box: dict[str, Any] = {}
 
         def choose(queue: list[dict[str, Any]], running: list[dict[str, Any]]) -> int | None:
+            if self.opt.turn_file is not None:
+                protocol = loads(queue[0].get("protocol_json")) or {}
+                budget = protocol.get("timeout_s")
+                remaining = turn_remaining(self.opt.turn_file, self.opt.turn_owner, time.time())
+                if budget is None or remaining < float(budget) + 30:
+                    return None
             head = int(queue[0]["exp_id"])
             if head != self.head:
                 self.head, self.head_bypassed = head, 0
@@ -413,6 +550,8 @@ class Worker:
                 )
                 for q in queue
             ]
+            if (loads(queue[0].get("protocol_json")) or {}).get("name") == "spike_diagnostic":
+                items = items[:1]  # dependencies run strictly in insertion order; no bypass
             runs = [
                 RunningItem(
                     int(r["exp_id"]),

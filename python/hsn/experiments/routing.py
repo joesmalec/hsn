@@ -262,6 +262,7 @@ def route_check(
     n_docs: int = 1000,
     cpu: bool = False,
     batch_rows: int = 64,
+    checkpoint_step: int | None = None,
 ) -> dict[str, Any]:
     """``route-check --exp N``: :func:`route_follow` on the experiment's latest checkpoint, on its
     dev documents (``split="dev"``) or the first ``n_docs`` delayed training documents
@@ -283,7 +284,9 @@ def route_check(
     )
     if not run_dir:
         raise ValueError(f"experiment {exp_id} has no run directory and no stored result")
-    _exp, _params, ctx, dev, checkpoint, model = _restored(db, exp_id, Path(run_dir), cpu=cpu)
+    _exp, _params, ctx, dev, checkpoint, model = _restored(
+        db, exp_id, Path(run_dir), cpu=cpu, checkpoint_step=checkpoint_step
+    )
     if split == "train":
         arm = db.arm(exp["arm_id"])
         cfg = RunConfig.model_validate(loads(exp.get("config_json") or arm["config_json"]))
@@ -301,6 +304,7 @@ def route_check(
         "exp_id": exp_id,
         "label": exp["label"],
         "checkpoint": str(checkpoint),
+        "checkpoint_step": checkpoint_step,
         "split": split,
         "keys": "seen in training (in-sample)" if split == "train" else "never seen in training",
         "device": str(ctx.device),

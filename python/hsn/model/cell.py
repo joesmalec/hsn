@@ -75,6 +75,7 @@ from torch import Tensor, nn
 
 from hsn import kernels
 from hsn.config import ModelConfig
+from hsn.kernels import native as native_ops
 from hsn.kernels.native import selection_mask
 from hsn.model.embeddings import init_weight_
 from hsn.model.graph import CellGraph
@@ -96,6 +97,15 @@ class WindowConsts(NamedTuple):
 
     edge_weights: Tensor
     w1_flat: Tensor
+    #: ``W2`` laid out ``[H, M·d]`` (:meth:`UnitBank._w2_flat`), for the forward sweep's
+    #: :meth:`PDGCell.sparse_products` (P2.10); ``None``: built where it is read.
+    w2_flat: Tensor | None = None
+    #: The forward sweep's merged first layer (P2.10): ``w1_flat`` followed by the gate's weight
+    #: as ``d`` more columns, ``[4d, M·H + d]``, and the matching bias ``[M·H + d]``. The gate's
+    #: linear and the unit bank's first layer read the same normalised input, so one matmul
+    #: serves both (:meth:`UnitBank.forward_static_chosen`'s rider). ``None``: two matmuls.
+    w1_gate: Tensor | None = None
+    b1_gate: Tensor | None = None
 
 
 def _mix(alpha: Tensor, unit_out: Tensor) -> Tensor:
@@ -179,6 +189,11 @@ class PDGCell(nn.Module):
         if self.disabled_cells:
             disabled[list(self.disabled_cells)] = True
         self.register_buffer("disabled", disabled, persistent=False)
+        #: A6 (``train.feedback_detach`` holds ``state``; set by :class:`~hsn.model.hsn.HSN`): the
+        #: units, the gate and the messages read a detached copy of the pre-round ``h``, so the
+        #: only gradient a round passes back into ``h`` is the carry ``(1 - b) * h``. The values
+        #: are unchanged.
+        self.detach_state_read = False
         #: P1.10e: True inside :meth:`window`, whose caller (``HSN.forward``) validated the window
         #: once: the rounds then skip their per-call shape / dtype / device checks.
         self._in_window = False
@@ -246,9 +261,11 @@ class PDGCell(nn.Module):
         w1_flat = None if consts is None else consts.w1_flat
         with self.graph.step():
             h_prev = state.h
-            m = self.graph.messages_dense(h_prev, self.V, weights=weights)  # [B, N, d]
+            # A6: what the round reads of the state (the carry below keeps the state itself)
+            h_read = h_prev.detach() if self.detach_state_read else h_prev
+            m = self.graph.messages_dense(h_read, self.V, weights=weights)  # [B, N, d]
             v_raw = torch.cat(
-                [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_prev, m], dim=-1
+                [u[:, None, :].expand(B, N, d), eps[:, None, :].expand(B, N, d), h_read, m], dim=-1
             )  # [B, N, 4d]
             v = self.norm(v_raw)  # P1.5a: what the units and the gate read
             unit_out = self.units.forward_all(v, w1_flat=w1_flat)  # [B, N, M, d] ([M, B·N, d])
@@ -336,13 +353,15 @@ class PDGCell(nn.Module):
         with self.graph.step():
             with profiler_segment(profiler, "messages", B):
                 h_prev = state.h
+                # A6: what the round reads of the state (the update below keeps the state itself)
+                h_read = h_prev.detach() if self.detach_state_read else h_prev
                 if static or weights is not None:  # P2.8: no range check, window weights
                     m = native.csr_messages(
-                        h_prev, self.graph, self.V, cells, weights=weights, validate=not static
+                        h_read, self.graph, self.V, cells, weights=weights, validate=not static
                     )
                 else:
-                    m = native.csr_messages(h_prev, self.graph, self.V, cells)  # [B, K, d]
-                v_raw = native.gather_concat(u, eps, h_prev, m, cells)  # [B, K, 4d]
+                    m = native.csr_messages(h_read, self.graph, self.V, cells)  # [B, K, d]
+                v_raw = native.gather_concat(u, eps, h_read, m, cells)  # [B, K, 4d]
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
@@ -373,6 +392,8 @@ class PDGCell(nn.Module):
                     state, cells, c, b, valid, validate=not static
                 )
         h_old = v_raw[..., 2 * d : 3 * d]  # the gathered h[cell] slice of the raw v
+        if self.detach_state_read:  # A6: the returned slots keep the carry's gradient
+            h_old = h_prev.gather(1, cells.unsqueeze(-1).expand(B, K, d))
         h_new = torch.where(valid.unsqueeze(-1), (1 - b) * h_old + b * c, h_old).to(state.dtype)
         info: dict[str, Tensor | CellGraphState] = {
             "m": m,
@@ -387,6 +408,116 @@ class PDGCell(nn.Module):
             "state": new_state,
         }
         return h_new, info
+
+    def sparse_products(
+        self,
+        u: Tensor,
+        eps: Tensor,
+        state: CellGraphState,
+        cells: Tensor,
+        units: Tensor,
+        valid: Tensor,
+        consts: WindowConsts,
+        *,
+        vh: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """The matrix products of :meth:`step_sparse`'s capturable round and nothing after them
+        (P2.10, the fused forward sweep): ``(gate, y)``, each ``[B, K, d]`` in the state's dtype,
+        the gate's pre-activation and ``W_out`` of the chosen unit's output. Messages, inputs,
+        norm, the gate's linear and ``W_out`` are :meth:`step_sparse`'s own calls in its order
+        (``static=True``); the unit bank runs :meth:`UnitBank.forward_static_chosen` (the static
+        pass's first layer, then only the chosen unit's activation and second layer: the same
+        values to rounding); the candidate norm, ``tanh``, the sigmoid and the state update are
+        left to the caller (:func:`hsn.kernels.window.cell_update`). No disabled cells, no
+        autograd. Two of the products can ride in a neighbour's matmul, with the same operands:
+        ``vh`` is ``V(h)`` ``[B, N, d]`` from the caller (the sweep computes it with the scorer,
+        which reads the same states), and ``consts.w1_gate`` / ``b1_gate`` put the gate's linear
+        into the unit bank's first layer."""
+        if self.disabled_cells:
+            raise ValueError("PDGCell.sparse_products does not support model.disabled_cells")
+        B, _, d = (int(n) for n in state.h.shape)
+        K = int(cells.shape[1])
+        native = kernels.ops()
+        cells = torch.where(valid, cells, torch.zeros_like(cells))
+        units = torch.where(valid, units, torch.zeros_like(units))
+        with self.graph.step():
+            h_read = state.h
+            if vh is None:
+                m = native.csr_messages(
+                    h_read, self.graph, self.V, cells, weights=consts.edge_weights, validate=False
+                )
+            else:  # V(h) came with the scorer's matmul: the native path's gather of the sources
+                m = self.graph.messages_selected(
+                    h_read, self.V, cells, weights=consts.edge_weights, validate=False, vh=vh
+                )
+            v = self.norm(native.gather_concat(u, eps, h_read, m, cells))
+            flat = v.reshape(B * K, 4 * d)
+            w2_flat = consts.w2_flat if consts.w2_flat is not None else self.units._w2_flat()
+            if consts.w1_gate is not None and consts.b1_gate is not None:
+                unit_out, rider = self.units.forward_static_chosen(
+                    flat,
+                    units.reshape(B * K),
+                    w1_flat=consts.w1_gate,
+                    w2_flat=w2_flat,
+                    b1_flat=consts.b1_gate,
+                )
+                assert rider is not None
+                gate = rider.reshape(B, K, d).to(state.dtype)
+            else:
+                gate = self.gate(v).to(state.dtype)
+                unit_out, _ = self.units.forward_static_chosen(
+                    flat, units.reshape(B * K), w1_flat=consts.w1_flat, w2_flat=w2_flat
+                )
+            y = self.W_out(unit_out.reshape(B, K, d)).to(state.dtype)
+        return gate, y
+
+    def replay_sparse(
+        self, u: Tensor, eps: Tensor, h_read: Tensor, sel: Selection
+    ) -> tuple[Tensor, Tensor]:
+        """The candidate and the gate of :meth:`step_sparse` without the state update (P2.10, the
+        split window's replay): ``(c, b)``, each ``[R, K, d]`` in ``h_read``'s dtype, for ``R``
+        independent rows (every position of a window at once). ``h_read [R, N, d]`` is the recorded
+        pre-round state, read as a constant (A6's ``state`` cut: the replay is only defined with
+        it); ``sel`` is the recorded decision with its gradient path
+        (:meth:`hsn.model.router.Router.finish_recorded`). The same operations as
+        :meth:`step_sparse` in the same order: messages, inputs, norm, gate, the unit bank's
+        grouped pass (one unit per pair, :meth:`UnitBank.forward_grouped`), ``W_out``, the
+        candidate norm, ``tanh``. Only inside :meth:`window` (the edge weights and ``W1`` layout
+        are the window's)."""
+        if not self._in_window:
+            raise RuntimeError("PDGCell.replay_sparse is only available inside PDGCell.window()")
+        if self.disabled_cells:
+            raise ValueError("PDGCell.replay_sparse does not support model.disabled_cells")
+        R, _, d = (int(n) for n in h_read.shape)
+        K = sel.k
+        dtype = h_read.dtype
+        valid = sel.valid
+        cells = torch.where(valid, sel.cell_idx, torch.zeros_like(sel.cell_idx))
+        units = torch.where(valid, sel.unit_idx, torch.zeros_like(sel.unit_idx))
+        h_const = h_read.detach()
+        graph = self.graph
+        D = graph.max_in_degree
+        with graph.step():
+            # the messages of CellGraph.messages_selected with V applied to the gathered sources
+            # only (the same rows of the same product): the state is a constant here, so nothing
+            # has to be scattered back over all N cells in the backward
+            index = graph._pad_src[cells].reshape(R, K * D, 1).expand(R, K * D, d)
+            sources = self.V(h_const.gather(1, index)).reshape(R, K, D, d)
+            edge_weights = graph._padded_weights_as(sources.dtype)[cells]  # [R, K, D_max]
+            m = (sources * edge_weights[..., None]).sum(dim=2)
+            v_raw = native_ops.gather_concat(u, eps, h_const, m, cells)  # [R, K, 4d]
+            v = self.norm(v_raw)
+            b = torch.sigmoid(self.gate(v).to(dtype))
+            unit_out = self.units.forward_grouped(
+                v.reshape(R * K, 4 * d), units.reshape(R * K)
+            ).reshape(R, K, d)
+            if self.cand_norm_kind == "none":
+                mixed = sel.alpha.unsqueeze(-1) * unit_out
+                c = torch.tanh(self.W_out(mixed).to(dtype))
+            else:
+                pre = self.cand_norm(self.W_out(unit_out).to(dtype))
+                c = torch.tanh(sel.alpha.unsqueeze(-1).to(dtype) * pre)
+        return c, b
 
     # ----------------------------------------------------------------------------------------------
     # Accounting and validation

@@ -520,8 +520,13 @@ def test_p2_5_runs_on_all_backends(device_type: str) -> None:
     from hsn.kernels import native
 
     assert kernels.ops() is native
-    with pytest.raises(NotImplementedError, match="P2.10"):
+    if kernels.cuda_ops.available():
         kernels.set_backend("cuda")
+        assert kernels.ops() is kernels.cuda_ops
+        kernels.set_backend("native")
+    else:
+        with pytest.raises(RuntimeError, match="P2.10 CUDA artifacts missing"):
+            kernels.set_backend("cuda")
     with pytest.raises(NotImplementedError, match="P2.11"):
         kernels.set_backend("metal")
     with pytest.raises(ValueError, match="unknown kernel backend"):

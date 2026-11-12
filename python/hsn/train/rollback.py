@@ -60,6 +60,7 @@ class RollbackPolicy:
     lr_mult: float = 1.0  # learning-rate factor after a rollback
     lr_steps: int = 0  # steps the factor lasts
     max_rollbacks: int = 5  # the run stops at its max_rollbacks + 1-th trigger
+    selection: str = "oldest"
 
     def __post_init__(self) -> None:
         if isinstance(self.every, bool) or not isinstance(self.every, int) or self.every < 1:
@@ -70,6 +71,8 @@ class RollbackPolicy:
             raise ValueError(f"rollback lr_mult must lie in (0, 1], got {self.lr_mult}")
         if self.max_rollbacks < 1:
             raise ValueError(f"rollback max_rollbacks must be >= 1, got {self.max_rollbacks}")
+        if self.selection not in ("oldest", "guard_horizon"):
+            raise ValueError(f"unknown rollback selection {self.selection!r}")
 
     @classmethod
     def from_config(cls, train: TrainConfig) -> RollbackPolicy | None:
@@ -82,6 +85,7 @@ class RollbackPolicy:
             lr_mult=train.rollback_lr_mult,
             lr_steps=train.rollback_lr_steps,
             max_rollbacks=train.rollback_max,
+            selection=train.rollback_selection,
         )
 
 
@@ -150,12 +154,17 @@ class Snapshot:
 
 
 class SnapshotRing:
-    """The two newest snapshots of a model and its optimiser (module docstring)."""
+    """The newest ``capacity`` snapshots (two by default), restored from the oldest slot."""
 
-    def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer) -> None:
+    def __init__(
+        self, model: nn.Module, optimizer: torch.optim.Optimizer, *, capacity: int = 2
+    ) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 2:
+            raise ValueError("snapshot capacity must be an integer >= 2")
         self.model = model
         self.optimizer = optimizer
-        self.slots: list[Snapshot] = []  # oldest first, at most two
+        self.capacity = capacity
+        self.slots: list[Snapshot] = []  # oldest first
 
     @property
     def steps(self) -> list[int]:
@@ -178,10 +187,10 @@ class SnapshotRing:
         return model, keys, tensors, other
 
     def take(self, step: int, spike_history: Iterable[float] = ()) -> Snapshot:
-        """Copy the live state into a slot: a new one while fewer than two exist, else the oldest
+        """Copy the live state into a slot: a new one while below capacity, else the oldest
         one's buffers (reallocated only when the layout changed, e.g. optimiser state appeared)."""
         model, keys, tensors, other = self._live()
-        reuse = self.slots.pop(0) if len(self.slots) == 2 else None
+        reuse = self.slots.pop(0) if len(self.slots) == self.capacity else None
         layout = (
             tuple((t.shape, t.dtype, t.device) for t in model),
             tuple(keys),
@@ -206,12 +215,18 @@ class SnapshotRing:
         self.slots.append(snap)
         return snap
 
-    def restore(self) -> Snapshot:
-        """Restore the oldest snapshot (the older of two; the only one otherwise) in place and drop
-        every newer one; returns it. Raises when the ring is empty."""
+    def restore(self, *, at_or_before: int | None = None) -> Snapshot:
+        """Restore the oldest snapshot, or the newest preceding a requested horizon.
+
+        If none precedes it, use the oldest available snapshot. Keep only the selected
+        anchor: snapshots on the abandoned trajectory must not be selected later.
+        This is an age-based selection, not a guarantee of a healthy weight state.
+        """
         if not self.slots:
             raise RuntimeError("no snapshot to roll back to")
         snap = self.slots[0]
+        if at_or_before is not None:
+            snap = next((s for s in reversed(self.slots) if s.step <= at_or_before), snap)
         self.slots = [snap]
         model = _model_tensors(self.model)
         _copy_into(model, snap.model)

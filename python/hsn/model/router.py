@@ -322,9 +322,11 @@ class Scorer(nn.Module):
     is given; :attr:`ema` views them and :meth:`load_ema` writes them (module docstring).
 
     A5: ``key_address`` appends ``a_cur`` and ``a_prev`` after ``one``, giving ``3d+10``
-    features. ``seed`` is required then and seeds fixed byte codes and cell addresses without
-    changing the global RNG or the existing scorer columns. The code buffers travel with the
-    checkpoint; the previous byte comes from the caller and is never stored in the scorer.
+    features (``model.address_init``: the value their two columns start at, for every unit; the
+    default is the random init of the other columns). ``seed`` is required then and seeds fixed
+    byte codes and cell addresses without changing the global RNG or the existing scorer columns.
+    The code buffers travel with the checkpoint; the previous byte comes from the caller and is
+    never stored in the scorer.
     """
 
     #: State-dict version (``nn.Module`` convention): 2 since P2.3 added the EMA buffers.
@@ -399,6 +401,12 @@ class Scorer(nn.Module):
             extra = first.weight.new_empty(first.out_features, 2)
             std = 1 / math.sqrt(self.in_features) if cfg.init == "fan_in" else parse_init(cfg.init)
             nn.init.trunc_normal_(extra, std=std, a=-2 * std, b=2 * std, generator=generator)
+            if cfg.address_init is not None:
+                # The address columns start at one value for every unit (model.address_init): a
+                # route then follows the byte codes from the first step, and which feature a unit
+                # follows at which byte class is left to training. The draw above is kept, so the
+                # generator's later use is the same either way.
+                extra = torch.full_like(extra, float(cfg.address_init))
             first.weight = nn.Parameter(torch.cat([first.weight.detach(), extra], dim=1))
             first.in_features = self.in_features
             if isinstance(self.net, MLP2):
@@ -764,6 +772,10 @@ class Selection:
     explored: Tensor
     refreshed: Tensor
     dense_fallback: Tensor
+    #: P2.10 (the split window's tape): the detached straight-through threshold ``θ [B]`` of the
+    #: scored decision before the probes; ``None`` where no threshold exists (the unscored modes,
+    #: ``dense``). Never read by the round itself.
+    threshold: Tensor | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -947,6 +959,8 @@ class Router(nn.Module):
         self.n_units = scorer.n_units
         self.age_max = scorer.age_max  # the refresh-probe threshold (model.age_max)
         self.lambda_cost = float(lambda_cost)
+        #: ``train.unit_credit``: "softmax" (P2.2) or "executed" (:meth:`set_unit_credit`).
+        self.unit_credit = "softmax"
         self.costs = costs
         self.cell_overhead = costs.cell_overhead
         self.shared_cost = costs.shared
@@ -1011,6 +1025,17 @@ class Router(nn.Module):
         with profiler.segment("scorer", tokens=n_tokens):
             logits: Tensor = self.scorer(feats)
         return logits
+
+    def set_unit_credit(self, mode: str) -> None:
+        """``train.unit_credit`` (opt-in; the hard values never change): which scores the
+        straight-through unit weight of a chosen unit differentiates. ``"softmax"``: the softmax
+        over the cell's units (P2.2), whose gradient lowers every other unit's score where the
+        chosen unit's weight is raised. ``"executed"``: the chosen unit's score only; the others
+        enter that softmax as constants, so a unit that did not run gets no gradient from the
+        slot. The soft warm-up and dense-fallback rows, where every unit runs, keep the softmax."""
+        if mode not in ("softmax", "executed"):
+            raise ValueError(f"unit_credit must be 'softmax' or 'executed', got {mode!r}")
+        self.unit_credit = mode
 
     def scores(self, logits: Tensor) -> Tensor:
         """``U − λ_cost · c`` per (cell, unit), fp32 ``[B, N, M]``."""
@@ -1569,8 +1594,15 @@ class Router(nn.Module):
         explored: Tensor,
         refreshed: Tensor,
         dense: Tensor | None,
+        executed_scores: bool = False,
     ) -> Selection:
-        """The gradient-path tensors of a sparse decision (module docstring) and the Selection."""
+        """The gradient-path tensors of a sparse decision (module docstring) and the Selection.
+
+        ``executed_scores`` (:meth:`finish_recorded`): a cell's score is read at the unit that
+        ran it instead of at the largest of ``scores``. In :meth:`select` the two are one unit
+        (the decision was taken from these ``scores``); for a recorded decision ``scores`` are
+        recomputed and may round a near-tie the other way, which would hand the cell mask's
+        gradient to a unit that did not run."""
         B, N, M = (int(s) for s in logits.shape)
         K = int(cells.shape[1])
         device = logits.device
@@ -1584,11 +1616,19 @@ class Router(nn.Module):
         delta = torch.where(valid, units - unit_argmax.gather(1, cells), torch.zeros_like(units))
         unit_full = unit_argmax.scatter_add(1, cells, delta)  # the chosen unit per cell
         unit_hard = F.one_hot(unit_full, M).to(torch.float32)  # [B, N, M]
-        cell_scores = scores.amax(dim=-1)  # [B, N], autograd intact
+        if executed_scores:  # the chosen unit's score: the executed unit on the selected cells
+            cell_scores = scores.gather(2, unit_full[:, :, None]).squeeze(2)
+        else:
+            cell_scores = scores.amax(dim=-1)  # [B, N], autograd intact
         if gate is None:
             cell_mask, unit_weights = hard_mask, unit_hard
         else:
-            soft_units = torch.softmax(scores / tau, dim=-1)
+            if self.unit_credit == "executed" and gate != "soft":
+                # the chosen unit's score with its graph, the other units' as constants
+                live = unit_hard > 0.0
+                soft_units = torch.softmax(torch.where(live, scores, scores.detach()) / tau, dim=-1)
+            else:
+                soft_units = torch.softmax(scores / tau, dim=-1)
             if scored:
                 assert threshold is not None
                 soft_mask = torch.sigmoid((cell_scores - threshold[:, None]) / tau)
@@ -1648,6 +1688,54 @@ class Router(nn.Module):
             dense_fallback=(
                 dense if dense is not None else torch.zeros(B, dtype=torch.bool, device=device)
             ),
+            threshold=threshold,
+        )
+
+    def finish_recorded(
+        self,
+        logits: Tensor,
+        cells: Tensor,
+        units: Tensor,
+        valid: Tensor,
+        threshold: Tensor,
+        *,
+        mode: SelectionMode,
+        gate: GateMode | None,
+        temperature: float = 1.0,
+        dense_rows: Tensor | None = None,
+        executed_scores: bool = True,
+    ) -> Selection:
+        """The :class:`Selection` of a decision that was already taken (P2.10, the split window's
+        replay): ``cells`` / ``units`` / ``valid`` (``[B, K]``) and the threshold ``θ [B]`` are the
+        recorded values of :meth:`select` on these rows, ``logits [B, N, M]`` the scorer's logits
+        recomputed with autograd. Nothing is decided again: the hard values (``alpha``, the masks,
+        the cost) follow the recorded slots exactly, and ``logits`` only supply the gradient path
+        of ``gate`` (:meth:`_finish`). No probes are flagged (``explored`` / ``refreshed`` are
+        the recording's). ``dense_rows`` (bool ``[B]``) are the rows that ran the dense step
+        instead (:meth:`select`'s ``dense_rows``)."""
+        B, N, _ = self._check_logits(logits)
+        dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
+        if mode not in SCORED_MODES:
+            raise ValueError(f"finish_recorded needs a scored mode {SCORED_MODES}, got {mode!r}")
+        tau = self._check_gate_args(mode, gate, temperature, 0.0)
+        K = int(cells.shape[1])
+        device = logits.device
+        none = torch.zeros(B, K, dtype=torch.bool, device=device)
+        return self._finish(
+            logits,
+            self.scores(logits),
+            cells,
+            units,
+            valid,
+            mode=mode,
+            gate=gate,
+            tau=tau,
+            threshold=threshold,
+            log_prob=torch.zeros(B, dtype=torch.float32, device=device),
+            explored=none,
+            refreshed=none,
+            dense=dense,
+            executed_scores=executed_scores,
         )
 
     @staticmethod

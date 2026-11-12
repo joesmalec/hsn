@@ -25,8 +25,9 @@ it already refuses the embedding backward, so MPS with ``train.deterministic=tru
 unsupported.
 
 Dtypes follow §3.7: the state is the fp32 master and ``u``, ``ε``, ``h`` share its dtype; under
-autocast the messages, the gate ``b``, the candidate ``c`` and the unit outputs come back in the
-autocast dtype (fp16 on MPS, bf16 on CUDA), exactly as on the dense path. :func:`gather_concat`
+autocast the gate ``b``, the candidate ``c`` and the unit outputs come back in the autocast dtype
+(fp16 on MPS, bf16 on CUDA), exactly as on the dense path. Messages follow the reduction policy:
+CUDA autocast promotes their final sum to fp32. :func:`gather_concat`
 casts the messages to the state dtype explicitly (the promotion ``torch.cat`` applies on the dense
 path) and :func:`gated_delta_update` evaluates the gated expression with the dense path's operand
 dtypes and casts the result to the state dtype before the scatter, so ``h``, ``q`` and ``v`` always
@@ -166,7 +167,9 @@ def grouped_unit_mlp(
     autocast and ``v``'s dtype otherwise. ``static=True`` (P2.8, the capturable round) runs
     :meth:`UnitBank.forward_static` instead (every unit on the pairs, then a gather: static
     shapes, no host-side histogram, indices not checked), with the window's ``w1_flat`` when
-    given; it agrees with the grouped pass to rounding."""
+    given; it agrees with the grouped pass to rounding. CUDA autocast rounds the activation
+    and intermediate gradients in reduced precision; the CUDA adapter retains this native
+    path because the raw single-dtype ABI's fp32 intermediates do not match that contract."""
     if not isinstance(bank, UnitBank):
         raise TypeError(f"bank must be a UnitBank, got {type(bank).__name__}")
     v_t = _check_tensor("v", v)
@@ -202,7 +205,7 @@ def csr_messages(
     gather of each selected cell's sources, weights ``a_ij``). ``cell_idx [B, K]`` is int64 in
     ``[0, N)`` (checked there, one device synchronisation, unless ``validate=False``: P2.8's
     capturable round). ``weights`` are a compiled window's padded edge weights (P2.8). The
-    messages have ``V(h)``'s dtype."""
+    messages have ``V(h)``'s dtype except that CUDA autocast promotes their sum to fp32."""
     if not isinstance(graph, CellGraph):
         raise TypeError(f"graph must be a CellGraph, got {type(graph).__name__}")
     if not isinstance(V, nn.Linear):

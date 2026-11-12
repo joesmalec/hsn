@@ -195,7 +195,7 @@ def _split_cells(
     return {**{c: entry.get(c) for c in SPLIT_COLUMNS}, "split_src": str(entry.get("tier", ""))}
 
 
-def _failure_cell(failure: Any, partial: Any) -> str:
+def _failure_cell(failure: Any, partial: Any, latest_saved: Any = None) -> str:
     """``<reason> @ <last step>``, and P1.16's ``; partial from step X (dev <acc>)`` when the
     failed attempt was re-scored from a kept checkpoint."""
     if not isinstance(failure, Mapping):
@@ -205,6 +205,10 @@ def _failure_cell(failure: Any, partial: Any) -> str:
         acc = (partial.get("final") or {}).get("dev_accuracy")
         dev = f" (dev {acc:.4f})" if isinstance(acc, int | float) else ""
         cell += f"; partial from step {partial['from_step']}{dev}"
+    if isinstance(latest_saved, Mapping) and latest_saved.get("from_step") is not None:
+        acc = (latest_saved.get("final") or {}).get("dev_accuracy")
+        dev = f" (dev {acc:.4f})" if isinstance(acc, int | float) else ""
+        cell += f"; latest saved step {latest_saved['from_step']}{dev} (diagnostic)"
     return cell
 
 
@@ -250,7 +254,7 @@ def _per_seed_row(
         "write_rate": (trained or {}).get("gate/write_rate"),
         "step_s": step_time.get("run_median_s"),
         "early_stop": f"{stopped['outcome']} @ {stopped['step']}" if stopped else "",
-        "failure": _failure_cell(failure, record.get("partial")),
+        "failure": _failure_cell(failure, record.get("partial"), record.get("latest_saved")),
         "train_s": row["train_s"] if row["train_s"] is not None else walls.get("fit_s"),
         "total_s": row["total_s"],
         "compile_s": walls.get("compile_s"),
