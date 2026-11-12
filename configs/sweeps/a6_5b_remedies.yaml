@@ -189,6 +189,24 @@ arms:
       - train.lambda_b=0.5
       - train.aux_enabled=[balance]
       - hardware.window=fused
+  - name: fused_softwarm_k8 # the paper's "reconsider sparsity": eight slots, so that the reader's
+    family: hsn # cells and the value writer's cells both fit at a value position
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - hardware.window=fused
+  - name: fused_softwarm_temp2 # a softer straight-through temperature after the switch (the
+    family: hsn # sharper ones made the takeover worse)
+    overrides:
+      - train.soft_until_step=1000
+      - train.temperature_start=2.0
+      - train.temperature_end=2.0
+      - hardware.window=fused
+  - name: fused_softwarm2000 # a warm-up twice as long
+    family: hsn
+    overrides:
+      - train.soft_until_step=2000
+      - hardware.window=fused
   - name: split_softwarm_dense05 # dense-fallback rows: the split window (the fused one has none)
     family: hsn
     overrides:
