@@ -259,3 +259,12 @@ baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which ba
     n_heads: 4 # attention heads
     ffn_hidden: 768 # MLP hidden width (4 x d_model)
     dropout: 0.0 # embeddings, attention, residual branches
+  selective_ssm: # Mamba-style control (model_name: selective_ssm); 1,887,744 parameters measured
+    d_model: 256 # residual width
+    n_layers: 4 # Mamba blocks
+    d_state: 16 # state per channel of the selective scan
+    d_conv: 4 # taps of the causal depthwise convolution
+    expand: 2 # inner width = expand x d_model
+    dt_rank: null # rank of the step-size path; null = d_model / 16
+  address_input: false # the HSN's fixed byte codes (A5) as an input of the baselines (a control)
+  address_dim: 64 # width of those codes; 64 = the recipe's model.d, the router's own table
