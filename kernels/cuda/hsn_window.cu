@@ -853,3 +853,6 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
     __syncthreads();
     if (tid == 0) *h_max = __int_as_float(*top);
 }
+
+/* The trainer's per-step passes (P2.10b) share this fatbin and its launcher. */
+#include "hsn_trainer.cu"
