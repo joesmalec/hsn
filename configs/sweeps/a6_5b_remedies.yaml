@@ -195,6 +195,14 @@ arms:
       - train.soft_until_step=1000
       - model.k_select=8
       - hardware.window=fused
+  - name: fused_softwarm_k8_balance # the two arms that held on seeds 2 and 3, together
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
   - name: fused_softwarm_temp2 # a softer straight-through temperature after the switch (the
     family: hsn # sharper ones made the takeover worse)
     overrides:
