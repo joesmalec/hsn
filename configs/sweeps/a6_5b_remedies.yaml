@@ -203,6 +203,25 @@ arms:
       - train.lambda_b=0.02
       - train.aux_enabled=[balance]
       - hardware.window=fused
+  # the same mechanisms without the warm-up: which of the three ingredients carries the result
+  - name: fused_k8
+    family: hsn
+    overrides:
+      - model.k_select=8
+      - hardware.window=fused
+  - name: fused_balance
+    family: hsn
+    overrides:
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_k8_balance
+    family: hsn
+    overrides:
+      - model.k_select=8
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
   - name: fused_softwarm_temp2 # a softer straight-through temperature after the switch (the
     family: hsn # sharper ones made the takeover worse)
     overrides:
