@@ -355,11 +355,97 @@ runs add:
 - *The two-layer scorer* does not learn to switch between the two rankings inside one unit in
   9,000 steps; *a softer temperature* and *a longer warm-up* leave the takeover as it is.
 
-**Twelve seeds** of the control, eight slots, balance 0.02 and the two together were running
-when this was written (11 Nov, 22:20 MST; `fused_softwarm*` in the database, `python3 night.py`
-beside it). Counts so far, runs with later queries at 80 % or more: control 2 of 6, eight slots
-2 of 3, balance 3 of 3, both 1 of 3. The fused window without the warm-up (`fused_baseline`,
-six seeds): 87.6 % mean, 3 of 6 at 80 % or more, 2 of 6 fell 10 pp or more.
+**Twelve seeds, and one more arm** (the night of 11 to 12 Nov; every run on the fused window,
+9,000 steps, diagnostics off; `fused_softwarm*`, `fused_balance*` and `fused_baseline` in the
+database, summarised by `tools/final_table.py` beside it; the routes of each run at five
+checkpoints in `night_runs.txt`):
+
+| Arm | Runs | Mean final dev | Range | Mean later queries | Later queries at 80 % or more | Pass the binding verdict | Fell 10 pp or more | Drawdown under 5 pp | Worst drawdown |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `fused_softwarm`: the control (warm-up only) | 12 | 81.3 % | 61.4 % to 90.5 % | 72.7 % | 4 of 12 | 2 of 12 | 2 of 12 | 9 of 12 | 13.5 pp |
+| `fused_softwarm_k8`: eight cells selected | 7 | 86.0 % | 80.4 % to 90.1 % | 79.2 % | 4 of 7 | 1 of 7 | 0 of 7 | 6 of 7 | 8.2 pp |
+| `fused_softwarm_balance`: balance loss, `lambda_b=0.02` | 12 | 85.4 % | 72.4 % to 94.7 % | 80.5 % | 9 of 12 | 6 of 12 | 5 of 12 | 5 of 12 | 16.7 pp |
+| `fused_softwarm_balance01`: `lambda_b=0.01` | 6 | 82.5 % | 73.4 % to 90.1 % | 74.1 % | 2 of 6 | 3 of 6 | 2 of 6 | 3 of 6 | 14.3 pp |
+| `fused_softwarm_balance_decay60`: balance 0.02, rate decay from step 3,600 | 3 | 81.8 % | 77.4 % to 90.3 % | 75.9 % | 1 of 3 | 2 of 3 | 1 of 3 | 2 of 3 | 11.3 pp |
+| `fused_softwarm_k8_balance`: eight cells and balance 0.02 | 5 | 86.7 % | 77.3 % to 98.6 % | 79.2 % | 1 of 5 | 1 of 5 | 1 of 5 | 4 of 5 | 13.6 pp |
+| `fused_softwarm_executed`: executed credit alone (opt-in candidate) | 6 | 84.6 % | 80.7 % to 91.5 % | 77.0 % | 1 of 6 | 1 of 6 | 1 of 6 | 5 of 6 | 11.2 pp |
+| `fused_softwarm_balance_executed`: balance 0.02 and executed credit (opt-in candidate) | 12 | 87.1 % | 67.6 % to 93.7 % | 83.2 % | 9 of 12 | 8 of 12 | 2 of 12 | 9 of 12 | 26.4 pp |
+| `fused_baseline`: no warm-up, nothing added | 6 | 87.6 % | 79.7 % to 94.8 % | 79.5 % | 3 of 6 | 2 of 6 | 2 of 6 | 2 of 6 | 16.9 pp |
+| `fused_balance`: no warm-up, balance 0.02 | 6 | 84.2 % | 76.2 % to 95.6 % | 74.7 % | 2 of 6 | 1 of 6 | 2 of 6 | 3 of 6 | 11.6 pp |
+| `fused_balance_executed`: no warm-up, balance 0.02 and executed credit (opt-in candidate) | 6 | 79.9 % | 68.9 % to 92.4 % | 71.6 % | 1 of 6 | 1 of 6 | 2 of 6 | 2 of 6 | 20.8 pp |
+
+"Later queries at 80 % or more" is the working mark for a run that binds keys (the key-blind
+level is 62 %); the binding verdict is the stricter probe (the answer follows a swapped key).
+Final dev by seed, in per cent, seeds in order:
+
+- control: 83.4, 79.8, 89.0, 68.7, 88.8, 82.2, 90.5, 83.7, 79.3, 87.3, 61.4, 81.8
+- eight slots: 87.3, 80.4, 89.9, 86.2, 81.9, 86.0, 90.1
+- balance 0.02: 94.7, 86.5, 89.2, 87.5, 83.9, 89.7, 72.4, 92.1, 78.4, 84.9, 77.5, 88.5
+- balance 0.02 with executed credit:
+  93.5, 86.4, 93.7, 91.3, 84.9, 91.8, 83.3, 93.3, 67.6, 81.0, 89.1, 89.0
+
+What the arms show:
+
+- *The control on twelve seeds.* Four runs of twelve end with later queries at 80 % or more (two
+  of six on the autograd window), two pass the binding verdict, two fall 10 pp or more, nine
+  stay under a 5 pp drawdown; the mean is 81.3 %. The fused window without the warm-up: 87.6 %
+  on six seeds, two falls of six, two of six under 5 pp. The warm-up alone gives fewer and
+  smaller falls for a lower mean: the plateau, as on the first six seeds.
+- *Balance 0.02 on twelve seeds.* Nine runs of twelve end with later queries at 80 % or more, and
+  five of the twelve fall 10 pp or more on the way. The reader stays off the value positions, as
+  on seeds 2 and 3. What goes wrong instead is that a third unit takes them: on seed 1 unit 7's
+  share goes to unit 0 between steps 3,000 and 5,000 and the binding overlap falls from 0.62 to
+  0.29 (dev 87 % to 74 %, 86.5 % at the end); on seed 6 unit 0 ends with 73 % of them, the
+  overlap falls from 0.41 to 0.13 and the run ends at 72.4 %. The falls start between steps
+  3,000 and 4,500, at the peak rate (the decay starts at step 7,200).
+- *Half the weight, and an earlier decay.* `lambda_b=0.01`: two of six, two falls. The rate decay
+  from step 3,600 instead of 7,200 (`train.decay_fraction=0.6`): two of three runs stay on the
+  plateau (77.4 % and 77.6 %); the peak rate is also what lets a run leave it. Both arms were
+  stopped there.
+- *Eight slots* on seven seeds: no fall (worst drawdown 8.2 pp), four of seven at 80 % or more,
+  one of seven passes the binding verdict. With the balance loss as well: one of five.
+- *Balance 0.02 with executed credit* (`fused_softwarm_balance_executed`;
+  `train.unit_credit=executed` is the opt-in candidate of section 3, not a paper mechanism and
+  not adopted). Twelve seeds: 87.1 % mean final dev, nine at 80 % or more on the later queries,
+  the binding verdict passed by eight, nine with a worst drawdown under 5 pp, two falls (seed 8:
+  93 % at step 3,000, 67.6 % at the end; seed 9: 15.6 pp, back to 81.0 %). On seeds 0 to 5 it met
+  the three points of section 5b's rule (no fall, worst drawdown 4.6 pp, four of six pass the
+  verdict); on twelve it does not meet "no fall". Each part does here what it did alone: the
+  balance loss keeps the reader off the value positions, and executed credit stops a unit that
+  lost slots from being pushed down by the unit that took them.
+- *Which part carries it.* Executed credit alone with the warm-up, six seeds: 84.6 %, one run of
+  six at 80 % or more, one fall: it keeps routes and does not form the binding, as in the
+  morning's runs. The balance loss alone forms it and does not keep it (above). The two without
+  the warm-up (`fused_balance_executed`), six seeds: 79.9 %, one of six at 80 % or more, two
+  falls (20.8 pp), below the fused window with nothing added (87.6 %, three of six). The balance
+  loss without the warm-up (`fused_balance`), six seeds: 84.2 %, two of six, two falls. Both
+  need the warm-up. A reading, not a measurement: the balance loss acts on the even start the
+  warm-up leaves, and executed credit keeps whatever the first steps produce, good or bad.
+- *What is left* (seed 8 of the candidate; `tools/sag_grad_balance.py`, eight windows of 32
+  documents per checkpoint, about 900 value positions). The reader holds the query keys (93 % of
+  their slots) while five units share the value positions (28, 12, 22, 13 and 25 % at step 4,000),
+  and the task loss's preference among them moves from checkpoint to checkpoint: +36 per value
+  position on unit 3 at step 4,000 (times 1e6, as above); −15 on it and +64 on unit 5 at step
+  4,500. The balance loss's push is 0.5 to 0.9 per position on the most used unit and the same at
+  every kind of position: steady, and some fifty times smaller there than the task loss's. No unit
+  settles as the writer, and the overlap decays (0.72 at step 3,000, 0.30 at 5,000, 0.17 at
+  7,000). This is the selection bias of section 2 again, among the writers instead of between
+  the reader and a writer: a unit is credited only where it ran.
+
+**How far these counts go.** They are of twelve runs or fewer, and one configuration differs by
+10 pp from run to run. The candidate against the control, twelve runs each: final dev 87.1 %
+against 81.3 % (rank test, p = 0.04); the binding verdict passed by 8 against 2 (Fisher's exact
+test, p = 0.04); later queries at 80 % or more in 9 against 4 (p = 0.10). The candidate against
+the balance loss alone: falls in 2 against 5 (p = 0.37), a drawdown under 5 pp in 9 against 5
+(p = 0.21). These are uncorrected for the eleven arms compared. On binding the candidate is at
+or above the balance loss, and both are above the control, on every measure. On stability the candidate equals the control in
+counts (two falls each, nine of twelve under 5 pp) and has the largest single fall of the night
+(26.4 pp). That the candidate binds keys more often than the control is likely; that it is
+steadier than the balance loss alone is not established.
+
+What the night does establish: the plateau and the falls are one event with two forms (the
+reader takes the value positions, or no writer settles); the balance loss removes the first
+form; and none of the config-only mechanisms tried removes the second.
 
 ## What the day's runs say
 
@@ -389,6 +475,10 @@ six seeds): 87.6 % mean, 3 of 6 at 80 % or more, 2 of 6 fell 10 pp or more.
   has to be judged on a dozen seeds by its worst runs; none of today's arms has that many.
 - The split window with the replay fix of this morning is, so far, no worse than the autograd
   window (table); the first replay, which credited a unit that had not run, was.
+- The night's twelve-seed sets (section 3b, last part) put counts on the warm-up arms: with the
+  balance loss nine runs of twelve bind keys and five fall; with executed credit as well (the
+  opt-in candidate) nine bind, eight pass the binding verdict and two fall; the control binds in
+  four. Without the warm-up both are worse than the recipe. No arm meets the rule of section 5b.
 
 ## 4. Is it this branch? No
 
@@ -414,4 +504,6 @@ one configuration is the recipe's, not the branch's.
 python /home/joe/hsn-experiments/a5-fix/probe/route_flip.py RUN_DIR STEP [STEP ...] --n-docs 150
 python evidence/P2.10/sag/sag_grad.py CKPT [CKPT ...] --windows 4 --batch 16     # CPU, fp32
 python -m hsn.experiments --db DB enqueue configs/sweeps/a6_5b_remedies.yaml --only 'split_dense10/s*'
+python -m hsn.experiments --db DB enqueue configs/sweeps/a6_5b_remedies.yaml \
+    --only 'fused_softwarm_balance_executed/s*' --mem-estimate-mib 4200       # the night's candidate
 ```

@@ -203,6 +203,25 @@ arms:
       - train.lambda_b=0.02
       - train.aux_enabled=[balance]
       - hardware.window=fused
+  # Balance 0.02 binds keys in six runs of six (seeds 0 to 5), and two of them dip 13 and 16 pp
+  # between steps 3,500 and 5,500 while another unit takes the value positions, at the peak rate;
+  # every run gains once the rate decays (from step 7,200). Two config-only arms against the dip:
+  # the decay from step 3,600, and half the balance weight.
+  - name: fused_softwarm_balance_decay60
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.decay_fraction=0.6
+      - hardware.window=fused
+  - name: fused_softwarm_balance01
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.01
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
   # the same mechanisms without the warm-up: which of the three ingredients carries the result
   - name: fused_k8
     family: hsn
@@ -221,6 +240,13 @@ arms:
       - model.k_select=8
       - train.lambda_b=0.02
       - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_balance_executed # the candidate fused_softwarm_balance_executed without the warm-up
+    family: hsn
+    overrides:
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.unit_credit=executed
       - hardware.window=fused
   - name: fused_softwarm_temp2 # a softer straight-through temperature after the switch (the
     family: hsn # sharper ones made the takeover worse)
@@ -255,6 +281,18 @@ arms:
     family: hsn
     overrides:
       - train.soft_until_step=1000
+      - train.unit_credit=executed
+      - hardware.window=fused
+  # NOT a paper mechanism either (the same opt-in candidate), with the paper's balance loss: on
+  # nine seeds balance 0.02 keeps the reader off the value positions (7 of 9 bind keys) and 4 of 9
+  # fall 10 pp or more while a third unit takes them; executed credit is the arm that kept formed
+  # routes (no fall in five runs) and did not form them.
+  - name: fused_softwarm_balance_executed
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
       - train.unit_credit=executed
       - hardware.window=fused
   - name: split_temp050
