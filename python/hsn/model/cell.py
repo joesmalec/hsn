@@ -522,9 +522,10 @@ class PDGCell(nn.Module):
             m = self.graph.messages_selected(
                 h_read, self.V, cells, weights=consts.edge_weights, validate=False, vh=vh
             )
-            v = self.norm(native.gather_concat(u, eps, h_read, m, cells))
+            u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
+            v = self.norm(native.gather_concat(u_read, eps, h_read, m, cells))
             unit_out, rider = self.units.forward_static_chosen(
-                v.reshape(B * K, 4 * d),
+                v.reshape(B * K, self.in_dim),
                 units.reshape(B * K),
                 w1_flat=consts.w1_gate,
                 w2_flat=consts.w2_flat,
