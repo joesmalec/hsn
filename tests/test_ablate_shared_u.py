@@ -866,6 +866,45 @@ def test_ablated_model_trains_and_reduces_the_loss(
             assert mine.loss == pytest.approx(theirs.loss, rel=1e-4)
 
 
+def test_standard_recipe_with_the_ablation_trains(tmp_path: Path) -> None:
+    """``configs/experiments/hsn_recipe_a6.yaml`` with the one override, shrunk to the trainer
+    tests' sizes: every part of the recipe (lazy AdamW, the WSD schedule, the feedback cut, the
+    update caps on ``cell.*`` and ``router.*``, the weight average, the route guard) runs on the
+    ablated model and the loss falls."""
+    from p1_15_support import TINY as SMALL_HSN
+    from p1_15_support import UNROLL
+
+    steps = 30
+    cfg = load_config(
+        RECIPE_A6,
+        overrides=[
+            ABLATE,
+            *SMALL_HSN,
+            f"train.unroll={UNROLL}",
+            "train.batch=4",
+            "train.micro_batch=4",
+            "train.precision=fp32",
+            f"train.steps={steps}",
+            "train.warmup_steps=2",
+            "train.eval_every=1000",
+            "train.ckpt_every=1000",
+            "train.stats_every=10",
+            "train.deterministic=true",
+        ],
+    )
+    assert cfg.model.ablate_shared_u and cfg.train.weight_ema == 0.99
+    assert cfg.train.route_guard.enabled and set(cfg.train.update_limit.groups) == {
+        "memory",
+        "routing",
+    }
+    trainer = hsn_trainer(cfg, tmp_path)
+    history = trainer.fit(*datasets(), steps)
+    losses = [s.loss for s in history.steps]
+    assert len(losses) == steps and all(math.isfinite(x) for x in losses)
+    assert sum(losses[-5:]) / 5 < sum(losses[:5]) / 5 - 0.1, losses  # measured: 5.54 to 5.18
+    assert trainer.model.cell.in_dim == 3 * cfg.model.d
+
+
 def _check_compiled_trainer_run(
     window: str, ablate: bool, run_dir: Path, *overrides: str, steps: int = 6
 ) -> None:
@@ -988,6 +1027,31 @@ def test_harness_variants_refuse_the_ablation() -> None:
         }
     )
     assert len(expand(spec)) >= 1
+
+
+def test_recipe_arms_with_the_ablation_expand(tmp_path: Path) -> None:
+    """How a sweep names the ablation: an arm of the standard recipe with the one override (and
+    one more for the fused window). The recipe's own arms keep the stored ids of exps 421-426;
+    the ablation's arms are new ones."""
+    import yaml
+    from p1_11_support import fake_repo
+    from test_p1_18_recipe import GUARDED
+
+    raw = yaml.safe_load((REPO / "configs" / "sweeps" / "example_p1_18.yaml").read_text())
+    raw["arms"] = [
+        {"name": "hsn_recipe", "family": "hsn"},
+        {"name": "no_shared_u", "family": "hsn", "overrides": [ABLATE]},
+        {
+            "name": "no_shared_u_fused",
+            "family": "hsn",
+            "overrides": [ABLATE, "hardware.window=fused"],
+        },
+    ]
+    arms = expand(SweepSpec.model_validate(raw), repo=fake_repo(tmp_path))
+    by_label = {arm.label: arm.arm_id for arm in arms}
+    assert len(by_label) == 18 and len(set(by_label.values())) == 18
+    assert tuple(by_label[f"hsn_recipe/s{seed}"] for seed in range(6)) == GUARDED
+    assert not set(GUARDED) & {v for k, v in by_label.items() if k.startswith("no_shared_u")}
 
 
 # --------------------------------------------------------------------------------------------------
