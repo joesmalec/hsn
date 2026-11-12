@@ -24,6 +24,10 @@ the matmuls, bias adds and activation in the autocast dtype):
   restored to the input order. Nothing is padded. The unit histogram is read on the host, which
   is one device-to-host copy per call and rules out graph capture of this reference path.
 
+``model.ablate_shared_u`` (P2.13's "remove shared path" ablation, :mod:`hsn.model.cell`): the cell
+input is ``[ε_t; h_i; m_i]``, so the bank's input width :attr:`UnitBank.in_dim` is ``3d`` instead of
+``4d`` (``W1 [M, 3d, H]``); nothing else in this module depends on the width.
+
 ``unit_ids`` and ``versions`` are the versioned-interface metadata of paper §4 that the P5.1
 manifests will carry. P1.2 holds them and carries them in the ``state_dict`` as extra state:
 loading a checkpoint restores the versions and refuses a bank whose unit ids differ.
@@ -98,10 +102,11 @@ class UnitBank(nn.Module):
 
     ``n_units`` is ``M``, ``d`` the width (the input width is ``4d``), ``hidden`` is ``H``;
     ``activation`` and ``init`` are ``model.activation`` / ``model.init``. ``unit_ids`` default to
-    ``unit0 .. unit{M-1}`` and ``versions`` to ``1`` for every unit.
+    ``unit0 .. unit{M-1}`` and ``versions`` to ``1`` for every unit. ``in_dim`` is the input width
+    when it is not ``4d``: ``3d`` for the cell input without ``u`` (``model.ablate_shared_u``).
     """
 
-    W1: nn.Parameter  # [M, 4d, H]
+    W1: nn.Parameter  # [M, 4d, H] ([M, in_dim, H])
     b1: nn.Parameter  # [M, H]
     W2: nn.Parameter  # [M, H, d]
     b2: nn.Parameter  # [M, d]
@@ -116,15 +121,18 @@ class UnitBank(nn.Module):
         init: str,
         unit_ids: Sequence[str] | None = None,
         versions: Sequence[int] | None = None,
+        in_dim: int | None = None,
     ) -> None:
         super().__init__()
         for name, value in (("n_units", n_units), ("d", d), ("hidden", hidden)):
             if value < 1:
                 raise ValueError(f"UnitBank needs {name} >= 1, got {value}")
+        if in_dim is not None and (isinstance(in_dim, bool) or in_dim < 1):
+            raise ValueError(f"UnitBank needs in_dim >= 1 or None (4d), got {in_dim!r}")
         self.n_units = n_units
         self.d = d
         self.hidden = hidden
-        self.in_dim = 4 * d
+        self.in_dim = 4 * d if in_dim is None else in_dim
         self.activation_name = activation
         self.init = init
         self.act = make_activation(activation)
@@ -143,7 +151,14 @@ class UnitBank(nn.Module):
 
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> Self:
-        return cls(cfg.n_units, cfg.d, cfg.hidden, cfg.activation, init=cfg.state_init)
+        return cls(
+            cfg.n_units,
+            cfg.d,
+            cfg.hidden,
+            cfg.activation,
+            init=cfg.state_init,
+            in_dim=cfg.cell_input_width,  # 4d; 3d with model.ablate_shared_u
+        )
 
     # ----------------------------------------------------------------------------------------------
     # Execution
@@ -392,7 +407,8 @@ class UnitBank(nn.Module):
     # ----------------------------------------------------------------------------------------------
 
     def param_count(self) -> int:
-        """Measured parameter count of the whole bank (``M × (4d·H + H + H·d + d)``)."""
+        """Measured parameter count of the whole bank (``M × (4d·H + H + H·d + d)``; ``in_dim``
+        in place of ``4d`` when it differs)."""
         return sum(p.numel() for p in self.parameters())
 
     def get_extra_state(self) -> dict[str, list[str] | list[int]]:
@@ -413,7 +429,10 @@ class UnitBank(nn.Module):
         self.versions = _check_versions(state["versions"], self.n_units)
 
     def extra_repr(self) -> str:
-        return (
+        text = (
             f"n_units={self.n_units}, d={self.d}, hidden={self.hidden}, "
             f"activation={self.activation_name!r}, init={self.init!r}"
         )
+        if self.in_dim != 4 * self.d:  # the default width is not printed (the P1.2 repr)
+            text += f", in_dim={self.in_dim}"
+        return text

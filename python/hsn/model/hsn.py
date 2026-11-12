@@ -113,6 +113,14 @@ limit keeps its gradient unscaled, so a healthy window is full backpropagation t
 the rounding of autograd's sums). Tested on the A5 recipe, the limit did not remove the drops (exps
 354, 355, 364); the cut above did.
 
+``model.ablate_shared_u`` (opt-in; the "remove shared path" ablation of the P2.13 matrix): the
+:class:`~hsn.model.cell.PDGCell` reads ``[ε_t ; h_i ; m_i]`` (width ``3d``) instead of
+``[u_t ; ε_t ; h_i ; m_i]``, on every round and window (:mod:`hsn.model.cell`). This module is
+unchanged by it:
+``u_t`` is computed as before and still read by the scorer's features and the decoder, and is
+handed to the cell, which does not read it. :meth:`HSN.param_report` then matches the closed form
+of :func:`hsn.train.memory_plan.expected_param_count` at the ``3d`` width.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
@@ -156,7 +164,7 @@ PARAM_REPORT_ROWS: tuple[str, ...] = (
     "w_out",
     "v_msg",
     "gate",
-    "cell_norm",  # P1.5a (amendment A1): the RMSNorm gain over the 4d cell input
+    "cell_norm",  # P1.5a (amendment A1): the RMSNorm gain over the 4d cell input (3d: ablation)
     "cand_norm",  # P1.13 (amendment A4): the RMSNorm gain before the candidate's tanh (0: none)
     "scorer",
     "halting",

@@ -3,7 +3,7 @@
 The sparse round of :meth:`hsn.model.cell.PDGCell.step_sparse` is composed of exactly four functions
 (plan P2.5 interfaces, the boundaries the fused kernels of P2.9–P2.11 replace)::
 
-    gather_concat(u, eps, h, m, cell_idx)              -> v [B, K, 4d]
+    gather_concat(u, eps, h, m, cell_idx)              -> v [B, K, 4d]   ([B, K, 3d] with u=None)
     grouped_unit_mlp(v, unit_idx, bank)                -> out [P, d]
     csr_messages(h, graph, V, cell_idx)                -> m [B, K, d]
     gated_delta_update(state, cell_idx, c, b, valid)   -> CellGraphState
@@ -58,7 +58,7 @@ class KernelOps(Protocol):
     attributes)."""
 
     def gather_concat(
-        self, u: Tensor, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor
+        self, u: Tensor | None, eps: Tensor, h: Tensor, m: Tensor, cell_idx: Tensor
     ) -> Tensor: ...
 
     def grouped_unit_mlp(

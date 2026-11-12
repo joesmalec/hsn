@@ -649,8 +649,10 @@ def test_p1_5_shapes(device_type: str) -> None:
         model.step(x, c, state, mode="sparse")
     with pytest.raises(ValueError, match="mode"):
         model.step(x, c, state, mode="soft")  # type: ignore[arg-type]
-    with pytest.raises(NotImplementedError, match="ablate_shared_u"):
-        HSN.from_config(load_config(TINY, overrides=["model.ablate_shared_u=true"]))
+    # the "remove shared path" ablation builds, with the 3d cell input (test_ablate_shared_u.py)
+    ablated = HSN.from_config(load_config(TINY, overrides=["model.ablate_shared_u=true"]))
+    assert ablated.cell.in_dim == 3 * cfg.model.d == ablated.cell.gate.in_features
+    assert model.cell.in_dim == 4 * cfg.model.d and not model.cell.ablate_shared_u
     with pytest.raises(ValueError, match="scorer_features.exclude"):
         HSN.from_config(load_config(TINY, overrides=["model.scorer_features.exclude=[eps, nope]"]))
     with pytest.raises(TypeError):

@@ -259,8 +259,18 @@ class ModelConfig(_StrictModel):
     halt_threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # inference halting threshold
     predictor_target: PredictorTarget = "fixed_embedding"  # P1.6
     disabled_cells: list[int] = []  # test hook
+    # P2.13's "remove shared path" ablation: remove u from v. The cell input is [eps; h_i; m_i]
+    # (width 3d, :attr:`cell_input_width`) for the cell-input norm, the unit MLPs and the gate;
+    # the scorer's features and the decoder still read u.
     ablate_shared_u: bool = False  # ablation: remove u from v
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
+
+    @property
+    def cell_input_width(self) -> int:
+        """Width of the cell input ``v`` that the cell-input norm, the unit MLPs and the gate
+        read: ``4d`` for ``[u; eps; h_i; m_i]``, ``3d`` for ``[eps; h_i; m_i]`` with
+        ``ablate_shared_u``. Derived, not a configuration key (it is not dumped or hashed)."""
+        return (3 if self.ablate_shared_u else 4) * self.d
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
@@ -1058,6 +1068,11 @@ class RunConfig(_StrictModel):
             if self.train.state_grad_clip is not None or self.train.state_grad_ratio is not None:
                 raise ValueError(
                     "train.state_grad_clip and train.state_grad_ratio (A6) are HSN-only"
+                )
+            if self.model.ablate_shared_u:
+                raise ValueError(
+                    "model.ablate_shared_u removes u from the HSN cell's input, but "
+                    f"model_name={self.model_name!r} has no such cell; leave it at false"
                 )
             if self.train.cell_lr_mult != 1.0:
                 ignored.append(f"train.cell_lr_mult={self.train.cell_lr_mult}")

@@ -205,6 +205,11 @@ def cell_round_error(cell: PDGCell) -> str | None:
         return f"model.activation={cell.units.activation_name!r}: the fused round implements GELU"
     if cell.disabled_cells:
         return "model.disabled_cells is a test hook of the native round"
+    if cell.ablate_shared_u:
+        return (
+            "model.ablate_shared_u: the fused round builds the 4d cell input [u; eps; h; m] in "
+            "its kernel (the fused window does not use it: its products are PDGCell's own)"
+        )
     if cell.V.weight.dtype != torch.float32:
         return f"fp32 master weights only, got {cell.V.weight.dtype}"
     H, K = cell.units.hidden, 1
