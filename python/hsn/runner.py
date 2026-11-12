@@ -910,12 +910,17 @@ def _parser() -> argparse.ArgumentParser:
 
     sweep = sub.add_parser("sweep", help="experiment sweeps (P1.11; python -m hsn.experiments)")
     sweep.add_argument("args", nargs=argparse.REMAINDER, help="hsn.experiments.cli arguments")
+    sub.add_parser("chat", help="full-screen chat with a local HSN checkpoint")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point of the ``hsn`` console script; returns the exit code."""
     raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["chat"]:
+        from hsn.chat.cli import main as chat_main
+
+        return chat_main(raw[1:])
     if raw[:1] == ["sweep"]:  # P1.11: everything after "sweep" belongs to hsn.experiments.cli
         from hsn.experiments.cli import main as sweep_main
 

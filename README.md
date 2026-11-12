@@ -87,3 +87,47 @@ configs are never reported as results.
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
+
+## Local terminal chat
+
+Install with `uv sync --extra dev --extra chat` (then rebuild `hsn_rs` with the
+maturin command above if needed). Launch from the repository:
+
+```bash
+uv run hsn chat --run-dir /absolute/path/to/training/run
+uv run hsn chat --checkpoint /path/step_00001000.pt --config /path/config.resolved.yaml --device cpu
+```
+
+The first command selects the highest numbered checkpoint. The second selects an exact
+checkpoint. Resolved configs must match checkpoint metadata. Training data is not needed
+at inference time. The optional UI dependency is only loaded by `hsn chat`.
+
+Enter inserts a newline; Ctrl+Enter or the Send button sends. Escape stops generation;
+Ctrl+N starts a fresh conversation (while generating, it requests stop first). Ctrl+E
+exports JSON to a new timestamped file in the current directory. Ctrl+F toggles filler
+filtering; Ctrl+Q exits. Exports retain original input and the filtered model input.
+There is no automatic saving or session restore.
+
+Standalone `um`, `uh`, and `erm` are removed before inference by default. Quoted text and
+backtick spans are preserved. This deliberately avoids general stop-word removal: words
+such as “not,” “can,” and “like” carry meaning. Use `--no-filter-fillers` when exact input
+matters, especially for code or raw synthetic tasks. The status bar reports bytes saved;
+HSN uses byte tokens, not word tokens. Input that becomes empty is rejected.
+
+Generation options: `--temperature` (0.8; zero is greedy), `--top-p` (0.95), `--seed` (0),
+`--context-id` (0), `--max-bytes` (512), and `--device auto|cpu|cuda|mps`.
+Auto prefers CUDA, then MPS, then CPU. Sampling uses a session-local CPU generator;
+reproducibility is within the same model/device, not a cross-device guarantee.
+
+The default `plain-v1` format encodes `User: <message>\nAssistant: ` as UTF-8 and separates
+subsequent turns with a newline. Generation stops before `\nUser:`, at the byte limit, or
+when cancelled. `--format raw` feeds exact prompt continuations without role delimiters
+(use `--no-filter-fillers` to disable preprocessing too). No EOS token is invented.
+Future conversation training must use the same serialization in `hsn.chat.session.serialize`.
+Current synthetic-task checkpoints do not imply natural-language conversation capability.
+
+Inference retains recurrent state but never updates model weights. Reset clears that state.
+An inference error or cancellation during prompt ingestion requires a reset. Generation
+cancellation retains the partial reply. Malformed UTF-8 is displayed with replacement
+characters; terminal controls are escaped. The current implementation uses Python/PyTorch
+HSN inference, not the future Rust service, and supports the 256-byte vocabulary only.
