@@ -126,6 +126,12 @@ Device = Literal["cuda", "mps", "cpu"]
 AutocastDtype = Literal["bf16", "fp16", "fp32"]
 MasterDtype = Literal["fp32", "fp64"]
 CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
+#: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
+#: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
+#: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut); ``fused`` is ``split``
+#: with the sweep's cell round as one fused CUDA op (:mod:`hsn.kernels.window`): experimental,
+#: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
+WindowMode = Literal["autograd", "split", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
 
@@ -592,6 +598,24 @@ class TrainConfig(_StrictModel):
     temperature_start: float = Field(default=1.0, gt=0.0)
     temperature_end: float = Field(default=1.0, gt=0.0)
     temperature_steps: int = Field(default=0, ge=0)
+    # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which scores the
+    # straight-through unit weight of an executed slot differentiates. "softmax" (the default,
+    # P2.2): the softmax over the cell's units, so raising the executed unit's weight lowers every
+    # other unit's score at that position, and a unit with most of the slots at a kind of position
+    # pushes the others down there. "executed": the executed unit's score alone (the other units'
+    # scores are constants of that softmax): a unit that did not run gets no gradient from the
+    # slot. Not adopted by any recipe: an amendment would have to do that.
+    unit_credit: Literal["softmax", "executed"] = "softmax"
+    # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
+    # straight-through gradient of a routed training window can reach. "selected" (the default):
+    # the sparse round computes the selected cells with their chosen unit only, so a cell or a
+    # unit that was not selected gets no gradient: the router is told how useful its choice was,
+    # never how useful another one would have been. "all": the training window runs the masked
+    # round, the model's own reference for the sparse one (every cell computes its candidate
+    # with the selection's unit weights over every unit; only the selected cells are written), so
+    # the cell mask's and the unit weights' straight-through gradient covers every cell and
+    # unit. Costs the dense step's time. Not adopted by any recipe.
+    ste_scope: Literal["selected", "all"] = "selected"
     epsilon_start: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_end: float = Field(default=0.0, ge=0.0, le=1.0)
     epsilon_steps: int = Field(default=0, ge=0)
@@ -918,6 +942,12 @@ class HardwareConfig(_StrictModel):
     unified_memory: bool
     pinned_memory: bool
     compile_mode: CompileMode = "none"
+    window: WindowMode = "autograd"  # P2.10: autograd | split | fused (hsn.train.split)
+    # P2.10: the split window's forward sweep runs a twin of the model with its autocast weights
+    # cast once per window (hsn.train.compile.SweepTwin; the values of eager autocast). False runs
+    # the model's own compiled blocks, which cast at every position and whose fused arithmetic
+    # rounds as the autograd window's does: about 11 ms per step slower, kept to compare the two.
+    sweep_twin: bool = True
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1000,6 +1030,14 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
+        # --- P2.10: the split window is only defined inside its scope ---
+        if self.hardware.window != "autograd":
+            reason = split_window_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.window={self.hardware.window!r} is not available for this "
+                    f"configuration: {reason}"
+                )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
@@ -1011,6 +1049,10 @@ class RunConfig(_StrictModel):
                 )
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
+            if self.train.unit_credit != "softmax":
+                raise ValueError("train.unit_credit is HSN-only")
+            if self.train.ste_scope != "selected":
+                raise ValueError("train.ste_scope is HSN-only")
             if self.train.route_guard.enabled:
                 raise ValueError("train.route_guard (A6) is HSN-only")
             if self.train.state_grad_clip is not None or self.train.state_grad_ratio is not None:
@@ -1319,7 +1361,51 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.state_grad_ratio",
     "train.weight_ema",
     "train.route_guard",
+    "hardware.window",
+    "hardware.sweep_twin",
+    "train.unit_credit",
+    "train.ste_scope",
 )
+
+
+def split_window_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
+    ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is only
+    defined where the heavy backward work is local to its position (the full A6 feedback cut)
+    and for the routed hard-gate round it replays. A soft warm-up (``train.soft_until_step``)
+    is inside the scope: its steps run every cell with autograd, which is the autograd window's
+    work, so they take that window and the split window takes over at the first hard-gate step
+    (:meth:`hsn.train.split.SplitWindow.splits_now`)."""
+    model, train = cfg.model, cfg.train
+    if cfg.model_name != "hsn":
+        return f"model_name={cfg.model_name!r} is not the HSN"
+    if model.routing != "topk":
+        return f"model.routing={model.routing!r}: the split window needs topk"
+    if train.gate_mode != "ste":
+        return f"train.gate_mode={train.gate_mode!r}: the split window needs ste"
+    if train.ste_scope != "selected":
+        return f"train.ste_scope={train.ste_scope!r}: the masked round runs every cell"
+    missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
+    if missing:
+        return (
+            f"train.feedback_detach lacks {missing}: without the full feedback cut the heavy "
+            "backward work is not local to its position"
+        )
+    if train.epsilon_start > 0.0 or train.epsilon_end > 0.0:
+        return "train.epsilon_*: exploration draws are not replayed"
+    if train.lambda_u > 0.0:
+        return "train.lambda_u > 0: the counterfactual probes are untested with the split window"
+    if train.state_grad_clip is not None or train.state_grad_ratio is not None:
+        return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
+    if model.disabled_cells:
+        return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
+    if model.r_max != 1:
+        return f"model.r_max={model.r_max}: one round per position only"
+    if train.precision == "fp16":
+        return "train.precision=fp16 scales the loss (GradScaler)"
+    if train.grad_accum != 1:
+        return f"train.grad_accum={train.grad_accum}: one window per step only"
+    return None
 
 
 def _hash_view(cfg: RunConfig) -> dict[str, Any]:

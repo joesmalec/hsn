@@ -1,0 +1,35 @@
+# P2.10: same-day controls of configs/sweeps/p2_10_split_seeds.yaml: the standard recipe on the
+# autograd window (the default hardware.window), the same protocol with diagnostics off, seeds 0 to 11.
+# With diagnostics on these are the arms of exps 421-423; they are run again here so that the split
+# window's runs have controls from the same code, day and protocol. Configuration only.
+name: p2_10_autograd_seeds
+description: "the A6 recipe on the autograd window, diagnostics off, seeds 0-11: same-day controls of p2_10_split_seeds"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_a6.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diagnostics: false # the user's rule for these runs (11 Nov 2026): no diagnostic samples
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+arms:
+  - name: autograd
+    family: hsn

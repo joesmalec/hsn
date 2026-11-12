@@ -1,0 +1,336 @@
+# The remaining route takeover of the A6 recipe (docs/p1_18_a6_results.md, section 5b): the white
+# paper's own mechanisms, one at a time, configuration only, on the standard recipe
+# (configs/experiments/hsn_recipe_a6.yaml, guard on), 9,000 steps, diagnostics off, seeds 0 to 11.
+# Each arm changes one key against the recipe. The baselines are the arms of
+# p2_10_autograd_seeds.yaml (autograd window) and p2_10_split_seeds.yaml (split window), run from
+# the same checkout. "split_*" arms train with the split window (hardware.window=split,
+# docs/p2_10_split_window.md); "native_*" arms with the autograd window.
+#   dense    train.p_dense: a sample runs the dense step with this probability, so a unit that
+#            lost a position still executes there (paper section 1, "dense fallback")
+#   balance  train.lambda_b: the balance loss, mild (paper section 7): a unit is penalised in
+#            proportion to its share of the slots. In every run inspected the unit that takes a
+#            route over is the most used one (it serves the filler: 70 to 99 % of all slots).
+#   softwarm train.soft_until_step=1000: the paper's soft-gate warm-up (section 6: "Warm up with
+#            soft gates, then use hard selection"): for the first 1,000 steps every cell executes
+#            under the soft mask, so every unit is observed everywhere before the hard selection
+#            starts; the recipe has no warm-up. The warm-up steps are the autograd window's in
+#            every arm (they run every cell with autograd); fused_softwarm takes the fused
+#            window from step 1,000 on (hardware.window=fused), native_softwarm stays on the
+#            autograd window throughout.
+#   utility  train.lambda_u: the scorer regressed onto counterfactual probes (paper section 6);
+#            autograd window only (the split window does not cover the probes)
+#   executed train.unit_credit=executed: NOT one of the paper's mechanisms and not configuration
+#            only in spirit: an opt-in change of the straight-through unit gradient (the executed
+#            unit alone is credited). Run as a candidate; adopting it would be an amendment.
+#   k6, k8   model.k_select=6 / 8 (the recipe selects 4 of 32 cells): the paper's risk register
+#            answers "router misses later-relevant information" with "reconsider sparsity". With
+#            four slots the reader's cells and the value writer's cells compete for the same
+#            slots at a value position; with more, both sets fit. Costs step time.
+#   fullste  train.ste_scope=all: NOT one of the paper's mechanisms: an opt-in change of what the
+#            straight-through gradient covers. The training window runs the masked round (the
+#            model's reference for the sparse round: same decision, same written values, every
+#            cell and unit computed), so a cell or unit that was not selected still gets its
+#            first-order credit: a route that lost its slots is told when it would have helped.
+#            Dense step time; autograd window only. Adopting it would be an amendment.
+#   routerlr train.router_lr_mult=0.1: the router's proposed step is about ten times its update
+#            cap, so its applied step is the cap whatever the rate; at a tenth of the rate the
+#            proposal sits at the cap and the schedule's decay reaches the router
+#   decay    the same with train.decay_fraction=0.7: the rate decays from step 2,700 on
+#   temp     a constant straight-through temperature: above 1 (softer), or below 1 (sharper: the
+#            selection gradient concentrates on the cells and units near their thresholds, and a
+#            decision with a wide margin stops being pushed)
+name: a6_5b_remedies
+description: "A6 recipe + one of the paper's routing mechanisms (dense fallback, balance loss, STE temperature), seeds 0-5"
+timing: false
+base:
+  config: configs/experiments/hsn_recipe_a6.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=reduce-overhead
+protocol:
+  name: reads_state
+  version: 3
+  steps: 9000
+  diagnostics: false # the user's rule for these runs (11 Nov 2026): no diagnostic samples
+  diag_every: 250
+  diag_docs: 32
+  eval_batch: 128
+  probe_batch: 64
+  checkpoint: retained
+  keep_every: 500
+  keep_last: 18
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623
+rules:
+  verdicts:
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+arms:
+  - name: split_dense10
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.p_dense=0.1
+  - name: split_dense05
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.p_dense=0.05
+  - name: split_dense25
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.p_dense=0.25
+  - name: split_balance
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+  - name: split_temp2
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=2.0
+      - train.temperature_end=2.0
+  - name: split_temp025
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.25
+      - train.temperature_end=0.25
+  - name: split_temp010
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.1
+      - train.temperature_end=0.1
+  - name: native_temp025
+    family: hsn
+    overrides:
+      - train.temperature_start=0.25
+      - train.temperature_end=0.25
+  - name: native_temp010
+    family: hsn
+    overrides:
+      - train.temperature_start=0.1
+      - train.temperature_end=0.1
+  - name: native_dense10
+    family: hsn
+    overrides:
+      - train.p_dense=0.1
+  - name: native_dense05
+    family: hsn
+    overrides:
+      - train.p_dense=0.05
+  - name: native_utility
+    family: hsn
+    overrides:
+      - train.lambda_u=1.0
+  - name: split_routerlr
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.router_lr_mult=0.1
+  - name: split_decay
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.router_lr_mult=0.1
+      - train.decay_fraction=0.7
+  - name: split_executed
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.unit_credit=executed
+  - name: native_executed
+    family: hsn
+    overrides:
+      - train.unit_credit=executed
+  - name: native_softwarm
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+  - name: fused_softwarm
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - hardware.window=fused
+  - name: fused_baseline # the recipe itself on the fused window: the control of fused_softwarm
+    family: hsn
+    overrides:
+      - hardware.window=fused
+  # The soft warm-up with one more mechanism (11 Nov, after the six native_softwarm runs): the
+  # warm-up runs that plateau near 75 % do not bind keys, and their routes show the unit that
+  # reads the query keys taking the value positions slowly after the switch (seed 2: 53 % of
+  # the value slots at step 1,500, 99 % at step 5,000), where the runs that bind keys keep a
+  # second unit on about half of them. The balance loss and the dense fallback are the
+  # paper's mechanisms against a unit's growing share; executed credit is the opt-in candidate.
+  - name: fused_softwarm_balance
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_softwarm_balance10
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.1
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_softwarm_balance50 # the weight at which the balance push matches the task's
+    family: hsn # differential at a value position (evidence/P2.10/sag/softwarm/grad-*.txt)
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.5
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_softwarm_k8 # the paper's "reconsider sparsity": eight slots, so that the reader's
+    family: hsn # cells and the value writer's cells both fit at a value position
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - hardware.window=fused
+  - name: fused_softwarm_k8_balance # the two arms that held on seeds 2 and 3, together
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.k_select=8
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  # Balance 0.02 binds keys in six runs of six (seeds 0 to 5), and two of them dip 13 and 16 pp
+  # between steps 3,500 and 5,500 while another unit takes the value positions, at the peak rate;
+  # every run gains once the rate decays (from step 7,200). Two config-only arms against the dip:
+  # the decay from step 3,600, and half the balance weight.
+  - name: fused_softwarm_balance_decay60
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.decay_fraction=0.6
+      - hardware.window=fused
+  - name: fused_softwarm_balance01
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.01
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  # the same mechanisms without the warm-up: which of the three ingredients carries the result
+  - name: fused_k8
+    family: hsn
+    overrides:
+      - model.k_select=8
+      - hardware.window=fused
+  - name: fused_balance
+    family: hsn
+    overrides:
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_k8_balance
+    family: hsn
+    overrides:
+      - model.k_select=8
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - hardware.window=fused
+  - name: fused_balance_executed # the candidate fused_softwarm_balance_executed without the warm-up
+    family: hsn
+    overrides:
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.unit_credit=executed
+      - hardware.window=fused
+  - name: fused_softwarm_temp2 # a softer straight-through temperature after the switch (the
+    family: hsn # sharper ones made the takeover worse)
+    overrides:
+      - train.soft_until_step=1000
+      - train.temperature_start=2.0
+      - train.temperature_end=2.0
+      - hardware.window=fused
+  - name: fused_softwarm2000 # a warm-up twice as long
+    family: hsn
+    overrides:
+      - train.soft_until_step=2000
+      - hardware.window=fused
+  # The linear scorer ranks a unit's cells by one weight on the current byte's address and one on
+  # the previous byte's, at every position: a run binds keys only while two units share the work
+  # (one ranks the query's cells by a_cur, the other the value's cells by a_prev; measured on
+  # the kept checkpoints, evidence/P2.10/sag/softwarm/). The plan's two-layer scorer (Appendix
+  # C.2) can switch between the two rankings inside one unit.
+  - name: fused_softwarm_mlp
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - model.scorer=mlp
+      - hardware.window=fused
+  - name: split_softwarm_dense05 # dense-fallback rows: the split window (the fused one has none)
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.p_dense=0.05
+      - hardware.window=split
+  - name: fused_softwarm_executed # NOT a paper mechanism: the opt-in candidate train.unit_credit
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.unit_credit=executed
+      - hardware.window=fused
+  # NOT a paper mechanism either (the same opt-in candidate), with the paper's balance loss: on
+  # nine seeds balance 0.02 keeps the reader off the value positions (7 of 9 bind keys) and 4 of 9
+  # fall 10 pp or more while a third unit takes them; executed credit is the arm that kept formed
+  # routes (no fall in five runs) and did not form them.
+  - name: fused_softwarm_balance_executed
+    family: hsn
+    overrides:
+      - train.soft_until_step=1000
+      - train.lambda_b=0.02
+      - train.aux_enabled=[balance]
+      - train.unit_credit=executed
+      - hardware.window=fused
+  - name: split_temp050
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.5
+      - train.temperature_end=0.5
+  - name: split_temp035
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.temperature_start=0.35
+      - train.temperature_end=0.35
+  - name: split_executed_decay
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.unit_credit=executed
+      - train.router_lr_mult=0.1
+      - train.decay_fraction=0.7
+  - name: split_executed_routerlr
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - train.unit_credit=executed
+      - train.router_lr_mult=0.1
+  - name: split_k8
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - model.k_select=8
+  - name: split_k6
+    family: hsn
+    overrides:
+      - hardware.window=split
+      - model.k_select=6
+  - name: native_fullste
+    family: hsn
+    overrides:
+      - train.ste_scope=all

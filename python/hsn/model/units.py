@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from typing import Self
+from typing import Any, Self
 
 import torch
 from torch import Tensor, nn
@@ -65,6 +65,32 @@ def _check_versions(versions: Sequence[int] | None, n_units: int) -> list[int]:
     ):
         raise ValueError(f"versions must be {n_units} integers >= 1, got {versions!r}")
     return vs
+
+
+class _PermuteRows(torch.autograd.Function):
+    """:func:`permute_rows`."""
+
+    @staticmethod
+    def forward(ctx: Any, x: Tensor, perm: Tensor, inverse: Tensor) -> Tensor:
+        ctx.save_for_backward(inverse)
+        return x.index_select(0, perm)
+
+    @staticmethod
+    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor, None, None]:
+        (inverse,) = ctx.saved_tensors
+        return grad.index_select(0, inverse), None, None
+
+
+def permute_rows(x: Tensor, perm: Tensor, inverse: Tensor) -> Tensor:
+    """``x.index_select(0, perm)`` for a permutation ``perm`` of ``range(len(x))`` with its
+    inverse ``inverse`` (``inverse[perm] = arange``; neither is checked). The value is
+    ``index_select``'s. The backward takes the gradient's rows in the inverse order, a gather:
+    ``index_select``'s own backward adds every row into a tensor of zeros (``index_add``), which
+    for a permutation writes each row exactly once, so the gradients are equal bit for bit and
+    the scatter and the zero tensor are saved (P2.10: two ``[B·T·K, ·]`` reorderings per
+    window in the replay's grouped unit pass)."""
+    out: Tensor = _PermuteRows.apply(x, perm, inverse)
+    return out
 
 
 class UnitBank(nn.Module):
@@ -240,6 +266,51 @@ class UnitBank(nn.Module):
         )
         return out_sorted.index_select(0, inverse)
 
+    def forward_grouped(self, v: Tensor, unit_idx: Tensor) -> Tensor:
+        """:meth:`forward_selected` for a large batch of pairs (P2.10, the split window's
+        replay: every pair of a window at once): the same grouped pass — pairs sorted by unit,
+        one ``addmm`` per layer and present unit, the order restored — with the sorted pairs cut
+        by one ``split`` instead of one slice per unit. The values are :meth:`forward_selected`'s;
+        the backward concatenates the units' input gradients once, where a slice per unit
+        allocates and adds a full ``[P, 4d]`` tensor per present unit (eight 33 MB tensors for a
+        B32/T256 window). One host read (the unit histogram); ``unit_idx`` must lie in
+        ``[0, M)`` (the caller's recorded decisions). The two reorderings are
+        :func:`permute_rows`: their backward gathers, where ``index_select``'s scatters each
+        ``[P, ·]`` gradient into a tensor of zeros."""
+        if v.ndim != 2 or v.shape[1] != self.in_dim:
+            raise ValueError(
+                f"forward_grouped expects v [P, {self.in_dim}], got shape {tuple(v.shape)}"
+            )
+        if unit_idx.ndim != 1 or unit_idx.shape[0] != v.shape[0]:
+            raise ValueError(
+                f"unit_idx must be [P] with P = {v.shape[0]} rows of v, got shape "
+                f"{tuple(unit_idx.shape)}"
+            )
+        n_pairs = int(v.shape[0])
+        if n_pairs == 0:
+            return v.new_zeros((0, self.d))
+        idx = unit_idx.to(torch.int64)
+        counts: list[int] = torch.bincount(idx, minlength=self.n_units).tolist()
+        if len(counts) != self.n_units:
+            raise IndexError(f"unit_idx values must lie in [0, {self.n_units})")
+        order = torch.argsort(idx, stable=True)
+        inverse = torch.empty_like(order).scatter_(
+            0, order, torch.arange(n_pairs, device=order.device)
+        )
+        blocks = torch.split(permute_rows(v, order, inverse), counts)
+        w1s = self.W1.unbind(0)
+        b1s = self.b1.unbind(0)
+        w2s = self.W2.unbind(0)
+        b2s = self.b2.unbind(0)
+        outputs: list[Tensor] = []
+        for j, count in enumerate(counts):
+            if count == 0:
+                continue
+            hidden = self.act(torch.addmm(b1s[j], blocks[j], w1s[j]))
+            outputs.append(torch.addmm(b2s[j], hidden, w2s[j]))
+        out_sorted = torch.cat(outputs, dim=0)
+        return permute_rows(out_sorted, inverse, order)
+
     def forward_static(
         self, v: Tensor, unit_idx: Tensor, *, w1_flat: Tensor | None = None
     ) -> Tensor:
@@ -266,6 +337,55 @@ class UnitBank(nn.Module):
         every = self.forward_all(v.reshape(1, P, self.in_dim), w1_flat=w1_flat)[0]  # [P, M, d]
         index = unit_idx.to(torch.int64)[:, None, None].expand(P, 1, self.d)
         return every.gather(1, index).squeeze(1)
+
+    def _w2_flat(self) -> Tensor:
+        """``W2 [M, H, d]`` laid out as ``[H, M·d]`` (column ``j·d + k`` is unit ``j``'s output
+        ``k``), the second layer's counterpart of :meth:`_w1_flat`."""
+        return self.W2.permute(1, 0, 2).reshape(self.hidden, self.n_units * self.d)
+
+    def forward_static_chosen(
+        self,
+        v: Tensor,
+        unit_idx: Tensor,
+        *,
+        w1_flat: Tensor,
+        w2_flat: Tensor,
+        b1_flat: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """:meth:`forward_static` without the work nobody reads (P2.10, the forward sweep):
+        ``out[p] = F_{unit_idx[p]}(v[p])``, ``[P, 4d] -> [P, d]``, static shapes, no host
+        synchronisation. The first layer is :meth:`forward_all`'s ``addmm`` (every unit: the
+        pairs' units differ, and one matmul over all of them is what keeps the shapes static);
+        the chosen unit's hidden row is gathered *before* the activation, so the activation and
+        the second layer run on ``[P, H]`` instead of ``[M, P, H]``: one ``addmm`` against ``W2``
+        laid out ``[H, M·d]`` (:meth:`_w2_flat`, ``w2_flat``) and a gather of the chosen unit's
+        ``d`` outputs. Each value is the same dot product as :meth:`forward_static`'s (the
+        chosen unit's row of ``W1``, its activation, its ``W2`` and biases); it agrees with it to
+        rounding (the second matmul has another shape). Forward only: the unselected units'
+        second-layer weights get no gradient path here, so a caller that needs gradients keeps
+        :meth:`forward_static`.
+
+        Returns ``(out, rider)``. With ``b1_flat`` the first layer carries riders: ``w1_flat`` is
+        ``[4d, M·H + r]`` and ``b1_flat`` ``[M·H + r]``, the bank's own layout followed by ``r``
+        columns of another linear map of the same input (the cell's gate: one matmul instead
+        of two); ``rider [P, r]`` is their output, ``None`` without ``b1_flat``."""
+        if v.ndim != 2 or v.shape[1] != self.in_dim:
+            raise ValueError(
+                f"forward_static_chosen expects v [P, {self.in_dim}], got shape {tuple(v.shape)}"
+            )
+        if unit_idx.ndim != 1 or unit_idx.shape[0] != v.shape[0]:
+            raise ValueError(
+                f"unit_idx must be [P] with P = {v.shape[0]} rows of v, got shape "
+                f"{tuple(unit_idx.shape)}"
+            )
+        P, M, H, d = int(v.shape[0]), self.n_units, self.hidden, self.d
+        index = unit_idx.to(torch.int64)[:, None, None]
+        first = torch.addmm(self.b1.reshape(M * H) if b1_flat is None else b1_flat, v, w1_flat)
+        rider = None if b1_flat is None else first[:, M * H :]
+        hidden = first[:, : M * H].view(P, M, H)
+        chosen = self.act(hidden.gather(1, index.expand(P, 1, H)).squeeze(1))  # [P, H]
+        out = torch.addmm(self.b2.reshape(M * d), chosen, w2_flat).view(P, M, d)
+        return out.gather(1, index.expand(P, 1, d)).squeeze(1), rider
 
     # ----------------------------------------------------------------------------------------------
     # Accounting and metadata

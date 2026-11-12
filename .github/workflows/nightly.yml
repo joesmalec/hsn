@@ -15,34 +15,45 @@ jobs:
   rtx3060:
     if: contains(vars.HSN_SELF_HOSTED_RUNNERS, 'rtx3060')
     runs-on: [self-hosted, rtx3060]
+    timeout-minutes: 180
+    env:
+      HSN_EXPECT_CUDA_CC: "8.6"
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           version: "0.13.7"
-      - run: rustup toolchain install
-      - run: uv sync --locked --extra dev --extra cuda
-      - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
-      - run: uv run python scripts/build_kernels.py --target cuda --out build
-      - run: uv run pytest -q
-      - run: uv run pytest tests/invariants -q
-      - run: cargo test --workspace
+      - name: Wait for database and host, then build and validate
+        run: python3 scripts/run_when_idle.py --wait -- python3 scripts/validate_cuda.py
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: cuda-rtx3060-evidence
+          path: |
+            build/cuda_build.json
+            evidence/P2.10/
 
   dgx_spark:
     if: contains(vars.HSN_SELF_HOSTED_RUNNERS, 'dgx_spark')
     runs-on: [self-hosted, dgx_spark]
+    timeout-minutes: 180
+    env:
+      HSN_EXPECT_CUDA_CC: "12.1"
+      TORCH_CUDA_ARCH_LIST: "12.1"
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           version: "0.13.7"
-      - run: rustup toolchain install
-      - run: uv sync --locked --extra dev --extra cuda
-      - run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
-      - run: uv run python scripts/build_kernels.py --target cuda --out build
-      - run: uv run pytest -q
-      - run: uv run pytest tests/invariants -q
-      - run: cargo test --workspace
+      - name: Wait for database and host, then build and validate
+        run: python3 scripts/run_when_idle.py --wait -- python3 scripts/validate_cuda.py
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: cuda-dgx-spark-evidence
+          path: |
+            build/cuda_build.json
+            evidence/P2.10/
 
   m_series:
     if: contains(vars.HSN_SELF_HOSTED_RUNNERS, 'm_series')

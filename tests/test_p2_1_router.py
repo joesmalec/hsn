@@ -744,12 +744,16 @@ def test_p2_1_selection_carries_no_authority() -> None:
         "explored",
         "refreshed",
         "dense_fallback",
+        # P2.10: the detached straight-through threshold of the decision (a number per row)
+        "threshold",
     ]
     hints = get_type_hints(Selection)
     for field in fields:
         name = field.name.lower()
         assert not any(word in name for word in forbidden), field.name
-        assert hints[field.name] in (Tensor, float, int), (field.name, hints[field.name])
+        # tensors and plain numbers only (the P2.10 threshold is a tensor or absent)
+        allowed = (Tensor, float, int, Tensor | None)
+        assert hints[field.name] in allowed, (field.name, hints[field.name])
     # Router.forward(tokens=...) is the profiler's token count, so "token" is not scanned there
     api_words = tuple(word for word in forbidden if word != "token")
     for name in ("select", "forward", "scores", "cell_scores", "deadline_exceeded", "from_config"):

@@ -174,8 +174,16 @@ class LazyAdamW(torch.optim.Optimizer):
     ``{"unit_dim": 0, "n_units": M}`` holds stacked unit tensors ``[M, ...]`` (only ``unit_dim=0``
     exists: the bank stacks on dimension 0). Hyperparameters and their defaults are
     ``torch.optim.AdamW``'s: ``lr`` 1e-3, ``betas`` (0.9, 0.999), ``eps`` 1e-8, ``weight_decay``
-    1e-2 (decoupled). No ``amsgrad``, ``foreach``, ``fused`` or ``capturable`` variants.
+    1e-2 (decoupled). No ``amsgrad``, ``fused`` or ``capturable`` variants.
+
+    P2.10: the ordinary (non-unit) tensors of a group are stepped together through torch's
+    multi-tensor ops (:meth:`_dense_steps`): the same operations per element as the
+    single-tensor step (:meth:`_dense_step`, kept as the reference), bit for bit, without one
+    Python round trip per tensor and operation. ``foreach = False`` restores the per-tensor loop.
     """
+
+    #: Step the ordinary tensors of a group through the multi-tensor ops (class docstring).
+    foreach: bool = True
 
     def __init__(
         self,
@@ -370,8 +378,11 @@ class LazyAdamW(torch.optim.Optimizer):
                 closure()
         active_cpu = self._check_mask(active_units)
         masks: dict[torch.device, Tensor] = {}
+        scalars: dict[tuple[float, torch.dtype, torch.device], Tensor] = {}
         for group in self.param_groups:
             lazy = "n_units" in group
+            # the group's ordinary tensors by (step count, device, dtype): one multi-tensor step
+            together: dict[tuple[int, torch.device, torch.dtype], list[list[Tensor]]] = {}
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
@@ -382,9 +393,47 @@ class LazyAdamW(torch.optim.Optimizer):
                 if not state:
                     self._init_state(p, state, group)
                 if lazy:
-                    self._unit_step(p, grad, state, group, active_cpu, masks)
-                else:
+                    self._unit_step(p, grad, state, group, active_cpu, masks, scalars)
+                elif not self.foreach:
                     self._dense_step(p, grad, state, group)
+                else:
+                    state["step"] += 1
+                    lists = together.setdefault(
+                        (int(state["step"]), p.device, p.dtype), [[], [], [], []]
+                    )
+                    for members, tensor in zip(
+                        lists, (p, grad, state["exp_avg"], state["exp_avg_sq"]), strict=True
+                    ):
+                        members.append(tensor)
+            for (step, _, _), (params, grads, exp_avgs, exp_avg_sqs) in together.items():
+                self._dense_steps(params, grads, exp_avgs, exp_avg_sqs, step, group)
+
+    @staticmethod
+    def _dense_steps(
+        params: list[Tensor],
+        grads: list[Tensor],
+        exp_avgs: list[Tensor],
+        exp_avg_sqs: list[Tensor],
+        step: int,
+        group: dict[str, Any],
+    ) -> None:
+        """:meth:`_dense_step` for several tensors at the same step count, through the
+        multi-tensor ops: the same operation per element, in the same order."""
+        lr, (beta1, beta2) = group["lr"], group["betas"]
+        eps, weight_decay = group["eps"], group["weight_decay"]
+        if weight_decay != 0:
+            torch._foreach_mul_(params, 1 - lr * weight_decay)
+        torch._foreach_lerp_(exp_avgs, grads, 1 - beta1)
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+        bias_correction1 = 1 - beta1**step
+        bias_correction2 = 1 - beta2**step
+        step_size = lr / bias_correction1
+        bias_correction2_sqrt = bias_correction2**0.5
+        denoms = torch._foreach_sqrt(exp_avg_sqs)
+        torch._foreach_div_(denoms, bias_correction2_sqrt)
+        torch._foreach_add_(denoms, eps)
+        torch._foreach_addcdiv_(params, exp_avgs, denoms, value=-step_size)
 
     @staticmethod
     def _dense_step(p: Tensor, grad: Tensor, state: dict[str, Any], group: dict[str, Any]) -> None:
@@ -413,8 +462,13 @@ class LazyAdamW(torch.optim.Optimizer):
         group: dict[str, Any],
         active_cpu: Tensor | None,
         masks: dict[torch.device, Tensor],
+        scalars: dict[tuple[float, torch.dtype, torch.device], Tensor] | None = None,
     ) -> None:
-        """The masked, per-unit vectorised step of a stacked unit tensor (module docstring)."""
+        """The masked, per-unit vectorised step of a stacked unit tensor (module docstring).
+        ``scalars`` caches the 0-dim device constants of one :meth:`step` (each is otherwise a
+        host-to-device copy per use)."""
+        if scalars is None:
+            scalars = {}
         n_units = int(group["n_units"])
         lr, (beta1, beta2) = group["lr"], group["betas"]
         eps, weight_decay = group["eps"], group["weight_decay"]
@@ -434,14 +488,17 @@ class LazyAdamW(torch.optim.Optimizer):
         view = (n_units,) + (1,) * (p.ndim - 1)
         actv = act.view(view)
 
-        def coef(on: float, off: float) -> Tensor:
-            return torch.where(
-                actv,
-                torch.tensor(on, dtype=dtype, device=device),
-                torch.tensor(off, dtype=dtype, device=device),
-            )
+        def const(value: float, kind: torch.dtype) -> Tensor:
+            key = (float(value), kind, device)
+            found = scalars.get(key)
+            if found is None:
+                found = scalars[key] = torch.tensor(value, dtype=kind, device=device)
+            return found
 
-        g = torch.where(actv, grad, torch.zeros((), dtype=grad.dtype, device=device))
+        def coef(on: float, off: float) -> Tensor:
+            return torch.where(actv, const(on, dtype), const(off, dtype))
+
+        g = torch.where(actv, grad, const(0.0, grad.dtype))
         if weight_decay != 0:
             p.mul_(coef(1 - lr * weight_decay, 1.0))
         exp_avg.lerp_(g, coef(1 - beta1, 0.0))

@@ -324,8 +324,14 @@ class HSN(nn.Module):
         feedback_detach: Collection[str] = (),
         state_grad_clip: float | None = None,
         state_grad_ratio: float | None = None,
+        unit_credit: str = "softmax",
+        ste_scope: str = "selected",
     ) -> None:
         super().__init__()
+        if ste_scope not in ("selected", "all"):
+            raise ValueError(f"ste_scope must be 'selected' or 'all', got {ste_scope!r}")
+        #: ``train.ste_scope`` (opt-in): "all" trains the routed window on the masked round.
+        self.ste_scope = ste_scope
         if state_grad_clip is not None and (
             isinstance(state_grad_clip, bool)
             or not isinstance(state_grad_clip, int | float)
@@ -401,6 +407,7 @@ class HSN(nn.Module):
         self.cell.detach_state_read = "state" in self.feedback_detach  # A6
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
         self.router = Router.from_config(cfg, unroll=unroll, seed=seed)
+        self.router.set_unit_credit(unit_credit)  # train.unit_credit (opt-in)
         self.halting = HaltingHead(cfg)
         self.decoder = Decoder(cfg, seed=seed)
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
@@ -430,6 +437,8 @@ class HSN(nn.Module):
             feedback_detach=run.train.feedback_detach,
             state_grad_clip=run.train.state_grad_clip,
             state_grad_ratio=run.train.state_grad_ratio,
+            unit_credit=run.train.unit_credit,
+            ste_scope=run.train.ste_scope,
         )
 
     def set_train_step(self, step: int) -> None:
@@ -1116,8 +1125,13 @@ class HSN(nn.Module):
     # -- the pieces of a window (P2.8: shared by forward and the compiled window) ----------------
 
     def _window_mode(self) -> StepMode:
-        """The mode every position of a window runs: ``dense`` or the routed round."""
-        return "dense" if self.cfg.routing == "dense" else "sparse"
+        """The mode every position of a window runs: ``dense`` or the routed round, which is the
+        sparse round, or in training with ``train.ste_scope=all`` the masked round (the same
+        hard selection and the same written values; every cell and unit computed, so that the
+        straight-through gradient reaches the ones that were not selected)."""
+        if self.cfg.routing == "dense":
+            return "dense"
+        return "masked" if self.training and self.ste_scope == "all" else "sparse"
 
     def _draw_dense_rows(self, B: int, state: CellGraphState) -> Tensor | None:
         """P2.2's dense fallback, drawn once per row per window in training with probability

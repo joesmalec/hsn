@@ -11,6 +11,7 @@ entry (``torch.profiler(with_stack=True)`` at L0).
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -45,6 +46,98 @@ def root(ps: ModuleType, monkeypatch: pytest.MonkeyPatch) -> str:
     package = CHECKOUT + "/python/hsn/"
     monkeypatch.setattr(ps, "PACKAGE_ROOT", package)
     return package
+
+
+@pytest.mark.cuda
+def test_p2_10_compiled_mlp_driver_launches_are_selected_cells(ps: ModuleType) -> None:
+    from hsn.kernels import cuda_ops, testvectors
+
+    if os.environ.get("HSN_REQUIRE_CUDA") != "1":
+        pytest.skip("custom CUDA artifacts and the idle guard are required")
+    cuda_ops.prepare_cuda(0)
+    vector = testvectors.load_vector("grouped_unit_mlp", "tiny")
+    names = ("v", "unit_idx", "W1", "b1", "W2", "b2")
+    inputs = tuple(
+        vector.tensors[name].to("cuda").requires_grad_(name != "unit_idx") for name in names
+    )
+    parameters = tuple(t for t in inputs if t.requires_grad)
+
+    def forward():
+        return cuda_ops.mlp_op(*inputs)[0]
+
+    compiled = torch.compile(forward, fullgraph=True, options={"triton.cudagraphs": False})
+    for _ in range(2):
+        out = compiled()
+        torch.autograd.grad(out, parameters, torch.ones_like(out))
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        with torch.profiler.record_function("STEP::mlp"):
+            out = compiled()
+            torch.autograd.grad(out, parameters, torch.ones_like(out))
+            torch.cuda.synchronize()
+    events = list(prof.events())
+    custom = [
+        e for e in events if e.device_type == ps.DeviceType.CUDA and "hsn_cuda_mlp_" in e.name
+    ]
+    assert len(custom) == 7  # hidden, out, dz, dv, route grouping, dW1 and dW2
+    attributed = ps.attribute(events, {})
+    assert attributed["kernels"]["selected_cells"] >= len(custom)
+    assert attributed["device_us"]["selected_cells"] >= sum(
+        e.time_range.end - e.time_range.start for e in custom
+    )
+    assert not any("hsn_cuda_mlp_" in key for key in attributed["unattributed_top"])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("p_dense", (0.0, 1.0))
+def test_p2_8_attribution_window_disables_graphs_for_all_buckets(
+    ps: ModuleType, monkeypatch: pytest.MonkeyPatch, p_dense: float
+) -> None:
+    from cards import CUDA_PROFILE
+    from hsn.train import compile as compile_mod
+    from test_p2_8_compile import (
+        MIN_MARGIN,
+        TOL,
+        _case_inputs,
+        _cfg,
+        _ctx,
+        _grad_diff,
+        _grads,
+        _margin,
+        _max_diff,
+        _model,
+        _run,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device on this machine")
+    monkeypatch.setattr(compile_mod, "MAX_BLOCK", 4)
+    ctx = _ctx(CUDA_PROFILE)
+    model = _model(
+        _cfg("model.routing=topk", "train.gate_mode=ste", f"train.p_dense={p_dense}"),
+        training=True,
+        scale=0.3,
+    ).to(ctx.device)
+    original = compile_mod.CompiledWindow(model, ctx, "reduce-overhead", "inductor")
+    plain = ps.ungraphed_window(original)
+    assert not plain.cuda_graphs
+    # Use the established routed parity fixture: distinct cell states and separated
+    # top-K scores keep this cache/lifetime regression independent of routing ties.
+    inputs = _case_inputs(model, True)
+    expected = _run(lambda: model(*inputs))
+    assert _margin(expected[2], model.cfg.k_select) > MIN_MARGIN
+    expected_grad = _grads(model, expected)
+    tol = TOL[("cuda", "fp32")]
+    for _ in range(2):
+        actual = _run(lambda: plain(*inputs))
+        difference = _max_diff(actual, expected)
+        assert difference["exact"] == 0 and difference["values"] <= tol["values"]
+        assert _grad_diff(_grads(model, actual), expected_grad) <= tol["grads"]
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        _grads(model, plain(*inputs))
+        torch.cuda.synchronize()
+    assert not any("GraphLaunch" in event.name for event in prof.events())
+    assert (inputs[0].shape[0] if p_dense else 0) in plain._bucket_blocks
 
 
 def test_p2_8_torch_files_named_like_hsn_files_do_not_classify(ps: ModuleType, root: str) -> None:
