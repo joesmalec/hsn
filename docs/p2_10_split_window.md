@@ -34,6 +34,12 @@ and checkpoints off; reports under `evidence/P2.10/speed/`; the split window mea
 (the step time of `gru_2m`, about 17 ms). It was not reached; the section "What did not work" says
 why and what would be needed.
 
+**Final check, one session** (11 Nov, 23:34 MST, nothing else on the card, the three windows one
+after the other; `evidence/P2.10/final/`): autograd 97.8 ms, split 54.3 ms (1.80×), fused 44.4 ms
+(2.20×). The autograd window was 3 ms faster than in the afternoon's session that the table above
+divides by, so against it the day's ratios are about 3 % high; the split and fused step times
+did not move.
+
 ## Why the per-op kernels could not win
 
 A compiled autograd window issues about 31,700 GPU kernels per step (`profiles/rtx3060_L1.json`):
@@ -353,6 +359,24 @@ all-units first layer is 4.5 ms: only a tensor-core kernel that runs each pair's
 remove it. Reaching 15 ms needs that, a compiled replay (its dynamic per-unit shapes stand in
 the way) and a fused optimiser. In a run with a soft warm-up the warm-up's own steps (0.216 s
 each, every cell and unit with autograd) are a third of the run and are bound by arithmetic.
+
+What the two baselines of the comparison do instead, measured the same night on the delayed task
+at B32 and T256 through the repository's trainer (one `torch.profiler` pass each; four plain
+steps):
+
+| Model | Parameters | Step time | GPU kernels per step | Device time per step |
+| --- | ---: | ---: | ---: | ---: |
+| `gru_2m` (eager, bf16; cuDNN runs the recurrence) | 1.98 M | 15.9 ms | 2,318 | 13.2 ms |
+| `transformer_2m` (eager, bf16; no loop over positions) | 1.93 M | 13.9 ms | 404 | 12.5 ms |
+| HSN, `hardware.window=fused` | 1.85 M | 44.7 ms | 7,133 | 40.9 ms |
+
+All three keep the card busy for most of the step (83, 90 and 91 %). The GRU's kernels are as
+small as the HSN's (5.7 µs on average in both) and it runs a third as many: about four per layer
+and position, forward and backward together, where the fused sweep alone is 23.7 per position.
+The Transformer runs 404 large ones (31 µs on average). The gap that is left is the number of
+kernels, not their size. Neither baseline reaches 85 % on this task (`gru_2m` 76.7 to 79.3 %;
+`transformer_2m` 32.5 and 35.9 % in two runs on the delayed task alone, at 54,000 and 27,000
+steps), so this is a comparison of step time only.
 
 ## Using it
 
