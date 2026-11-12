@@ -272,6 +272,14 @@ def test_fused_cell_round_equals_the_native_round(
     assert torch.equal(got.h[~written], state.h[~written])  # unselected cells bit for bit
 
 
+def test_fused_cell_round_refuses_the_shared_u_ablation(device: torch.device) -> None:
+    """The in-kernel round builds the 4d input ``[u; eps; h; m]``: it names the ablation as the
+    reason it cannot run that cell (the fused window does not use this op)."""
+    overrides = ("model.cand_norm=rms", "model.ablate_shared_u=true")
+    _, model, *_ = _round_case(device, overrides, 2, 1.0, seed=11)
+    assert "ablate_shared_u" in (window.cell_round_error(model.cell) or "")
+
+
 def test_fused_cell_round_over_a_window_stays_close(device: torch.device) -> None:
     """256 positions of fused rounds against 256 native ones from the same start (the same
     decisions each position, taken from the native trajectory's scores)."""
@@ -376,14 +384,26 @@ def test_select_kernel_takes_the_routers_decision(
 # --------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("extra", [(), ("model.cand_norm=none",), ("model.budget=0.1",)])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        (),
+        ("model.cand_norm=none",),
+        ("model.budget=0.1",),
+        # the 3d cell input [eps; h; m] (the products' width), without and with the candidate
+        # norm and padded slots
+        ("model.ablate_shared_u=true",),
+        ("model.budget=0.1", "model.ablate_shared_u=true"),
+    ],
+)
 def test_cell_update_kernel_equals_the_native_round(
     device: torch.device, extra: tuple[str, ...]
 ) -> None:
     """``sparse_products`` + ``hsn_win_cell_update`` against ``step_sparse`` (static) and the
     tick on the same decision: the same state, summary, ages and position, the slots' cells
     after the update and the state's largest magnitude, with and without the candidate norm
-    and with padded slots."""
+    and with padded slots; and for the ablated cell input (the kernel reads the products'
+    outputs, whose width does not change)."""
     from hsn.kernels import native
     from test_a6_feedback_detach import A5, ALL, _cfg, _model
 

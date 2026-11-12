@@ -130,6 +130,7 @@ def _dims(cfg: RunConfig, model: HSN) -> dict[str, Any]:
         "edge_norm": m.edge_norm,
         "cell_norm": m.cell_norm,  # P1.5a: RMSNorm on the cell input, or none
         "cand_norm": m.cand_norm,  # P1.13: RMSNorm before the candidate's tanh, or none
+        "ablate_shared_u": m.ablate_shared_u,  # the cell input without u (test_ablate_shared_u)
         "disabled": set(m.disabled_cells),
         "indptr": graph.indptr.tolist(),
         "indices": graph.indices.tolist(),
@@ -264,7 +265,8 @@ def _ref_step(
 
     v, c_out, b_out, h_new, unit_out = [], [], [], [], []
     for i in range(N):
-        v_raw = u + eps + h[i] + m[i]
+        # the cell input [u; eps; h_i; m_i], or [eps; h_i; m_i] with model.ablate_shared_u
+        v_raw = (eps + h[i] + m[i]) if dims["ablate_shared_u"] else (u + eps + h[i] + m[i])
         # P1.5a: the units and the gate read the normalised input; the gated update reads h[i]
         v_i = _rmsnorm(v_raw, p["cell.norm.weight"]) if dims["cell_norm"] == "rms" else v_raw
         outs = [_unit(p, j, v_i) for j in range(M)]

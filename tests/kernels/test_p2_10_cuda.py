@@ -303,6 +303,37 @@ def test_p2_10_no_nvrtc_symbols():
     assert "sm_120a" not in listing
 
 
+def test_p2_10_shared_u_ablation_keeps_the_native_gather_and_unit_mlp():
+    """``model.ablate_shared_u``: the cell input ``[eps; h; m]`` and its unit bank are ``3d``
+    wide, outside the raw ABI (``[.., 4d]``). The adapters keep the native path for them on
+    CUDA tensors (the same values as the native backend); the messages and the update are the
+    kernels', unchanged."""
+    from hsn.kernels import native
+    from hsn.model.units import UnitBank
+
+    g = torch.Generator().manual_seed(3)
+    B, N, K, d, M, H = 3, 7, 4, 8, 3, 16
+    eps = torch.randn(B, d, generator=g).cuda()
+    h = torch.randn(B, N, d, generator=g).cuda().requires_grad_(True)
+    m = torch.randn(B, K, d, generator=g).cuda()
+    cells = torch.stack([torch.randperm(N, generator=g)[:K] for _ in range(B)]).cuda()
+    v = ops.gather_concat(None, eps, h, m, cells)
+    assert v.shape == (B, K, 3 * d)
+    torch.testing.assert_close(v, native.gather_concat(None, eps, h, m, cells), atol=0, rtol=0)
+    torch.manual_seed(0)
+    bank = UnitBank(M, d, H, "gelu", init="fan_in", in_dim=3 * d).cuda()
+    idx = (torch.arange(B * K) % M).cuda()
+    flat = v.reshape(B * K, 3 * d)
+    for static in (False, True):
+        got = ops.grouped_unit_mlp(flat, idx, bank, static=static)
+        want = native.grouped_unit_mlp(flat, idx, bank, static=static)
+        torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
+        grads = torch.autograd.grad(got.square().sum(), (h, bank.W1), retain_graph=True)
+        ref = torch.autograd.grad(want.square().sum(), (h, bank.W1), retain_graph=True)
+        for a, b in zip(grads, ref, strict=True):
+            torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+
+
 def test_p2_10_inplace_mutation_contract():
     _, t, _ = case("gated_delta_update")
     names = ("h", "q", "age", "cell_idx", "valid", "c", "b")
