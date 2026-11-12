@@ -211,7 +211,7 @@ def test_ablated_model_builds_with_the_3d_cell_input(path: Path) -> None:
     reset = torch.zeros(B, T, dtype=torch.bool)
     logits, final, info = model(tokens, ctx, model.init_state(B), reset)
     assert logits.shape == (B, T, m.vocab_size) and bool(torch.isfinite(logits).all())
-    assert float(final.h.abs().max()) <= 1.0 and info["u"].shape == (B, T, d)
+    assert float(final.h.detach().abs().max()) <= 1.0 and info["u"].shape == (B, T, d)
     _, twin = p15._model(path, [ABLATE])
     twin.load_state_dict(model.state_dict())
     again, _, _ = twin(tokens, ctx, twin.init_state(B), reset)
@@ -711,9 +711,9 @@ def _check_split_window_compiled_equals_eager(ctx: DeviceContext, p_dense: float
     tol = p28.TOL[(ctx.device.type, "fp32")]
     for key in ("cell_idx", "unit_idx", "valid"):
         assert torch.equal(s_info[key], info[key]), key
-    assert float((s_logits - logits).abs().max()) <= tol["values"]
+    assert float((s_logits - logits).detach().abs().max()) <= tol["values"]
     for name in ("h", "q"):
-        gap = (getattr(s_final, name) - getattr(final, name)).abs().max()
+        gap = (getattr(s_final, name) - getattr(final, name)).detach().abs().max()
         assert float(gap) <= tol["values"], name
     assert torch.equal(s_final.age, final.age) and torch.equal(s_final.pos, final.pos)
     for g, w in zip(got, want, strict=True):
