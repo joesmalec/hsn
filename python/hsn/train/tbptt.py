@@ -195,7 +195,7 @@ from hsn.losses import (
     assemble_terms,
     auxiliary_terms,
     grad_norm_report,
-    total_and_parts,
+    terms_total,
     utility_loss,
 )
 from hsn.model.hsn import HSN
@@ -215,7 +215,7 @@ from hsn.train.checkpoint import (
 )
 from hsn.train.compile import CompiledWindow, compile_window
 from hsn.train.grad_norm import clip_grad_norm_, norm_float64
-from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices
+from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices, active_units_packed
 from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
 from hsn.train.probes import (
     ProbeResult,
@@ -274,6 +274,49 @@ def trailing_cut(window: Mapping[str, Tensor]) -> int:
 def _columns(batch: Batch, cut: int) -> Batch:
     """The first ``cut`` columns of every ``[B, T]`` window tensor (views, no copy)."""
     return {key: value[:, :cut] for key, value in batch.items()}
+
+
+@dataclass
+class _WindowStatistics:
+    """What a step's record needs from one window's device tensors, before it is read (P2.10b,
+    :meth:`TBPTTTrainer._window_statistics`): ``floats`` holds the window's terms in order, its
+    total, ``state_abs_max``, the means of ``eps_abs_mean``, ``alpha_entropy`` and ``cost`` and
+    of the rates named in ``rates``; ``ints`` (``None``: nothing to read) the number of correct
+    predictions at the loss positions (with ``count > 0``), the unit uses of the parameter sum
+    (with ``unit_uses``) and the active-unit mask with its range check (``units + 1`` flags,
+    with ``units > 0``). The rest is host data of the window."""
+
+    floats: Tensor
+    ints: Tensor | None
+    terms: tuple[str, ...]
+    rates: tuple[str, ...]
+    count: int  # the window's loss positions
+    raw_task: float | None  # the unweighted task term under gradient accumulation
+    tokens: int  # the window's non-padding positions
+    unit_uses: bool
+    units: int
+    every_unit: bool  # a soft-gated window: every unit ran, nothing to read
+    #: the window's unit indices held inside ``[0, units)`` (``None`` without the range check):
+    #: what may index the device before the check is read
+    unit_idx: Tensor | None = None
+
+
+@dataclass
+class _StepStatistics:
+    """A step's sums over its windows (the accumulators of :meth:`TBPTTTrainer.fit`)."""
+
+    part_sums: dict[str, float] = field(default_factory=dict)
+    total_sum: float = 0.0
+    state_abs_max: float = 0.0
+    eps_sum: float = 0.0
+    entropy_sum: float = 0.0
+    cost_sum: float = 0.0
+    rate_sums: dict[str, float] = field(default_factory=dict)
+    loss_sum: float = 0.0
+    correct: int = 0
+    n_loss: int = 0
+    parameter_sum: float = 0.0
+    active: Tensor | None = None  # P2.6: the units the step's windows executed
 
 
 class _CompiledEval:
@@ -664,21 +707,155 @@ class TBPTTTrainer(Trainer):
         This is logical routing, not physical MACs: the compiled static unit bank can execute all
         units before gathering the selected outputs. Profiling measures that physical work.
         """
-        unused = report["halting"] if self.cfg.model.r_max == 1 else 0
-        full = report["total_trainable"] - unused
+        uses = self._window_unit_uses(info, batch)
+        return self._parameter_sum(tokens, report, None if uses is None else int(uses))
+
+    def _window_unit_uses(
+        self, info: Mapping[str, Tensor], batch: Batch, unit_idx: Tensor | None = None
+    ) -> Tensor | None:
+        """The distinct units selected per non-padding row/position, summed over the window
+        (every unit on a dense-fallback row): a 0-dim int64 tensor on the device, not read here.
+        ``None`` in dense routing and under the soft gate (every unit, everywhere).
+        ``unit_idx`` stands in for ``info["unit_idx"]``."""
         if "unit_idx" not in info or self.hsn.schedule.gate(self.step) == "soft":
-            return float(full * tokens)
+            return None
         units = self.cfg.model.n_units
-        indices, valid = info["unit_idx"], info["valid"]
+        indices, valid = info["unit_idx"] if unit_idx is None else unit_idx, info["valid"]
         counts = torch.zeros(*indices.shape[:2], units, dtype=torch.int32, device=indices.device)
         counts.scatter_add_(
             2, indices.masked_fill(~valid, 0).to(torch.int64), valid.to(torch.int32)
         )
         distinct = (counts > 0).sum(dim=-1)
         distinct = torch.where(info["dense_fallback"] > 0, units, distinct)
-        unit_uses = int(distinct.masked_fill(batch["doc"] < 0, 0).sum())
+        uses: Tensor = distinct.masked_fill(batch["doc"] < 0, 0).sum()
+        return uses
+
+    def _parameter_sum(
+        self, tokens: int, report: Mapping[str, int], unit_uses: int | None
+    ) -> float:
+        """:meth:`_window_parameter_sum` from the window's ``tokens`` and its unit uses
+        (:meth:`_window_unit_uses` on the host; ``None``: every unit at every position)."""
+        unused = report["halting"] if self.cfg.model.r_max == 1 else 0
+        full = report["total_trainable"] - unused
+        if unit_uses is None:
+            return float(full * tokens)
+        units = self.cfg.model.n_units
         shared = full - report["units"]
         return float(shared * tokens + (report["units"] // units) * unit_uses)
+
+    # P2.10b: the window's statistics, issued after its backward and read once ---------------------
+
+    @torch.no_grad()
+    def _window_statistics(
+        self,
+        info: Mapping[str, Tensor],
+        fwd: Batch,
+        logits: Tensor,
+        terms: Mapping[str, Tensor],
+        total: Tensor,
+        count: int,
+        raw_task: float | None,
+        tokens: int,
+    ) -> _WindowStatistics:
+        """Everything a step's record reads from one window, as two small device tensors and no
+        host read (:class:`_WindowStatistics`). The trainer calls it once the window's backward
+        pass is issued and reads it (:meth:`_read_window_statistics`) after the gradient norm,
+        so the card works through the backward pass while the host prepares these, and one
+        transfer per tensor replaces a dozen reads between the forward and the backward pass.
+        The values are those of the reads they replace: the same expressions on the same
+        tensors, which the backward pass does not change."""
+        floats = [value.detach() for value in terms.values()]
+        floats.append(total.detach())
+        floats.append(info["state_abs_max"].max())
+        floats.append(info["eps_abs_mean"].float().mean())
+        floats.append(info["alpha_entropy"].float().mean())
+        floats.append(info["cost"].float().mean())
+        rates = tuple(key for key in ("explored", "refreshed", "dense_fallback") if key in info)
+        floats.extend(info[key].float().mean() for key in rates)
+        ints: list[Tensor] = []
+        if count > 0:
+            # the correct predictions at the loss positions. The argmax of every position and
+            # the mask afterwards: the count of logits[loss_mask].argmax(-1) == targets[loss_mask]
+            # without the two index lookups, each of which waits for the device
+            hits = logits.detach().float().argmax(dim=-1) == fwd["targets"]
+            ints.append((hits & fwd["loss_mask"]).sum())
+        units = 0
+        every_unit = False
+        packed: Tensor | None = None
+        unit_idx: Tensor | None = None
+        if "unit_idx" in info:  # P2.6: the units the window executed (_window_active_units)
+            if self.hsn.schedule.gate(self.step) == "soft":
+                every_unit = True
+            else:
+                units = self.hsn.cell.units.n_units
+                packed = active_units_packed(
+                    info["unit_idx"], info["valid"], units, dense_rows=info["dense_fallback"] > 0
+                )
+                # the range check is read with the rest, after these indices were used: what
+                # indexes the device meanwhile stays inside the bank (the same indices unless
+                # the check fails, and then the read raises before anything is kept)
+                unit_idx = info["unit_idx"].clamp(0, units - 1)
+        uses = self._window_unit_uses(info, fwd, unit_idx)
+        if uses is not None:
+            ints.append(uses)
+        joined = [torch.stack(ints)] if ints else []
+        if packed is not None:
+            joined.append(packed.to(torch.int64))
+        return _WindowStatistics(
+            floats=torch.stack(floats),
+            ints=torch.cat(joined) if joined else None,
+            terms=tuple(terms),
+            rates=rates,
+            count=count,
+            raw_task=raw_task,
+            tokens=tokens,
+            unit_uses=uses is not None,
+            units=units,
+            every_unit=every_unit,
+            unit_idx=unit_idx,
+        )
+
+    def _read_window_statistics(
+        self, window: _WindowStatistics, totals: _StepStatistics, report: Mapping[str, int]
+    ) -> None:
+        """Read a window's :class:`_WindowStatistics` (one transfer per tensor) and add them to
+        the step's sums, as :meth:`fit` did read by read."""
+        values: list[float] = window.floats.tolist()
+        ints: list[int] = window.ints.tolist() if window.ints is not None else []
+        n_terms = len(window.terms)
+        parts = dict(zip(window.terms, values[:n_terms], strict=True))
+        total, state_abs_max, eps, entropy, cost = values[n_terms : n_terms + 5]
+        position = 0
+        if window.count > 0:
+            totals.correct += ints[position]
+            position += 1
+            task = parts["task"] if window.raw_task is None else window.raw_task
+            totals.loss_sum += task * window.count
+            totals.n_loss += window.count
+        unit_uses: int | None = None
+        if window.unit_uses:
+            unit_uses = ints[position]
+            position += 1
+        totals.parameter_sum += self._parameter_sum(window.tokens, report, unit_uses)
+        active: Tensor | None = None
+        if window.units:
+            flags = ints[position : position + window.units + 1]
+            if not flags[-1]:
+                raise IndexError(f"unit_idx has a valid slot outside [0, {window.units})")
+            active = torch.tensor(flags[:-1], dtype=torch.bool)
+        elif window.every_unit:
+            active = torch.ones(self.hsn.cell.units.n_units, dtype=torch.bool)
+        if active is not None:
+            totals.active = active if totals.active is None else totals.active | active
+        totals.total_sum += total
+        for name, value in parts.items():
+            totals.part_sums[name] = totals.part_sums.get(name, 0.0) + value
+        totals.state_abs_max = max(totals.state_abs_max, state_abs_max)
+        totals.eps_sum += eps
+        totals.entropy_sum += entropy
+        totals.cost_sum += cost
+        for key, value in zip(window.rates, values[n_terms + 5 :], strict=True):
+            totals.rate_sums[key] = totals.rate_sums.get(key, 0.0) + value
 
     def _grad_groups(self) -> dict[str, list[nn.Parameter]]:
         """Trainable parameters per top-level submodule (plus ``root`` for direct parameters)."""
@@ -818,20 +995,13 @@ class TBPTTTrainer(Trainer):
             compiled_before = self._compiled.compile_seconds if self._compiled is not None else 0.0
             term_norms: dict[str, float] = {}
             self.optimizer.zero_grad(set_to_none=True)
-            part_sums: dict[str, float] = {}
-            total_sum = 0.0
-            state_abs_max = 0.0
-            eps_sum = 0.0
-            entropy_sum = 0.0
-            cost_sum = 0.0
-            rate_sums: dict[str, float] = {}
-            loss_sum = 0.0
-            correct = torch.zeros((), dtype=torch.int64, device=device)
-            n_loss = 0
+            # P2.10b: the windows' statistics are issued after each backward pass and read
+            # together once the gradient norm is in (_window_statistics): totals holds the
+            # step's sums from then on
+            totals = _StepStatistics()
+            pending: list[_WindowStatistics] = []
             tokens_in_step = 0
-            step_parameter_sum = 0.0
             positions_sum = 0  # P1.10d: the columns the step's windows computed
-            active: Tensor | None = None  # P2.6: the units the step's windows executed
             probe_counts = {
                 "probe_windows": 0.0,
                 "probe_pairs": 0.0,
@@ -890,14 +1060,8 @@ class TBPTTTrainer(Trainer):
                 )
                 if self.cfg.model.key_address:
                     self._prev_tokens = fwd["tokens"][:, -1].detach().clone()
-                window_active = self._window_active_units(info)
-                if window_active is not None:
-                    active = window_active if active is None else active | window_active
-                if self.route_guard is not None:  # A6: slots per (input byte, unit)
-                    self.route_guard.observe(fwd["tokens"], fwd["loss_mask"], info)
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
-                loss_mask = fwd["loss_mask"]
                 terms = self._routing_terms(terms, info, count)
                 if self.counterfactual:  # P2.3: the utility regression
                     terms = {**terms, "utility": self._utility_term(probe)}
@@ -911,7 +1075,7 @@ class TBPTTTrainer(Trainer):
                         n_windows * count / step_loss_positions if step_loss_positions else 0
                     )
                     terms = {**terms, "task": terms["task"] * task_weight}
-                total, parts = total_and_parts(terms)
+                total = terms_total(terms)
                 if stats_step and window_index == 0 and own_graph:  # P2.4: one window
                     scale = self.scaler.get_scale() if self.scaler is not None else 1.0
                     term_norms = grad_norm_report(
@@ -919,31 +1083,45 @@ class TBPTTTrainer(Trainer):
                     )
                 window_tokens = int((window["doc"] >= 0).sum())
                 tokens_in_step += window_tokens
-                step_parameter_sum += self._window_parameter_sum(info, fwd, window_tokens, report)
-                if count > 0:
-                    flat_targets = fwd["targets"][loss_mask]
-                    correct += (logits[loss_mask].float().argmax(dim=-1) == flat_targets).sum()
-                    loss_sum += (parts["task"] if raw_task is None else raw_task) * count
-                    n_loss += count
-                total_sum += float(total.detach())
-                for name, value in parts.items():
-                    part_sums[name] = part_sums.get(name, 0.0) + value
-                state_abs_max = max(state_abs_max, float(info["state_abs_max"].max()))
-                eps_sum += float(info["eps_abs_mean"].float().mean())
-                entropy_sum += float(info["alpha_entropy"].float().mean())
-                cost_sum += float(info["cost"].float().mean())
-                for key in ("explored", "refreshed", "dense_fallback"):
-                    if key in info:
-                        rate_sums[key] = rate_sums.get(key, 0.0) + float(info[key].float().mean())
                 scaled = total / n_windows
                 with self._segment("backward", tokens=tokens_in_step):
                     if self.scaler is not None:
                         scaled = self.scaler.scale(scaled)
                     scaled.backward()  # type: ignore[no-untyped-call]
+                # P2.10b: with the backward pass on its way, the statistics of the window (no
+                # host read here; read below, after the gradient norm) and the guard's counts
+                statistics = self._window_statistics(
+                    info, fwd, logits, terms, total, count, raw_task, window_tokens
+                )
+                pending.append(statistics)
+                if self.route_guard is not None:  # A6: slots per (input byte, unit)
+                    observed = (
+                        info
+                        if statistics.unit_idx is None
+                        else {**info, "unit_idx": statistics.unit_idx}
+                    )
+                    self.route_guard.observe(fwd["tokens"], fwd["loss_mask"], observed)
                 if self.counterfactual:  # P2.3: once per window, after its selections ran
                     self._update_ema(info, fwd, probe)
-            if snapshot is not None:  # P1.15: the dump records the step's loss
-                snapshot.loss = loss_sum / n_loss if n_loss else math.nan
+
+            def settle(
+                pending: list[_WindowStatistics] = pending,
+                totals: _StepStatistics = totals,
+                snapshot: Any = snapshot,
+            ) -> None:
+                """Read the windows' statistics (once) and give the snapshot the step's loss."""
+                if not pending:
+                    return
+                for window_statistics in pending:
+                    self._read_window_statistics(window_statistics, totals, report)
+                pending.clear()
+                if snapshot is not None:  # P1.15: the dump records the step's loss
+                    snapshot.loss = totals.loss_sum / totals.n_loss if totals.n_loss else math.nan
+
+            if self.grad_hook is not None or self.profiler is not None:
+                # a hook may read the snapshot's loss, and a profiled step keeps these reads
+                # out of its optimiser segment: read now, as before P2.10b
+                settle()
             with self._segment("optimizer_step"):
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
@@ -958,6 +1136,11 @@ class TBPTTTrainer(Trainer):
                 grad_norm = float(
                     clip_grad_norm_(params, max_norm, precision=train.grad_norm_precision)
                 )
+                # the gradient norm waited for the backward pass; the statistics queued behind
+                # it are ready (the guards below may dump the snapshot, which holds the loss)
+                settle()
+                active = totals.active
+                loss_sum, n_loss = totals.loss_sum, totals.n_loss
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 skipped = self._guard_nonfinite(grad_norm, next_step)  # P1.12
                 if not skipped and self.spike_factor is not None:  # P1.15
@@ -1008,11 +1191,12 @@ class TBPTTTrainer(Trainer):
                 self._prev_tokens = None
             self._rollback_after_step(loader, skipped)  # P1.16
             active_ids = None if active is None else active.nonzero().flatten().tolist()
+            step_parameter_sum = totals.parameter_sum
             parameter_sum += step_parameter_sum
             parameter_tokens += tokens_in_step
             dependency_eligible += probe_counts["probe_dependency_eligible"]
             dependency_total += probe_counts["probe_dependency_total"]
-            mean_total = total_sum / n_windows
+            mean_total = totals.total_sum / n_windows
             mean_loss = loss_sum / n_loss if n_loss else float("nan")
             if self.route_guard is not None:
                 self.route_guard.note_loss(mean_loss)
@@ -1031,7 +1215,7 @@ class TBPTTTrainer(Trainer):
                         event["scale_before"],
                         event["scale"],
                     )
-            accuracy = float(correct) / n_loss if n_loss else float("nan")
+            accuracy = float(totals.correct) / n_loss if n_loss else float("nan")
             if self.scaler is None and not math.isfinite(mean_total) and not skipped:
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
             seconds = time.perf_counter() - started
@@ -1045,10 +1229,10 @@ class TBPTTTrainer(Trainer):
                 train_seconds += seconds
                 total_tokens += tokens_in_step
             stats = {
-                "state_abs_max": state_abs_max,
-                "eps_mean": eps_sum / n_windows,
-                "alpha_entropy": entropy_sum / n_windows,
-                "route_cost": cost_sum / n_windows,
+                "state_abs_max": totals.state_abs_max,
+                "eps_mean": totals.eps_sum / n_windows,
+                "alpha_entropy": totals.entropy_sum / n_windows,
+                "route_cost": totals.cost_sum / n_windows,
                 "window_positions": positions_sum / n_windows,
                 "active_param_count": step_parameter_sum / tokens_in_step
                 if tokens_in_step
@@ -1058,7 +1242,7 @@ class TBPTTTrainer(Trainer):
                 **({"skipped_spike": float(self.skipped_spike)} if self.spike_factor else {}),
                 # P1.16: the rollbacks so far (only with train.rollback_every set)
                 **({"rollbacks": float(len(self.rollbacks))} if self.rollback else {}),
-                **{key: value / n_windows for key, value in rate_sums.items()},
+                **{key: value / n_windows for key, value in totals.rate_sums.items()},
                 **({"active_units": float(len(active_ids))} if active_ids is not None else {}),
                 **(probe_counts if self.counterfactual else {}),
                 **group_norms,
@@ -1074,7 +1258,7 @@ class TBPTTTrainer(Trainer):
                 loss_positions=n_loss,
                 seconds=seconds,
                 total=mean_total,
-                parts={name: value / n_windows for name, value in part_sums.items()},
+                parts={name: value / n_windows for name, value in totals.part_sums.items()},
                 stats=stats,
                 windows=self.windows,
                 resyncs=self.resyncs,
