@@ -280,6 +280,13 @@ class ModelConfig(_StrictModel):
     # same input, settle on one unit and hold one vector: rank 1.1 to 1.25 of 4, 12 Nov 2026).
     fast_units: Literal["routed", "fixed"] = "routed"
     # --- end A8 ---
+    # cell_units (13 Nov 2026; opt-in control for A8, not an amendment proposal): which unit a
+    # cell runs. "routed" (default): the unit the scorer ranks highest for the cell. "fixed":
+    # every cell i runs unit i mod n_units, in every gate mode; the router still chooses the
+    # cells, by each cell's score at its own unit. The control separates the two things the
+    # fixed-unit fast cells change at once: cells written at every position, and units that are
+    # all in use. Needs model.routing=topk; the split and fused windows refuse it.
+    cell_units: Literal["routed", "fixed"] = "routed"
     # --- Amendment A9 (docs/amendments/A9_ngram_address.md; opt-in, needs key_address) ---
     # address_ngram = n > 1 adds, for every m in 2..n, two scorer features per cell: the
     # similarity of the cell's address to a fixed code of the last m bytes (a_cur<m>) and of
@@ -367,6 +374,11 @@ class ModelConfig(_StrictModel):
                     f"model.disabled_cells {fast_disabled} lie in the fast group "
                     f"[0, {self.fast_cells})"
                 )
+        if self.cell_units != "routed" and self.routing != "topk":
+            raise ValueError(
+                f"model.cell_units={self.cell_units!r} needs model.routing=topk, got "
+                f"{self.routing!r}"
+            )
         if self.fast_units != "routed" and not self.fast_cells:
             raise ValueError(f"model.fast_units={self.fast_units!r} requires model.fast_cells > 0")
         if self.address_ngram > 1 and not self.key_address:
@@ -676,6 +688,14 @@ class TrainConfig(_StrictModel):
     # with a fresh optimiser, schedule, weight average and loader: nothing else of the
     # checkpoint is used. null = the usual initialisation. Hashed when set.
     init_from: Path | None = None
+    # Opt-in diagnostic (13 Nov 2026), training only: the weight of an answer position in the
+    # task loss relative to the other loss positions. An answer is a loss position whose recorded
+    # dependency is longer than one symbol (the answer to a stored fact); the supervised text
+    # positions of the story-text tasks have dependency 1. The task loss is the weighted mean
+    # sum(w * ce) / sum(w). 1.0 (default) is the plain mean, bit for bit. Not a fix for real
+    # text, where no position is marked as an answer; it shows whether a failure to bind is a
+    # matter of loss balance. Hashed when set; the split and fused windows refuse it.
+    answer_weight: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -1148,6 +1168,8 @@ class RunConfig(_StrictModel):
                 )
             if self.model.fast_cells or self.model.fast_readout:
                 raise ValueError("model.fast_cells and model.fast_readout (A8) are HSN-only")
+            if self.model.cell_units != "routed":
+                raise ValueError("model.cell_units is HSN-only")
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.unit_credit != "softmax":
@@ -1490,6 +1512,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_ngram",
     "model.fast_units",
     "train.init_from",
+    "train.answer_weight",
+    "model.cell_units",
 )
 
 
@@ -1533,6 +1557,16 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
             "has A5's two address columns only; use hardware.window=autograd"
+        )
+    if model.cell_units != "routed":
+        return (
+            f"model.cell_units={model.cell_units!r}: the split window replays the scorer's "
+            "unit choice; use hardware.window=autograd"
+        )
+    if train.answer_weight != 1.0:
+        return (
+            f"train.answer_weight={train.answer_weight}: the split window's task loss is the "
+            "plain mean; use hardware.window=autograd"
         )
     if model.r_max != 1:
         return f"model.r_max={model.r_max}: one round per position only"

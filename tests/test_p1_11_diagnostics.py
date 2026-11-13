@@ -164,6 +164,19 @@ def test_p1_11_window_state_stats_routed(routing: str) -> None:
     assert dg.trained_state(gru, tiny_gru_config(), cpu_ctx(), dev, 4) == {}
 
 
+def test_trained_state_without_edges() -> None:
+    """The no-graph ablation (``model.in_degree = 0``) has no edge logit: the end-of-run
+    measurement reports 0 for both edge statistics instead of failing on an empty tensor."""
+    cfg = tiny_hsn_config("model.routing=topk", "model.in_degree=0")
+    seed_everything(0)
+    model = build_model(cfg)
+    assert isinstance(model, HSN)
+    assert model.cell.graph.edge_logit.numel() == 0
+    out = dg.trained_state(model, cfg, cpu_ctx(), ByteDataset(docs("delayed", "dev", 6)), 4)
+    assert out["edge_logit/absmax"] == 0.0 and out["edge_logit/spread"] == 0.0
+    assert 0.0 <= out["write_share/min"] <= out["write_share/max"] <= 1.0
+
+
 def test_participation_ratio_equals_the_singular_value_form() -> None:
     """The Gram form is the SVD form's number (no decomposition): random, rank-1 and zero."""
     g = torch.Generator().manual_seed(0)

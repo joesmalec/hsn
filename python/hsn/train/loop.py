@@ -182,6 +182,7 @@ from hsn.device import (
     synchronize,
 )
 from hsn.eval.evaluate import DEFAULT_METRICS, Metric, PositionGroups, evaluate_windows
+from hsn.losses import task_cross_entropy
 from hsn.train.adaptive import AdaptiveLR
 from hsn.train.amp import autocast_ctx, autocast_name, make_grad_scaler
 from hsn.train.checkpoint import (
@@ -1431,7 +1432,13 @@ class Trainer:
                 if count > 0:
                     flat_logits = logits[loss_mask].float()
                     flat_targets = batch["targets"][loss_mask]
-                    loss = F.cross_entropy(flat_logits, flat_targets)
+                    weight = self.cfg.train.answer_weight
+                    if weight == 1.0:  # the plain mean, by the trainer's own call as before
+                        loss = F.cross_entropy(flat_logits, flat_targets)
+                    else:  # train.answer_weight (opt-in diagnostic)
+                        loss = task_cross_entropy(
+                            flat_logits, flat_targets, batch["dep"][loss_mask], weight
+                        )
                     correct += (flat_logits.argmax(dim=-1) == flat_targets).sum()
                     loss_sum += loss.detach().cpu().double() * count
                     n_loss += count
