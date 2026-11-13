@@ -22,6 +22,11 @@ Tasks of the manifest (``data.tasks`` selects one; the documents are the same):
            dev accuracy is answer accuracy, comparable with the delayed task's.
 * ``tfq``  train, dev, test: the answers only (the text is an unsupervised distractor).
 
+``--densities 32,128`` writes tasks ``tf32`` and ``tf128`` instead (the same documents, text
+supervised at one position in 32 and in 128): with one in eight the answers are 8.7 % of the
+supervised positions and no model without the byte codes learned them in 9,000 steps (12 Nov
+2026), so the sparser forms exist to see where recall comes back.
+
 ``--oor DIR`` also writes an evaluation-only manifest of out-of-range documents (the facts lie
 more than a window before their queries; dev and test only, answers supervised).
 
@@ -162,22 +167,26 @@ def build(args: argparse.Namespace) -> int:
     jobs: list[tuple[Path, str, list[tuple[TaskSpec, dict[str, int]]]]] = []
     in_range = v1.task("delayed", "in_range")
     # the two tasks share a generator seed, so their documents and their story cuts are the same
-    jobs.append(
-        (
-            Path(args.out),
-            args.name,
-            [
-                (
-                    task_spec(in_range, "tf", args.seed, sizes, args.context_id),
-                    {"train": args.text_every, "dev": 0, "test": 0},
-                ),
-                (
-                    task_spec(in_range, "tfq", args.seed, sizes, args.context_id),
-                    {"train": 0, "dev": 0, "test": 0},
-                ),
-            ],
-        )
-    )
+    if args.densities:  # tasks tf<n>: the same documents, one text position in n supervised
+        in_tasks = [
+            (
+                task_spec(in_range, f"tf{every}", args.seed, sizes, args.context_id),
+                {"train": every, "dev": 0, "test": 0},
+            )
+            for every in args.densities
+        ]
+    else:
+        in_tasks = [
+            (
+                task_spec(in_range, "tf", args.seed, sizes, args.context_id),
+                {"train": args.text_every, "dev": 0, "test": 0},
+            ),
+            (
+                task_spec(in_range, "tfq", args.seed, sizes, args.context_id),
+                {"train": 0, "dev": 0, "test": 0},
+            ),
+        ]
+    jobs.append((Path(args.out), args.name, in_tasks))
     if args.oor:
         oor = v1.task("delayed", "out_of_range")
         jobs.append(
@@ -260,6 +269,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--n-test", type=int, default=2000)
     p.add_argument("--n-oor", type=int, default=1000, help="dev and test documents of --oor")
     p.add_argument("--text-every", type=int, default=8)
+    p.add_argument(
+        "--densities",
+        type=lambda text: [int(x) for x in text.split(",")],
+        default=None,
+        help="instead of tf and tfq: tasks tf<n> for each n of this comma list (text supervised "
+        "at one position in n), the same documents as the default build of the same seed",
+    )
     p.add_argument("--skip-stories", type=int, default=32000)
     p.add_argument("--context-id", type=int, default=7)
     return build(p.parse_args(argv))
