@@ -295,6 +295,14 @@ class ModelConfig(_StrictModel):
     # codes; nothing about a key is learned. 1 (default): A5's two features only.
     address_ngram: int = Field(default=1, ge=1, le=3)
     # --- end A9 ---
+    # --- Amendment A11 (docs/amendments/A11_position_bound.md; opt-in) ---
+    # The position the scorer's ``pos`` feature reads. "document" (default): the position in the
+    # document, pos / unroll, which grows past 1 in a document longer than the training window.
+    # "clamp": min(pos, unroll - 1) / unroll. "wrap": (pos mod unroll) / unroll. All three are
+    # equal while pos < unroll, so a model trained on documents that fit the window is the same
+    # model with any of them.
+    scorer_position: Literal["document", "clamp", "wrap"] = "document"
+    # --- end A11 ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -1514,6 +1522,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.init_from",
     "train.answer_weight",
     "model.cell_units",
+    "model.scorer_position",
 )
 
 
@@ -1557,6 +1566,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
             "has A5's two address columns only; use hardware.window=autograd"
+        )
+    if model.scorer_position != "document":
+        return (
+            f"model.scorer_position={model.scorer_position!r} (A11) has not been checked "
+            "against the split window's tape; use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (
