@@ -167,6 +167,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import RunConfig, config_hash, wsd_decay_steps
@@ -1432,12 +1433,12 @@ class Trainer:
                     flat_logits = logits[loss_mask].float()
                     flat_targets = batch["targets"][loss_mask]
                     weight = self.cfg.train.answer_weight
-                    loss = task_cross_entropy(
-                        flat_logits,
-                        flat_targets,
-                        batch["dep"][loss_mask] if weight != 1.0 else None,
-                        weight,
-                    )
+                    if weight == 1.0:  # the plain mean, by the trainer's own call as before
+                        loss = F.cross_entropy(flat_logits, flat_targets)
+                    else:  # train.answer_weight (opt-in diagnostic)
+                        loss = task_cross_entropy(
+                            flat_logits, flat_targets, batch["dep"][loss_mask], weight
+                        )
                     correct += (flat_logits.argmax(dim=-1) == flat_targets).sum()
                     loss_sum += loss.detach().cpu().double() * count
                     n_loss += count
