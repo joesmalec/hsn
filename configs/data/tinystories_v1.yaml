@@ -1,0 +1,48 @@
+# tinystories_v1: the first real-text dataset of the program (12 Nov 2026).
+#
+# Source: TinyStories (Eldan and Li, 2023), the GPT-4 set "V2", from the Hugging Face dataset
+# roneneldan/TinyStories at commit f54c09fd23315a6f9c86f9dc80f725de7d8f9c64. Licence of the data:
+# CDLA-Sharing-1.0 (the dataset card). The raw files are not in the repository; fetch them into an
+# empty folder (the build checks their SHA-256):
+#
+#   U=https://huggingface.co/datasets/roneneldan/TinyStories/resolve/f54c09fd23315a6f9c86f9dc80f725de7d8f9c64
+#   curl -L -o TinyStoriesV2-GPT4-valid.txt $U/TinyStoriesV2-GPT4-valid.txt
+#   curl -L -r 0-268435455 -o TinyStoriesV2-GPT4-train.first256MiB.txt $U/TinyStoriesV2-GPT4-train.txt
+#
+# What the build makes (python/hsn/data/text.py):
+#   documents  one story each, BOS + bytes + EOS; median about 720 bytes, so a story spans about
+#              three 256-position windows (the state is carried, the gradient is not)
+#   bytes      newline -> 16, tab -> 17, everything from 32 up as it is (UTF-8 passes through)
+#   targets    every next byte: dev accuracy is next-byte accuracy, dev loss / ln 2 is bits per byte
+#   train      the first 200,000,000 positions of the 256 MiB head of the training file (about one
+#              pass in 27,000 steps at batch 32; 9,000 steps read about a third of it)
+#   dev, test  the first 2,000 and the next 2,000 distinct stories of the validation file
+# Select it with
+#   data.dataset=tinystories_v1 data.manifest=data/tinystories_v1/manifest.json
+#   data.tasks=[tinystories] data.variants=[out_of_range]
+# Golden manifest: configs/data/tinystories_v1.manifest.json.
+
+name: tinystories_v1
+unroll: 256
+task: tinystories
+variant: out_of_range # documents are longer than a window
+family: text
+context_id: 6 # synthetic_v1 uses 1 to 5
+separator: "<|endoftext|>"
+min_bytes: 64
+newline: 16
+tab: 17
+max_train_tokens: 200000000
+n_dev: 2000
+n_test: 2000
+n_gram: 32
+
+train:
+  file: TinyStoriesV2-GPT4-train.first256MiB.txt
+  sha256: cce19c15f7326df79083b0bdb868bc9f596d73c2e98f71bb44dad12e05992c2a
+  drop_last: true # a byte-range download ends inside a story
+
+heldout:
+  file: TinyStoriesV2-GPT4-valid.txt
+  sha256: 6874bae9a4c1a4e7edcf0e53b86c17817e9cf881fc75ff2368da457b80c0585d
+  drop_first: true # the file starts inside a story
