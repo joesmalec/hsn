@@ -1,0 +1,169 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kv/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kv/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed/in_range/dev"
+    }
+  ],
+  "name": "synthetic_v2",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.in_range.train.npz",
+      "hash": "f80482cd18b8cfa8d702d6517fd304870e8b2d7e7f2ce9831aa36df18444efb7",
+      "n_docs": 100000,
+      "n_loss": 643972,
+      "n_tokens": 19675082,
+      "split": "train",
+      "task": "kv",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.in_range.dev.npz",
+      "hash": "1110687785a270ba2c8dc9d925a78a270d18a528da269314fbed70c81adc3bb2",
+      "n_docs": 2000,
+      "n_loss": 12964,
+      "n_tokens": 396087,
+      "split": "dev",
+      "task": "kv",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.in_range.test.npz",
+      "hash": "30322b39015bc3892a3082230a5d918734c9cd55434bf72a96c2661241112ece",
+      "n_docs": 2000,
+      "n_loss": 12800,
+      "n_tokens": 392005,
+      "split": "test",
+      "task": "kv",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.in_range.train.npz",
+      "hash": "9da6eb61bdc9dd61a2059e2de3f224b0a09cfbe1ce250038633960a9ad7ea157",
+      "n_docs": 100000,
+      "n_loss": 343109,
+      "n_tokens": 19471999,
+      "split": "train",
+      "task": "delayed",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.in_range.dev.npz",
+      "hash": "320562daf82f1e5533f329a289dcbe63c88cfd02d447daa1dd76139fa29d2249",
+      "n_docs": 2000,
+      "n_loss": 6814,
+      "n_tokens": 392017,
+      "split": "dev",
+      "task": "delayed",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.in_range.test.npz",
+      "hash": "cfccebc5bbca4b2aeb12e2198af402af365b6b4978af962ca83f271867c91e77",
+      "n_docs": 2000,
+      "n_loss": 6817,
+      "n_tokens": 390440,
+      "split": "test",
+      "task": "delayed",
+      "variant": "in_range"
+    }
+  ],
+  "spec_hash": "64eb11ad236f065d5b65d1bca9e4478129b65ef9b409d98b87ad72228eca685b",
+  "split_hashes": {
+    "dev": "6c096cfa08c34a37fb609d04523b95be28e76ca0cd23fefd1837f5fb36c7add0",
+    "test": "200330230cd74d6da231ae05e5888210fca9ee719cffe1147c42dc14b08b903e",
+    "train": "193319a66dbb751778fd56beb6892482fc0d89e862de21e607f8c3b0e42d0ecc"
+  },
+  "unroll": 256
+}

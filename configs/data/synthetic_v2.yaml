@@ -1,0 +1,57 @@
+# synthetic_v2: a larger and harder form of the two G1 families (12 Nov 2026).
+#
+# Why: on synthetic_v1's delayed task the eight-slot arms reach 99 % at 22,000 steps, and that
+# task is guessable without binding: a document has at most six facts, so a later query has one
+# to four candidates (a key-blind reader scores 62 % on later queries, 100 % in the last slot).
+# synthetic_v1 stays frozen (it is the G1 task set); this is an additional dataset, selected with
+#   data.dataset=synthetic_v2 data.manifest=data/synthetic_v2/manifest.json
+#
+# Against synthetic_v1, in range only (every dependency fits one 256-position window):
+#   delayed  up to 12 facts and 8 queries per document (v1: 6 and 4)
+#   kv       up to 12 keys and 12 queries per document (v1: 8 and 8)
+#   both     100,000 training documents (v1: 20,000), so 9,000 steps at batch 32 see each
+#            document three times, not fourteen; 2,000 dev and test documents
+# Alphabets, markers, lengths and the per-split key ranges are synthetic_v1's (dev and test keys
+# are never seen in training). Golden manifest: configs/data/synthetic_v2.manifest.json.
+
+name: synthetic_v2
+unroll: 256
+
+tasks:
+  - name: kv
+    variant: in_range
+    family: kv
+    context_id: 1
+    seed: 11001
+    n_train: 100000
+    n_dev: 2000
+    n_test: 2000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      markers: { ins: 16, ovr: 17, del: 18 }
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] } # disjoint per split
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 12
+      op_rate: 0.15
+      p_del: 0.25
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 }
+      max_queries: 12
+
+  - name: delayed
+    variant: in_range
+    family: delayed
+    context_id: 2
+    seed: 12001
+    n_train: 100000
+    n_dev: 2000
+    n_test: 2000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] } # disjoint per split
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 12
+      max_queries: 8

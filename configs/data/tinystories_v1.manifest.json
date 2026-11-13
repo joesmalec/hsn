@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 298688,
+      "test": "tinystories/out_of_range/dev",
+      "test_docs_with_overlap": 1997,
+      "train": "tinystories/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 296584,
+      "test": "tinystories/out_of_range/test",
+      "test_docs_with_overlap": 1999,
+      "train": "tinystories/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 30593,
+      "test": "tinystories/out_of_range/test",
+      "test_docs_with_overlap": 1858,
+      "train": "tinystories/out_of_range/dev"
+    }
+  ],
+  "name": "tinystories_v1",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "tinystories.out_of_range.train.npz",
+      "hash": "cc0bbba63f4291185d3ee2103f97620dc393b06458896cf0b4b7c77f8aca0c98",
+      "n_docs": 248173,
+      "n_loss": 199751432,
+      "n_tokens": 199999605,
+      "split": "train",
+      "task": "tinystories",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "tinystories.out_of_range.dev.npz",
+      "hash": "672425a6a5a424e5d7fd2249da3522b3f891956aab449fdf91623a7d7de2fdf0",
+      "n_docs": 2000,
+      "n_loss": 1592796,
+      "n_tokens": 1594796,
+      "split": "dev",
+      "task": "tinystories",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "tinystories.out_of_range.test.npz",
+      "hash": "eda65b24c6449f6d9b2c299155f169771cc876b26c25a2fc07f9179507f17686",
+      "n_docs": 2000,
+      "n_loss": 1601343,
+      "n_tokens": 1603343,
+      "split": "test",
+      "task": "tinystories",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "0756230dd5aba72b6951c049faac89956fa8d9f313654b72dd7466732a14ab6c",
+  "split_hashes": {
+    "dev": "93632cdb65702993437340b5f02e167c5995e519357e583373c8e646c97c7ffa",
+    "test": "032fc1830445dc3b626023d648ca82ea0365d60348aeb17f063cc0bde0e5bc6c",
+    "train": "5e93f67546fca85e86c33fc87932fd39c3dc767e3ce773a4e3edf93dfcc9906f"
+  },
+  "unroll": 256
+}
