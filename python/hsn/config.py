@@ -280,6 +280,13 @@ class ModelConfig(_StrictModel):
     # same input, settle on one unit and hold one vector: rank 1.1 to 1.25 of 4, 12 Nov 2026).
     fast_units: Literal["routed", "fixed"] = "routed"
     # --- end A8 ---
+    # cell_units (13 Nov 2026; opt-in control for A8, not an amendment proposal): which unit a
+    # cell runs. "routed" (default): the unit the scorer ranks highest for the cell. "fixed":
+    # every cell i runs unit i mod n_units, in every gate mode; the router still chooses the
+    # cells, by each cell's score at its own unit. The control separates the two things the
+    # fixed-unit fast cells change at once: cells written at every position, and units that are
+    # all in use. Needs model.routing=topk; the split and fused windows refuse it.
+    cell_units: Literal["routed", "fixed"] = "routed"
     # --- Amendment A9 (docs/amendments/A9_ngram_address.md; opt-in, needs key_address) ---
     # address_ngram = n > 1 adds, for every m in 2..n, two scorer features per cell: the
     # similarity of the cell's address to a fixed code of the last m bytes (a_cur<m>) and of
@@ -367,6 +374,11 @@ class ModelConfig(_StrictModel):
                     f"model.disabled_cells {fast_disabled} lie in the fast group "
                     f"[0, {self.fast_cells})"
                 )
+        if self.cell_units != "routed" and self.routing != "topk":
+            raise ValueError(
+                f"model.cell_units={self.cell_units!r} needs model.routing=topk, got "
+                f"{self.routing!r}"
+            )
         if self.fast_units != "routed" and not self.fast_cells:
             raise ValueError(f"model.fast_units={self.fast_units!r} requires model.fast_cells > 0")
         if self.address_ngram > 1 and not self.key_address:
@@ -1156,6 +1168,8 @@ class RunConfig(_StrictModel):
                 )
             if self.model.fast_cells or self.model.fast_readout:
                 raise ValueError("model.fast_cells and model.fast_readout (A8) are HSN-only")
+            if self.model.cell_units != "routed":
+                raise ValueError("model.cell_units is HSN-only")
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.unit_credit != "softmax":
@@ -1499,6 +1513,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.fast_units",
     "train.init_from",
     "train.answer_weight",
+    "model.cell_units",
 )
 
 
@@ -1542,6 +1557,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
             "has A5's two address columns only; use hardware.window=autograd"
+        )
+    if model.cell_units != "routed":
+        return (
+            f"model.cell_units={model.cell_units!r}: the split window replays the scorer's "
+            "unit choice; use hardware.window=autograd"
         )
     if train.answer_weight != 1.0:
         return (

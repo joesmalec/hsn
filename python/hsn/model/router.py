@@ -165,6 +165,7 @@ __all__ = [
     "CANDIDATE_ADD",
     "CANDIDATE_NONE",
     "CANDIDATE_REMOVE",
+    "CLOSED_UNIT_LOGIT",
     "GATE_MODES",
     "SCORED_MODES",
     "SCORER_FEATURE_NAMES",
@@ -185,6 +186,10 @@ GATE_MODES: tuple[str, ...] = tuple(get_args(GateMode))
 #: The modes whose decision follows the scores: the gate's cell mask, the refresh probes and the
 #: exploration apply to these; ``random`` and ``fixed`` are controls and ``dense`` has no selection.
 SCORED_MODES: tuple[str, ...] = ("topk", "greedy_budget")
+#: The logit of a (cell, unit) pair that ``model.cell_units = fixed`` closes: finite (so that an
+#: entropy or a balance term of the logits stays finite) and far enough below any score that the
+#: pair's softmax weight is exactly 0 in fp32.
+CLOSED_UNIT_LOGIT = -1.0e4
 #: Relative tolerance of the budget comparison: costs are accumulated in fp32 on the device, so
 #: the exact all-cells case (``cost = 1.0``, ``budget = 1.0``) must not lose a cell to an ulp.
 BUDGET_SLACK = 1e-5
@@ -1034,6 +1039,10 @@ class Router(nn.Module):
         self._dense_cost = costs.dense_cost()
         self._unit_costs: list[float] = [float(v) for v in costs.unit.tolist()]
         self.register_buffer("cost_table", costs.unit.to(torch.float32), persistent=False)
+        #: ``model.cell_units = fixed`` (:meth:`set_cell_units`): True where a (cell, unit) pair is
+        #: closed, ``[N, M]``; ``None`` (default) leaves the scorer's logits as they are.
+        self.closed_units: Tensor | None
+        self.register_buffer("closed_units", None, persistent=False)
         self._tap: RouterTap | None = None  # P2.3: armed by intercept()
 
     @classmethod
@@ -1056,6 +1065,7 @@ class Router(nn.Module):
         if scorer is None:
             scorer = Scorer(cfg, unroll=unroll, seed=seed)
         router = cls(scorer, cost_table_from_config(cfg), lambda_cost=cfg.lambda_cost)
+        router.set_cell_units(cfg.cell_units)
         if cfg.routing == "fixed":
             router.require_affordable(cfg.budget, len(cfg.fixed_route), "model.fixed_route")
         elif cfg.routing != "dense":
@@ -1075,7 +1085,7 @@ class Router(nn.Module):
         if self._tap is not None:
             self._tap.features.append(feats.detach())
         if profiler is None:
-            plain: Tensor = self.scorer(feats)
+            plain: Tensor = self._close_units(self.scorer(feats))
             return plain
         if not isinstance(feats, Tensor) or feats.ndim != 3:
             raise ValueError(
@@ -1084,8 +1094,30 @@ class Router(nn.Module):
             )
         n_tokens = int(feats.shape[0]) if tokens is None else tokens
         with profiler.segment("scorer", tokens=n_tokens):
-            logits: Tensor = self.scorer(feats)
+            logits: Tensor = self._close_units(self.scorer(feats))
         return logits
+
+    def set_cell_units(self, mode: str) -> None:
+        """``model.cell_units``: ``"routed"`` (the scorer's logits as they are) or ``"fixed"``:
+        cell ``i`` runs unit ``i mod M``. The other units' logits of the cell are set to
+        :data:`CLOSED_UNIT_LOGIT`, so every consumer of the logits agrees without a special
+        case: the hard unit is the cell's own, the cell's score is that unit's score, the unit
+        softmax is exactly one-hot in fp32 (no gradient reaches a closed pair) and the probes'
+        argmax unit is the cell's own."""
+        if mode not in ("routed", "fixed"):
+            raise ValueError(f"cell_units must be 'routed' or 'fixed', got {mode!r}")
+        if mode == "routed":
+            self.closed_units = None
+            return
+        own = torch.arange(self.n_cells) % self.n_units  # [N]
+        closed = torch.ones(self.n_cells, self.n_units, dtype=torch.bool)
+        closed[torch.arange(self.n_cells), own] = False
+        self.closed_units = closed.to(self.cost_table.device)
+
+    def _close_units(self, logits: Tensor) -> Tensor:
+        if self.closed_units is None:
+            return logits
+        return logits.masked_fill(self.closed_units, CLOSED_UNIT_LOGIT)
 
     def set_unit_credit(self, mode: str) -> None:
         """``train.unit_credit`` (opt-in; the hard values never change): which scores the
