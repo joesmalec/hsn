@@ -1,8 +1,9 @@
-# P2.10c: a fast training window for the state gradient (phase 1: design and reference)
+# P2.10c: a fast training window for the state gradient
 
-13 November 2026. Branch `claude/cutc-fused-window`, from `09db900`. Phase 1 is CPU work only:
-this note, the float64 reference and its tests. Nothing here was run on a GPU, no kernel was
-written, and every step time below that is not marked *measured* is an estimate.
+13 November 2026. Branch `claude/cutc-fused-window`, from `09db900`. Phase 1 (CPU only) is this
+note, the float64 reference and its tests. Phase 2 (the kernels) was approved the same day and
+is logged at the end ("Phase 2 log"). Up to that log nothing here was run on a GPU, no kernel
+was written, and every step time that is not marked *measured* is an estimate.
 
 ## What this is
 
@@ -460,6 +461,14 @@ are measurements outside the suite (`trained.py`, `onestep.py`).
 Phase 2 (on the card, when it is free). Every comparison is on one trajectory: one tape, one
 replay, and only the sweep's implementation differs.
 
+**This replaces the rule "fp32 on the card to rounding, end to end, with identical routing
+decisions"** that P2.10 was held to (decided 13 Nov with phase 2's approval). The reason is
+the measurement under "At trained checkpoints": on the trained candidate base the model's own
+two autograd rounds are 5e-7 and 2.4e-6 apart in float64 and fp32 autograd is order one from
+float64, so two correct fp32 paths cannot agree end to end there, whatever they are. The
+steps below test the same thing where it can be tested: per step, on one tape, end to end on
+models whose own rounds agree, and by accuracy runs.
+
 1. **Per step.** Each kernel step against one step of `state_gradient_backward`, both started
    from the reference's cotangent after the position (`initial`): `dc`, `db`, `A`, `R`, and the
    `trace`'s `dh`, `Vᵀ dm`. fp32; small and recipe shapes; resets at block boundaries; padded
@@ -482,10 +491,99 @@ replay, and only the sweep's implementation differs.
    gradient on the sensitive windows is not determined in bf16 by any window, these runs, not
    a gradient comparison, are what shows that training is unchanged.
 
+## Phase 2 log
+
+### 13 Nov: approval, the shape, decisions
+
+The user approved phase 2 ("yes on started on this shape, with the cheaper arithmetic for the
+fast cells first"). The shape to build for and to time: 64 cells, 8 fast + 12 routed slots
+(`model.n_cells=64`, `k_select=20`, `fast_cells=8`, `fast_units=fixed`, `fast_readout=true`,
+`selected_readout=true`), the state gradient, executed credit, no soft warm-up. Its four
+training runs finished on the autograd window at 229 to 233 ms per step on the rented cards
+(arithmetic 99.0 %, TinyStories 0.970 bits per byte, delayed 97.3 %, the pair task 93.4 %,
+one seed each). The routed-only shape stays supported; `K`, `N` and the number of fast cells
+stay parameters; `model.address_ngram=2` and `model.scorer_position=wrap` may be added.
+
+Decided with it (by the coordinating session, reported to the user):
+
+- **Configuration.** `hardware.window=split|fused` will accept `[summary, eps, router]` and
+  fast cells once the path exists and is tested. No new key; existing hashes unchanged.
+- **Test bar.** The plan of "Test plan" above, which replaces the end-to-end fp32 rule.
+- **Dense-fallback rows** keep going to the autograd window.
+
+Order: the cheaper arithmetic for the fast slots first; then the forward sweep for this shape,
+the reverse sweep and the record; then timing alone on the card and accuracy runs.
+
+### Step 1: the fast slots' unit products (CPU, done)
+
+With `fast_units=fixed` slot `i < F` runs unit `i mod M` at every position, so its unit is
+known before the window. The static rounds multiplied every pair with every unit's weights
+(the all-units layout keeps the shapes static when a pair's unit is the router's choice). For
+the fast slots one unit's weights are enough: their weights are stacked per slot once per
+window and a slot's pairs take one batched product per layer.
+
+What changed:
+
+- `UnitBank.slot_layout` (the per-slot stacks, with the gate's columns for the merged first
+  layer), `forward_static_slots` (the capturable round: values and gradients) and
+  `forward_static_chosen_slots` (the fused sweep's pass).
+- `WindowConsts.fast_w1/b1/w2/b2`: when a window's constants carry them,
+  `PDGCell.step_sparse(static=True)`, `sparse_products` and `sparse_products_raw` send the
+  first `F` slots through the per-slot products and the others through the all-units products
+  as before.
+- Only the split window's sweep sets them: `run_tape` for the eager sweep and
+  `SweepTwin` (buffers `sweep_fast_*`, refreshed per window) for the compiled one, both from
+  `fixed_fast_slots(model)`. The autograd window's constants never carry them, so its round is
+  the one it ran; a model without fast cells, or with fast cells at routed units, takes the
+  existing code (tested: the new passes are never entered).
+- The reverse sweep's products in the layouts a compiled sweep will multiply with
+  (`SweepLayouts`, `sweep_layouts`, `cell_state_vjp(layouts=)`): the all-units operands for
+  the routed slots, one batched product per layer for the fast slots. This is the arithmetic
+  the kernels of the reverse sweep run; the per-unit reference stays the oracle.
+
+How equal (CPU; `tests/test_p2_10c_fast_slots.py`, 31 tests, and
+`scratch/fastslots.py` at the trained fast-group checkpoint, B32, T256, 20 slots of which 8
+fast):
+
+| Comparison | Result |
+| --- | --- |
+| `forward_static_slots` against `forward_static` and the grouped pass: values, and gradients into the inputs and every weight of the bank (1, 3 and 5 fixed slots of 3 units) | rtol 1e-12 |
+| `forward_static_chosen_slots` against `forward_static_chosen`, with and without the gate riding | rtol 1e-12 |
+| The cell's capturable round, and the fused sweep's products (`sparse_products`, `sparse_products_raw`), with the slot layouts against without | rtol 1e-12 |
+| The sweep's tape with the per-slot products against the all-units products, small model (also refresh probes, and a budget that cuts fast slots) | every decision identical, values at rtol 1e-12 |
+| The same at the trained checkpoint, two real windows | every decision identical; state values within 4.3e-14 and 2.3e-13 in float64; the fp32 tape bit-identical |
+| The sweep twin's slot buffers against `slot_layout`, before and after a weight change; a twin block's tape against the model's | identical |
+| The cell's backward and a whole reverse sweep in the static layouts against the per-unit reference, small model | rtol 1e-12 and 1e-11 |
+| The same at the trained checkpoint (`dL/dc`, `dL/db`, the state cotangent) | 2e-16 to 7e-16 (relative L2) |
+| Window against autograd on the sweep's round at the trained checkpoint, after the change | 9.2e-15; logits identical; one step 5.5e-16 at worst |
+| The existing split and autograd windows against `09db900` (the 23 cases of phase 1) | bit for bit |
+
+What it should save, per position, in multiply-accumulates of the matrix products (B32):
+
+| Shape | Forward sweep | Reverse sweep |
+| --- | --- | --- |
+| 20 slots, 8 fast, 64 cells | 894 M to 601 M (33 % less): first layer with the gate 682 to 447, second layer 168 to 109 | 514 M to 338 M (34 % less): first layer's state rows 341 to 223, second layer 168 to 109 |
+| 16 slots, 4 fast | 724 M to 577 M (20 % less) | 411 M to 323 M (21 % less) |
+| 12 slots, no fast cells | unchanged | unchanged |
+
+In time, at P2.10's measured rates for these products (7.8e12 and 5.2e12 multiply-accumulates
+per second), that is about 41 µs per position less in the forward sweep and 26 µs in the
+reverse, against two more matrix-product calls per position in each (the fast slots' batched
+products) and the copies that join the two groups' results. What a batched product over 8
+small matrices costs on this card is not measured; if it costs what a small matmul does
+(2 to 6 µs), the step at this shape is about 10 to 14 ms shorter than the table under
+"Expected step time" (110 to 147 ms, likely 130): 96 to 137 ms, likely about 118. On the CPU
+the float64 reference sweep went from 11.2 s to 7.9 s per window and the reverse sweep in the
+static layouts from 7.3 s to 5.6 s, which shows the arithmetic is gone, not what the card
+will do.
+
 ## Files
 
 - `python/hsn/train/state_gradient.py`: the cell's backward into the state, the sweep, the
-  node.
+  node; the reverse sweep's static layouts.
+- `python/hsn/model/units.py`, `cell.py`, `python/hsn/train/compile.py`: the fixed slots' unit
+  products in the static rounds and the sweep twin (phase 2, step 1);
+  `tests/test_p2_10c_fast_slots.py`.
 - `python/hsn/train/split.py`: `SplitWindow(state_gradient=)`, the fast read and the reserved
   slots in the replay.
 - `python/hsn/model/cell.py`, `units.py`, `router.py`, `python/hsn/config.py`: the default-off
