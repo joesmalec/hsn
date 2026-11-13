@@ -263,6 +263,31 @@ class ModelConfig(_StrictModel):
     # (width 3d, :attr:`cell_input_width`) for the cell-input norm, the unit MLPs and the gate;
     # the scorer's features and the decoder still read u.
     ablate_shared_u: bool = False  # ablation: remove u from v
+    # --- Amendment A8 (docs/amendments/A8_fast_cells.md; opt-in, default off) ---
+    # fast_cells = F > 0: cells 0..F-1 are selected at every position (the "fast" group, written
+    # on every token), and the router chooses the remaining k_select - F slots among the other
+    # cells (the "slow" group) exactly as before. The cell equation, the units, the graph and the
+    # gate are unchanged; only the selection rule differs. Needs model.routing=topk and
+    # F < k_select. 0 (default): every slot is the router's.
+    fast_cells: int = Field(default=0, ge=0)
+    # fast_readout (needs fast_cells > 0 and selected_readout): the fast group gets its own read,
+    # f = mean of the fast cells. S reads [z; q; ctx; f_{t-1}], the decoder reads [q; u; r; f],
+    # and the selected-cell readout r covers the routed (slow) slots only.
+    fast_readout: bool = False
+    # fast_units (needs fast_cells > 0): which unit a fast cell runs. "routed": the unit the
+    # scorer ranks highest for it, as for every cell. "fixed": fast cell i always runs unit
+    # i mod n_units, so the fast cells differ by construction (with "routed" they receive the
+    # same input, settle on one unit and hold one vector: rank 1.1 to 1.25 of 4, 12 Nov 2026).
+    fast_units: Literal["routed", "fixed"] = "routed"
+    # --- end A8 ---
+    # --- Amendment A9 (docs/amendments/A9_ngram_address.md; opt-in, needs key_address) ---
+    # address_ngram = n > 1 adds, for every m in 2..n, two scorer features per cell: the
+    # similarity of the cell's address to a fixed code of the last m bytes (a_cur<m>) and of
+    # the m bytes before the current one (a_prev<m>), so that a key of m bytes has one address at
+    # its fact's value and at its query. The codes are fixed products of per-position byte
+    # codes; nothing about a key is learned. 1 (default): A5's two features only.
+    address_ngram: int = Field(default=1, ge=1, le=3)
+    # --- end A9 ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -324,6 +349,35 @@ class ModelConfig(_StrictModel):
                 f"model.routing=greedy_budget needs model.budget > 0, got {self.budget}"
             )
         # --- end P2.1 ---
+        # --- Amendment A8: the fast group ---
+        if self.fast_cells:
+            if self.routing != "topk":
+                raise ValueError(
+                    f"model.fast_cells={self.fast_cells} needs model.routing=topk, got "
+                    f"{self.routing!r}"
+                )
+            if self.fast_cells >= self.k_select:
+                raise ValueError(
+                    f"model.fast_cells={self.fast_cells} must be < model.k_select="
+                    f"{self.k_select}: the router keeps at least one slot"
+                )
+            fast_disabled = [i for i in self.disabled_cells if i < self.fast_cells]
+            if fast_disabled:
+                raise ValueError(
+                    f"model.disabled_cells {fast_disabled} lie in the fast group "
+                    f"[0, {self.fast_cells})"
+                )
+        if self.fast_units != "routed" and not self.fast_cells:
+            raise ValueError(f"model.fast_units={self.fast_units!r} requires model.fast_cells > 0")
+        if self.address_ngram > 1 and not self.key_address:
+            raise ValueError(
+                f"model.address_ngram={self.address_ngram} requires model.key_address=true"
+            )
+        if self.fast_readout and not (self.fast_cells and self.selected_readout):
+            raise ValueError(
+                "model.fast_readout requires model.fast_cells > 0 and model.selected_readout=true"
+            )
+        # --- end A8 ---
         return self
 
 
@@ -616,6 +670,12 @@ class TrainConfig(_StrictModel):
     # scores are constants of that softmax): a unit that did not run gets no gradient from the
     # slot. Not adopted by any recipe: an amendment would have to do that.
     unit_credit: Literal["softmax", "executed"] = "softmax"
+    # Opt-in warm start (13 Nov 2026): the weights of a checkpoint written by another run whose
+    # model has the same parameters (strict key match); the run's weight average is taken when
+    # the checkpoint holds one (the model its evaluations scored). Training starts at step 0
+    # with a fresh optimiser, schedule, weight average and loader: nothing else of the
+    # checkpoint is used. null = the usual initialisation. Hashed when set.
+    init_from: Path | None = None
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -919,11 +979,35 @@ class TransformerBaselineConfig(_StrictModel):
         return self
 
 
+class SelectiveSSMBaselineConfig(_StrictModel):
+    """``baseline.selective_ssm.*``: the Mamba-style selective state-space model (the paper's
+    "selective recurrent memory" control, plan P2.13; :mod:`hsn.baselines.mamba`).
+
+    Defaults are a ≈2M-parameter setting for the reference data: 1,887,744 parameters as measured
+    by ``MambaBaseline.param_report``.
+    """
+
+    d_model: int = Field(default=256, ge=1)  # residual width
+    n_layers: int = Field(default=4, ge=1)  # Mamba blocks
+    d_state: int = Field(default=16, ge=1)  # state per channel of the selective scan
+    d_conv: int = Field(default=4, ge=1)  # taps of the causal depthwise convolution
+    expand: int = Field(default=2, ge=1)  # inner width = expand × d_model
+    dt_rank: int | None = Field(default=None, ge=1)  # rank of the step-size path; None = d_model/16
+
+
 class BaselineConfig(_StrictModel):
     """``baseline.*``: sizes of the P0.5 baselines (``model_name`` selects which one runs)."""
 
     gru: GRUBaselineConfig = GRUBaselineConfig()
     transformer: TransformerBaselineConfig = TransformerBaselineConfig()
+    selective_ssm: SelectiveSSMBaselineConfig = SelectiveSSMBaselineConfig()
+    # The HSN's fixed byte codes (amendment A5, ``model.key_address``) as a baseline input: the
+    # codes of the current and of the previous byte, frozen, through one learned projection
+    # (:mod:`hsn.baselines.address`). Opt-in; a control for how much of the HSN's score on keys it
+    # never trained on comes from that fixed code. ``address_dim`` 64 is the recipe's ``model.d``,
+    # which with the same seed gives the HSN's own code table.
+    address_input: bool = False
+    address_dim: int = Field(default=64, ge=1)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1048,6 +1132,11 @@ class RunConfig(_StrictModel):
                     f"hardware.window={self.hardware.window!r} is not available for this "
                     f"configuration: {reason}"
                 )
+        if self.baseline.address_input and self.model_name == "hsn":
+            raise ValueError(
+                "baseline.address_input is an input of the baselines; the HSN's own address "
+                "features are model.key_address"
+            )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name != "hsn":
             ignored = []
@@ -1057,6 +1146,8 @@ class RunConfig(_StrictModel):
                 raise ValueError(
                     "model.key_address and model.selected_readout are HSN-only A5 features"
                 )
+            if self.model.fast_cells or self.model.fast_readout:
+                raise ValueError("model.fast_cells and model.fast_readout (A8) are HSN-only")
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.unit_credit != "softmax":
@@ -1095,6 +1186,17 @@ class RunConfig(_StrictModel):
         if routing in ("dense", "random", "fixed") and train.route_guard.enabled:
             raise ValueError("train.route_guard requires learned routing (topk or greedy_budget)")
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
+        # --- Amendment A8: the fast group is a rule of the scored hard/soft selection only ---
+        if self.model.fast_cells and train.gate_mode == "reinforce":
+            raise ValueError(
+                "model.fast_cells (A8) is not defined for train.gate_mode=reinforce (the sampled "
+                "order has no reserved slots)"
+            )
+        if self.model.fast_cells and train.lambda_u > 0.0:
+            raise ValueError(
+                "model.fast_cells (A8) with train.lambda_u > 0 is untested: the counterfactual "
+                "probes swap slots without regard to the reserved ones"
+            )
         if train.gate_mode == "reinforce" and routing != "topk":
             raise ValueError(
                 f"train.gate_mode=reinforce samples cells by Gumbel-top-k and needs "
@@ -1380,6 +1482,14 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "hardware.sweep_twin",
     "train.unit_credit",
     "train.ste_scope",
+    "baseline.selective_ssm",
+    "baseline.address_input",
+    "baseline.address_dim",
+    "model.fast_cells",
+    "model.fast_readout",
+    "model.address_ngram",
+    "model.fast_units",
+    "train.init_from",
 )
 
 
@@ -1414,6 +1524,16 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
     if model.disabled_cells:
         return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
+    if model.fast_cells:
+        return (
+            f"model.fast_cells={model.fast_cells} (A8): the reserved slots and the fast read "
+            "are not built into the split window; use hardware.window=autograd"
+        )
+    if model.address_ngram > 1:
+        return (
+            f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
+            "has A5's two address columns only; use hardware.window=autograd"
+        )
     if model.r_max != 1:
         return f"model.r_max={model.r_max}: one round per position only"
     if train.precision == "fp16":

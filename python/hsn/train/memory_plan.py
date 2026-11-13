@@ -86,7 +86,8 @@ def _mlp(d_in: int, hidden: int, d_out: int) -> int:
 
 def _scorer_params(m: ModelConfig) -> int:
     """Parameters of one scorer application: ``(3d + 8) -> M``, or via ``scorer_hidden`` for mlp."""
-    d_in = 3 * m.d + SCORER_SCALAR_FEATURES + (2 if m.key_address else 0)
+    # A5: a_cur, a_prev; A9: two more per extra n-gram length
+    d_in = 3 * m.d + SCORER_SCALAR_FEATURES + (2 * m.address_ngram if m.key_address else 0)
     if m.scorer == "linear":
         return d_in * m.n_units + m.n_units
     return _mlp(d_in, m.scorer_hidden, m.n_units)
@@ -114,7 +115,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "ctx_emb": m.n_context * m.context_dim,
         "encoder": _mlp(d, h, d),
         "predictor": _mlp(d, h, d),
-        "shared": _mlp(2 * d + m.context_dim, h, d),
+        "shared": _mlp(2 * d + m.context_dim + (d if m.fast_readout else 0), h, d),  # A8: + f
         "units": m.n_units * _mlp(v_in, h, d),
         "w_out": d * d,
         "v_msg": d * d,
@@ -123,7 +124,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "cand_norm": d if m.cand_norm == "rms" else 0,  # P1.13 (amendment A4)
         "scorer": _scorer_params(m),
         "halting": 2 * d + 1,
-        "decoder": _mlp((3 if m.selected_readout else 2) * d, h, v),
+        "decoder": _mlp((2 + int(m.selected_readout) + int(m.fast_readout)) * d, h, v),
     }
     rows["total"] = sum(rows.values())
     return rows
@@ -145,7 +146,9 @@ def macs_per_token(m: ModelConfig) -> dict[str, int]:
     shared = params["encoder"] + params["predictor"] + params["shared"] + params["decoder"]
     per_cell = unit + params["w_out"] + m.in_degree * params["v_msg"] + params["gate"]
     # A5's fixed code/address dot products are scorer work (global rule 5).
-    scorer = m.n_cells * params["scorer"] + (2 * m.n_cells * m.d if m.key_address else 0)
+    scorer = m.n_cells * params["scorer"] + (
+        2 * m.address_ngram * m.n_cells * m.d if m.key_address else 0
+    )
     return {
         "shared": shared,
         "per_cell": per_cell,
@@ -165,7 +168,9 @@ def activations_per_token(m: ModelConfig) -> dict[str, int]:
     in ``shared`` (the scorer and the decoder read it).
     """
     return {
-        "shared": (5 if m.selected_readout else 4) * m.d + 4 * m.hidden + m.vocab_size,
+        "shared": (4 + int(m.selected_readout) + int(m.fast_readout)) * m.d
+        + 4 * m.hidden
+        + m.vocab_size,
         "per_cell": m.cell_input_width + m.hidden + 3 * m.d,
     }
 

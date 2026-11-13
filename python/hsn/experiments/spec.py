@@ -106,8 +106,8 @@ __all__ = [
     "slug",
 ]
 
-FAMILIES = ("hsn", "gru", "transformer")
-Family = Literal["hsn", "gru", "transformer"]
+FAMILIES = ("hsn", "gru", "transformer", "selective_ssm")
+Family = Literal["hsn", "gru", "transformer", "selective_ssm"]
 # P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
 # computes; P1.16: neither do the kept mid-run checkpoints (keep_every, keep_last)
 EXECUTION_ONLY = frozenset(
@@ -739,6 +739,11 @@ def _expand_one(
         raise SpecError(
             f"arm {entry.name}: A5 requires variant pdg; variant {variant} may replace its "
             "scorer, cell, or readout. Ablate A5 with key_address / selected_readout flags"
+        )
+    if cfg.model.fast_cells and variant != "pdg":
+        raise SpecError(
+            f"arm {entry.name}: model.fast_cells (A8) requires variant pdg; variant {variant} "
+            "may replace the router or the readout"
         )
     if cfg.model.ablate_shared_u and variant not in ("pdg", "none"):
         raise SpecError(

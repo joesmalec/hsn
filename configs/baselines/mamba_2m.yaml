@@ -1,0 +1,42 @@
+# Mamba-style selective state-space baseline at a ≈2M-parameter setting: 1,887,744 parameters
+# measured by MambaBaseline.param_report() for V=256 and 16 context symbols (d_model 256, 4 blocks,
+# d_state 16, d_conv 4, expand 2). The paper's "selective recurrent memory" control (§2, §12; plan
+# P2.13), python/hsn/baselines/mamba.py. Trained with the generic trainer like the GRU; the state
+# (scan state and convolution inputs of every block) is carried between windows.
+# Everything not listed keeps its Appendix A default (configs/_example.yaml).
+
+run_id: mamba_2m
+seed: 0
+notes: "Mamba-style selective state-space baseline, ~2M parameters (the selective-memory control)."
+profile: cpu # override with `profile=<name>`
+model_name: selective_ssm
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv, delayed, brackets, arithmetic, algorithmic]
+  variants: [in_range] # as the G0 baselines
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train:
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 256 # the window synthetic_v1 defines in_range against
+  batch: 4
+  micro_batch: 4
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  search_trials: 1 # the same budget for every method in the ladder
+
+baseline:
+  selective_ssm:
+    d_model: 256
+    n_layers: 4
+    d_state: 16
+    d_conv: 4
+    expand: 2

@@ -81,6 +81,14 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "hardware.sweep_twin",
         "train.unit_credit",
         "train.ste_scope",
+        "baseline.selective_ssm",
+        "baseline.address_input",
+        "baseline.address_dim",
+        "model.fast_cells",
+        "model.fast_readout",
+        "model.address_ngram",
+        "model.fast_units",
+        "train.init_from",
     )
 
 

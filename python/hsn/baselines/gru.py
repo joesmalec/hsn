@@ -31,6 +31,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from hsn.baselines.address import AddressInput
 from hsn.config import RunConfig
 
 __all__ = ["GRUBaseline"]
@@ -48,6 +49,8 @@ class GRUBaseline(nn.Module):
         self.n_layers = spec.n_layers
         self.tok_emb = nn.Embedding(self.vocab_size, self.d_model)
         self.ctx_emb = nn.Embedding(self.n_context, self.d_model)
+        # baseline.address_input: the HSN's fixed byte codes as an input (a control, off by default)
+        self.address = AddressInput(cfg, self.d_model) if cfg.baseline.address_input else None
         self.drop = nn.Dropout(spec.dropout)
         self.gru = nn.GRU(
             self.d_model,
@@ -94,7 +97,10 @@ class GRUBaseline(nn.Module):
         if reset.dtype is not torch.bool:
             raise TypeError(f"reset must be a bool tensor, got {reset.dtype}")
         self._check_state(state, B)
-        x = self.drop(self.tok_emb(tokens) + self.ctx_emb(context))
+        x = self.tok_emb(tokens) + self.ctx_emb(context)
+        if self.address is not None:
+            x = x + self.address(tokens, reset)
+        x = self.drop(x)
         h = state
         if x.device.type == "cuda" and torch.is_autocast_enabled(x.device.type):
             # cuDNN: autocast copies the RNN weights to the autocast dtype; input and state match it
@@ -130,6 +136,7 @@ class GRUBaseline(nn.Module):
         parts = {
             "byte_emb": _count(self.tok_emb),
             "ctx_emb": _count(self.ctx_emb),
+            **({"address": _count(self.address)} if self.address is not None else {}),
             "gru": _count(self.gru),
             "norm": _count(self.norm),
             "head": _count(self.head),

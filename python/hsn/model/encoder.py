@@ -11,7 +11,8 @@ Plan §2.1 / §2.2 and Appendix C.1:
   (``context_dim = d``); using ``2d + context_dim`` keeps the module equal to the P1.1 closed form
   ``shared`` for every configuration.
 * ``D``: ``logits_t = D([q_t; u_t])``, ``2d -> H -> V`` (:class:`Decoder`); A5's optional
-  selected-cell readout appends ``r_t`` and expands the input to ``3d``.
+  selected-cell readout appends ``r_t`` and expands the input to ``3d``. A8's optional fast read
+  (``model.fast_readout``) appends ``f`` to the inputs of ``S`` and ``D`` (one more ``d`` each).
 
 The activation is ``model.activation`` (``gelu`` in A.1, taken as the exact erf form; the P2.9
 kernels must compute the same function) and the weights follow ``model.init`` through
@@ -140,14 +141,36 @@ class SharedTransform(MLP2):
     """``S``: shared features ``u_t = S([z_t; q_{t-1}; ctx_t])``, ``(2d + context_dim) -> H -> d``
     (C.1 row ``shared``; ``3d`` in A.1 where ``context_dim = d``)."""
 
-    def __init__(self, cfg: ModelConfig) -> None:
+    def __init__(self, cfg: ModelConfig, *, seed: int = 0) -> None:
         super().__init__(
             2 * cfg.d + cfg.context_dim, cfg.hidden, cfg.d, cfg.activation, init=cfg.state_init
         )
+        if cfg.fast_readout:  # A8: f_{t-1}, the fast cells' mean, after [z; q; ctx]
+            _widen_first_layer(self, cfg.d, cfg.state_init, seed + 0xA8FA57)
+
+
+def _widen_first_layer(mlp: MLP2, extra: int, init: str, seed: int) -> None:
+    """Append ``extra`` input columns to ``mlp.fc1``. The network is built first, so no existing
+    parameter's initialisation changes and the global random stream is not consumed: the new
+    layer is drawn from a generator seeded by ``seed`` inside a forked RNG, and the old columns
+    and the bias are copied over it."""
+    original = mlp.fc1
+    width = original.in_features + extra
+    with torch.random.fork_rng(devices=[]):
+        generator = torch.Generator(device="cpu").manual_seed(seed % (2**63 - 1))
+        torch.set_rng_state(generator.get_state())
+        expanded = nn.Linear(width, original.out_features)
+        init_weight_(expanded.weight, init)
+    with torch.no_grad():
+        expanded.weight[:, : original.in_features].copy_(original.weight)
+        expanded.bias.copy_(original.bias)
+    mlp.fc1 = expanded
+    mlp.in_dim = width
 
 
 class Decoder(MLP2):
-    """``D``: ``D([q_t; u_t])``, ``2d -> H -> V`` (C.1 row ``decoder``), or ``3d`` with A5."""
+    """``D``: ``D([q_t; u_t])``, ``2d -> H -> V`` (C.1 row ``decoder``), or ``3d`` with A5 and
+    ``4d`` with A8's ``model.fast_readout`` (``[q; u; r; f]``)."""
 
     def __init__(self, cfg: ModelConfig, *, seed: int = 0) -> None:
         super().__init__(2 * cfg.d, cfg.hidden, cfg.vocab_size, cfg.activation, init=cfg.init)
@@ -167,6 +190,8 @@ class Decoder(MLP2):
                 expanded.bias.copy_(original.bias)
             self.fc1 = expanded
             self.in_dim = 3 * cfg.d
+        if cfg.fast_readout:  # A8: f_t after [q; u; r] (the configuration requires A5's readout)
+            _widen_first_layer(self, cfg.d, cfg.init, seed + 0xA8DEC0DE)
 
 
 class EMATarget(nn.Module):

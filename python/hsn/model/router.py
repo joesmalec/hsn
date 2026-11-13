@@ -151,6 +151,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import GateMode, ModelConfig, Routing
+from hsn.data.synthetic import BOS
 from hsn.kernels.costs import CostTable, cost_table_from_config
 from hsn.model.embeddings import init_weight_, parse_init
 from hsn.model.encoder import MLP2
@@ -337,6 +338,7 @@ class Scorer(nn.Module):
     ema_selected: Tensor  # [N] P2.3 running average of the selection indicator (persistent)
     byte_codes: Tensor  # [V, d], A5 only: fixed code for each byte
     cell_addresses: Tensor  # [N, d], A5 only: fixed address for each cell
+    ngram_codes: Tensor  # [n - 1, V, d], A9 only: the byte codes of key positions 2..n
 
     def __init__(self, cfg: ModelConfig, *, unroll: int, seed: int | None = None) -> None:
         super().__init__()
@@ -351,9 +353,15 @@ class Scorer(nn.Module):
         self.unroll = unroll
         self.kind = cfg.scorer
         self.key_address = cfg.key_address
+        #: A9: the longest byte n-gram with an address (1: A5's a_cur and a_prev only)
+        self.address_ngram = cfg.address_ngram if cfg.key_address else 1
+        ngram_names = tuple(
+            f"a_{which}{m}" for m in range(2, self.address_ngram + 1) for which in ("cur", "prev")
+        )
+        address_names = (ADDRESS_FEATURE_NAMES + ngram_names) if cfg.key_address else ()
         base_features = 3 * cfg.d + SCORER_SCALAR_FEATURES
-        self.in_features = base_features + (2 if cfg.key_address else 0)
-        feature_names = SCORER_FEATURE_NAMES + (ADDRESS_FEATURE_NAMES if cfg.key_address else ())
+        self.in_features = base_features + len(address_names)
+        feature_names = SCORER_FEATURE_NAMES + address_names
 
         unknown = [name for name in cfg.scorer_features.exclude if name not in feature_names]
         if unknown:
@@ -408,6 +416,19 @@ class Scorer(nn.Module):
                 # generator's later use is the same either way.
                 extra = torch.full_like(extra, float(cfg.address_init))
             first.weight = nn.Parameter(torch.cat([first.weight.detach(), extra], dim=1))
+            if self.address_ngram > 1:
+                # A9, drawn after everything A5 draws: the codes of key positions 2..n and the
+                # new columns, so the A5 buffers and columns are those of address_ngram = 1.
+                tables = [
+                    torch.randn(cfg.vocab_size, cfg.d, generator=generator) / scale
+                    for _ in range(self.address_ngram - 1)
+                ]
+                self.register_buffer("ngram_codes", torch.stack(tables))
+                more = first.weight.new_empty(first.out_features, len(ngram_names))
+                nn.init.trunc_normal_(more, std=std, a=-2 * std, b=2 * std, generator=generator)
+                if cfg.address_init is not None:
+                    more = torch.full_like(more, float(cfg.address_init))
+                first.weight = nn.Parameter(torch.cat([first.weight.detach(), more], dim=1))
             first.in_features = self.in_features
             if isinstance(self.net, MLP2):
                 self.net.in_dim = self.in_features
@@ -486,6 +507,7 @@ class Scorer(nn.Module):
         *,
         tokens: Tensor | None = None,
         prev_tokens: Tensor | None = None,
+        older: Tensor | None = None,
     ) -> Tensor:
         """The ``[B, N, 3d+8]`` feature tensor in the module's layout, in ``u``'s dtype.
 
@@ -516,8 +538,8 @@ class Scorer(nn.Module):
             ctx[:, None], state.pos[:, None], budget_frac, round_idx, ema, u.dtype, u.device
         )[:, 0]
         if self.key_address:
-            addresses = self.address_features(tokens, prev_tokens)
-            if addresses.shape != (B, N, 2):
+            addresses = self.address_features(tokens, prev_tokens, older)
+            if addresses.shape != (B, N, 2 * self.address_ngram):
                 raise ValueError("key-address step tokens and prev_tokens must have shape [B]")
             scalars = torch.cat([scalars, addresses.to(u.dtype)], dim=-1)
         return self._assemble(u, eps, state.h, state.age, scalars)
@@ -533,6 +555,7 @@ class Scorer(nn.Module):
         ema: EMAFeatures | None = None,
         tokens: Tensor | None = None,
         prev_tokens: Tensor | None = None,
+        older: Tensor | None = None,
     ) -> Tensor:
         """The features of a window that do not depend on the step (P1.10a): ``[B, T, N, 7]`` in
         ``dtype``, the scalars after ``age`` in layout order (budget, round, context, the two P2.3
@@ -559,19 +582,30 @@ class Scorer(nn.Module):
         self._check_round(round_idx)
         scalars = self._scalars(ctx, pos, budget_frac, round_idx, ema, dtype, ctx.device)
         if self.key_address:
-            addresses = self.address_features(tokens, prev_tokens)
-            if addresses.shape != (*ctx.shape, self.n_cells, 2):
+            addresses = self.address_features(tokens, prev_tokens, older)
+            if addresses.shape != (*ctx.shape, self.n_cells, 2 * self.address_ngram):
                 raise ValueError("key-address window tokens and prev_tokens must have shape [B, T]")
             scalars = torch.cat([scalars, addresses.to(dtype)], dim=-1)
         return scalars
 
-    def address_features(self, tokens: Tensor | None, prev_tokens: Tensor | None) -> Tensor:
+    def address_features(
+        self, tokens: Tensor | None, prev_tokens: Tensor | None, older: Tensor | None = None
+    ) -> Tensor:
         """A5's fixed similarities ``[..., N, 2]`` in ``a_cur, a_prev`` order.
 
         Both token tensors have the same shape and contain only current/past bytes. The caller
         supplies BOS for ``prev_tokens`` at document resets. Fixed codes are persistent buffers,
         not trainable parameters; the two matmuls run outside autocast so addresses agree at a
         fact's value and its query even when training uses mixed precision.
+
+        A9 (``model.address_ngram = n > 1``): ``[..., N, 2n]``, the two features above and then
+        ``a_cur<m>, a_prev<m>`` for ``m = 2 .. n``. ``older [..., n − 1]`` holds the bytes two to
+        ``n`` positions back (``x_{t−2}`` first; BOS where the document has none; ``None``: all
+        BOS). The code of the ``m`` bytes ``b_1 .. b_m`` is the elementwise product of
+        ``codes_i[b_i]`` (``codes_1`` = A5's byte codes) scaled to A5's variance; ``a_cur<m>``
+        reads the bytes ``x_{t−m+1} .. x_t`` and ``a_prev<m>`` the bytes ``x_{t−m} .. x_{t−1}``,
+        so a key of ``m`` bytes has one address at its fact's value and at its query's last
+        key byte.
         """
         if not self.key_address:
             raise ValueError("address_features requires model.key_address=true")
@@ -583,11 +617,38 @@ class Scorer(nn.Module):
         assert isinstance(tokens, Tensor) and isinstance(prev_tokens, Tensor)
         if tokens.shape != prev_tokens.shape:
             raise ValueError("key-address tokens and prev_tokens must have the same shape")
+        n = self.address_ngram
+        if n > 1:
+            if older is None:
+                older = torch.full(
+                    (*tokens.shape, n - 1), BOS, dtype=tokens.dtype, device=tokens.device
+                )
+            elif (
+                not isinstance(older, Tensor)
+                or older.dtype not in _INDEX_DTYPES
+                or older.shape != (*tokens.shape, n - 1)
+                or older.device != tokens.device
+            ):
+                raise ValueError(
+                    f"older must be an integer tensor {(*tokens.shape, n - 1)} on {tokens.device}"
+                )
         with torch.autocast(device_type=tokens.device.type, enabled=False):
             addresses = self.cell_addresses.transpose(0, 1)
             current = F.embedding(tokens, self.byte_codes) @ addresses
             previous = F.embedding(prev_tokens, self.byte_codes) @ addresses
-            return torch.stack([current, previous], dim=-1) * math.sqrt(self.d)
+            feats = [current, previous]
+            if n > 1:
+                assert older is not None
+                lags = [tokens, prev_tokens, *older.unbind(dim=-1)]  # x_t, x_{t-1}, ..., x_{t-n}
+                root = math.sqrt(self.d)
+                for m in range(2, n + 1):
+                    for back in (0, 1):  # a_cur<m>, a_prev<m>
+                        code = F.embedding(lags[back + m - 1], self.byte_codes)  # the first byte
+                        for i in range(2, m + 1):
+                            table = self.ngram_codes[i - 2]
+                            code = code * F.embedding(lags[back + m - i], table) * root
+                        feats.append(code @ addresses)
+            return torch.stack(feats, dim=-1) * math.sqrt(self.d)
 
     def _scalars(
         self,
@@ -1069,8 +1130,19 @@ class Router(nn.Module):
         epsilon: float = 0.0,
         age: Tensor | None = None,
         dense_rows: Tensor | None = None,
+        reserved: int = 0,
+        reserved_units: bool = False,
     ) -> Selection:
         """Select up to ``k_max`` (cell, unit) slots per row within ``budget`` (module docstring).
+
+        ``reserved`` (amendment A8, ``model.fast_cells``; ``topk`` without ``reinforce`` only):
+        cells ``0 .. reserved − 1`` take the first ``reserved`` slots at every call, each at its
+        best unit, and the scored decision fills the other ``k_max − reserved`` slots from the
+        remaining cells. The straight-through threshold is taken among the remaining cells, the
+        reserved cells' mask is the constant 1 (they have no selection gradient), and the probes
+        never replace a reserved slot. ``0``: the decision as before, bit for bit.
+        ``reserved_units`` (``model.fast_units = fixed``): reserved cell ``i`` runs unit ``i mod
+        M`` instead of its best unit, with a constant one-hot unit weight in every gate mode.
 
         ``logits`` are the scorer's ``[B, N, M]`` on the router's device; ``budget`` is ``B_t`` as
         a fraction of the dense step (finite, >= 0); ``0 <= k_min <= k_max <= N`` with
@@ -1103,6 +1175,18 @@ class Router(nn.Module):
         elif fixed is not None:
             raise ValueError(f"`fixed` is only used with mode='fixed', got mode={mode!r}")
         tau = self._check_gate_args(mode, gate, temperature, epsilon)
+        if isinstance(reserved, bool) or not isinstance(reserved, int) or reserved < 0:
+            raise ValueError(f"reserved must be an int >= 0, got {reserved!r}")
+        if reserved:
+            if mode != "topk" or gate == "reinforce":
+                raise ValueError(
+                    f"reserved={reserved} needs mode='topk' without gate='reinforce', got "
+                    f"mode={mode!r}, gate={gate!r}"
+                )
+            if reserved >= k_max:
+                raise ValueError(f"reserved={reserved} must be < k_max={k_max}")
+        elif reserved_units:
+            raise ValueError("reserved_units needs reserved > 0")
         age_t = self._check_age(age, mode, B, N, logits.device)
         dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
         if generator is not None and not (mode == "random" or epsilon > 0.0 or gate == "reinforce"):
@@ -1120,6 +1204,13 @@ class Router(nn.Module):
         if mode == "topk":
             if gate == "reinforce":
                 cells, units, order = self._gumbel_topk(scores_d, k_max, tau, generator)
+            elif reserved:
+                cells, units = self._topk(scores_d, k_max, reserved)
+                if reserved_units:  # fast cell i runs unit i mod M
+                    fixed_units = torch.arange(reserved, device=units.device) % M
+                    units = torch.cat(
+                        [fixed_units[None, :].expand(B, reserved), units[:, reserved:]], dim=1
+                    )
             else:
                 cells, units = self._topk(scores_d, k_max)
             cells, units, valid = self._truncate(cells, units, budget_f)
@@ -1135,10 +1226,12 @@ class Router(nn.Module):
             cells, units, valid = self._fixed(scores_d, fixed_cells, k_max)
         scored = mode in SCORED_MODES
         # the straight-through threshold belongs to the scored decision, before the probes
-        threshold = self._ste_threshold(scores_d.amax(dim=-1), cells, valid) if scored else None
+        threshold = (
+            self._ste_threshold(scores_d.amax(dim=-1), cells, valid, reserved) if scored else None
+        )
         if scored and (age_t is not None or epsilon > 0.0):
             cells, units, explored, refreshed = self._post_process(
-                cells, units, valid, scores_d, age_t, epsilon, budget_f, dense, generator
+                cells, units, valid, scores_d, age_t, epsilon, budget_f, dense, generator, reserved
             )
         else:
             explored = torch.zeros(B, k_max, dtype=torch.bool, device=logits.device)
@@ -1157,6 +1250,8 @@ class Router(nn.Module):
             explored=explored,
             refreshed=refreshed,
             dense=dense,
+            reserved=reserved,
+            reserved_units=reserved_units,
         )
         return self._tapped(selection)
 
@@ -1381,8 +1476,11 @@ class Router(nn.Module):
         )
 
     @staticmethod
-    def _topk(scores: Tensor, k_max: int) -> tuple[Tensor, Tensor]:
+    def _topk(scores: Tensor, k_max: int, reserved: int = 0) -> tuple[Tensor, Tensor]:
         cell_scores = scores.amax(dim=-1)  # [B, N]
+        if reserved:  # A8: the fast group sorts first, in index order (the sort is stable)
+            head = torch.full_like(cell_scores[:, :reserved], float("inf"))
+            cell_scores = torch.cat([head, cell_scores[:, reserved:]], dim=1)
         # stable: equal scores keep index order (never torch.topk, whose tie order is unspecified)
         order = torch.sort(cell_scores, dim=1, descending=True, stable=True).indices[:, :k_max]
         units = scores.argmax(dim=-1).gather(1, order)
@@ -1509,12 +1607,20 @@ class Router(nn.Module):
         K = int(valid.shape[1])
         return (terms[:, :K] * valid.to(terms.dtype)).sum(dim=1)
 
-    def _ste_threshold(self, cell_scores_d: Tensor, cells: Tensor, valid: Tensor) -> Tensor:
+    def _ste_threshold(
+        self, cell_scores_d: Tensor, cells: Tensor, valid: Tensor, reserved: int = 0
+    ) -> Tensor:
         """θ ``[B]``: the midpoint between the lowest selected and the highest unselected cell
-        score (``+inf`` when nothing is selected, ``−inf`` when everything is)."""
+        score (``+inf`` when nothing is selected, ``−inf`` when everything is). With ``reserved``
+        (A8) the lowest selected score is taken among the scored slots' cells only: the reserved
+        cells are selected whatever their score."""
         selected = self._selected(cells, valid, int(cell_scores_d.shape[1]))
         inf = float("inf")
         lowest_in = torch.where(selected, cell_scores_d, torch.full_like(cell_scores_d, inf))
+        if reserved:
+            lowest_in = torch.cat(
+                [torch.full_like(lowest_in[:, :reserved], inf), lowest_in[:, reserved:]], dim=1
+            )
         highest_out = torch.where(selected, torch.full_like(cell_scores_d, -inf), cell_scores_d)
         return 0.5 * (lowest_in.amin(dim=1) + highest_out.amax(dim=1))
 
@@ -1529,9 +1635,11 @@ class Router(nn.Module):
         budget: float,
         dense: Tensor | None,
         generator: torch.Generator | None,
+        reserved: int = 0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Refresh probes, then exploration, then the budget recheck (module docstring); returns
-        ``(cells, units, explored, refreshed)``. ``valid`` never changes."""
+        ``(cells, units, explored, refreshed)``. ``valid`` never changes. The first ``reserved``
+        slots (A8) are never replaced."""
         B, K = int(cells.shape[0]), int(cells.shape[1])
         N = self.n_cells
         device = cells.device
@@ -1546,7 +1654,7 @@ class Router(nn.Module):
         explored = torch.zeros(B, K, dtype=torch.bool, device=device)
         if age is not None:
             stale = (age > self.age_max) & ~self._selected(cells, valid, N)
-            n_force = torch.minimum(stale.sum(dim=1), n_valid)
+            n_force = torch.minimum(stale.sum(dim=1), (n_valid - reserved).clamp(min=0))
             key = torch.where(stale, age, torch.full_like(age, -1)).to(torch.float32)
             order = torch.sort(key, dim=1, descending=True, stable=True).indices  # stalest first
             j = n_valid[:, None] - 1 - slots  # the tail of the valid slots, lowest score first
@@ -1559,6 +1667,8 @@ class Router(nn.Module):
             draw = self._draw((B, N + 2), generator, device)  # one host-to-device copy
             u, r, keys = draw[:, 0], draw[:, 1], draw[:, 2:]
             candidate = valid & ~refreshed
+            if reserved:
+                candidate = candidate & (slots >= reserved)
             n_candidate = candidate.sum(dim=1)
             # never a cell the scorer chose, even one a refresh probe just evicted
             selected = self._selected(cells, valid, N) | self._selected(cells0, valid, N)
@@ -1595,6 +1705,8 @@ class Router(nn.Module):
         refreshed: Tensor,
         dense: Tensor | None,
         executed_scores: bool = False,
+        reserved: int = 0,
+        reserved_units: bool = False,
     ) -> Selection:
         """The gradient-path tensors of a sparse decision (module docstring) and the Selection.
 
@@ -1632,6 +1744,10 @@ class Router(nn.Module):
             if scored:
                 assert threshold is not None
                 soft_mask = torch.sigmoid((cell_scores - threshold[:, None]) / tau)
+                if reserved:  # A8: the fast group is always written; no selection gradient
+                    soft_mask = torch.cat(
+                        [torch.ones_like(soft_mask[:, :reserved]), soft_mask[:, reserved:]], dim=1
+                    )
             if gate == "soft":  # the relaxation; the controls (random, fixed) stay hard
                 unit_weights = soft_units if scored else unit_hard
                 cell_mask = soft_mask if scored else hard_mask
@@ -1647,6 +1763,10 @@ class Router(nn.Module):
                     hard_mask + (soft_mask - soft_mask.detach())
                     if scored and gate == "ste"
                     else hard_mask
+                )
+            if reserved_units:  # the fast cells' unit is fixed: a constant one-hot weight
+                unit_weights = torch.cat(
+                    [unit_hard[:, :reserved], unit_weights[:, reserved:]], dim=1
                 )
         cost = self._executed_cost(units, valid)
         dense_cost = self._dense_cost

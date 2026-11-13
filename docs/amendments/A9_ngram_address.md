@@ -1,0 +1,144 @@
+# Amendment A9: an address for keys of several bytes (experimental)
+
+Status: **implemented as an opt-in experiment on 12 Nov 2026; not adopted.** Results (section
+"Results"): under the full cut with eight slots the two-byte address lifts `delayed2` from
+59.9 / 64.2 % to 95.0 / 94.3 % and the three-byte address lifts `delayed3` from 77.6 to
+95.5 %: the amendment's own test is passed on two seeds. With the state gradient the one-byte
+address already reaches 91.6 %, and the longer address adds little there.
+- Asked for by the user on 12 Nov 2026 with A8 (the worktree for the architecture changes of the
+  white paper v1.2 review). It is the first step of the "learned address" idea of that review,
+  in the form A5's own analysis allows (below).
+- `model.address_ngram: n` (default 1; 2 or 3), needs `model.key_address`. Left out of the
+  configuration hash at its default: existing configurations, hashes, arm ids, the A5 buffers
+  and the A5 scorer columns are unchanged.
+- It amends plan §2.2 step 4 (the router's features) and the scorer row of Appendix C. It
+  changes no metric, threshold or existing task. The delayed generator gains `key_len`
+  (default 1: synthetic_v1 symbol for symbol), and `configs/data/synthetic_keys.yaml` defines
+  the tasks that test it.
+
+## Cause
+
+**A5's address is one byte wide.**
+- A5 gives the scorer two features per cell: `a_cur = √d·⟨C[x_t], A_i⟩` and
+  `a_prev = √d·⟨C[x_{t−1}], A_i⟩`. At a fact `k v` the value's position has `x_{t−1} = k`, at the
+  query `QRY k` the key's position has `x_t = k`: one number at the write and at the read.
+- With a key of two bytes `k_1 k_2` the value's position sees only `k_2` in `a_prev`. Two facts
+  whose keys end in the same byte get the same write address, whatever the model learns.
+- Names in real records (a drug, a patient, a test) are several bytes long and share bytes.
+
+**Why not a learned key.** A5's analysis (`A5_key_address.md`, "Cause") applies unchanged: a
+key that generalises to names never seen in training needs an identity whose distribution is
+the same for seen and unseen keys, and a similarity without learned weights. A learned
+embedding of a key meets an unseen key out of distribution. So the address of a longer key is
+built the way A5 builds the address of a byte: from fixed codes.
+
+## The change (opt-in; needs `model.key_address`)
+
+For every `m` in `2 .. n` the scorer gets two more features per cell, appended after `a_prev`
+(`a_cur2, a_prev2, a_cur3, a_prev3`; the layout grows from `3d + 10` to `3d + 8 + 2n`):
+
+```
+code_m(b_1 .. b_m) = d^((m−1)/2) · C_1[b_1] ⊙ C_2[b_2] ⊙ … ⊙ C_m[b_m]        (elementwise)
+a_cur<m>[i]  = √d · ⟨code_m(x_{t−m+1} .. x_t),   A_i⟩
+a_prev<m>[i] = √d · ⟨code_m(x_{t−m}   .. x_{t−1}), A_i⟩
+```
+
+- `C_1` is A5's byte-code table; `C_2 .. C_n` are new fixed tables drawn the same way, after
+  everything A5 draws, so A5's buffers and columns are those of `address_ngram = 1`.
+- **One address for a key.** At a fact `k_1 .. k_m v` the value's position has the key in the
+  `m` bytes before it; at the query the key's last byte has it in the last `m` bytes. So
+  `a_prev<m>` at the write equals `a_cur<m>` at the read, for any key, seen or unseen.
+- **Keys that share bytes have unrelated addresses.** The code is a product, not a sum: the
+  codes of `(a, b)`, `(a, c)` and `(b, a)` are uncorrelated. The scale factor gives every
+  feature A5's variance.
+- **What is learned.** As in A5: which feature a unit follows at which class of byte. A model
+  whose task has keys of two bytes can let its writer units follow `a_prev2` and its reader
+  unit `a_cur2`. No meaning of a key is learned, and the length of a key is chosen by the
+  units, not fixed by the configuration (up to `n`).
+- **Older bytes.** A window takes `x_{t−2} .. x_{t−n}` from its own tokens, BOS before a
+  document's start. The trainer carries one byte across windows (A5's `prev_tokens`), so at
+  the first `n − 1` positions of a window that continues a document the bytes further back read
+  as BOS. A document that starts at a window boundary (`data.align_docs`, in-range tasks) is
+  exact. `HSN.step` takes `prev_tokens` as `[B, n]` for exact features; `[B]` means BOS for the
+  older bytes.
+
+**What stays.** Cells, graph, units, ε, the convex tanh gate, the router and its linear scorer,
+A5's features and `q` are unchanged. No attention over the sequence, no new state, nothing
+learned about any key.
+
+**What it does not do.** A key longer than `n` bytes, or of unknown length in running text,
+needs a running code with a learned start and end. That needs a new field in the state and is
+not part of this amendment.
+
+**Parameters:** `2·(n−1)·M` scorer weights (16 for `n = 2`). **Cost per position:**
+`2·(n−1)·N·d` MACs for the dot products (4,096 for `n = 2`), scorer work.
+
+**Windows.** Eager and compiled autograd windows. The split and fused windows refuse the key:
+their scorer layout has A5's two address columns.
+
+## The tasks (`configs/data/synthetic_keys.yaml`)
+
+`delayed2` and `delayed3`: synthetic_v1's delayed task with keys of two and three bytes. The
+keys of one document are cells of a small grid of key bytes (`@g bA b_ Mg M_ MA`), so they
+share bytes: in three documents of four, two keys end in the same byte. Dev and test keys use
+bytes never seen in training, as in synthetic_v1. `delayed2` also has an out-of-range variant
+for evaluation.
+
+## The smallest test, and its kill rule
+
+On `delayed2`, 9,000 steps, the eight-slot recipe:
+1. the recipe as is (A5's one-byte address): expected to stay near the level of a reader that
+   knows only a key's last byte;
+2. the recipe with `model.address_ngram=2`.
+
+**It works** if arm 2 is clearly above arm 1 on two seeds and near the eight-slot arm's score
+on synthetic_v1's delayed task (91 %). **Kill rule:** if arm 2 is not above arm 1, the scorer
+does not pick up the longer address by itself, and an oracle run (the address columns of the
+writer and reader units set by hand) decides whether the mechanism or its learning fails.
+
+## Results (13 Nov 2026, 01:50 MST; `delayed2`, 9,000 steps, one seed unless two are given)
+
+Final dev accuracy of the runs: `k2_ng2` 95.0 / 94.3 % against `k2_a8` 59.9 / 64.2 % (the
+recipe as is), the GRU 74.9 % and the Transformer with byte codes 44.3 %. Three-byte keys:
+`k3_ng3` 95.5 % against `k3_a8` 77.6 %. With the state gradient: `k2_ng2_cutC` (eight slots)
+92.7 %, `k2_k12_ng2_cutC` 92.3 %, and with the one-byte address `k2_k12_cutC` 91.6 %; twelve
+slots under the full cut with the one-byte address (`k2_k12`) 56.9 %. One-byte keys with the
+two-byte address (`v1_ng2`, synthetic_v1's delayed task) 89.9 %, against 90.8 to 92.5 % for
+the arm without it.
+
+The 9k checkpoints evaluated again on the CPU (`eval_keys.py` in the hand-off folder), split by
+the queried key. "Shared": another key of the document ends in the same byte (75 % of the
+queries; a reader that knows only the last byte is right half the time at best). In range /
+out of range (facts 272 to 768 bytes back; trained in range only), per cent:
+
+| Arm | Slots, cut | Address | All | Unique last byte | Shared last byte |
+| --- | --- | --- | --- | --- | --- |
+| `k2_a8` s0 | 8, full | 1 byte | 60.0 / 59.6 | 72.5 / 70.5 | 55.8 / 55.6 |
+| `k2_a8` s1 | 8, full | 1 byte | 64.4 / 66.3 | 71.8 / 79.1 | 61.9 / 61.6 |
+| `k2_ng2` s0 | 8, full | 2 bytes | 94.9 / 92.5 | 96.5 / 95.5 | 94.3 / 91.4 |
+| `k2_k12_cutC` s0 | 12, state gradient | 1 byte | 90.8 / 92.4 | 98.2 / 97.6 | 88.3 / 90.6 |
+| `k2_k12_ng2_cutC` s0 | 12, state gradient | 2 bytes | 92.2 / 93.6 | 90.7 / 94.0 | 92.6 / 93.4 |
+
+- **The mechanism works as designed under the full cut.** Keys that share their last byte go
+  from 56 to 62 % to 94 %, for keys never seen in training, and the score holds out of range.
+  By the amendment's own test arm 2 is clearly above arm 1 on two seeds.
+- **With twelve slots and the state gradient the model resolves most shared keys without
+  it** (88 to 91 %). How is not known: the cells can now be trained for what a later position
+  reads, so a cell may hold the whole key as content. The longer address adds about 4 points
+  on shared keys and loses about as much on unique ones (one seed each: within the spread).
+- **It is the state gradient and not the slot count** that resolves the shared keys without
+  the longer address: twelve slots under the full cut score 56.9 %.
+- The longer address costs nothing visible on one-byte keys (`v1_ng2`).
+- So the amendment matters where the full cut stays, which is what the split and fused
+  windows implement. Open: `k2_a8_cutC` (eight slots, state gradient, one byte; queued) and
+  three-byte keys with the state gradient.
+
+## Tests
+
+`tests/test_a9_ngram_address.py`: opt-in and hashing; A5's buffers, columns and every other
+parameter unchanged; the features against a direct computation; one address at a fact's value
+and at its query for two and three bytes, unrelated addresses for keys sharing a byte or in
+the other order; closed forms; the window against stepping with the history; the limit at a
+window's start; the compiled window against the eager one; thirty training steps; the
+generator's `key_len` (the reference solver agrees, keys are distinct and share bytes, and
+`key_len = 1` is synthetic_v1).

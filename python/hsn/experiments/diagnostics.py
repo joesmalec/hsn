@@ -407,6 +407,24 @@ def window_state_stats(
     if gates.numel():
         out.update(_write_rate(gates))
         out.update(_quantiles(gates))
+    fast = model.cfg.fast_cells
+    if fast:  # A8: the same gate statistics for the fast group and for the routed (slow) cells
+        all_gates = info["cell_gates"].float()[valid]  # [P, N, d]
+        for tag, cells in (("fast", slice(0, fast)), ("slow", slice(fast, None))):
+            group = all_gates[:, cells][written[:, cells]]
+            group = group[~torch.isnan(group)]
+            if group.numel():
+                stats = {**_write_rate(group), **_quantiles(group)}
+                out.update({k.replace("gate/", f"gate_{tag}/"): v for k, v in stats.items()})
+            out.update(
+                {
+                    f"{k}_{tag}/{pos}": v
+                    for pos, mask in (("answer", w["loss_mask"].bool()), ("valid", valid))
+                    if bool(mask.any())
+                    for k, v in cell_stats(h[mask][:, cells]).items()
+                    if k in ("rank_pr", "abs_h")
+                }
+            )
     if model.cfg.routing != "dense":
         writes = written.float().sum(0)  # [N]
         share = writes / writes.sum().clamp_min(1)
