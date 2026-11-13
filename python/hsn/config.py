@@ -676,6 +676,14 @@ class TrainConfig(_StrictModel):
     # with a fresh optimiser, schedule, weight average and loader: nothing else of the
     # checkpoint is used. null = the usual initialisation. Hashed when set.
     init_from: Path | None = None
+    # Opt-in diagnostic (13 Nov 2026), training only: the weight of an answer position in the
+    # task loss relative to the other loss positions. An answer is a loss position whose recorded
+    # dependency is longer than one symbol (the answer to a stored fact); the supervised text
+    # positions of the story-text tasks have dependency 1. The task loss is the weighted mean
+    # sum(w * ce) / sum(w). 1.0 (default) is the plain mean, bit for bit. Not a fix for real
+    # text, where no position is marked as an answer; it shows whether a failure to bind is a
+    # matter of loss balance. Hashed when set; the split and fused windows refuse it.
+    answer_weight: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -1490,6 +1498,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_ngram",
     "model.fast_units",
     "train.init_from",
+    "train.answer_weight",
 )
 
 
@@ -1533,6 +1542,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
             "has A5's two address columns only; use hardware.window=autograd"
+        )
+    if train.answer_weight != 1.0:
+        return (
+            f"train.answer_weight={train.answer_weight}: the split window's task loss is the "
+            "plain mean; use hardware.window=autograd"
         )
     if model.r_max != 1:
         return f"model.r_max={model.r_max}: one round per position only"

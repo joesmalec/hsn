@@ -167,7 +167,6 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import RunConfig, config_hash, wsd_decay_steps
@@ -182,6 +181,7 @@ from hsn.device import (
     synchronize,
 )
 from hsn.eval.evaluate import DEFAULT_METRICS, Metric, PositionGroups, evaluate_windows
+from hsn.losses import task_cross_entropy
 from hsn.train.adaptive import AdaptiveLR
 from hsn.train.amp import autocast_ctx, autocast_name, make_grad_scaler
 from hsn.train.checkpoint import (
@@ -1431,7 +1431,13 @@ class Trainer:
                 if count > 0:
                     flat_logits = logits[loss_mask].float()
                     flat_targets = batch["targets"][loss_mask]
-                    loss = F.cross_entropy(flat_logits, flat_targets)
+                    weight = self.cfg.train.answer_weight
+                    loss = task_cross_entropy(
+                        flat_logits,
+                        flat_targets,
+                        batch["dep"][loss_mask] if weight != 1.0 else None,
+                        weight,
+                    )
                     correct += (flat_logits.argmax(dim=-1) == flat_targets).sum()
                     loss_sum += loss.detach().cpu().double() * count
                     n_loss += count

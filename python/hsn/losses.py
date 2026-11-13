@@ -140,6 +140,7 @@ __all__ = [
     "graph_loss",
     "pred_loss",
     "prediction_terms",
+    "task_cross_entropy",
     "terms_total",
     "total_and_parts",
     "utility_loss",
@@ -285,6 +286,32 @@ def _check_tensor(name: str, x: object) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
+def task_cross_entropy(
+    logits: Tensor, targets: Tensor, dep: Tensor | None, answer_weight: float = 1.0
+) -> Tensor:
+    """The task term over the loss positions: ``logits [P, V]`` (fp32), ``targets [P]``.
+
+    With ``answer_weight = 1`` (the default) it is the plain mean cross-entropy. Otherwise
+    (``train.answer_weight``, an opt-in diagnostic) it is the weighted mean ``Σ w·ce / Σ w`` with
+    ``w = answer_weight`` at the answers, the positions whose recorded dependency ``dep [P]`` is
+    longer than one symbol, and ``w = 1`` at the others."""
+    if answer_weight == 1.0:
+        return F.cross_entropy(logits, targets)
+    if dep is None:
+        raise ValueError(
+            "train.answer_weight != 1 needs the window's `dep` (the dependency of every loss "
+            "position) to tell the answers from the other loss positions"
+        )
+    if tuple(dep.shape) != tuple(targets.shape):
+        raise ValueError(
+            f"task_cross_entropy: dep must have shape {tuple(targets.shape)}, got "
+            f"{tuple(dep.shape)}"
+        )
+    ce = F.cross_entropy(logits, targets, reduction="none")
+    weight = torch.where(dep > 1, answer_weight, 1.0).to(ce.dtype)
+    return (weight * ce).sum() / weight.sum()
+
+
 def assemble_terms(
     out: Mapping[str, Tensor],
     batch: Mapping[str, Tensor],
@@ -337,7 +364,13 @@ def assemble_terms(
             f"{targets.dtype} {tuple(targets.shape)}"
         )
     if bool(loss_mask.any()):
-        terms["task"] = F.cross_entropy(logits[loss_mask].float(), targets[loss_mask])
+        dep = batch.get("dep") if train.answer_weight != 1.0 else None
+        terms["task"] = task_cross_entropy(
+            logits[loss_mask].float(),
+            targets[loss_mask],
+            None if dep is None else dep[loss_mask],
+            train.answer_weight,
+        )
     else:  # padding only: a zero term that still carries a (zero) gradient
         terms["task"] = logits.float().sum() * 0.0
 

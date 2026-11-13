@@ -89,6 +89,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.address_ngram",
         "model.fast_units",
         "train.init_from",
+        "train.answer_weight",
     )
 
 
