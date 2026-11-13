@@ -171,6 +171,20 @@ def activation_grad(name: str, x: Tensor) -> Tensor:
     raise ValueError(f"no derivative for model.activation={name!r}")
 
 
+def _by_unit(x: Tensor, units: Tensor, weight: Tensor) -> Tensor:
+    """``out[p] = x[p] @ weight[units[p]]`` for ``x […, K, a]``, ``units […, K]`` and ``weight
+    [M, a, b]``: one product per unit on that unit's slots (the grouped pass of the unit bank,
+    transposed), without a per-slot copy of the weights."""
+    flat = x.reshape(-1, int(x.shape[-1]))
+    index = units.reshape(-1)
+    out = flat.new_zeros(flat.shape[0], int(weight.shape[-1]))
+    for j in range(int(weight.shape[0])):
+        rows = (index == j).nonzero().flatten()
+        if rows.numel():
+            out = out.index_copy(0, rows, flat.index_select(0, rows) @ weight[j])
+    return out.reshape(*x.shape[:-1], int(weight.shape[-1]))
+
+
 def cell_state_vjp(
     dc: Tensor,
     db: Tensor,
@@ -209,10 +223,10 @@ def cell_state_vjp(
         d_unit = weight * (dz @ consts.w_out)
     hid = hidden.to(dtype)
     # the executed unit's two layers, transposed: F = act(hid) @ W2_j + b2_j, hid = v @ W1_j + b1_j
-    d_act = torch.matmul(consts.w2[units], d_unit[..., None]).squeeze(-1)  # […, K, H]
+    d_act = _by_unit(d_unit, units, consts.w2.transpose(1, 2))  # […, K, H]
     d_hid = d_act * activation_grad(consts.activation, hid)
     d_gate = db * b * (1.0 - b)
-    dv = torch.matmul(consts.w1_state[units], d_hid[..., None]).squeeze(-1)  # […, K, 2d]
+    dv = _by_unit(d_hid, units, consts.w1_state.transpose(1, 2))  # […, K, 2d]
     dv = dv + d_gate @ consts.gate_state
     if consts.norm_gain_state is not None:
         if rms is None:
@@ -243,6 +257,7 @@ def state_gradient_backward(
     record: dict[str, Tensor],
     consts: CellConstants,
     trace: dict[str, Tensor] | None = None,
+    initial: tuple[Tensor, Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """The reverse sweep of the module docstring in plain torch (any device and dtype): the
     total ``(dL/dc, dL/db)``, each ``[B, T, K, d]``.
@@ -262,13 +277,21 @@ def state_gradient_backward(
     ``trace`` (tests, and the oracle of a kernel's intermediate values) receives, stacked over
     the positions at dim 1: ``A [B, T, N, d]`` and ``R [B, T, d]``, the cotangents of the state
     that position ``t`` reads (after its reset; before they are zeroed on the rows that reset),
-    and ``dh`` / ``dvm`` ``[B, T, K, d]``, :func:`cell_state_vjp`'s results on the valid slots."""
+    and ``dh`` / ``dvm`` ``[B, T, K, d]``, :func:`cell_state_vjp`'s results on the valid slots.
+
+    ``initial`` is the cotangent ``(A [B, N, d], R [B, d])`` of the state after the last
+    position. A window's final state is detached, so the window passes ``None`` (zeros); a
+    test gives a single position the cotangent that autograd found for the state after it,
+    which checks one step of the sweep with nothing accumulated."""
     B, T, K, d = (int(n) for n in c.shape)
     N = int(n_cells)
     D = int(consts.pad_src.shape[1])
     n_fast = 0 if d_h_fast is None else int(d_h_fast.shape[2])
     A = c.new_zeros(B, N + 1, d)  # row N: the dummy cell of the padded slots
     R = c.new_zeros(B, d)
+    if initial is not None:
+        A = torch.cat([initial[0].to(c.dtype), A[:, N:]], dim=1)
+        R = initial[1].to(c.dtype)
     dc = torch.zeros_like(c)
     db = torch.zeros_like(b)
     zero = c.new_zeros(())

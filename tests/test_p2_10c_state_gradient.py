@@ -480,16 +480,20 @@ def test_fast_cells_the_budget_cuts_keep_their_state_in_the_fast_read() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("extra", [(), PINNED])
-def test_sweeps_state_cotangent_is_autograds(
-    extra: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The sweep's ``A`` and ``R`` (its ``trace``) are the gradient of the objective with
-    respect to the state each position reads. Autograd's side: every position is handed a
-    copy of its entry state, so the copy's gradient is what that position alone passes back
-    (the model resets inside the position: the rows that reset there pass nothing)."""
-    cfg = _cfg(*BASE, *extra)
-    model, (tokens, ctx, state, reset), mask = _case(cfg)
+def _autograd_by_position(
+    model: HSN,
+    inputs: tuple[Tensor, Tensor, CellGraphState, Tensor],
+    mask: Tensor,
+    *,
+    static: bool,
+) -> tuple[Tensor, list[Tensor], list[Tensor]]:
+    """The model's own window with autograd, every position reading a copy of its entry state:
+    ``(logits, dL/dh, dL/dq)`` with the gradients of the copies, which are what each position
+    alone passes back (the model resets inside the position, so a row that resets there passes
+    nothing). ``static`` runs the capturable round (:meth:`PDGCell.step_sparse` with
+    ``static=True``: the round of the compiled window and of the split window's sweep) instead
+    of the eager one: the same function, with the unit bank's products in another order."""
+    tokens, ctx, state, reset = inputs
     entries: list[CellGraphState] = []
     position = model._position
 
@@ -498,6 +502,8 @@ def test_sweeps_state_cotangent_is_autograds(
             h=entry.h.clone(), q=entry.q.clone(), age=entry.age, pos=entry.pos
         )
         entries.append(copy)
+        if static:
+            kwargs = {**kwargs, "static": True, "consts": model.cell.window_consts()}
         return position(copy, *args, **kwargs)  # type: ignore[arg-type]
 
     start = CellGraphState._make(
@@ -506,41 +512,91 @@ def test_sweeps_state_cotangent_is_autograds(
         age=state.age,
         pos=state.pos,
     )
-    monkeypatch.setattr(model, "_position", recording)
-    logits, _, info = model(tokens, ctx, start, reset)
-    monkeypatch.undo()
-    T = cfg.train.unroll
-    assert len(entries) == T
+    model._position = recording  # type: ignore[method-assign]
+    try:
+        logits, _, info = model(tokens, ctx, start, reset)
+    finally:
+        del model._position
     grads = torch.autograd.grad(
         _objective(logits, info, mask), [x for entry in entries for x in (entry.h, entry.q)]
     )
+    return logits.detach(), list(grads[0::2]), list(grads[1::2])
+
+
+@pytest.mark.parametrize("static", [False, True], ids=["eager_round", "sweeps_round"])
+@pytest.mark.parametrize("extra", [(), PINNED], ids=["routed", "fast_cells"])
+def test_sweeps_state_cotangent_is_autograds(
+    extra: tuple[str, ...], static: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep's ``A`` and ``R`` (its ``trace``) are the gradient of the objective with
+    respect to the state each position reads, at every position; and a single step of the
+    sweep, started from autograd's cotangent of the state after a position, gives autograd's
+    cotangent of the state before it. The single step accumulates nothing, so it stays a sharp
+    test where rounding is amplified along a window (a trained model: see the write-up).
+
+    Against the model's capturable round the window's forward sweep is the same arithmetic
+    position by position, so the two passes follow one trajectory (the logits then differ only
+    by the replay's batched ``S`` and decoder)."""
+    cfg = _cfg(*BASE, *extra)
+    model, inputs, mask = _case(cfg)
+    tokens, ctx, state, reset = inputs
+    logits, d_h, d_q = _autograd_by_position(model, inputs, mask, static=static)
+    B, T, N, d = cfg.train.batch, cfg.train.unroll, cfg.model.n_cells, cfg.model.d
 
     trace: dict[str, Tensor] = {}
+    given: list[tuple] = []
     sweep = state_gradient.state_gradient_backward
 
     def traced(*args: object, **kwargs: object) -> tuple[Tensor, Tensor]:
+        given.append(args)
         return sweep(*args, **kwargs, trace=trace)  # type: ignore[arg-type]
 
     monkeypatch.setattr(state_gradient, "state_gradient_backward", traced)
     window = SplitWindow(model, cfg, None, state_gradient=True)
     s_logits, _, s_info = window(tokens, ctx, state, reset)
     _objective(s_logits, s_info, mask).backward()
-    assert trace["A"].shape == (cfg.train.batch, T, cfg.model.n_cells, cfg.model.d)
+    monkeypatch.undo()
+    if static:
+        torch.testing.assert_close(s_logits.detach(), logits, rtol=1e-12, atol=1e-13)
+    assert trace["A"].shape == (B, T, N, d) and len(given) == 1
+    tol = {"rtol": 1e-9, "atol": 1e-12}
     largest = 0.0
     for t in range(T):
         keep = ~reset[:, t]
-        d_h, d_q = grads[2 * t], grads[2 * t + 1]
         got_h = torch.where(keep[:, None, None], trace["A"][:, t], 0.0)
         got_q = torch.where(keep[:, None], trace["R"][:, t], 0.0)
-        torch.testing.assert_close(
-            got_h, d_h, rtol=1e-9, atol=1e-12, msg=lambda m, t=t: f"h {t}{m}"
-        )
-        torch.testing.assert_close(
-            got_q, d_q, rtol=1e-9, atol=1e-12, msg=lambda m, t=t: f"q {t}{m}"
-        )
-        largest = max(largest, float(d_h.abs().max()))
+        torch.testing.assert_close(got_h, d_h[t], **tol, msg=lambda m, t=t: f"h {t}{m}")
+        torch.testing.assert_close(got_q, d_q[t], **tol, msg=lambda m, t=t: f"q {t}{m}")
+        largest = max(largest, float(d_h[t].abs().max()))
     assert largest > 1e-3
     assert float(trace["dh"].abs().max()) > 0 and float(trace["dvm"].abs().max()) > 0
+
+    # one step at a time, from autograd's cotangent of the state after the position
+    c, b, h_old, cells, units, valid, rst, n_cells, *cots, record, consts = given[0]
+    for t in range(T):
+        at = slice(t, t + 1)
+        after = (d_h[t + 1], d_q[t + 1]) if t + 1 < T else (torch.zeros(B, N, d), torch.zeros(B, d))
+        step: dict[str, Tensor] = {}
+        sweep(
+            c[:, at],
+            b[:, at],
+            h_old[:, at],
+            cells[:, at],
+            units[:, at],
+            valid[:, at],
+            rst[:, at],
+            n_cells,
+            *(None if x is None else x[:, at] for x in cots),
+            {key: value[:, at] for key, value in record.items()},
+            consts,
+            trace=step,
+            initial=(after[0].to(torch.float64), after[1].to(torch.float64)),
+        )
+        keep = ~reset[:, t]
+        got_h = torch.where(keep[:, None, None], step["A"][:, 0], 0.0)
+        got_q = torch.where(keep[:, None], step["R"][:, 0], 0.0)
+        torch.testing.assert_close(got_h, d_h[t], **tol, msg=lambda m, t=t: f"step h {t}{m}")
+        torch.testing.assert_close(got_q, d_q[t], **tol, msg=lambda m, t=t: f"step q {t}{m}")
 
 
 def test_without_the_cells_backward_the_gradients_are_wrong(
