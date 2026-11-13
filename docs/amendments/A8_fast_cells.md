@@ -1,8 +1,12 @@
 # Amendment A8: fast cells and slow cells (experimental)
 
-Status: **implemented as an opt-in experiment on 12 Nov 2026; tested the same evening and not
-supported: the fast group adds nothing over the same number of slots (section "Results"). Not
-adopted.**
+Status: **implemented as an opt-in experiment on 12 Nov 2026. Not adopted.**
+- With routed units the fast group adds nothing over the same number of slots and is dropped
+  by its kill rule (section "Results").
+- With `model.fast_units=fixed` it lowers TinyStories bits per byte by 0.06 to 0.09 at the same
+  number of slots on two seeds and keeps the delayed score, but the slow cells do not become
+  memory-like on text, and the arms run all eight units per byte where the controls run about
+  two (section "Results with fixed units"). What the gain is due to is open.
 - The user asked on 12 Nov 2026 (about 19:40 MST) for a worktree with the architecture changes
   discussed in the review of white paper v1.2, and for their tests at the front of the queue.
 - `model.fast_cells: F` (default 0) and `model.fast_readout: true` (default false). Both are
@@ -134,7 +138,7 @@ attribute the gain to twelve slots with the state gradient, not to the fast grou
   1.25 of 4).
 - By the kill rule the fast group with routed units is dropped. The only open arms are the two
   with `model.fast_units=fixed` on TinyStories (`ts_f4ru_cutC`, `ts_f8ru_cutC`): if neither
-  beats `ts_k12_cutC`, the amendment is closed.
+  beats `ts_k12_cutC`, the amendment is closed. Both beat it: see "Results with fixed units".
 
 **What the story-text set showed instead.** Twelve slots without a fast group hold facts across
 real story text when the text is not supervised (`tfq_k12`: 92.5 % in range, 90.7 % with the
@@ -144,6 +148,51 @@ Predicting the text opens the routed cells' gates (median 0.5), and a fast group
 stop that, because nothing makes writing a routed cell cost anything. A rule that lets the
 router select no routed cell at a position, with a cost on selecting one, is the change this
 points to. It is not part of this amendment.
+
+## Results with fixed units (13 Nov 2026, 01:50 MST; 9,000 steps, state gradient on)
+
+All arms: the eight-slot recipe's settings, `train.feedback_detach=[summary, eps, router]`,
+autograd window (step 0.17 to 0.22 s).
+
+**TinyStories, dev bits per byte** (GRU 0.952 / 0.954, Transformer 0.919 / 0.925, Mamba 0.816):
+
+| Arm | Slots (fast + routed) | Bits per byte (seeds) | `rank_pr_fast` | `gate_slow/p50` | Active parameters per byte |
+| --- | --- | --- | --- | --- | --- |
+| `ts_k12_cutC` (control) | 0 + 12 | 1.054 / 1.067 | – | – | 0.87 to 0.89 M of 1.85 M |
+| `ts_f4r_cutC` (routed units) | 4 + 8 | 1.060 | 1.1 to 1.25 of 4 | 0.49 to 0.53 | 1.07 M of 1.92 M |
+| `ts_f4ru_cutC` | 4 + 8 | 0.996 / 0.996 | 3.2 / 3.1 of 4 | 0.69 / 0.40 | 1.47 / 1.49 M of 1.92 M |
+| `ts_k16_cutC` (control) | 0 + 16 | 1.046 | – | – | 0.91 M of 1.85 M |
+| `ts_f8u_cutC` (no `fast_readout`) | 8 + 8 | 0.977 | 4.8 of 8 | 0.92 | all (1.85 M) |
+| `ts_f8ru_cutC` | 8 + 8 | 0.951 / 0.961 | 5.2 / 5.3 of 8 | 0.81 / 0.32 | all (1.92 M) |
+
+**Delayed:** `f8ru20_cutC` (8 fast + 12 routed) 98.6 % (later queries 97.3 %), against
+`k12_cutC` 98.5 / 99.1 / 95.5 %. On this task the fast cells' median gate is 0.000: they are
+selected at every position and mostly left unwritten.
+
+Against the amendment's three points:
+- **Point 1 (text improves over the same slots): met on two seeds at both sizes.** 0.996
+  against 1.054 / 1.067 at twelve slots; 0.951 / 0.961 against 1.046 at sixteen. Most of it
+  comes without the extra read (0.977 without `fast_readout`).
+- **Point 2 (memory stays): met on the one delayed arm so far.** The G1 pair, arithmetic, the
+  sixteen-slot delayed arms and the out-of-range evaluation are pending.
+- **Point 3 (the slow cells act as memory on text): not met.** The routed cells' median gate
+  is 0.32 to 0.92 and differs between two seeds of the same arm.
+
+**What the result does and does not show.**
+- The fast cells now differ (`rank_pr_fast` 3.1 to 5.3 instead of 1.1), which is what fixed
+  units were for.
+- **The controls match the slots, not the compute.** On TinyStories the router sends the
+  selected cells of the plain arms to about two of the eight units per byte (active
+  parameters 0.87 to 0.91 M of 1.85 M). Four fixed-unit fast cells bring that to about five
+  units, eight to all of them. The gain may come from the unit bank being in use as much as
+  from cells that are written at every byte. The GRU, the Transformer and Mamba use all their
+  parameters at every byte, so the comparison with them is like for like in that respect.
+- **It is not shown that the routed cells contribute on text.** `ts_f8ru9_cutC` (eight fast
+  cells and one routed slot) was asked for on 13 Nov to measure that.
+- What a fixed-unit fast group amounts to: F cells with their own weights, written at every
+  position and read through their mean. It uses the HSN's cell equation, messages, ε and gate,
+  and adds no state, but it works like a small gated recurrent layer beside the routed memory.
+  Whether that is inside the design's identity is the user's call; it is not adopted here.
 
 ## Tests
 

@@ -1,6 +1,9 @@
 # Amendment A9: an address for keys of several bytes (experimental)
 
-Status: **implemented as an opt-in experiment on 12 Nov 2026; not adopted, no result claimed.**
+Status: **implemented as an opt-in experiment on 12 Nov 2026; not adopted.** First results
+(section "Results"): under the full cut with eight slots the two-byte address lifts `delayed2`
+from 60 to 64 % to 95 % (one seed; the second is running). With twelve slots and the state
+gradient the one-byte address already reaches 91 %, and the longer address adds little there.
 - Asked for by the user on 12 Nov 2026 with A8 (the worktree for the architecture changes of the
   white paper v1.2 review). It is the first step of the "learned address" idea of that review,
   in the form A5's own analysis allows (below).
@@ -91,6 +94,38 @@ On `delayed2`, 9,000 steps, the eight-slot recipe:
 on synthetic_v1's delayed task (91 %). **Kill rule:** if arm 2 is not above arm 1, the scorer
 does not pick up the longer address by itself, and an oracle run (the address columns of the
 writer and reader units set by hand) decides whether the mechanism or its learning fails.
+
+## Results (13 Nov 2026, 01:50 MST; `delayed2`, 9,000 steps, one seed unless two are given)
+
+Final dev accuracy of the runs: `k2_ng2` 95.0 % against `k2_a8` 59.9 / 64.2 % (the recipe as
+is), the GRU 74.9 % and the Transformer with byte codes 44.3 %. Three-byte keys with the
+one-byte address: `k3_a8` 77.6 %.
+
+The 9k checkpoints evaluated again on the CPU (`eval_keys.py` in the hand-off folder), split by
+the queried key. "Shared": another key of the document ends in the same byte (75 % of the
+queries; a reader that knows only the last byte is right half the time at best). In range /
+out of range (facts 272 to 768 bytes back; trained in range only), per cent:
+
+| Arm | Slots, cut | Address | All | Unique last byte | Shared last byte |
+| --- | --- | --- | --- | --- | --- |
+| `k2_a8` s0 | 8, full | 1 byte | 60.0 / 59.6 | 72.5 / 70.5 | 55.8 / 55.6 |
+| `k2_a8` s1 | 8, full | 1 byte | 64.4 / 66.3 | 71.8 / 79.1 | 61.9 / 61.6 |
+| `k2_ng2` s0 | 8, full | 2 bytes | 94.9 / 92.5 | 96.5 / 95.5 | 94.3 / 91.4 |
+| `k2_k12_cutC` s0 | 12, state gradient | 1 byte | 90.8 / 92.4 | 98.2 / 97.6 | 88.3 / 90.6 |
+| `k2_k12_ng2_cutC` s0 | 12, state gradient | 2 bytes | 92.2 / 93.6 | 90.7 / 94.0 | 92.6 / 93.4 |
+
+- **The mechanism works as designed under the full cut.** Keys that share their last byte go
+  from 56 to 62 % to 94 %, for keys never seen in training, and the score holds out of range.
+  By the amendment's own test arm 2 is clearly above arm 1 on one seed; the second seed
+  (`k2_ng2/s1`) is running.
+- **With twelve slots and the state gradient the model resolves most shared keys without
+  it** (88 to 91 %). How is not known: the cells can now be trained for what a later position
+  reads, so a cell may hold the whole key as content. The longer address adds about 4 points
+  on shared keys and loses about as much on unique ones (one seed each: within the spread).
+- Open: the second seed; `k2_ng2_cutC` (eight slots, state gradient, two bytes) and its
+  control `k2_a8_cutC`; `k2_k12` (twelve slots, full cut) to separate the slots from the state
+  gradient; three bytes (`k3_ng3`); `v1_ng2` (that the longer address does not cost anything
+  on one-byte keys).
 
 ## Tests
 
