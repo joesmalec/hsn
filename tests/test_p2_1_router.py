@@ -746,6 +746,10 @@ def test_p2_1_selection_carries_no_authority() -> None:
         "dense_fallback",
         # P2.10: the detached straight-through threshold of the decision (a number per row)
         "threshold",
+        # A10: the weight on a written cell's gate and the share of the slots written (a weight
+        # and a cost input; nothing outside the model's own state is written)
+        "write_mask",
+        "write_fraction",
     ]
     hints = get_type_hints(Selection)
     for field in fields:

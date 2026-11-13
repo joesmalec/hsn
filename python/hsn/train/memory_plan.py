@@ -91,7 +91,8 @@ def _scorer_params(m: ModelConfig) -> int:
     if m.scorer == "linear":
         # A12: the address gate, d -> n_units * (address features), no bias
         gate = m.d * m.n_units * 2 * m.address_ngram if m.address_gate else 0
-        return d_in * m.n_units + m.n_units + gate
+        # A10: the write output is a second linear layer of the same shape
+        return (2 if m.write_gate else 1) * (d_in * m.n_units + m.n_units) + gate
     return _mlp(d_in, m.scorer_hidden, m.n_units)
 
 

@@ -97,7 +97,6 @@ from hsn.kernels import window as window_kernels
 from hsn.model.cell import WindowConsts
 from hsn.model.hsn import (
     HSN,
-    SELECTION_RECORD_KEYS,
     StepMode,
     _Controls,
     _Prologue,
@@ -253,6 +252,73 @@ def mps_inductor_options(mode: str) -> dict[str, Any]:
     return {**torch._inductor.list_mode_options(mode), **MPS_INDUCTOR_OPTIONS}
 
 
+def live_alias_index(path_weakrefs: Sequence[Sequence[Any]], maybe_deref: Any) -> dict[int, Any]:
+    """Storage pointer -> ``(depth, output index)`` of the first live recorded output with that
+    pointer, in the order ``CUDAGraphNode._is_alias_of_live_recorded_tensor`` walks them."""
+    index: dict[int, Any] = {}
+    for depth, output_refs in enumerate(path_weakrefs):
+        for output_index, storage_ref in enumerate(output_refs):
+            alive = maybe_deref(storage_ref)
+            if alive is not None:
+                index.setdefault(alive[1], (depth, output_index))
+    return index
+
+
+def install_graph_alias_index() -> bool:
+    """Opt-in (``hardware.graph_alias_index``): make PyTorch's recording of a CUDA graph's first
+    outputs linear in the number of tensors. ``True`` when the index is in place (also from an
+    earlier call), ``False`` when this PyTorch does not have the internals it was written for
+    (torch 2.15's ``torch._inductor.cudagraph_trees``), in which case nothing is changed.
+
+    ``CUDAGraphNode._add_first_outputs`` asks, for every output of the graph it has just
+    recorded, whether it aliases a live output of an earlier graph on the path
+    (``_is_alias_of_live_recorded_tensor``), and that question walks every output of every
+    earlier node and dereferences its weak reference. A compiled training block returns its
+    outputs and everything saved for the backward, thousands of tensors, so recording the k-th
+    block of a window costs (its outputs) x (the outputs of the k - 1 blocks before it). Measured
+    on 13 and 14 Nov 2026: 2.5 to 6 minutes at the start of every compiled autograd window, and
+    no end in 20 to 37 minutes for larger graphs (the write decision with fast cells; the dense
+    fallback arms on an RTX 5060 Ti), with every thread's stack in that walk.
+
+    The replacement builds :func:`live_alias_index` once at the start of ``_add_first_outputs``
+    and answers each question from it. Nothing is freed during that loop (the outputs are held
+    by the caller), so the liveness the walk would see at each call is the liveness at the
+    start, and ``setdefault`` in the walk's order returns the walk's first match. Outside
+    ``_add_first_outputs`` the original method runs. Process-wide and not undone."""
+    try:
+        from torch._inductor import cudagraph_trees as trees
+    except Exception:  # pragma: no cover - a PyTorch without CUDA-graph trees
+        return False
+    node = getattr(trees, "CUDAGraphNode", None)
+    maybe_deref = getattr(trees, "maybe_deref", None)
+    if node is None or maybe_deref is None:
+        return False
+    if getattr(node, "_hsn_alias_index", False):
+        return True
+    add = getattr(node, "_add_first_outputs", None)
+    alias = getattr(node, "_is_alias_of_live_recorded_tensor", None)
+    if add is None or alias is None:
+        return False
+
+    def indexed_alias(self: Any, t: Tensor) -> Any:
+        index = getattr(self, "_hsn_live_index", None)
+        if index is None:
+            return alias(self, t)
+        return index.get(t.untyped_storage().data_ptr())
+
+    def indexed_add(self: Any, *args: Any, **kwargs: Any) -> Any:
+        self._hsn_live_index = live_alias_index(self.path_weakrefs, maybe_deref)
+        try:
+            return add(self, *args, **kwargs)
+        finally:
+            self._hsn_live_index = None
+
+    node._is_alias_of_live_recorded_tensor = indexed_alias
+    node._add_first_outputs = indexed_add
+    node._hsn_alias_index = True
+    return True
+
+
 def _uses_cuda_graphs(ctx: DeviceContext, mode: CompileMode, backend: Backend) -> bool:
     return ctx.device.type == "cuda" and backend == "inductor" and mode != "none"
 
@@ -369,7 +435,7 @@ def _block(
         "unit_logits_d": torch.stack(logit_steps, dim=1),
     }
     if records:
-        for key in SELECTION_RECORD_KEYS:
+        for key in model.selection_record_keys:
             out["sel_" + key] = _stack_record([r[key] for r in records])
     if readouts:
         out["readouts"] = torch.stack(readouts, dim=1)
@@ -1431,7 +1497,8 @@ class CompiledWindow:
         routed: dict[str, Tensor] | None = None
         if "sel_cell_idx" in blocks[0]:
             routed = {
-                key: _cat_record([b["sel_" + key] for b in blocks]) for key in SELECTION_RECORD_KEYS
+                key: _cat_record([b["sel_" + key] for b in blocks])
+                for key in model.selection_record_keys
             }
         return model._window_epilogue(
             pro,

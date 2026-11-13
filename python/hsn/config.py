@@ -322,6 +322,18 @@ class ModelConfig(_StrictModel):
     # model with any of them.
     scorer_position: Literal["document", "clamp", "wrap"] = "document"
     # --- end A11 ---
+    # --- Amendment A10 (docs/amendments/A10_write_decision.md; opt-in, default off) ---
+    # write_gate: the scorer gets a second linear output of the same features, one write logit
+    # per (cell, unit). A selected routed cell is executed and read as before, but it is written
+    # only where the write logit of its chosen unit is positive: the cell's gate b is multiplied
+    # by w in {0, 1} (straight-through sigmoid(logit / tau) in training; the soft warm-up uses
+    # the sigmoid itself). The fast cells of A8 are always written. Selection, units, graph, the
+    # convex tanh gate and q are unchanged. Needs model.routing=topk and the linear scorer.
+    write_gate: bool = False
+    # The write output starts with zero weights and this bias: positive, so that every selected
+    # cell is written at the start, as without the key.
+    write_init: float = Field(default=2.0, allow_inf_nan=False)
+    # --- end A10 ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -401,6 +413,11 @@ class ModelConfig(_StrictModel):
                     f"model.disabled_cells {fast_disabled} lie in the fast group "
                     f"[0, {self.fast_cells})"
                 )
+        if self.write_gate and (self.routing != "topk" or self.scorer != "linear"):
+            raise ValueError(
+                "model.write_gate (A10) needs model.routing=topk and model.scorer=linear, got "
+                f"routing={self.routing!r}, scorer={self.scorer!r}"
+            )
         if self.address_gate and not (self.key_address and self.scorer == "linear"):
             raise ValueError(
                 "model.address_gate (A12) needs model.key_address=true and model.scorer=linear, "
@@ -709,6 +726,9 @@ class TrainConfig(_StrictModel):
     lambda_g: float = 0.0
     lambda_u: float = 0.0
     lambda_ponder: float = 0.0
+    # A10 (needs model.write_gate): weight of the write cost, the share of the routed slots that
+    # may write, averaged over the window. 0 (default): no cost term.
+    lambda_w: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     aux_enabled: list[str] = []  # which of cost / balance / graph are on (<= 1 unless justified)
     allow_multiple_aux: str = ""  # written justification enabling > 1
     gate_mode: GateMode = "soft"  # P2.2
@@ -1112,6 +1132,14 @@ class HardwareConfig(_StrictModel):
     # the model's own compiled blocks, which cast at every position and whose fused arithmetic
     # rounds as the autograd window's does: about 11 ms per step slower, kept to compare the two.
     sweep_twin: bool = True
+    # Opt-in (14 Nov 2026): record compiled CUDA graphs with an index for PyTorch's alias check
+    # (hsn.train.compile.install_graph_alias_index). torch 2.15 checks every output of a newly
+    # recorded graph against every live output of the earlier graphs of the window by walking
+    # them all, which is quadratic in the number of tensors a training block returns: minutes
+    # at the start of every compiled autograd window and no end in useful time for larger
+    # graphs. The index gives the same answers by dictionary lookup. Bookkeeping only: no
+    # tensor value changes. false (default): PyTorch as it is.
+    graph_alias_index: bool = False
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1220,6 +1248,8 @@ class RunConfig(_StrictModel):
                 raise ValueError("model.fast_cells and model.fast_readout (A8) are HSN-only")
             if self.model.cell_units != "routed":
                 raise ValueError("model.cell_units is HSN-only")
+            if self.model.write_gate or self.train.lambda_w > 0.0:
+                raise ValueError("model.write_gate and train.lambda_w (A10) are HSN-only")
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.unit_credit != "softmax":
@@ -1264,6 +1294,20 @@ class RunConfig(_StrictModel):
             )
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
         # --- Amendment A8: the fast group is a rule of the scored hard/soft selection only ---
+        if train.lambda_w > 0.0 and not self.model.write_gate:
+            raise ValueError(
+                f"train.lambda_w={train.lambda_w} (A10) requires model.write_gate=true"
+            )
+        if self.model.write_gate and train.gate_mode == "reinforce":
+            raise ValueError(
+                "model.write_gate (A10) is not defined for train.gate_mode=reinforce (the write "
+                "decision trains through the straight-through mask)"
+            )
+        if self.model.write_gate and train.lambda_u > 0.0:
+            raise ValueError(
+                "model.write_gate (A10) with train.lambda_u > 0 is untested: the counterfactual "
+                "probes edit a selection without its write mask"
+            )
         if self.model.fast_cells and train.gate_mode == "reinforce":
             raise ValueError(
                 "model.fast_cells (A8) is not defined for train.gate_mode=reinforce (the sampled "
@@ -1483,12 +1527,10 @@ def _resolve_hardware(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
 #: that meant "off". A resolved configuration written by a tree that carried them holds them at
 #: that value; it is the same run without them (they were left out of the configuration hash at
 #: their defaults), so :func:`load_config` removes them from the file's content. Any other value
-#: needs the tree that had the code and is refused.
-RETIRED_KEYS: dict[str, tuple[Any, str]] = {
-    "model.write_gate": (False, "amendment A10, dropped 13 Nov 2026"),
-    "model.write_init": (2.0, "amendment A10, dropped 13 Nov 2026"),
-    "train.lambda_w": (0.0, "amendment A10, dropped 13 Nov 2026"),
-}
+#: needs the tree that had the code and is refused. Empty at present: amendment A10's three keys
+#: (``model.write_gate``, ``model.write_init``, ``train.lambda_w``), retired on 13 Nov 2026, are
+#: schema keys again since 14 Nov 2026, so run folders that hold them load as they are.
+RETIRED_KEYS: dict[str, tuple[Any, str]] = {}
 
 
 def _drop_retired_keys(raw: dict[str, Any], path: Path) -> None:
@@ -1502,7 +1544,7 @@ def _drop_retired_keys(raw: dict[str, Any], path: Path) -> None:
         if block[key] != off:
             raise ValueError(
                 f"{path}: {dotted}={block[key]!r} belongs to {what}; its code is not in this "
-                "tree (docs/amendments/A10_write_decision.md names the commit that has it)"
+                "tree (the amendment's document names the commit that has it)"
             )
         del block[key]
 
@@ -1602,6 +1644,10 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_gate",
     "train.address_gate_hold_step",
     "model.address_gate_input",
+    "model.write_gate",
+    "model.write_init",
+    "train.lambda_w",
+    "hardware.graph_alias_index",
 )
 
 
@@ -1689,6 +1735,11 @@ def split_window_scope_error(
             f"model.address_gate_input={model.address_gate_input!r} (A13): the split window's "
             "replay and compiled sweeps compute the gate's term from u; use "
             "hardware.window=autograd"
+        )
+    if model.write_gate:
+        return (
+            "model.write_gate (A10): the write decision is not built into the split window; "
+            "use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

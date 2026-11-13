@@ -456,6 +456,16 @@ class Scorer(nn.Module):
         #: of what :meth:`_assemble` returns. The scorer's own map never reads those columns.
         self.gate_input: str = cfg.address_gate_input if cfg.address_gate else "u"
         self._gate_extra = cfg.d if self.gate_input != "u" else 0
+        #: A10 (``model.write_gate``): the write output, one logit per (cell, unit) from the same
+        #: features. Zero weights and a positive bias: every selected cell is written at the start.
+        #: Built last and without a draw, so no other parameter's initial value changes.
+        self.write_net: nn.Linear | None = None
+        if cfg.write_gate:
+            rng = torch.get_rng_state()  # nn.Linear draws its default init: put the stream back
+            self.write_net = nn.Linear(self.in_features, cfg.n_units)
+            torch.set_rng_state(rng)
+            nn.init.zeros_(self.write_net.weight)
+            nn.init.constant_(self.write_net.bias, float(cfg.write_init))
 
         excluded = torch.zeros(self.in_features, dtype=torch.bool)
         for name in self.exclude:
@@ -787,6 +797,16 @@ class Scorer(nn.Module):
             out = out + torch.einsum("bna,bma->bnm", address, gate.to(address.dtype))
         return out
 
+    def write_logits(self, feats: Tensor) -> Tensor | None:
+        """A10: ``feats [B, N, F] -> [B, N, M]``, the write logit of every (cell, unit); ``None``
+        without ``model.write_gate``."""
+        if self.write_net is None:
+            return None
+        if self._gate_extra:  # A13: the address gate's own input rides behind the features
+            feats = feats[:, :, : self.in_features]
+        out: Tensor = self.write_net(feats)
+        return out
+
     # ----------------------------------------------------------------------------------------------
     # Accounting and validation
     # ----------------------------------------------------------------------------------------------
@@ -890,6 +910,14 @@ class Selection:
     #: scored decision before the probes; ``None`` where no threshold exists (the unscored modes,
     #: ``dense``). Never read by the round itself.
     threshold: Tensor | None = None
+    #: A10 (``model.write_gate``): ``write_mask [B, N]`` (fp32) multiplies the gate of a written
+    #: cell: 1 / 0 by the sign of the chosen unit's write logit in the hard modes (with the
+    #: straight-through gradient in ``ste``), the sigmoid itself in the soft warm-up, the constant
+    #: 1 on A8's fast cells and on dense-fallback rows. ``write_fraction [B]`` (fp32,
+    #: differentiable) is the share of the row's valid routed slots that may write, the write
+    #: cost's input. ``None`` without the key: every valid slot is written through its gate.
+    write_mask: Tensor | None = None
+    write_fraction: Tensor | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -1212,8 +1240,13 @@ class Router(nn.Module):
         dense_rows: Tensor | None = None,
         reserved: int = 0,
         reserved_units: bool = False,
+        write_logits: Tensor | None = None,
     ) -> Selection:
         """Select up to ``k_max`` (cell, unit) slots per row within ``budget`` (module docstring).
+
+        ``write_logits`` (amendment A10, ``model.write_gate``; ``topk`` without ``reinforce``
+        only): the scorer's write logits ``[B, N, M]``. The decision is unchanged; the selection
+        also carries ``write_mask`` and ``write_fraction`` (:class:`Selection`).
 
         ``reserved`` (amendment A8, ``model.fast_cells``; ``topk`` without ``reinforce`` only):
         cells ``0 .. reserved − 1`` take the first ``reserved`` slots at every call, each at its
@@ -1267,6 +1300,16 @@ class Router(nn.Module):
                 raise ValueError(f"reserved={reserved} must be < k_max={k_max}")
         elif reserved_units:
             raise ValueError("reserved_units needs reserved > 0")
+        if write_logits is not None:
+            if mode != "topk" or gate == "reinforce":
+                raise ValueError(
+                    "write_logits (A10) need mode='topk' without gate='reinforce', got "
+                    f"mode={mode!r}, gate={gate!r}"
+                )
+            if tuple(write_logits.shape) != (B, N, M):
+                raise ValueError(
+                    f"write_logits must have shape {(B, N, M)}, got {tuple(write_logits.shape)}"
+                )
         age_t = self._check_age(age, mode, B, N, logits.device)
         dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
         if generator is not None and not (mode == "random" or epsilon > 0.0 or gate == "reinforce"):
@@ -1332,6 +1375,7 @@ class Router(nn.Module):
             dense=dense,
             reserved=reserved,
             reserved_units=reserved_units,
+            write_logits=write_logits,
         )
         return self._tapped(selection)
 
@@ -1787,6 +1831,7 @@ class Router(nn.Module):
         executed_scores: bool = False,
         reserved: int = 0,
         reserved_units: bool = False,
+        write_logits: Tensor | None = None,
     ) -> Selection:
         """The gradient-path tensors of a sparse decision (module docstring) and the Selection.
 
@@ -1863,6 +1908,34 @@ class Router(nn.Module):
         expected = self.shared_cost + (cell_mask * per_cell).sum(dim=1)
         if dense is not None:
             expected = torch.where(dense, torch.full_like(expected, dense_cost), expected)
+        write_mask: Tensor | None = None
+        write_fraction: Tensor | None = None
+        if write_logits is not None:  # A10: the chosen unit's write logit decides the write
+            chosen = write_logits.float().gather(2, unit_full[:, :, None]).squeeze(2)  # [B, N]
+            hard_write = (chosen.detach() > 0).to(torch.float32)
+            if gate is None:
+                write_mask = hard_write
+            else:
+                soft_write = torch.sigmoid(chosen / tau)
+                write_mask = (
+                    soft_write
+                    if gate == "soft"
+                    else hard_write + (soft_write - soft_write.detach())
+                )
+            if reserved:  # A8: the fast group is always written
+                write_mask = torch.cat(
+                    [torch.ones_like(write_mask[:, :reserved]), write_mask[:, reserved:]], dim=1
+                )
+            if dense is not None:  # a dense-fallback row executes the dense step
+                write_mask = torch.where(dense[:, None], torch.ones_like(write_mask), write_mask)
+            routed_slots = valid_f
+            if reserved:
+                routed_slots = torch.cat(
+                    [torch.zeros_like(valid_f[:, :reserved]), valid_f[:, reserved:]], dim=1
+                )
+            write_fraction = (write_mask.gather(1, cells) * routed_slots).sum(dim=1) / (
+                routed_slots.sum(dim=1).clamp_min(1.0)
+            )
         slot_cell = cell_mask.gather(1, cells)
         slot_unit = (
             unit_weights.gather(1, cells[:, :, None].expand(B, K, M))
@@ -1889,6 +1962,8 @@ class Router(nn.Module):
                 dense if dense is not None else torch.zeros(B, dtype=torch.bool, device=device)
             ),
             threshold=threshold,
+            write_mask=write_mask,
+            write_fraction=write_fraction,
         )
 
     def finish_recorded(

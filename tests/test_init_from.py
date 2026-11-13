@@ -91,3 +91,46 @@ def test_the_run_record_names_the_warm_start(
     assert record["init_from"]["path"] == str(ckpt)
     assert record["init_from"]["step"] == 8
     assert record["final"]["steps"] == 8  # the warm-started run counts its own steps from 0
+
+
+@pytest.mark.parametrize("ema", [False, True])
+def test_warm_start_of_a_write_gate_model_from_a_run_without_it(ema: bool, tmp_path: Path) -> None:
+    """A10: the source run has no write output. Every other weight is loaded, the write output
+    keeps its initial value (every write open) and the record names what was not loaded. Any
+    other mismatch is still refused."""
+    extra = ("train.weight_ema=0.9",) if ema else ()
+    steps = 6
+    first = hsn_trainer(hsn_config(steps, *SMALL, *extra), tmp_path / "first")
+    first.fit(*datasets(), steps)
+    ckpt = latest_checkpoint(tmp_path / "first")
+    assert ckpt is not None
+    if ema:
+        assert first.install_averaged_weights()
+    want = {n: v.detach().clone() for n, v in first.model.named_parameters()}
+
+    cfg = hsn_config(steps, *SMALL, *extra, "model.write_gate=true", f"train.init_from={ckpt}")
+    model = HSN.from_config(cfg)
+    report = warm_start(model, cfg.train.init_from)
+    assert report["not_loaded"] == [
+        "router.scorer.write_net.weight",
+        "router.scorer.write_net.bias",
+    ]
+    after = dict(model.named_parameters())
+    for name, value in want.items():
+        assert torch.equal(after[name], value), name
+    net = model.scorer.write_net
+    assert net is not None
+    assert bool((net.weight == 0).all()) and bool((net.bias == cfg.model.write_init).all())
+
+    # the other direction (a source with the write output, a model without) stays refused
+    second = hsn_trainer(
+        hsn_config(steps, *SMALL, *extra, "model.write_gate=true"), tmp_path / "second"
+    )
+    second.fit(*datasets(), steps)
+    with_write = latest_checkpoint(tmp_path / "second")
+    assert with_write is not None
+    with pytest.raises(RuntimeError, match="write_net"):
+        warm_start(HSN.from_config(hsn_config(steps, *SMALL, *extra)), with_write)
+    # and a model with the write output loads a source that has it, with nothing left out
+    full = warm_start(HSN.from_config(cfg), with_write)
+    assert "not_loaded" not in full

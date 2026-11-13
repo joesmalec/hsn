@@ -95,6 +95,10 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.address_gate",
         "train.address_gate_hold_step",
         "model.address_gate_input",
+        "model.write_gate",
+        "model.write_init",
+        "train.lambda_w",
+        "hardware.graph_alias_index",
     )
 
 

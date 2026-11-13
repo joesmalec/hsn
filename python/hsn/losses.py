@@ -394,6 +394,10 @@ def assemble_terms(
             )
         )
 
+    # A10: the write cost, the mean over positions of the share of routed slots that may write
+    if train.lambda_w > 0.0:
+        terms["write"] = train.lambda_w * _field(out, "write_fraction", "out").float().mean()
+
     # continual-learning terms (P3.1-P3.3): on when their weight is positive
     for name in _CONTINUAL_TERMS:
         lam = _weight(train, name)
