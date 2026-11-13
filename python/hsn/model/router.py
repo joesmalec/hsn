@@ -440,6 +440,18 @@ class Scorer(nn.Module):
             if isinstance(self.net, MLP2):
                 self.net.in_dim = self.in_features
 
+        #: A12 (``model.address_gate``): ``G``, a linear map of ``u`` to one weight per (unit,
+        #: address feature), added to the unit's own weight on that feature. Zero at the start
+        #: and built without consuming a random draw, so the model starts as the model without
+        #: the key and every other parameter has the same initial value.
+        self.address_gate: nn.Linear | None = None
+        self._address_start = self.in_features - len(address_names)
+        if cfg.address_gate:
+            rng = torch.get_rng_state()  # nn.Linear draws its default init: put the stream back
+            self.address_gate = nn.Linear(cfg.d, cfg.n_units * len(address_names), bias=False)
+            torch.set_rng_state(rng)
+            nn.init.zeros_(self.address_gate.weight)
+
         excluded = torch.zeros(self.in_features, dtype=torch.bool)
         for name in self.exclude:
             excluded[self.feature_slices[name]] = True
@@ -743,6 +755,12 @@ class Scorer(nn.Module):
                 f"feats must have shape [B, N, {self.in_features}], got {tuple(feats.shape)}"
             )
         out: Tensor = self.net(feats)
+        if self.address_gate is not None:  # A12: address weights that depend on the content u_t
+            B, N, _ = feats.shape
+            u = feats[:, 0, self.feature_slices["u"]]  # [B, d]: the same in every cell's row
+            address = feats[:, :, self._address_start :]  # [B, N, A]
+            gate = self.address_gate(u).view(B, self.n_units, -1)  # [B, M, A]
+            out = out + torch.einsum("bna,bma->bnm", address, gate.to(address.dtype))
         return out
 
     # ----------------------------------------------------------------------------------------------

@@ -89,7 +89,9 @@ def _scorer_params(m: ModelConfig) -> int:
     # A5: a_cur, a_prev; A9: two more per extra n-gram length
     d_in = 3 * m.d + SCORER_SCALAR_FEATURES + (2 * m.address_ngram if m.key_address else 0)
     if m.scorer == "linear":
-        return d_in * m.n_units + m.n_units
+        # A12: the address gate, d -> n_units * (address features), no bias
+        gate = m.d * m.n_units * 2 * m.address_ngram if m.address_gate else 0
+        return d_in * m.n_units + m.n_units + gate
     return _mlp(d_in, m.scorer_hidden, m.n_units)
 
 
