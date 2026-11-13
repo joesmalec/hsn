@@ -281,7 +281,9 @@ class UnitBank(nn.Module):
         )
         return out_sorted.index_select(0, inverse)
 
-    def forward_grouped(self, v: Tensor, unit_idx: Tensor) -> Tensor:
+    def forward_grouped(
+        self, v: Tensor, unit_idx: Tensor, *, record: dict[str, Tensor] | None = None
+    ) -> Tensor:
         """:meth:`forward_selected` for a large batch of pairs (P2.10, the split window's
         replay: every pair of a window at once): the same grouped pass — pairs sorted by unit,
         one ``addmm`` per layer and present unit, the order restored — with the sorted pairs cut
@@ -291,7 +293,12 @@ class UnitBank(nn.Module):
         B32/T256 window). One host read (the unit histogram); ``unit_idx`` must lie in
         ``[0, M)`` (the caller's recorded decisions). The two reorderings are
         :func:`permute_rows`: their backward gathers, where ``index_select``'s scatters each
-        ``[P, ·]`` gradient into a tensor of zeros."""
+        ``[P, ·]`` gradient into a tensor of zeros.
+
+        ``record`` (P2.10c, the state-gradient sweep of :mod:`hsn.train.state_gradient`): a dict
+        that receives ``hidden [P, H]``, the first layer's pre-activation of every pair's own
+        unit in the input order, detached (the values this pass computed, not a second
+        product). ``None`` (default): nothing is kept and the pass is the one above."""
         if v.ndim != 2 or v.shape[1] != self.in_dim:
             raise ValueError(
                 f"forward_grouped expects v [P, {self.in_dim}], got shape {tuple(v.shape)}"
@@ -303,6 +310,8 @@ class UnitBank(nn.Module):
             )
         n_pairs = int(v.shape[0])
         if n_pairs == 0:
+            if record is not None:
+                record["hidden"] = v.new_zeros((0, self.hidden))
             return v.new_zeros((0, self.d))
         idx = unit_idx.to(torch.int64)
         counts: list[int] = torch.bincount(idx, minlength=self.n_units).tolist()
@@ -318,12 +327,18 @@ class UnitBank(nn.Module):
         w2s = self.W2.unbind(0)
         b2s = self.b2.unbind(0)
         outputs: list[Tensor] = []
+        first: list[Tensor] = []
         for j, count in enumerate(counts):
             if count == 0:
                 continue
-            hidden = self.act(torch.addmm(b1s[j], blocks[j], w1s[j]))
+            pre = torch.addmm(b1s[j], blocks[j], w1s[j])
+            if record is not None:
+                first.append(pre.detach())
+            hidden = self.act(pre)
             outputs.append(torch.addmm(b2s[j], hidden, w2s[j]))
         out_sorted = torch.cat(outputs, dim=0)
+        if record is not None:
+            record["hidden"] = torch.cat(first, dim=0).index_select(0, inverse)
         return permute_rows(out_sorted, inverse, order)
 
     def forward_static(

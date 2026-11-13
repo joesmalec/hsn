@@ -536,7 +536,13 @@ class PDGCell(nn.Module):
         return rider, y
 
     def replay_sparse(
-        self, u: Tensor, eps: Tensor, h_read: Tensor, sel: Selection
+        self,
+        u: Tensor,
+        eps: Tensor,
+        h_read: Tensor,
+        sel: Selection,
+        *,
+        record: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
         """The candidate and the gate of :meth:`step_sparse` without the state update (P2.10, the
         split window's replay): ``(c, b)``, each ``[R, K, d]`` in ``h_read``'s dtype, for ``R``
@@ -547,7 +553,18 @@ class PDGCell(nn.Module):
         :meth:`step_sparse` in the same order: messages, inputs, norm, gate, the unit bank's
         grouped pass (one unit per pair, :meth:`UnitBank.forward_grouped`), ``W_out``, the
         candidate norm, ``tanh``. Only inside :meth:`window` (the edge weights and ``W1`` layout
-        are the window's)."""
+        are the window's).
+
+        ``record`` (P2.10c, :mod:`hsn.train.state_gradient`: the window without the ``state``
+        cut): a dict that receives what the reverse sweep reads of this pass, detached and in
+        ``h_read``'s dtype unless said: ``y [R, K, d]`` (``W_out``'s output, the candidate
+        norm's input), ``alpha [R, K]`` (the slot weights' values), ``hidden [R, K, H]`` (the
+        executed unit's first-layer pre-activation, in the unit bank's dtype), ``gate_pre
+        [R, K, d]`` (the gate before its sigmoid), ``m [R, K, d]`` (the messages) and ``rms
+        [R, K]`` (the cell norm's ``1 / sqrt(mean(v_raw²) + eps)``; absent with
+        ``model.cell_norm = none``). The state is still read as a constant here: ``(c, b)`` and
+        their graph are the local half of the gradient, and the sweep adds the half that
+        passes through the state. ``None`` (default): the pass above, bit for bit."""
         if not self._in_window:
             raise RuntimeError("PDGCell.replay_sparse is only available inside PDGCell.window()")
         if self.disabled_cells:
@@ -572,16 +589,31 @@ class PDGCell(nn.Module):
             u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
             v_raw = native_ops.gather_concat(u_read, eps, h_const, m, cells)  # [R, K, 4d]
             v = self.norm(v_raw)
-            b = torch.sigmoid(self.gate(v).to(dtype))
+            gate_pre = self.gate(v).to(dtype)
+            b = torch.sigmoid(gate_pre)
             unit_out = self.units.forward_grouped(
-                v.reshape(R * K, self.in_dim), units.reshape(R * K)
+                v.reshape(R * K, self.in_dim), units.reshape(R * K), record=record
             ).reshape(R, K, d)
             if self.cand_norm_kind == "none":
                 mixed = sel.alpha.unsqueeze(-1) * unit_out
-                c = torch.tanh(self.W_out(mixed).to(dtype))
+                y = self.W_out(mixed).to(dtype)
+                c = torch.tanh(y)
             else:
-                pre = self.cand_norm(self.W_out(unit_out).to(dtype))
+                y = self.W_out(unit_out).to(dtype)
+                pre = self.cand_norm(y)
                 c = torch.tanh(sel.alpha.unsqueeze(-1).to(dtype) * pre)
+            if record is not None:
+                record["y"] = y.detach()
+                record["alpha"] = sel.alpha.detach().to(dtype)
+                record["hidden"] = record["hidden"].reshape(R, K, self.units.hidden)
+                record["gate_pre"] = gate_pre.detach()
+                record["m"] = v_raw.detach()[..., self.in_dim - d :]
+                if isinstance(self.norm, nn.RMSNorm):
+                    eps_norm = self.norm.eps  # torch's default when unset: the dtype's epsilon
+                    if eps_norm is None:
+                        eps_norm = torch.finfo(dtype).eps
+                    mean_square = v_raw.detach().square().mean(dim=-1)
+                    record["rms"] = torch.rsqrt(mean_square + eps_norm)
         return c, b
 
     # ----------------------------------------------------------------------------------------------

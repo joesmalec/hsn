@@ -1517,14 +1517,24 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
 )
 
 
-def split_window_scope_error(cfg: RunConfig) -> str | None:
+def split_window_scope_error(cfg: RunConfig, *, state_gradient: bool = False) -> str | None:
     """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
     ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is only
     defined where the heavy backward work is local to its position (the full A6 feedback cut)
     and for the routed hard-gate round it replays. A soft warm-up (``train.soft_until_step``)
     is inside the scope: its steps run every cell with autograd, which is the autograd window's
     work, so they take that window and the split window takes over at the first hard-gate step
-    (:meth:`hsn.train.split.SplitWindow.splits_now`)."""
+    (:meth:`hsn.train.split.SplitWindow.splits_now`).
+
+    ``state_gradient`` (P2.10c, ``docs/p2_10c_state_gradient_window.md``; default False: the
+    scope above, which is what ``hardware.window`` is checked against at load) asks for the
+    scope of the split window *with the state gradient*: ``train.feedback_detach`` holds
+    ``summary``, ``eps`` and ``router`` and not ``state``, and the state recurrence's reverse
+    sweep carries the cell's read of the state (:mod:`hsn.train.state_gradient`). That sweep
+    also takes amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and
+    ``fast_readout``) and A9's ``model.address_ngram``, which the windows of P2.10 refuse.
+    No configuration key selects it yet: it is the float64 reference of that work's phase 1,
+    built through :class:`hsn.train.split.SplitWindow` directly."""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn":
         return f"model_name={cfg.model_name!r} is not the HSN"
@@ -1535,7 +1545,18 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
     if train.ste_scope != "selected":
         return f"train.ste_scope={train.ste_scope!r}: the masked round runs every cell"
     missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
-    if missing:
+    if state_gradient:
+        if not missing:
+            return (
+                "train.feedback_detach holds every path: with the state read cut there is no "
+                "state gradient to sweep, and the split window of P2.10 is the window to use"
+            )
+        if missing != ["state"]:
+            return (
+                f"train.feedback_detach lacks {missing}: the state-gradient sweep carries the "
+                "cell's read of the state only; summary, eps and router must be cut"
+            )
+    elif missing:
         return (
             f"train.feedback_detach lacks {missing}: without the full feedback cut the heavy "
             "backward work is not local to its position"
@@ -1548,12 +1569,12 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
     if model.disabled_cells:
         return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
-    if model.fast_cells:
+    if model.fast_cells and not state_gradient:
         return (
             f"model.fast_cells={model.fast_cells} (A8): the reserved slots and the fast read "
             "are not built into the split window; use hardware.window=autograd"
         )
-    if model.address_ngram > 1:
+    if model.address_ngram > 1 and not state_gradient:
         return (
             f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
             "has A5's two address columns only; use hardware.window=autograd"

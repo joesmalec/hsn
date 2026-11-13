@@ -55,6 +55,14 @@ has its own recurrence (:func:`dense_recurrence_backward`): every cell is writte
 Scope (:func:`scope_error`; anything else keeps the autograd window): routed ``topk`` with the
 ``ste`` gate at every step, all four feedback paths cut, no exploration, no counterfactual
 probes, no state-gradient clip, no disabled cells, one round, no loss scaler.
+
+P2.10c (``docs/p2_10c_state_gradient_window.md``; ``SplitWindow(..., state_gradient=True)``,
+no configuration key yet): the same window without the ``state`` cut
+(``train.feedback_detach = [summary, eps, router]``). The sweep and the replay are the ones
+above; the recurrence node is :class:`hsn.train.state_gradient.StateGradientRecurrence`, whose
+reverse sweep also carries the cell's read of the state position by position. It takes
+amendment A8's fast cells (the reserved slots of the recorded decision, the fast read of ``S``
+as a constant and of the decoder as a fourth output of the node) and A9's address n-grams.
 """
 
 from __future__ import annotations
@@ -74,6 +82,7 @@ from hsn.model.hsn import HSN, _Prologue
 from hsn.model.router import Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.train.compile import CompiledWindow, WindowOut, _tape_block, run_tape
+from hsn.train.state_gradient import StateGradientRecurrence, cell_constants
 
 __all__ = [
     "SplitWindow",
@@ -87,11 +96,12 @@ __all__ = [
 DENSE_BYTES = 4 << 30
 
 
-def scope_error(cfg: RunConfig) -> str | None:
+def scope_error(cfg: RunConfig, *, state_gradient: bool = False) -> str | None:
     """Why ``cfg`` cannot train with the split window, or ``None`` when it can (module
     docstring, "Scope"): :func:`hsn.config.split_window_scope_error`, which the configuration
-    itself applies when ``hardware.window`` asks for the split window."""
-    return split_window_scope_error(cfg)
+    itself applies when ``hardware.window`` asks for the split window. ``state_gradient``: the
+    scope of the window with the state gradient (P2.10c) instead."""
+    return split_window_scope_error(cfg, state_gradient=state_gradient)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -300,18 +310,25 @@ def _scorer_logits(
     return cells + row.to(dtype)[:, None, :]
 
 
-def _readout_of_slots(chosen: Tensor, sel: Selection, gate: str | None, q: Tensor) -> Tensor:
+def _readout_of_slots(
+    chosen: Tensor, sel: Selection, gate: str | None, q: Tensor, fast: int = 0
+) -> Tensor:
     """:meth:`HSN._selected_readout`'s hard branch from the selected slots' updated states
     ``chosen [R, K, d]`` (the same operations; ``q [R, d]`` serves the dense-fallback rows, of
-    which the split window has none)."""
+    which the split window has none). ``fast`` (A8's ``model.fast_readout``): the first
+    ``fast`` slots are the fast cells, which have their own read, and the mean is taken over
+    the routed slots only; the caller appends the fast read."""
     dtype = chosen.dtype
     safe_idx = sel.cell_idx.masked_fill(~sel.valid, 0)
-    weights = sel.valid.to(dtype)
+    valid = sel.valid
+    if fast:  # the reserved slots are the first `fast` slots (Router.select)
+        valid = torch.cat([torch.zeros_like(valid[:, :fast]), valid[:, fast:]], dim=1)
+    weights = valid.to(dtype)
     if gate == "ste":
         mask = sel.cell_mask.gather(1, safe_idx).to(dtype)
         weights = weights * (1.0 + mask - mask.detach())
     readout = (chosen * weights[..., None]).sum(1)
-    readout = readout / sel.valid.sum(1, keepdim=True).clamp_min(1).to(dtype)
+    readout = readout / valid.sum(1, keepdim=True).clamp_min(1).to(dtype)
     return torch.where(sel.dense_fallback[:, None], q, readout)
 
 
@@ -329,15 +346,39 @@ class SplitWindow:
     its counters account for it) or ``None`` (the sweep then runs eagerly: the CPU, tests).
     Calls outside the split window's use — evaluation, ``torch.no_grad()``, a diagnostic
     ``capture``, the steps of a soft warm-up — go to ``fallback`` (the compiled window, or the
-    model's forward)."""
+    model's forward).
 
-    def __init__(self, model: HSN, cfg: RunConfig, compiled: CompiledWindow | None) -> None:
-        reason = scope_error(cfg)
+    ``state_gradient`` (P2.10c, module docstring; default False: the window of P2.10): the
+    window for a model without the ``state`` cut, with the reverse sweep of
+    :mod:`hsn.train.state_gradient`. The reference of that work's phase 1: the eager sweep
+    only (``compiled=None``), and a window with dense-fallback rows goes to the fallback."""
+
+    def __init__(
+        self,
+        model: HSN,
+        cfg: RunConfig,
+        compiled: CompiledWindow | None,
+        *,
+        state_gradient: bool = False,
+    ) -> None:
+        reason = scope_error(cfg, state_gradient=state_gradient)
         if reason is not None:
             raise ValueError(f"hardware.window=split is not available for this run: {reason}")
+        if state_gradient and compiled is not None:
+            raise ValueError(
+                "the split window with the state gradient is the eager reference of P2.10c: "
+                "it has no compiled sweep yet (compiled=None)"
+            )
+        if state_gradient and model.cell.detach_state_read:
+            raise ValueError(
+                "state_gradient=True does not match the model: its cell cuts the read of the "
+                "state (it was built with `state` in train.feedback_detach)"
+            )
         self.model = model
         self.cfg = cfg
         self.compiled = compiled
+        #: P2.10c: the recurrence's reverse sweep carries the cell's read of the state.
+        self.state_gradient = state_gradient
         self.fallback: Callable[..., WindowOut] = compiled if compiled is not None else model
         self.calls = 0
         #: ``hardware.window=fused``: the sweep's cell round is the fused CUDA op.
@@ -430,9 +471,14 @@ class SplitWindow:
         dense_indices: Tensor | None = None
         if dense_rows is not None:
             dense_ids = dense_rows.nonzero().flatten()
-            if self.fused or self._dense_replay_bytes(int(dense_ids.numel()), T) > DENSE_BYTES:
-                # the fused round has no dense rows; a window with too many would not fit the
-                # batched replay: the autograd window runs it, from the same draw
+            if (
+                self.fused
+                or self.state_gradient
+                or self._dense_replay_bytes(int(dense_ids.numel()), T) > DENSE_BYTES
+            ):
+                # the fused round has no dense rows, the state-gradient sweep has no dense
+                # recurrence, and a window with too many would not fit the batched replay:
+                # the autograd window runs it, from the same draw
                 torch.set_rng_state(rng)
                 return self.fallback(
                     tokens,
@@ -511,10 +557,16 @@ class SplitWindow:
         context = pro.context.reshape(R, -1)
         scalars = pro.scalars.reshape(R, N, -1)
 
+        # A8 (P2.10c's scope only): the fast cells take the first slots, and with the fast read
+        # S and the decoder read their mean
+        n_fast = cfg.fast_cells if cfg.fast_readout else 0
         # the shared path's local half: S, and what the cell and the scorer read of the error
         with torch.no_grad():
             z_hat_value = model.predictor(q_pre)
-        u = model.shared(torch.cat([z, q_pre, context], dim=-1))
+        if n_fast:  # [z; q; ctx; f]: the taped state is a constant, as the summary cut makes it
+            u = model.shared(model._shared_input(z, q_pre, context, h_pre))
+        else:
+            u = model.shared(torch.cat([z, q_pre, context], dim=-1))
         u_s = u.to(dtype)
         eps_s = (z - z_hat_value).to(dtype)  # A6 `eps`: z keeps its gradient, the prediction none
         # the scorer on detached features (A6 `router`), and the recorded decision's gradient path
@@ -536,12 +588,19 @@ class SplitWindow:
             temperature=controls.tau,
             dense_rows=dense_r,
             executed_scores=self.executed_scores,
+            reserved=cfg.fast_cells,
+            reserved_units=cfg.fast_units == "fixed",
         )
         c_dense: Tensor | None = None
         b_dense: Tensor | None = None
         h_dense_old: Tensor | None = None
+        # P2.10c: what the reverse sweep reads of the replay's own values and of the weights
+        record: dict[str, Tensor] | None = {} if self.state_gradient else None
+        consts = None
         with cell.window():
-            c, b = cell.replay_sparse(u_s, eps_s, h_pre, selection)  # [R, K, d]
+            c, b = cell.replay_sparse(u_s, eps_s, h_pre, selection, record=record)  # [R, K, d]
+            if self.state_gradient:
+                consts = cell_constants(cell, dtype)
             if dense_ids is not None:
                 # the rows that ran the dense round: every cell, the softmax mix of the units
                 Bd = int(dense_ids.numel())
@@ -576,9 +635,26 @@ class SplitWindow:
             assert h_dense_old is not None
             recurrence_tape["dense_ids"] = dense_ids
             recurrence_tape["h_dense_old"] = h_dense_old.reshape(-1, T, N, d)
-        q_pre_n, q_post_n, h_sel_n = StateRecurrence.apply(
-            c.reshape(B, T, K, d), b.reshape(B, T, K, d), c_dense, b_dense, recurrence_tape, N
-        )
+        h_fast_n: Tensor | None = None
+        if record is not None and consts is not None:
+            # P2.10c: the node whose reverse sweep also carries the cell's read of the state
+            assert dense_ids is None  # such a window went to the fallback
+            recurrence_tape["units"] = units.masked_fill(~valid, 0).reshape(B, T, K)
+            for key, value in record.items():
+                recurrence_tape[key] = value.reshape(B, T, K, *value.shape[2:])
+            # the fast cells after every position (A8's read of the decoder): fast cell i is
+            # slot i's cell; a slot the budget cut wrote nothing and its cell kept its state
+            fast_valid = tape["sel_valid"][:, :, :n_fast, None]
+            recurrence_tape["h_fast"] = torch.where(
+                fast_valid, tape["tape_hsel"][:, :, :n_fast], tape["tape_h"][:, :, :n_fast]
+            )
+            q_pre_n, q_post_n, h_sel_n, h_fast_n = StateGradientRecurrence.apply(
+                c.reshape(B, T, K, d), b.reshape(B, T, K, d), recurrence_tape, consts, N
+            )
+        else:
+            q_pre_n, q_post_n, h_sel_n = StateRecurrence.apply(
+                c.reshape(B, T, K, d), b.reshape(B, T, K, d), c_dense, b_dense, recurrence_tape, N
+            )
 
         # the reads of the state that carry gradient: P, the selected readout, the decoder
         z_hat = model.predictor(q_pre_n.reshape(R, d))
@@ -586,8 +662,11 @@ class SplitWindow:
         readouts: Tensor | None = None
         if cfg.selected_readout:
             readouts = _readout_of_slots(
-                h_sel_n.reshape(R, K, d), selection, controls.gate, q_post_n.reshape(R, d)
+                h_sel_n.reshape(R, K, d), selection, controls.gate, q_post_n.reshape(R, d), n_fast
             ).reshape(B, T, d)
+            if n_fast:  # [r; f]: the fast cells' mean after the position (HSN._fast_read)
+                assert h_fast_n is not None
+                readouts = torch.cat([readouts, h_fast_n.mean(dim=2)], dim=-1)
         routed = {
             "cell_idx": tape["sel_cell_idx"],
             "unit_idx": tape["sel_unit_idx"],
