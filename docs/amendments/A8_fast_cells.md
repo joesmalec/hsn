@@ -4,9 +4,12 @@ Status: **implemented as an opt-in experiment on 12 Nov 2026. Not adopted.**
 - With routed units the fast group adds nothing over the same number of slots and is dropped
   by its kill rule (section "Results").
 - With `model.fast_units=fixed` it lowers TinyStories bits per byte by 0.06 to 0.09 at the same
-  number of slots on two seeds and keeps the delayed score, but the slow cells do not become
-  memory-like on text, and the arms run all eight units per byte where the controls run about
-  two (section "Results with fixed units"). What the gain is due to is open.
+  number of slots on two seeds (0.842 at 27,000 steps; GRU 0.879), reaches 86.5 / 99.8 % on
+  arithmetic and keeps the delayed score. With a single routed slot text and arithmetic stay
+  and the delayed task falls to the key-blind level: the fast cells do the processing, the
+  routed cells hold the facts (sections "Results with fixed units" and "What each group
+  does"). The slow cells do not become memory-like on text, and the arms run all eight units
+  per position where the routed-only arms run about two.
 - The user asked on 12 Nov 2026 (about 19:40 MST) for a worktree with the architecture changes
   discussed in the review of white paper v1.2, and for their tests at the front of the queue.
 - `model.fast_cells: F` (default 0) and `model.fast_readout: true` (default false). Both are
@@ -187,12 +190,35 @@ Against the amendment's three points:
   units, eight to all of them. The gain may come from the unit bank being in use as much as
   from cells that are written at every byte. The GRU, the Transformer and Mamba use all their
   parameters at every byte, so the comparison with them is like for like in that respect.
-- **It is not shown that the routed cells contribute on text.** `ts_f8ru9_cutC` (eight fast
-  cells and one routed slot) was asked for on 13 Nov to measure that.
+- **The routed cells do not contribute on text**: next section.
 - What a fixed-unit fast group amounts to: F cells with their own weights, written at every
   position and read through their mean. It uses the HSN's cell equation, messages, ε and gate,
   and adds no state, but it works like a small gated recurrent layer beside the routed memory.
   Whether that is inside the design's identity is the user's call; it is not adopted here.
+
+## What each group does (13 Nov 2026, 05:45 MST)
+
+The eight-fast-cell arm with one routed slot instead of eight (`k_select = 9`; the
+configuration refuses zero routed slots), state gradient on, 9,000 steps:
+
+| Task | 8 fast + 8 routed | 8 fast + 1 routed |
+| --- | --- | --- |
+| TinyStories, bits per byte | `ts_f8ru_cutC` 0.951 / 0.961 | `ts_f8ru9_cutC` 0.948 / 0.956 |
+| Arithmetic | `arith_f8ru_cutC` 86.5 / 99.8 % | `arith_f8ru9_cutC` 100.0 % |
+| Delayed | `f8ru_cutC` 99.7 % (later queries 99.5) | `f8ru9_cutC` 80.2 % (first query 100, later 62.7: "does not bind keys") |
+
+- Text and arithmetic are carried by the fast cells. The delayed task with one routed slot
+  scores what a reader that ignores the key scores (about 80 % overall, 63 % of the later
+  queries): the fast cells do not bind a key, the routed cells do.
+- So the fast group has not replaced the routed memory. It is a processing part beside it.
+- More results of the eight-fast-cell arms: TinyStories at 27,000 steps 0.842 (GRU 0.879,
+  Transformer 0.827); delayed out of range 99.5 %; answers-only story text
+  (`tfq_f8ru20_cutC`) 99.5 % in range and 99.6 % out of range; G1 pair (`g1_f8ru20_cutC`)
+  85.8 %, 76.4 % out of range (twelve slots without the group: 89.7 / 78.4 %). Arithmetic
+  without the group: `arith_k12_cutC` 84.2 / 84.3 %.
+- Open: seeds (arithmetic's two are 13 points apart), the five-task mix, the G1 pair, and
+  the amendment's third point, which is still not met (on text the routed cells are written
+  at most positions although they add nothing).
 
 ## Tests
 

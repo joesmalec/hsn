@@ -1,9 +1,10 @@
 # Amendment A9: an address for keys of several bytes (experimental)
 
-Status: **implemented as an opt-in experiment on 12 Nov 2026; not adopted.** First results
-(section "Results"): under the full cut with eight slots the two-byte address lifts `delayed2`
-from 60 to 64 % to 95 % (one seed; the second is running). With twelve slots and the state
-gradient the one-byte address already reaches 91 %, and the longer address adds little there.
+Status: **implemented as an opt-in experiment on 12 Nov 2026; not adopted.** Results (section
+"Results"): under the full cut with eight slots the two-byte address lifts `delayed2` from
+59.9 / 64.2 % to 95.0 / 94.3 % and the three-byte address lifts `delayed3` from 77.6 to
+95.5 %: the amendment's own test is passed on two seeds. With the state gradient the one-byte
+address already reaches 91.6 %, and the longer address adds little there.
 - Asked for by the user on 12 Nov 2026 with A8 (the worktree for the architecture changes of the
   white paper v1.2 review). It is the first step of the "learned address" idea of that review,
   in the form A5's own analysis allows (below).
@@ -97,9 +98,13 @@ writer and reader units set by hand) decides whether the mechanism or its learni
 
 ## Results (13 Nov 2026, 01:50 MST; `delayed2`, 9,000 steps, one seed unless two are given)
 
-Final dev accuracy of the runs: `k2_ng2` 95.0 % against `k2_a8` 59.9 / 64.2 % (the recipe as
-is), the GRU 74.9 % and the Transformer with byte codes 44.3 %. Three-byte keys with the
-one-byte address: `k3_a8` 77.6 %.
+Final dev accuracy of the runs: `k2_ng2` 95.0 / 94.3 % against `k2_a8` 59.9 / 64.2 % (the
+recipe as is), the GRU 74.9 % and the Transformer with byte codes 44.3 %. Three-byte keys:
+`k3_ng3` 95.5 % against `k3_a8` 77.6 %. With the state gradient: `k2_ng2_cutC` (eight slots)
+92.7 %, `k2_k12_ng2_cutC` 92.3 %, and with the one-byte address `k2_k12_cutC` 91.6 %; twelve
+slots under the full cut with the one-byte address (`k2_k12`) 56.9 %. One-byte keys with the
+two-byte address (`v1_ng2`, synthetic_v1's delayed task) 89.9 %, against 90.8 to 92.5 % for
+the arm without it.
 
 The 9k checkpoints evaluated again on the CPU (`eval_keys.py` in the hand-off folder), split by
 the queried key. "Shared": another key of the document ends in the same byte (75 % of the
@@ -116,16 +121,17 @@ out of range (facts 272 to 768 bytes back; trained in range only), per cent:
 
 - **The mechanism works as designed under the full cut.** Keys that share their last byte go
   from 56 to 62 % to 94 %, for keys never seen in training, and the score holds out of range.
-  By the amendment's own test arm 2 is clearly above arm 1 on one seed; the second seed
-  (`k2_ng2/s1`) is running.
+  By the amendment's own test arm 2 is clearly above arm 1 on two seeds.
 - **With twelve slots and the state gradient the model resolves most shared keys without
   it** (88 to 91 %). How is not known: the cells can now be trained for what a later position
   reads, so a cell may hold the whole key as content. The longer address adds about 4 points
   on shared keys and loses about as much on unique ones (one seed each: within the spread).
-- Open: the second seed; `k2_ng2_cutC` (eight slots, state gradient, two bytes) and its
-  control `k2_a8_cutC`; `k2_k12` (twelve slots, full cut) to separate the slots from the state
-  gradient; three bytes (`k3_ng3`); `v1_ng2` (that the longer address does not cost anything
-  on one-byte keys).
+- **It is the state gradient and not the slot count** that resolves the shared keys without
+  the longer address: twelve slots under the full cut score 56.9 %.
+- The longer address costs nothing visible on one-byte keys (`v1_ng2`).
+- So the amendment matters where the full cut stays, which is what the split and fused
+  windows implement. Open: `k2_a8_cutC` (eight slots, state gradient, one byte; queued) and
+  three-byte keys with the state gradient.
 
 ## Tests
 
