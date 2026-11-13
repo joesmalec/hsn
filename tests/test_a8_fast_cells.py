@@ -422,3 +422,46 @@ def test_recipe_with_fast_cells_trains(extra: tuple[str, ...], tmp_path: Path) -
     assert len(losses) == steps and all(math.isfinite(x) for x in losses)
     first, last = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
     assert last < first - 0.05, (first, last)
+
+
+# --------------------------------------------------------------------------------------------------
+# Diagnostics: the gate statistics by group
+# --------------------------------------------------------------------------------------------------
+
+
+def test_trained_state_reports_the_gate_by_group() -> None:
+    from hsn.data.dataset import ByteDataset
+    from hsn.device import seed_everything
+    from hsn.experiments.diagnostics import state_window, window_state_stats
+    from hsn.runner import build_model
+    from p1_11_support import cpu_ctx, docs, tiny_hsn_config
+
+    routed = ("model.routing=topk", "train.gate_mode=ste", "model.k_select=3")
+    plain = tiny_hsn_config(*routed)
+    cfg = tiny_hsn_config(*routed, "model.fast_cells=2")
+    seed_everything(0)
+    model = build_model(cfg)
+    window = state_window(cfg, cpu_ctx(), ByteDataset(docs("delayed", "dev", 4)), 4)
+    stats = window_state_stats(model, window)
+    seed_everything(0)
+    before = window_state_stats(build_model(plain), window)
+    assert not any("fast" in key or "slow" in key for key in before)
+    model.eval()
+    with torch.no_grad():
+        B = int(window["tokens"].shape[0])
+        _, _, info = model(
+            window["tokens"], window["context"], model.init_state(B), window["reset"], capture=True
+        )
+    valid = window["doc"] >= 0
+    gates, written = info["cell_gates"].float()[valid], info["cell_written"][valid]
+    for tag, cells in (("fast", slice(0, 2)), ("slow", slice(2, None))):
+        group = gates[:, cells][written[:, cells]]
+        group = group[~torch.isnan(group)]
+        assert stats[f"gate_{tag}/mean"] == pytest.approx(float(group.mean()), rel=1e-6)
+        assert stats[f"gate_{tag}/write_rate"] == float((group >= 0.5).float().mean())
+        assert stats[f"gate_{tag}/p10"] <= stats[f"gate_{tag}/p50"] <= stats[f"gate_{tag}/p90"]
+        assert math.isfinite(stats[f"rank_pr_{tag}/valid"])
+    # the pooled statistics are still there, unchanged in meaning
+    pooled = gates[written]
+    pooled = pooled[~torch.isnan(pooled)]
+    assert stats["gate/mean"] == pytest.approx(float(pooled.mean()), rel=1e-6)
