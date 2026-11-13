@@ -7,11 +7,14 @@ from pathlib import Path
 import pytest
 import torch
 from hsn.config import canonical_json, config_hash
+from hsn.experiments.protocols import run_protocol
 from hsn.model.hsn import HSN
 from hsn.runner import warm_start
 from hsn.train.checkpoint import latest_checkpoint
+from p1_11_support import tiny_manifest  # noqa: F401
 from p1_15_support import datasets, hsn_config, hsn_trainer
 from test_a6_feedback_detach import A5, ALL
+from test_p1_15_spike_guard import _arm
 
 SMALL = (*A5, ALL, "model.cand_norm=rms", "model.n_cells=6", "model.k_select=3", "train.lr=3e-3")
 
@@ -72,3 +75,19 @@ def test_warm_start_refuses_a_missing_file_and_other_parameters(tmp_path: Path) 
     other = HSN.from_config(hsn_config(2, *SMALL, "model.n_cells=8"))
     with pytest.raises((RuntimeError, ValueError)):
         warm_start(other, ckpt)
+
+
+def test_the_run_record_names_the_warm_start(
+    tmp_path: Path,
+    tiny_manifest: Path,  # noqa: F811
+) -> None:
+    """Through the experiment protocol: the record of a warm-started arm carries ``init_from``
+    (path, step, the source's configuration hash); an ordinary arm's record has no such key."""
+    first = run_protocol(_arm(tmp_path / "first", tiny_manifest))
+    assert "init_from" not in first
+    ckpt = latest_checkpoint(tmp_path / "first")
+    assert ckpt is not None, "the first arm left its last checkpoint"
+    record = run_protocol(_arm(tmp_path / "second", tiny_manifest, f"train.init_from={ckpt}"))
+    assert record["init_from"]["path"] == str(ckpt)
+    assert record["init_from"]["step"] == 8
+    assert record["final"]["steps"] == 8  # the warm-started run counts its own steps from 0

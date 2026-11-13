@@ -870,6 +870,8 @@ def _train(
         # A6: the route-takeover guard's events and final router step scale (None: off)
         "route_guard": route_guard.report() if route_guard is not None else None,
     }
+    if "init_from" in arm.record:  # train.init_from: what the warm start loaded
+        full["init_from"] = arm.record["init_from"]
     record = arm.record  # P1.14: filled in place, so that a later stage's failure keeps it
     record.clear()
     record.update(full)
