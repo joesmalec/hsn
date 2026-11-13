@@ -421,31 +421,157 @@ What the arms show:
   loss without the warm-up (`fused_balance`), six seeds: 84.2 %, two of six, two falls. Both
   need the warm-up. A reading, not a measurement: the balance loss acts on the even start the
   warm-up leaves, and executed credit keeps whatever the first steps produce, good or bad.
-- *What is left* (seed 8 of the candidate; `tools/sag_grad_balance.py`, eight windows of 32
-  documents per checkpoint, about 900 value positions). The reader holds the query keys (93 % of
-  their slots) while five units share the value positions (28, 12, 22, 13 and 25 % at step 4,000),
-  and the task loss's preference among them moves from checkpoint to checkpoint: +36 per value
-  position on unit 3 at step 4,000 (times 1e6, as above); −15 on it and +64 on unit 5 at step
-  4,500. The balance loss's push is 0.5 to 0.9 per position on the most used unit and the same at
-  every kind of position: steady, and some fifty times smaller there than the task loss's. No unit
-  settles as the writer, and the overlap decays (0.72 at step 3,000, 0.30 at 5,000, 0.17 at
-  7,000). This is the selection bias of section 2 again, among the writers instead of between
-  the reader and a writer: a unit is credited only where it ran.
+- *What is left.* In the two candidate runs that fell, one unit takes the value positions while
+  the reader keeps the query keys (seed 8: 93 % of them at step 4,000), and the binding overlap
+  decays (seed 8: 0.72 at step 3,000, 0.30 at 5,000, 0.17 at 7,000). Section 3c says which unit
+  and why. (The first version of this paragraph quoted per-position pushes on the unit logits of
+  seed 8. They were taken with the default estimator on that run's weights, not with the run's
+  own `train.unit_credit=executed`, and are withdrawn; section 3c's measurements use the run's
+  estimator. The balance loss's push, 0.5 to 0.9 per position on the most used unit and the same
+  at every kind of position, does not depend on that choice.)
 
-**How far these counts go.** They are of twelve runs or fewer, and one configuration differs by
-10 pp from run to run. The candidate against the control, twelve runs each: final dev 87.1 %
-against 81.3 % (rank test, p = 0.04); the binding verdict passed by 8 against 2 (Fisher's exact
-test, p = 0.04); later queries at 80 % or more in 9 against 4 (p = 0.10). The candidate against
-the balance loss alone: falls in 2 against 5 (p = 0.37), a drawdown under 5 pp in 9 against 5
-(p = 0.21). These are uncorrected for the eleven arms compared. On binding the candidate is at
-or above the balance loss, and both are above the control, on every measure. On stability the candidate equals the control in
-counts (two falls each, nine of twelve under 5 pp) and has the largest single fall of the night
-(26.4 pp). That the candidate binds keys more often than the control is likely; that it is
-steadier than the balance loss alone is not established.
+**How far these counts go.** They are of twelve runs or fewer, and one configuration differs by 10
+pp from run to run. The candidate against the control, twelve runs each: final dev 87.1 % against
+81.3 % (rank test, p = 0.04); the binding verdict passed by 8 against 2 (Fisher's exact test, p =
+0.04); later queries at 80 % or more in 9 against 4 (p = 0.10). The candidate against the balance
+loss alone: falls in 2 against 5 (p = 0.37), a drawdown under 5 pp in 9 against 5 (p = 0.21). These
+are uncorrected for the eleven arms compared. On binding the candidate is at or above the balance
+loss, and both are above the control, on every measure. On stability the candidate equals the
+control in counts (two falls each, nine of twelve under 5 pp) and has the largest single fall of
+the night (26.4 pp). That the candidate binds keys more often than the control is likely; that it
+is steadier than the balance loss alone is not established.
 
 What the night does establish: the plateau and the falls are one event with two forms (the
 reader takes the value positions, or no writer settles); the balance loss removes the first
 form; and none of the config-only mechanisms tried removes the second.
+
+## 3c. Why a run loses its binding: a unit of the opposite sign at the value positions
+
+12 November, the follow-up the user asked for on the night's result ("why no value writer
+settles"). It reads the 24 runs whose checkpoints were kept (twelve seeds of the balance loss,
+twelve of the balance loss with executed credit; 18 checkpoints each), on the CPU: the scorer's
+two address weights per unit from every checkpoint, the routes at five of them, and the gradient
+on those weights by kind of position. Scripts beside the database (`tools/writer_align.py`,
+`wrong_sign.py`, `wrong_sign_table.py`, `addr_traj.py`, `addr_grad.py`); output in
+`evidence/P2.10/sag/softwarm/` (`writer_align.csv`, `addr-*.txt`).
+
+Weights are given in the reader's direction: multiplied by the sign of the reader's weight on
+`a_cur`, so that a positive weight on `a_prev` means "this unit writes a value into the cells its
+key will select" (section 3b, "What binding is").
+
+**Writers do settle, and there are several of them.** By step 3,000 the reader's weight on `a_cur`
+is 0.17 to 0.34 in size, and the value positions are run by two to six units whose weights on
+`a_prev` are mostly of the reader's sign and small (+0.05 to +0.15). In 16 of the 24 runs at least
+90 % of the value slots are on units of that sign at step 3,000. A few runs later grow one strong
+writer (weight +0.42 against the reader's 0.30 on seed 7 of the candidate, 93.3 %; +0.45 on seed 7
+of the balance loss, 92.1 %). Over the 24 runs the share of the value slots on units of the
+reader's sign does not rank the binding overlap at step 3,000 (rank correlation −0.01: the runs do
+not differ yet) and ranks it at steps 5,000, 7,000 and 9,000 (+0.66, +0.65, +0.77). More writers go
+with more overlap, not less (+0.72 at step 9,000).
+
+**A fall is one unit of the opposite sign taking the value positions.** Per run: the unit, other
+than the reader, whose weight on `a_prev` is most against the reader's direction at step 9,000
+(listed when below −0.02), its share of the value slots, and the binding overlap:
+
+| Arm | Seed | Final dev | Later queries | Worst drawdown | Most opposed unit: a_prev weight at 9,000 | Its share of the value slots at 3,000 / 9,000 | Binding overlap at 3,000 / 9,000 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| balance | 0 | 94.7 % | 91.3 % | 2.7 pp | unit 6: -0.06 | 23 % / 62 % | 0.50 / 0.29 |
+| balance | 1 | 86.5 % | 80.9 % | 13.2 pp (fell) | unit 0: -0.11 | 8 % / 67 % | 0.62 / 0.26 |
+| balance | 2 | 89.2 % | 82.0 % | 15.6 pp (fell) | unit 4: -0.18 | 25 % / 74 % | 0.52 / 0.21 |
+| balance | 3 | 87.5 % | 80.9 % | 6.2 pp | unit 1: -0.02 | 0 % / 0 % | 0.69 / 0.30 |
+| balance | 4 | 83.9 % | 81.3 % | 6.3 pp | unit 6: -0.03 | 0 % / 0 % | 0.66 / 0.66 |
+| balance | 5 | 89.7 % | 86.5 % | 2.6 pp | unit 4: -0.07 | 5 % / 33 % | 0.60 / 0.48 |
+| balance | 6 | 72.4 % | 59.9 % | 12.4 pp (fell) | unit 0: -0.11 | 21 % / 73 % | 0.41 / 0.13 |
+| balance | 7 | 92.1 % | 90.1 % | 1.0 pp | unit 0: -0.07 | 0 % / 0 % | 0.46 / 0.65 |
+| balance | 8 | 78.4 % | 74.8 % | 16.7 pp (fell) | unit 6: -0.06 | 1 % / 37 % | 0.70 / 0.39 |
+| balance | 9 | 84.9 % | 80.9 % | 3.9 pp | unit 6: -0.30 | 35 % / 34 % | 0.55 / 0.53 |
+| balance | 10 | 77.5 % | 74.2 % | 15.4 pp (fell) | unit 6: -0.07 | 3 % / 48 % | 0.65 / 0.34 |
+| balance | 11 | 88.5 % | 82.7 % | 3.3 pp | unit 1: -0.25 | 0 % / 1 % | 0.57 / 0.38 |
+| balance + executed | 0 | 93.5 % | 90.9 % | 2.5 pp | none (lowest +0.01) | – | 0.68 / 0.68 |
+| balance + executed | 1 | 86.4 % | 78.8 % | 4.6 pp | none (lowest -0.01) | – | 0.41 / 0.38 |
+| balance + executed | 2 | 93.7 % | 91.6 % | 2.8 pp | none (lowest -0.00) | – | 0.69 / 0.77 |
+| balance + executed | 3 | 91.3 % | 88.0 % | 3.4 pp | none (lowest -0.02) | – | 0.67 / 0.62 |
+| balance + executed | 4 | 84.9 % | 77.4 % | 1.6 pp | none (lowest +0.03) | – | 0.50 / 0.46 |
+| balance + executed | 5 | 91.8 % | 91.0 % | 1.7 pp | none (lowest +0.02) | – | 0.70 / 0.64 |
+| balance + executed | 6 | 83.3 % | 82.1 % | 7.1 pp | none (lowest +0.02) | – | 0.59 / 0.53 |
+| balance + executed | 7 | 93.3 % | 90.9 % | 3.5 pp | none (lowest +0.01) | – | 0.49 / 0.52 |
+| balance + executed | 8 | 67.6 % | 59.4 % | 26.4 pp (fell) | unit 3: -0.11 | 0 % / 56 % | 0.72 / 0.17 |
+| balance + executed | 9 | 81.0 % | 82.0 % | 15.6 pp (fell) | unit 6: -0.08 | 32 % / 51 % | 0.57 / 0.34 |
+| balance + executed | 10 | 89.1 % | 85.5 % | 2.9 pp | none (lowest +0.01) | – | 0.69 / 0.75 |
+| balance + executed | 11 | 89.0 % | 81.5 % | 1.4 pp | none (lowest -0.01) | – | 0.55 / 0.34 |
+
+- All seven runs that fell end with such a unit on 37 to 74 % of the value slots, up from 0 to
+  32 % at step 3,000, and their overlap falls with it.
+- Of the seventeen runs that did not fall, three have such a unit on 30 % or more (seeds 0, 5 and
+  9 of the balance loss). Seed 0 ends at 94.7 % with an overlap of 0.29: there one unit runs 74 %
+  of the fact keys, 62 % of the values and 36 % of the query keys, and how it answers is not
+  explained by these two weights. The overlap is not the only way to a correct later answer.
+- With executed credit an opposed unit exists in two runs of twelve, and they are the two that
+  fell.
+
+**Where the opposed units come from: the default credit makes them.** Units other than the
+reader with a weight on `a_prev` below −0.02 in the reader's direction:
+
+| | Balance loss (default credit) | Balance loss with executed credit |
+| --- | --- | --- |
+| Step 2,000 | 12 runs of 12, 3.3 units per run | 1 run of 12 |
+| Step 3,000 | 10 of 12, 2.3 per run | 1 of 12 |
+| Step 9,000 | 12 of 12, 2.4 per run, the most opposed −0.11 on average | 2 of 12 |
+
+With the default credit the straight-through weight of the unit that ran is a softmax over the
+cell's units, so every slot a writer is credited for lowers the other units' scores on the same
+cells: on the cells the key addresses. A unit that never runs at a value position is given a
+weight on `a_prev` of the opposite sign as a by-product. Measured on one set of weights with both
+estimators (seed 7 of the candidate at step 1,500, eight windows; the push on each unit's
+`a_prev` weight from the value positions, in the reader's direction, per window, times 1e3):
+
+| Unit (share of the value slots) | 0 (0 %) | 1 (0 %) | 6 (0 %) | 7 (0 %) | 2 (18 %) | 3 (51 %) | 4 (14 %) | 5 (17 %) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Default credit | −2.49 | −2.65 | −2.50 | −2.48 | +8.56 | +16.80 | +4.44 | +10.11 |
+| Executed credit | 0.00 | −0.01 | 0.00 | 0.00 | +10.72 | +18.72 | +6.76 | +12.28 |
+
+Such a unit is harmless while it holds no value slots. The balance loss then moves usage between
+units (it is meant to), and when one of them is given value slots it writes the value away from
+the key's cells: seed 6 of the balance loss, unit 0, −0.06 at step 2,500 with 10 % of the value
+slots, −0.11 at the end with 73 %. This is what executed credit removes, and it is the measured
+reason for the candidate's fewer falls.
+
+**What is left with executed credit: a unit that enters the value positions and is pushed off the
+key's cells.** A unit now has to run at the value positions to acquire a weight there. On seed 9
+unit 6 is at −0.03 by step 2,000 and holds a third of the value slots at step 3,000. On seed 8 unit
+3 holds none until step 3,000 and its weight is zero until step 3,500; then, with the run's own
+estimator (eight windows per checkpoint; pushes in the units of the table above):
+
+| Step | Unit 3's share of the value slots | Its `a_prev` weight | Push on it from the value positions (cell-mask path / unit path) | Push on its `a_cur` weight from the value positions |
+| ---: | ---: | ---: | --- | ---: |
+| 3,500 | 5 % | 0.00 | −0.77 (−0.44 / −0.32) | +1.62 |
+| 4,000 | 13 % | −0.01 | −5.22 (−3.17 / −2.04) | −1.75 |
+| 4,500 | 23 % | −0.03 | −2.84 (−1.75 / −1.09) | +6.52 |
+| 5,000 | 38 % | −0.05 | −4.79 (−2.84 / −1.96) | +8.56 |
+
+The task loss lowers the newcomer's score on the key's cells at every checkpoint, through both
+paths, while its share of the value slots grows from 5 % to 38 % and the overlap falls from 0.72
+(step 3,000) to 0.30 (step 5,000). The three established writers (weights +0.14, +0.10, +0.13) keep
+their weights and lose the slots. A reading, not a measurement: where the newcomer runs on a key's
+cell its write is worth less than an established writer's, and its own score is the only thing this
+estimator can lower; lowering it there does not give the cell back, because a position has four
+slots and the newcomer's other cells now win them, and a key's cell that is no longer selected is
+not told that it would have helped. That is the selection bias of section 2 between the cells of
+one position.
+
+**What this says about remedies** (none run; each needs the card and the user's word):
+
+- Executed credit has a measured mechanism, not only a count: it stops the manufacture of
+  opposed units (12 runs of 12 against 1 of 12 at step 2,000).
+- The remaining failure is a shortage of slots at the value positions once a second unit
+  competes for them. Two existing keys address that directly: eight slots (`model.k_select=8`,
+  section 3b: no fall in seven runs with the default credit, where the key's cells are selected
+  whoever takes the others) together with executed credit, which has not been run; and
+  `train.ste_scope=all` (section 3), which gives a cell that lost its slot its first-order
+  credit at the dense step's time.
+- Limits: the gradient was attributed on one fallen run and one run that binds; the two weights
+  describe a linear scorer; three runs of seventeen keep their accuracy with an opposed unit on
+  the value positions.
 
 ## What the day's runs say
 
