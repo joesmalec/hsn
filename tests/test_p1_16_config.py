@@ -86,6 +86,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "baseline.address_dim",
         "model.fast_cells",
         "model.fast_readout",
+        "model.address_ngram",
     )
 
 

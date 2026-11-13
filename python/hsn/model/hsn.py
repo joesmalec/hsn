@@ -129,6 +129,15 @@ fast group has its own read ``f = mean_{i < F} h[i]``: ``u_t = S([z_t ; q_{t−1
 f_{t−1}])`` (a ``summary`` read under A6), ``D([q_t ; u_t ; r_t ; f_t])``, and the selected-cell
 readout ``r_t`` averages the routed slots only. The split and fused windows refuse both keys.
 
+Amendment A9 (``model.address_ngram = n > 1``, ``docs/amendments/A9_ngram_address.md``; opt-in,
+needs ``model.key_address``): the scorer also gets the address of the last ``m`` bytes and of the
+``m`` bytes before the current one, for ``m = 2 .. n`` (:meth:`Scorer.address_features`). A
+window derives the older bytes from its own tokens; the trainer carries one byte across windows
+(A5's ``prev_tokens``), so at the first ``n − 1`` positions of a window that continues a document
+the bytes further back than that one read as BOS. A document that starts at a window boundary is
+exact. :meth:`step` takes ``prev_tokens`` as ``[B, n]`` (``x_{t−1}`` first) for exact features;
+``[B]`` means the older bytes are BOS.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
@@ -137,7 +146,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, NamedTuple, Self
+from typing import Any, Literal, NamedTuple, Self
 
 import torch
 import torch.nn.functional as F
@@ -529,10 +538,19 @@ class HSN(nn.Module):
             raise TypeError(f"profiler must be a hsn.profiler.Profiler or None, got {profiler!r}")
         self._check_step_inputs(x_t, ctx_t, state)
         dense_rows = self._check_dense_rows(dense_rows, mode, state)
+        older: Tensor | None = None
         if self.cfg.key_address:
+            if prev_tokens is not None and prev_tokens.ndim == 2:  # A9: [B, n], x_{t-1} first
+                n = self.cfg.address_ngram
+                if prev_tokens.shape != (state.batch_size, n):
+                    raise ValueError(
+                        f"prev_tokens must be [B] or [B, model.address_ngram] = "
+                        f"{(state.batch_size, n)}, got {tuple(prev_tokens.shape)}"
+                    )
+                prev_tokens, older = prev_tokens[:, 0], prev_tokens[:, 1:]
             prev_tokens = self._previous_tokens(x_t, prev_tokens)
         return self._step_impl(
-            x_t, ctx_t, state, mode, profiler, dense_rows, prev_tokens=prev_tokens
+            x_t, ctx_t, state, mode, profiler, dense_rows, prev_tokens=prev_tokens, older=older
         )
 
     def _step_impl(
@@ -546,6 +564,7 @@ class HSN(nn.Module):
         *,
         static: bool = False,
         prev_tokens: Tensor | None = None,
+        older: Tensor | None = None,
     ) -> StepOutput:
         """:meth:`step` after its checks (``mode`` resolved). ``static`` (P2.8: the captured
         serving step of :func:`hsn.train.compile.compile_step`) runs the capturable sparse
@@ -576,6 +595,7 @@ class HSN(nn.Module):
                         {
                             "tokens": x_t,
                             "prev_tokens": self._reset_previous(prev_tokens, state.pos == 0, x_t),
+                            **self._older_bytes(older, state.pos, x_t),
                         }
                         if cfg.key_address
                         else {}
@@ -1223,6 +1243,17 @@ class HSN(nn.Module):
             previous = self._previous_tokens(tokens[:, 0], prev_tokens)
             shifted = torch.cat([previous[:, None], tokens[:, :-1]], dim=1)
             previous_window = shifted.masked_fill(reset, BOS)
+        older_window: dict[str, Any] = {}
+        if cfg.key_address and cfg.address_ngram > 1:
+            # A9: x_{t-2} .. x_{t-n} from the window's own bytes; BOS where the document has
+            # none, and before column 0 beyond the one carried byte (module docstring)
+            assert previous_window is not None
+            lag, lags = previous_window, []
+            for back in range(2, cfg.address_ngram + 1):
+                lag = torch.cat([torch.full_like(lag[:, :1], BOS), lag[:, :-1]], dim=1)
+                lag = lag.masked_fill(positions < back, BOS)
+                lags.append(lag)
+            older_window = {"older": torch.stack(lags, dim=-1)}
         scalars = self.scorer.window_scalars(
             ctx,
             positions,
@@ -1231,7 +1262,8 @@ class HSN(nn.Module):
             dtype=state.dtype,
             tokens=tokens if cfg.key_address else None,
             prev_tokens=previous_window,
-        )  # [B, T, N, 7] (9 with A5)
+            **older_window,
+        )  # [B, T, N, 7] (9 with A5; 7 + 2n with A9)
         # P1.10b: the dense round writes every cell, so its counters are known for the window
         dense_window = mode == "dense" and not self.cell.disabled_cells
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
@@ -1412,6 +1444,20 @@ class HSN(nn.Module):
             return torch.full_like(tokens, BOS)
         self._check_ids("prev_tokens", previous, tuple(tokens.shape), tokens.device)
         return previous
+
+    def _older_bytes(self, older: Tensor | None, pos: Tensor, tokens: Tensor) -> dict[str, Tensor]:
+        """A9's ``older`` keyword of one step: ``x_{t−2} .. x_{t−n}`` (``[B, n − 1]``), BOS where
+        the document has no such byte (``pos < back``) and everywhere when the caller gave only
+        one previous byte. ``{}`` without ``model.address_ngram > 1``."""
+        n = self.cfg.address_ngram
+        if n <= 1:
+            return {}
+        if older is None:
+            older = torch.full(
+                (*tokens.shape, n - 1), BOS, dtype=tokens.dtype, device=tokens.device
+            )
+        back = torch.arange(2, n + 1, device=pos.device)
+        return {"older": older.masked_fill(pos[:, None] < back[None, :], BOS)}
 
     @staticmethod
     def _reset_previous(previous: Tensor | None, reset: Tensor, tokens: Tensor) -> Tensor:

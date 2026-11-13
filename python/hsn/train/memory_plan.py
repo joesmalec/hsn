@@ -86,7 +86,8 @@ def _mlp(d_in: int, hidden: int, d_out: int) -> int:
 
 def _scorer_params(m: ModelConfig) -> int:
     """Parameters of one scorer application: ``(3d + 8) -> M``, or via ``scorer_hidden`` for mlp."""
-    d_in = 3 * m.d + SCORER_SCALAR_FEATURES + (2 if m.key_address else 0)
+    # A5: a_cur, a_prev; A9: two more per extra n-gram length
+    d_in = 3 * m.d + SCORER_SCALAR_FEATURES + (2 * m.address_ngram if m.key_address else 0)
     if m.scorer == "linear":
         return d_in * m.n_units + m.n_units
     return _mlp(d_in, m.scorer_hidden, m.n_units)
@@ -145,7 +146,9 @@ def macs_per_token(m: ModelConfig) -> dict[str, int]:
     shared = params["encoder"] + params["predictor"] + params["shared"] + params["decoder"]
     per_cell = unit + params["w_out"] + m.in_degree * params["v_msg"] + params["gate"]
     # A5's fixed code/address dot products are scorer work (global rule 5).
-    scorer = m.n_cells * params["scorer"] + (2 * m.n_cells * m.d if m.key_address else 0)
+    scorer = m.n_cells * params["scorer"] + (
+        2 * m.address_ngram * m.n_cells * m.d if m.key_address else 0
+    )
     return {
         "shared": shared,
         "per_cell": per_cell,

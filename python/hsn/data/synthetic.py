@@ -266,6 +266,12 @@ class DelayedParams(_Params):
     filler: ByteRange = (192, 256)
     max_facts: int = Field(default=6, ge=1)
     max_queries: int = Field(default=4, ge=1)
+    # Bytes per key (12 Nov 2026, the multi-byte address of amendment A9). 1: synthetic_v1's
+    # documents, symbol for symbol. L > 1: a fact is ``k_1 .. k_L v`` and a query ``QRY k_1 ..
+    # k_L``; a document's keys are cells of a small grid (the fewest symbols per key position
+    # that give ``n`` distinct keys), so keys of one document share their bytes and no single
+    # byte identifies a key.
+    key_len: int = Field(default=1, ge=1, le=4)
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -273,6 +279,13 @@ class DelayedParams(_Params):
             [*_check_keys(self.keys), ("values", self.values), ("filler", self.filler)], []
         )
         return self
+
+    def grid_side(self, n: int) -> int:
+        """The fewest symbols per key position that give ``n`` distinct keys of ``key_len``."""
+        side = 1
+        while side**self.key_len < n:
+            side += 1
+        return side
 
 
 class BracketsParams(_Params):
@@ -805,6 +818,10 @@ class _Delayed(_Generator[DelayedParams]):
 
     The first query asks the first fact; its key position is D after that fact's value, so the
     filler between facts and queries has exactly ``D - 2n - 1`` symbols. ``T == L`` exactly.
+
+    With ``key_len = K > 1`` a key is ``K`` symbols: a fact has ``K + 1`` symbols, a query ``K +
+    2``, the supervised position is the key's last symbol, and the filler has ``D - (K + 1) n -
+    1`` symbols. ``key_len = 1`` is the form above, symbol for symbol.
     """
 
     family: Family = "delayed"
@@ -812,19 +829,22 @@ class _Delayed(_Generator[DelayedParams]):
 
     def validate(self, spec: TaskSpec, params: DelayedParams) -> None:
         super().validate(spec, params)
+        need = params.max_facts if params.key_len == 1 else params.grid_side(params.max_facts)
         for split in SPLITS:
             lo, hi = params.keys[split]
-            if hi - lo < params.max_facts:
+            if hi - lo < need:
                 raise ValueError(
                     f"{spec.key}: keys[{split}] has {hi - lo} symbols but "
                     f"max_facts={params.max_facts}"
+                    + ("" if params.key_len == 1 else f" needs {need} per key position")
                 )
 
     def min_dep(self, params: DelayedParams) -> int:
-        return 3  # one fact (2 symbols) and an empty filler
+        return params.key_len + 2  # one fact (key and value) and an empty filler
 
     def min_length(self, params: DelayedParams, dep: int) -> int:
-        return dep + 5  # BOS + facts and filler (dep - 1) + SEP + first query (3) + EOS
+        # BOS + facts and filler (dep - 1) + SEP + first query (key_len + 2) + EOS
+        return dep + params.key_len + 4
 
     def emit(
         self,
@@ -835,39 +855,57 @@ class _Delayed(_Generator[DelayedParams]):
         dep: int,
     ) -> Emitted:
         key_lo, key_hi = params.keys[split]
-        n_max = min(params.max_facts, (dep - 1) // 2)
+        klen = params.key_len
+        fact_w, query_w = klen + 1, klen + 2  # symbols per fact and per query
+        n_max = min(params.max_facts, (dep - 1) // fact_w)
         n = int(rng.integers(1, n_max + 1))
-        keys: list[int] = (key_lo + rng.choice(key_hi - key_lo, size=n, replace=False)).tolist()
+        keys: list[list[int]]
+        if klen == 1:  # synthetic_v1's draw, unchanged
+            keys = [[k] for k in (key_lo + rng.choice(key_hi - key_lo, size=n, replace=False))]
+        else:  # n distinct cells of a side^klen grid of key symbols (class docstring)
+            side = params.grid_side(n)
+            axes = [
+                (key_lo + rng.choice(key_hi - key_lo, size=side, replace=False)).tolist()
+                for _ in range(klen)
+            ]
+            keys = []
+            for cell in rng.choice(side**klen, size=n, replace=False).tolist():
+                key = []
+                for axis in axes:
+                    cell, digit = divmod(cell, side)
+                    key.append(axis[digit])
+                keys.append(key)
+        keys = [[int(k) for k in key] for key in keys]
         values: list[int] = rng.integers(params.values[0], params.values[1], size=n).tolist()
-        filler_len = dep - 2 * n - 1
-        avail = length - dep - 5
+        filler_len = dep - fact_w * n - 1
+        avail = length - dep - (klen + 4)
         if avail < 0:
             raise RuntimeError(f"delayed: length {length} below min_length for dep {dep}")
-        # Query slot q (0-based) lies 3q symbols right of the first query, so it may only ask a
-        # fact stated at least 3q / 2 facts after the first one; otherwise its dependency would
-        # exceed the anchor's D. Candidates come in random order.
+        # Query slot q (0-based) lies query_w * q symbols right of the first query, so it may
+        # only ask a fact stated at least query_w * q / fact_w facts after the first one;
+        # otherwise its dependency would exceed the anchor's D. Candidates come in random order.
         order: list[int] = (1 + rng.permutation(n - 1)).tolist() if n > 1 else []
         chosen = [0]
         for which in order:
-            if len(chosen) > min(params.max_queries - 1, avail // 3):
+            if len(chosen) > min(params.max_queries - 1, avail // query_w):
                 break
-            if 2 * which >= 3 * len(chosen):
+            if fact_w * which >= query_w * len(chosen):
                 chosen.append(which)
         extra = len(chosen) - 1
-        prefix_len = avail - 3 * extra
+        prefix_len = avail - query_w * extra
         facts: list[int] = []
         for key, value in zip(keys, values, strict=True):
-            facts += [key, value]
+            facts += [*key, value]
         fact_start = 1 + prefix_len
-        sep_pos = fact_start + 2 * n + filler_len
+        sep_pos = fact_start + fact_w * n + filler_len
         queries: list[int] = []
         positions: list[int] = []
         deps: list[int] = []
         for q, which in enumerate(chosen):
-            queries += [QRY, keys[which], values[which]]
-            key_pos = sep_pos + 2 + 3 * q
+            queries += [QRY, *keys[which], values[which]]
+            key_pos = sep_pos + 1 + klen + query_w * q  # the key's last symbol
             positions.append(key_pos)
-            deps.append(key_pos - (fact_start + 2 * which + 1))
+            deps.append(key_pos - (fact_start + fact_w * which + klen))
         tokens = _assemble(
             [
                 [BOS],
@@ -888,18 +926,23 @@ class _Delayed(_Generator[DelayedParams]):
         is_filler = _byte_table([params.filler])
         t: list[int] = tokens.tolist()
         _frame(t)
-        value_of: dict[int, int] = {}
-        value_pos: dict[int, int] = {}
+        klen = params.key_len
+        value_of: dict[tuple[int, ...], int] = {}
+        value_pos: dict[tuple[int, ...], int] = {}
         i = 1
         try:
             while is_filler[t[i]]:
                 i += 1
             while is_key[t[i]]:
-                if t[i] in value_of:
-                    raise ValueError(f"delayed: key {t[i]} stated twice")
-                value_of[t[i]] = t[i + 1]
-                value_pos[t[i]] = i + 1
-                i += 2
+                key = tuple(t[i : i + klen])
+                if not all(is_key[k] for k in key):
+                    raise ValueError(f"delayed: malformed key at position {i}")
+                if key in value_of:
+                    shown = key[0] if klen == 1 else list(key)
+                    raise ValueError(f"delayed: key {shown} stated twice")
+                value_of[key] = t[i + klen]
+                value_pos[key] = i + klen
+                i += klen + 1
             while is_filler[t[i]]:
                 i += 1
             if t[i] != SEP:
@@ -909,13 +952,13 @@ class _Delayed(_Generator[DelayedParams]):
             targets: list[int] = []
             deps: list[int] = []
             while t[i] != EOS:
-                if t[i] != QRY or t[i + 1] not in value_of:
+                key = tuple(t[i + 1 : i + 1 + klen])
+                if t[i] != QRY or key not in value_of:
                     raise ValueError(f"delayed: malformed query at position {i}")
-                key = t[i + 1]
-                positions.append(i + 1)
+                positions.append(i + klen)
                 targets.append(value_of[key])
-                deps.append(i + 1 - value_pos[key])
-                i += 3
+                deps.append(i + klen - value_pos[key])
+                i += klen + 2
         except IndexError as exc:
             raise ValueError("delayed: truncated document") from exc
         if i != len(t) - 1:

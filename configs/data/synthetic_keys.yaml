@@ -1,0 +1,65 @@
+# synthetic_keys: the delayed task with keys of two and of three bytes (12 Nov 2026, amendment A9).
+#
+# Why: in synthetic_v1 a key is one byte, and the HSN's address (amendment A5) is the fixed code of
+# one byte. Names in real records are several bytes long. These tasks have keys of several bytes
+# whose bytes are shared between the keys of one document (the keys are cells of a small grid:
+# `@g bA b_ Mg M_ MA`), so no single byte identifies a key and an address has to cover the whole
+# key. In three documents of four, two keys of a document end in the same byte.
+#
+# Otherwise synthetic_v1's delayed task: the same alphabets, the per-split key ranges (dev and
+# test keys are never seen in training), lengths, dependency ranges, at most six facts and four
+# queries, and the same split sizes. A fact is `k_1 .. k_L v`, a query `QRY k_1 .. k_L`, and the
+# supervised position is the key's last byte. Select with
+#   data.dataset=synthetic_keys data.manifest=data/synthetic_keys/manifest.json data.tasks=[delayed2]
+# Golden manifest: configs/data/synthetic_keys.manifest.json.
+
+name: synthetic_keys
+unroll: 256
+
+tasks:
+  - name: delayed2
+    variant: in_range
+    family: delayed
+    context_id: 2
+    seed: 42001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params: &two
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] } # disjoint per split
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
+      key_len: 2
+  - name: delayed2
+    variant: out_of_range # evaluation: the facts lie more than a window before their queries
+    family: delayed
+    context_id: 2
+    seed: 42002
+    n_train: 200
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params: *two
+
+  - name: delayed3
+    variant: in_range
+    family: delayed
+    context_id: 2
+    seed: 43001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
+      key_len: 3

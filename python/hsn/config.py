@@ -275,6 +275,14 @@ class ModelConfig(_StrictModel):
     # and the selected-cell readout r covers the routed (slow) slots only.
     fast_readout: bool = False
     # --- end A8 ---
+    # --- Amendment A9 (docs/amendments/A9_ngram_address.md; opt-in, needs key_address) ---
+    # address_ngram = n > 1 adds, for every m in 2..n, two scorer features per cell: the
+    # similarity of the cell's address to a fixed code of the last m bytes (a_cur<m>) and of
+    # the m bytes before the current one (a_prev<m>), so that a key of m bytes has one address at
+    # its fact's value and at its query. The codes are fixed products of per-position byte
+    # codes; nothing about a key is learned. 1 (default): A5's two features only.
+    address_ngram: int = Field(default=1, ge=1, le=3)
+    # --- end A9 ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -354,6 +362,10 @@ class ModelConfig(_StrictModel):
                     f"model.disabled_cells {fast_disabled} lie in the fast group "
                     f"[0, {self.fast_cells})"
                 )
+        if self.address_ngram > 1 and not self.key_address:
+            raise ValueError(
+                f"model.address_ngram={self.address_ngram} requires model.key_address=true"
+            )
         if self.fast_readout and not (self.fast_cells and self.selected_readout):
             raise ValueError(
                 "model.fast_readout requires model.fast_cells > 0 and model.selected_readout=true"
@@ -1462,6 +1474,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "baseline.address_dim",
     "model.fast_cells",
     "model.fast_readout",
+    "model.address_ngram",
 )
 
 
@@ -1500,6 +1513,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"model.fast_cells={model.fast_cells} (A8): the reserved slots and the fast read "
             "are not built into the split window; use hardware.window=autograd"
+        )
+    if model.address_ngram > 1:
+        return (
+            f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
+            "has A5's two address columns only; use hardware.window=autograd"
         )
     if model.r_max != 1:
         return f"model.r_max={model.r_max}: one round per position only"

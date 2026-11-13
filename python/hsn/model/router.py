@@ -151,6 +151,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import GateMode, ModelConfig, Routing
+from hsn.data.synthetic import BOS
 from hsn.kernels.costs import CostTable, cost_table_from_config
 from hsn.model.embeddings import init_weight_, parse_init
 from hsn.model.encoder import MLP2
@@ -337,6 +338,7 @@ class Scorer(nn.Module):
     ema_selected: Tensor  # [N] P2.3 running average of the selection indicator (persistent)
     byte_codes: Tensor  # [V, d], A5 only: fixed code for each byte
     cell_addresses: Tensor  # [N, d], A5 only: fixed address for each cell
+    ngram_codes: Tensor  # [n - 1, V, d], A9 only: the byte codes of key positions 2..n
 
     def __init__(self, cfg: ModelConfig, *, unroll: int, seed: int | None = None) -> None:
         super().__init__()
@@ -351,9 +353,15 @@ class Scorer(nn.Module):
         self.unroll = unroll
         self.kind = cfg.scorer
         self.key_address = cfg.key_address
+        #: A9: the longest byte n-gram with an address (1: A5's a_cur and a_prev only)
+        self.address_ngram = cfg.address_ngram if cfg.key_address else 1
+        ngram_names = tuple(
+            f"a_{which}{m}" for m in range(2, self.address_ngram + 1) for which in ("cur", "prev")
+        )
+        address_names = (ADDRESS_FEATURE_NAMES + ngram_names) if cfg.key_address else ()
         base_features = 3 * cfg.d + SCORER_SCALAR_FEATURES
-        self.in_features = base_features + (2 if cfg.key_address else 0)
-        feature_names = SCORER_FEATURE_NAMES + (ADDRESS_FEATURE_NAMES if cfg.key_address else ())
+        self.in_features = base_features + len(address_names)
+        feature_names = SCORER_FEATURE_NAMES + address_names
 
         unknown = [name for name in cfg.scorer_features.exclude if name not in feature_names]
         if unknown:
@@ -408,6 +416,19 @@ class Scorer(nn.Module):
                 # generator's later use is the same either way.
                 extra = torch.full_like(extra, float(cfg.address_init))
             first.weight = nn.Parameter(torch.cat([first.weight.detach(), extra], dim=1))
+            if self.address_ngram > 1:
+                # A9, drawn after everything A5 draws: the codes of key positions 2..n and the
+                # new columns, so the A5 buffers and columns are those of address_ngram = 1.
+                tables = [
+                    torch.randn(cfg.vocab_size, cfg.d, generator=generator) / scale
+                    for _ in range(self.address_ngram - 1)
+                ]
+                self.register_buffer("ngram_codes", torch.stack(tables))
+                more = first.weight.new_empty(first.out_features, len(ngram_names))
+                nn.init.trunc_normal_(more, std=std, a=-2 * std, b=2 * std, generator=generator)
+                if cfg.address_init is not None:
+                    more = torch.full_like(more, float(cfg.address_init))
+                first.weight = nn.Parameter(torch.cat([first.weight.detach(), more], dim=1))
             first.in_features = self.in_features
             if isinstance(self.net, MLP2):
                 self.net.in_dim = self.in_features
@@ -486,6 +507,7 @@ class Scorer(nn.Module):
         *,
         tokens: Tensor | None = None,
         prev_tokens: Tensor | None = None,
+        older: Tensor | None = None,
     ) -> Tensor:
         """The ``[B, N, 3d+8]`` feature tensor in the module's layout, in ``u``'s dtype.
 
@@ -516,8 +538,8 @@ class Scorer(nn.Module):
             ctx[:, None], state.pos[:, None], budget_frac, round_idx, ema, u.dtype, u.device
         )[:, 0]
         if self.key_address:
-            addresses = self.address_features(tokens, prev_tokens)
-            if addresses.shape != (B, N, 2):
+            addresses = self.address_features(tokens, prev_tokens, older)
+            if addresses.shape != (B, N, 2 * self.address_ngram):
                 raise ValueError("key-address step tokens and prev_tokens must have shape [B]")
             scalars = torch.cat([scalars, addresses.to(u.dtype)], dim=-1)
         return self._assemble(u, eps, state.h, state.age, scalars)
@@ -533,6 +555,7 @@ class Scorer(nn.Module):
         ema: EMAFeatures | None = None,
         tokens: Tensor | None = None,
         prev_tokens: Tensor | None = None,
+        older: Tensor | None = None,
     ) -> Tensor:
         """The features of a window that do not depend on the step (P1.10a): ``[B, T, N, 7]`` in
         ``dtype``, the scalars after ``age`` in layout order (budget, round, context, the two P2.3
@@ -559,19 +582,30 @@ class Scorer(nn.Module):
         self._check_round(round_idx)
         scalars = self._scalars(ctx, pos, budget_frac, round_idx, ema, dtype, ctx.device)
         if self.key_address:
-            addresses = self.address_features(tokens, prev_tokens)
-            if addresses.shape != (*ctx.shape, self.n_cells, 2):
+            addresses = self.address_features(tokens, prev_tokens, older)
+            if addresses.shape != (*ctx.shape, self.n_cells, 2 * self.address_ngram):
                 raise ValueError("key-address window tokens and prev_tokens must have shape [B, T]")
             scalars = torch.cat([scalars, addresses.to(dtype)], dim=-1)
         return scalars
 
-    def address_features(self, tokens: Tensor | None, prev_tokens: Tensor | None) -> Tensor:
+    def address_features(
+        self, tokens: Tensor | None, prev_tokens: Tensor | None, older: Tensor | None = None
+    ) -> Tensor:
         """A5's fixed similarities ``[..., N, 2]`` in ``a_cur, a_prev`` order.
 
         Both token tensors have the same shape and contain only current/past bytes. The caller
         supplies BOS for ``prev_tokens`` at document resets. Fixed codes are persistent buffers,
         not trainable parameters; the two matmuls run outside autocast so addresses agree at a
         fact's value and its query even when training uses mixed precision.
+
+        A9 (``model.address_ngram = n > 1``): ``[..., N, 2n]``, the two features above and then
+        ``a_cur<m>, a_prev<m>`` for ``m = 2 .. n``. ``older [..., n − 1]`` holds the bytes two to
+        ``n`` positions back (``x_{t−2}`` first; BOS where the document has none; ``None``: all
+        BOS). The code of the ``m`` bytes ``b_1 .. b_m`` is the elementwise product of
+        ``codes_i[b_i]`` (``codes_1`` = A5's byte codes) scaled to A5's variance; ``a_cur<m>``
+        reads the bytes ``x_{t−m+1} .. x_t`` and ``a_prev<m>`` the bytes ``x_{t−m} .. x_{t−1}``,
+        so a key of ``m`` bytes has one address at its fact's value and at its query's last
+        key byte.
         """
         if not self.key_address:
             raise ValueError("address_features requires model.key_address=true")
@@ -583,11 +617,38 @@ class Scorer(nn.Module):
         assert isinstance(tokens, Tensor) and isinstance(prev_tokens, Tensor)
         if tokens.shape != prev_tokens.shape:
             raise ValueError("key-address tokens and prev_tokens must have the same shape")
+        n = self.address_ngram
+        if n > 1:
+            if older is None:
+                older = torch.full(
+                    (*tokens.shape, n - 1), BOS, dtype=tokens.dtype, device=tokens.device
+                )
+            elif (
+                not isinstance(older, Tensor)
+                or older.dtype not in _INDEX_DTYPES
+                or older.shape != (*tokens.shape, n - 1)
+                or older.device != tokens.device
+            ):
+                raise ValueError(
+                    f"older must be an integer tensor {(*tokens.shape, n - 1)} on {tokens.device}"
+                )
         with torch.autocast(device_type=tokens.device.type, enabled=False):
             addresses = self.cell_addresses.transpose(0, 1)
             current = F.embedding(tokens, self.byte_codes) @ addresses
             previous = F.embedding(prev_tokens, self.byte_codes) @ addresses
-            return torch.stack([current, previous], dim=-1) * math.sqrt(self.d)
+            feats = [current, previous]
+            if n > 1:
+                assert older is not None
+                lags = [tokens, prev_tokens, *older.unbind(dim=-1)]  # x_t, x_{t-1}, ..., x_{t-n}
+                root = math.sqrt(self.d)
+                for m in range(2, n + 1):
+                    for back in (0, 1):  # a_cur<m>, a_prev<m>
+                        code = F.embedding(lags[back + m - 1], self.byte_codes)  # the first byte
+                        for i in range(2, m + 1):
+                            table = self.ngram_codes[i - 2]
+                            code = code * F.embedding(lags[back + m - i], table) * root
+                        feats.append(code @ addresses)
+            return torch.stack(feats, dim=-1) * math.sqrt(self.d)
 
     def _scalars(
         self,

@@ -1,0 +1,293 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed3/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed3/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed3/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed3/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed2/out_of_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed3/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed3/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed3/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed2/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed3/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed3/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayed3/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed3/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed3/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayed3/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayed3/in_range/dev"
+    }
+  ],
+  "name": "synthetic_keys",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed2.in_range.train.npz",
+      "hash": "c9e67cf282dd3ae43b6995db3ceb17840372a2f1bbf1eb2a2df456182a1777f4",
+      "n_docs": 20000,
+      "n_loss": 42680,
+      "n_tokens": 3902114,
+      "split": "train",
+      "task": "delayed2",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed2.in_range.dev.npz",
+      "hash": "9136285523c5e49846b6d8e47d4fd284f9e3c6b63c0aa1e667aec5a34de97386",
+      "n_docs": 1000,
+      "n_loss": 2180,
+      "n_tokens": 196521,
+      "split": "dev",
+      "task": "delayed2",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed2.in_range.test.npz",
+      "hash": "a70ca30e82981037deb91ccc0ceba8c49057def7fbc98d28968e451f5bede601",
+      "n_docs": 1000,
+      "n_loss": 2128,
+      "n_tokens": 193718,
+      "split": "test",
+      "task": "delayed2",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed2.out_of_range.train.npz",
+      "hash": "057da95660b68d5d964421f1a81e8b79e75e65fddddb8a303d1ef2e26900475f",
+      "n_docs": 200,
+      "n_loss": 471,
+      "n_tokens": 157182,
+      "split": "train",
+      "task": "delayed2",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed2.out_of_range.dev.npz",
+      "hash": "57ffc2b0d090bfff9d28ad7d0ce66fb0e7daeb459bfb8898c7b43398c5c3a30d",
+      "n_docs": 1000,
+      "n_loss": 2172,
+      "n_tokens": 775514,
+      "split": "dev",
+      "task": "delayed2",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed2.out_of_range.test.npz",
+      "hash": "068c167ddc0e04c05489be92e0109f4c810f2503008c36ed4a443c904c935c53",
+      "n_docs": 1000,
+      "n_loss": 2164,
+      "n_tokens": 779114,
+      "split": "test",
+      "task": "delayed2",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed3.in_range.train.npz",
+      "hash": "6205cc8314079f5d37d4c8ddd7503a3b54f4d3726ac0e0895fd3dafafecf2dd2",
+      "n_docs": 20000,
+      "n_loss": 41802,
+      "n_tokens": 3910865,
+      "split": "train",
+      "task": "delayed3",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed3.in_range.dev.npz",
+      "hash": "fac76d24c38d73f6cd273427335a6634d0fc1f79bd73c8f2d0f34b182e42c533",
+      "n_docs": 1000,
+      "n_loss": 2056,
+      "n_tokens": 195246,
+      "split": "dev",
+      "task": "delayed3",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed3.in_range.test.npz",
+      "hash": "204727fc88d5217c7596764557bf04f4df78459d80c9400636f5814fecf96bd3",
+      "n_docs": 1000,
+      "n_loss": 2072,
+      "n_tokens": 194603,
+      "split": "test",
+      "task": "delayed3",
+      "variant": "in_range"
+    }
+  ],
+  "spec_hash": "c3692c76ec8ba4447dd149c7854fbb2e1eb64f93e37e03bbd497a9643fe4ed34",
+  "split_hashes": {
+    "dev": "105625a79cc8c2f011e2bd12fa7130bedfc076053e63669c8cd564adaa6b5f29",
+    "test": "32a56ae3d2a04a7924651bcfc6a3ae23faac6dd4701c60fbe13d16c48df23cdf",
+    "train": "1e07adcb4e1ab40cac5e98895863022cdb6e372e482d96a6c766688dc2fc3126"
+  },
+  "unroll": 256
+}
