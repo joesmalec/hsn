@@ -438,11 +438,14 @@ def trained_state(
 ) -> dict[str, float]:
     """The audit's ``trained_state`` (:func:`window_state_stats` on the first ``n_docs``
     documents) plus, new in P1.11, the edge logits' absolute maximum and spread (``max - min``),
-    which are exactly 0 while the dense cells stay symmetric. ``{}`` for a non-HSN model."""
+    which are exactly 0 while the dense cells stay symmetric. ``{}`` for a non-HSN model. A graph
+    without edges (``model.in_degree = 0``, the no-graph ablation) has no edge logit: both are
+    reported as 0."""
     if not isinstance(model, HSN):
         return {}
     out = window_state_stats(model, state_window(cfg, ctx, docs, n_docs))
     edge = model.cell.graph.edge_logit.detach().float()
-    out["edge_logit/absmax"] = float(edge.abs().max())
-    out["edge_logit/spread"] = float(edge.max() - edge.min())
+    has_edges = edge.numel() > 0
+    out["edge_logit/absmax"] = float(edge.abs().max()) if has_edges else 0.0
+    out["edge_logit/spread"] = float(edge.max() - edge.min()) if has_edges else 0.0
     return out
