@@ -483,6 +483,21 @@ class SweepTwin:
                 torch.zeros(units.hidden, units.n_units * units.d, dtype=dtype, device=device),
                 persistent=False,
             )
+        #: P2.10c: the leading slots with a fixed unit (:func:`fixed_fast_slots`); their units'
+        #: weights are held stacked per slot (``sweep_fast_*``, with the gate's columns on a
+        #: merged twin), so the sweep multiplies their pairs with one unit's weights.
+        self.fast_slots = fixed_fast_slots(model)
+        if self.fast_slots:
+            first = units.hidden + (cell.d if self.merged else 0)
+            for name, shape in (
+                ("sweep_fast_w1", (self.fast_slots, units.in_dim, first)),
+                ("sweep_fast_b1", (self.fast_slots, first)),
+                ("sweep_fast_w2", (self.fast_slots, units.hidden, units.d)),
+                ("sweep_fast_b2", (self.fast_slots, units.d)),
+            ):
+                twin.cell.units.register_buffer(
+                    name, torch.zeros(*shape, dtype=dtype, device=device), persistent=False
+                )
         if self.merged:
             pred, shared = model.predictor, model.shared
             net = cast(nn.Linear, model.router.scorer.net)
@@ -533,6 +548,10 @@ class SweepTwin:
         cell, units = model.cell, model.cell.units
         if self.fused:
             twin.cell.units.get_buffer("sweep_w2_flat").copy_(units._w2_flat())
+        if self.fast_slots:
+            layout = units.slot_layout(self.fast_slots, rider=cell.gate if self.merged else None)
+            for name, value in zip(("w1", "b1", "w2", "b2"), layout, strict=True):
+                twin.cell.units.get_buffer(f"sweep_fast_{name}").copy_(value)
         if not self.merged:
             twin.cell.units.get_buffer("sweep_w1_flat").copy_(consts.w1_flat)
             return
@@ -564,6 +583,15 @@ class SweepTwin:
         b1_gate = twin.cell.units.get_buffer("sweep_b1_gate")
         b1_gate[:mh].copy_(units.b1.reshape(mh))
         b1_gate[mh:].copy_(cell.gate.bias)
+
+
+def fixed_fast_slots(model: HSN) -> int:
+    """The number of leading slots whose unit is fixed for the whole window: amendment A8's
+    fast cells with ``model.fast_units = fixed`` (slot ``i < F`` holds cell ``i`` at unit
+    ``i mod M`` at every position), else 0. The split window's sweep multiplies those slots'
+    pairs with their own unit's weights (P2.10c, :class:`~hsn.model.cell.WindowConsts`)."""
+    cfg = model.cfg
+    return int(cfg.fast_cells) if cfg.fast_cells and cfg.fast_units == "fixed" else 0
 
 
 def sweep_merge_error(model: HSN) -> str | None:
@@ -959,6 +987,13 @@ def _tape_block(
                 edge_weights=model.cell.get_buffer("sweep_edge"),
                 w1_flat=bank.get_buffer("sweep_w1_flat"),
                 w2_flat=bank._buffers.get("sweep_w2_flat") if fused else None,
+            )
+        if bank._buffers.get("sweep_fast_w1") is not None:  # P2.10c: slots with a fixed unit
+            consts = consts._replace(
+                fast_w1=bank.get_buffer("sweep_fast_w1"),
+                fast_b1=bank.get_buffer("sweep_fast_b1"),
+                fast_w2=bank.get_buffer("sweep_fast_w2"),
+                fast_b2=bank.get_buffer("sweep_fast_b2"),
             )
     if fused and fold and consts.w1_gate is not None:
         return _folded_tape_block(model, h, q, age, pos, z_b, c_b, s_b, r_b, consts, controls, fold)
@@ -1395,7 +1430,7 @@ def run_tape(
             twin.refresh()
             runner = twin.twin
         else:
-            consts = model.cell.window_consts()
+            consts = model.cell.window_consts(fast_slots=fixed_fast_slots(model))
         for index in range(n_blocks):
             out = block(
                 runner,

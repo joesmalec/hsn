@@ -14,6 +14,7 @@ from hsn.device import seed_everything
 from hsn.model.hsn import HSN
 from hsn.model.state import CellGraphState
 from hsn.train import state_gradient
+from hsn.train.compile import fixed_fast_slots
 from hsn.train.split import SplitWindow, recurrence_backward, scope_error
 from hsn.train.state_gradient import (
     CellConstants,
@@ -502,8 +503,9 @@ def _autograd_by_position(
             h=entry.h.clone(), q=entry.q.clone(), age=entry.age, pos=entry.pos
         )
         entries.append(copy)
-        if static:
-            kwargs = {**kwargs, "static": True, "consts": model.cell.window_consts()}
+        if static:  # the sweep's constants: its round, product for product
+            consts = model.cell.window_consts(fast_slots=fixed_fast_slots(model))
+            kwargs = {**kwargs, "static": True, "consts": consts}
         return position(copy, *args, **kwargs)  # type: ignore[arg-type]
 
     start = CellGraphState._make(

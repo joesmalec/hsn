@@ -418,6 +418,123 @@ class UnitBank(nn.Module):
         return out.gather(1, index.expand(P, 1, d)).squeeze(1), rider
 
     # ----------------------------------------------------------------------------------------------
+    # Slots with a fixed unit (P2.10c: amendment A8's fast cells with ``model.fast_units = fixed``)
+    # ----------------------------------------------------------------------------------------------
+
+    def slot_layout(
+        self, n_slots: int, *, rider: nn.Linear | None = None
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """The weights of ``n_slots`` slots whose unit is fixed, slot ``i`` at unit ``i mod M``
+        (:meth:`hsn.model.router.Router.select`'s ``reserved_units``), stacked per slot:
+        ``(w1 [F, in, H], b1 [F, H], w2 [F, H, d], b2 [F, d])``. A static pass multiplies such
+        a slot's pairs with its own unit's weights (:meth:`forward_static_slots`) where the
+        all-units pass multiplies them with every unit's. ``rider`` (a linear map of the same
+        input: the cell's gate) puts its weight and bias after the first layer's columns,
+        ``w1 [F, in, H + r]`` and ``b1 [F, H + r]``, as
+        :meth:`forward_static_chosen`'s rider columns do. The stacks are gathers of the
+        parameters: autograd reaches the units through them."""
+        if isinstance(n_slots, bool) or not isinstance(n_slots, int) or n_slots < 1:
+            raise ValueError(f"slot_layout needs n_slots >= 1, got {n_slots!r}")
+        units = torch.arange(n_slots, device=self.W1.device) % self.n_units
+        w1 = self.W1.index_select(0, units)
+        b1 = self.b1.index_select(0, units)
+        if rider is not None:
+            if rider.in_features != self.in_dim or rider.bias is None:
+                raise ValueError("the rider must be a linear map of the bank's input with a bias")
+            out = int(rider.out_features)
+            extra = rider.weight.t().to(w1.dtype)[None].expand(n_slots, self.in_dim, out)
+            w1 = torch.cat([w1, extra], dim=2)
+            b1 = torch.cat([b1, rider.bias.to(b1.dtype)[None].expand(n_slots, out)], dim=1)
+        return w1, b1, self.W2.index_select(0, units), self.b2.index_select(0, units)
+
+    def _slots_first(self, v: Tensor, fast_w1: Tensor, fast_b1: Tensor) -> Tensor:
+        """The first layer of the fixed slots: ``v [B, F, in]`` against ``fast_w1 [F, in, ·]``,
+        one batched product per slot, ``[F, B, ·]``."""
+        return torch.baddbmm(fast_b1[:, None, :], v.transpose(0, 1), fast_w1)
+
+    def _check_slots(self, v: Tensor, unit_idx: Tensor, fast_w1: Tensor) -> tuple[int, int, int]:
+        if v.ndim != 3 or v.shape[2] != self.in_dim:
+            raise ValueError(f"expected v [B, K, {self.in_dim}], got shape {tuple(v.shape)}")
+        if unit_idx.shape != v.shape[:2]:
+            raise ValueError(
+                f"unit_idx must be [B, K] = {tuple(v.shape[:2])}, got {tuple(unit_idx.shape)}"
+            )
+        B, K, F = int(v.shape[0]), int(v.shape[1]), int(fast_w1.shape[0])
+        if not 1 <= F < K:
+            raise ValueError(f"the fixed slots must be a proper prefix of the {K} slots, got {F}")
+        return B, K, F
+
+    def forward_static_slots(
+        self,
+        v: Tensor,
+        unit_idx: Tensor,
+        fast_w1: Tensor,
+        fast_b1: Tensor,
+        fast_w2: Tensor,
+        fast_b2: Tensor,
+        *,
+        w1_flat: Tensor | None = None,
+    ) -> Tensor:
+        """:meth:`forward_static` for ``K`` slots per row whose first ``F`` run a fixed unit
+        (:meth:`slot_layout`): ``v [B, K, in] -> [B, K, d]``, static shapes, no host
+        synchronisation. The fixed slots run one batched product per layer against their own
+        unit's weights; the other slots run :meth:`forward_static` (every unit, then a
+        gather: ``unit_idx [B, K]`` is read for them only). The values are
+        :meth:`forward_static`'s to rounding (other matmul shapes) at ``1 / M`` of the
+        arithmetic on the fixed slots; autograd is intact. The caller guarantees that slot
+        ``i < F`` of every row ran unit ``i mod M`` (the recorded decision of a model with
+        ``model.fast_units = fixed``); a padded slot's result is as unread as before."""
+        B, K, F = self._check_slots(v, unit_idx, fast_w1)
+        hidden = self.act(self._slots_first(v[:, :F], fast_w1, fast_b1))  # [F, B, H]
+        fixed = torch.baddbmm(fast_b2[:, None, :], hidden, fast_w2).transpose(0, 1)  # [B, F, d]
+        rest = self.forward_static(
+            v[:, F:].reshape(B * (K - F), self.in_dim),
+            unit_idx[:, F:].reshape(B * (K - F)),
+            w1_flat=w1_flat,
+        )
+        return torch.cat([fixed, rest.reshape(B, K - F, self.d)], dim=1)
+
+    def forward_static_chosen_slots(
+        self,
+        v: Tensor,
+        unit_idx: Tensor,
+        fast_w1: Tensor,
+        fast_b1: Tensor,
+        fast_w2: Tensor,
+        fast_b2: Tensor,
+        *,
+        w1_flat: Tensor,
+        w2_flat: Tensor,
+        b1_flat: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """:meth:`forward_static_chosen` for ``K`` slots per row whose first ``F`` run a fixed
+        unit (the fused forward sweep, P2.10c): ``(out [B, K, d], rider [B, K, r] | None)``.
+        The fixed slots run one batched product per layer against their own unit's weights
+        (:meth:`slot_layout`, with the rider's columns when ``b1_flat`` gives the others
+        theirs); the other slots run :meth:`forward_static_chosen` with the all-units
+        layouts. Forward only, the same values to rounding."""
+        B, K, F = self._check_slots(v, unit_idx, fast_w1)
+        H = self.hidden
+        first = self._slots_first(v[:, :F], fast_w1, fast_b1)  # [F, B, H (+ r)]
+        hidden = self.act(first[:, :, :H])
+        fixed = torch.baddbmm(fast_b2[:, None, :], hidden, fast_w2).transpose(0, 1)  # [B, F, d]
+        rest, rest_rider = self.forward_static_chosen(
+            v[:, F:].reshape(B * (K - F), self.in_dim),
+            unit_idx[:, F:].reshape(B * (K - F)),
+            w1_flat=w1_flat,
+            w2_flat=w2_flat,
+            b1_flat=b1_flat,
+        )
+        out = torch.cat([fixed, rest.reshape(B, K - F, self.d)], dim=1)
+        if rest_rider is None:
+            return out, None
+        if first.shape[2] <= H:
+            raise ValueError("the fixed slots' first layer carries no rider columns")
+        fixed_rider = first[:, :, H:].transpose(0, 1)  # [B, F, r]
+        rider = torch.cat([fixed_rider, rest_rider.reshape(B, K - F, -1)], dim=1)
+        return out, rider
+
+    # ----------------------------------------------------------------------------------------------
     # Accounting and metadata
     # ----------------------------------------------------------------------------------------------
 

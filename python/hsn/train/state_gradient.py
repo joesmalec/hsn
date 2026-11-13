@@ -86,10 +86,12 @@ from hsn.model.cell import PDGCell
 __all__ = [
     "CellConstants",
     "StateGradientRecurrence",
+    "SweepLayouts",
     "activation_grad",
     "cell_constants",
     "cell_state_vjp",
     "state_gradient_backward",
+    "sweep_layouts",
 ]
 
 #: What :meth:`hsn.model.cell.PDGCell.replay_sparse` records for the sweep (``rms`` only with
@@ -185,6 +187,72 @@ def _by_unit(x: Tensor, units: Tensor, weight: Tensor) -> Tensor:
     return out.reshape(*x.shape[:-1], int(weight.shape[-1]))
 
 
+class SweepLayouts(NamedTuple):
+    """The cell's two transposed unit layers in the layouts a compiled reverse sweep multiplies
+    with (:func:`sweep_layouts`): static shapes, one product per layer for the slots whose unit
+    the router chose and one batched product per layer for the slots whose unit is fixed.
+
+    The routed slots use the all-units layout of the forward sweep, transposed: a slot's
+    cotangent is written into its unit's block of an operand that is zero elsewhere, so one
+    matmul serves every unit (``M`` times the arithmetic of the slot's own unit, on static
+    shapes). The first ``n_fast`` slots (amendment A8's fast cells with ``model.fast_units =
+    fixed``: slot ``i`` at unit ``i mod M`` at every position) multiply with their own unit's
+    weights, stacked per slot."""
+
+    w2_t: Tensor  # [M·d, H]: row j·d + k is unit j's W2[:, k]
+    w1_state_t: Tensor  # [M·H + d, 2d]: row j·H + h is unit j's W1[state rows, h]; then the gate
+    n_fast: int
+    fast_w2_t: Tensor | None  # [F, d, H]
+    fast_w1_state_t: Tensor | None  # [F, H + d, 2d]: slot i's W1[state rows, :]ᵀ; then the gate
+
+
+def sweep_layouts(consts: CellConstants, n_fast: int = 0) -> SweepLayouts:
+    """The :class:`SweepLayouts` of a cell's weights; ``n_fast`` leading slots have a fixed unit."""
+    n_units, hidden, d = (int(n) for n in consts.w2.shape)
+    w2_t = consts.w2.permute(0, 2, 1).reshape(n_units * d, hidden)
+    w1_t = consts.w1_state.permute(0, 2, 1).reshape(n_units * hidden, 2 * d)
+    w1_state_t = torch.cat([w1_t, consts.gate_state], dim=0)
+    if not n_fast:
+        return SweepLayouts(w2_t, w1_state_t, 0, None, None)
+    slots = torch.arange(n_fast, device=consts.w2.device) % n_units
+    fast_w1 = consts.w1_state.index_select(0, slots).transpose(1, 2)  # [F, H, 2d]
+    gate = consts.gate_state[None].expand(n_fast, d, 2 * d)
+    return SweepLayouts(
+        w2_t,
+        w1_state_t,
+        n_fast,
+        consts.w2.index_select(0, slots).transpose(1, 2).contiguous(),
+        torch.cat([fast_w1, gate], dim=1),
+    )
+
+
+def _static_product(
+    x: Tensor,
+    units: Tensor,
+    flat_t: Tensor,
+    fast_t: Tensor | None,
+    n_fast: int,
+    extra: Tensor | None = None,
+) -> Tensor:
+    """``out[b, k] = x[b, k] @ W[units[b, k]] (+ extra[b, k] @ G)`` in the static layouts of
+    :class:`SweepLayouts`: ``x [B, K, a]``, ``flat_t [M·a (+ r), o]`` (the units' blocks, then
+    ``G``), ``fast_t [F, a (+ r), o]``, ``extra [B, K, r]`` the rider's operand."""
+    B, K, a = (int(n) for n in x.shape)
+    width = int(flat_t.shape[0]) - (0 if extra is None else int(extra.shape[-1]))
+    routed = x[:, n_fast:].reshape(-1, a)
+    index = units[:, n_fast:].reshape(-1)
+    columns = index[:, None] * a + torch.arange(a, device=x.device)[None, :]
+    operand = routed.new_zeros(routed.shape[0], width).scatter(1, columns, routed)
+    if extra is not None:
+        operand = torch.cat([operand, extra[:, n_fast:].reshape(routed.shape[0], -1)], dim=1)
+    out = (operand @ flat_t).reshape(B, K - n_fast, -1)
+    if not n_fast:
+        return out
+    assert fast_t is not None
+    fixed = x[:, :n_fast] if extra is None else torch.cat([x, extra], dim=-1)[:, :n_fast]
+    return torch.cat([torch.bmm(fixed.transpose(0, 1), fast_t).transpose(0, 1), out], dim=1)
+
+
 def cell_state_vjp(
     dc: Tensor,
     db: Tensor,
@@ -200,6 +268,7 @@ def cell_state_vjp(
     m: Tensor,
     rms: Tensor | None,
     consts: CellConstants,
+    layouts: SweepLayouts | None = None,
 ) -> tuple[Tensor, Tensor]:
     """The vector-Jacobian product of the selected cells' candidate and gate with respect to
     what they read of the state (module docstring): ``(dh, dvm)``, each ``[…, K, d]``. ``dh``
@@ -209,7 +278,11 @@ def cell_state_vjp(
     cotangents of ``c`` and ``b``; the other arguments are the recorded forward values of the
     same slots (``units`` int64 ``[…, K]``, the unit that ran; ``y``, ``gate_pre``, ``m`` ``[…,
     K, d]``; ``alpha``, ``rms`` ``[…, K]``; ``hidden [… , K, H]``). Nothing here depends on a
-    slot being valid: the caller masks the padded slots' results."""
+    slot being valid: the caller masks the padded slots' results.
+
+    ``layouts`` (``[B, K, …]`` arguments only) takes the two transposed unit layers in the
+    static layouts of a compiled sweep (:class:`SweepLayouts`) instead of one product per unit
+    on that unit's slots: the same values to rounding, in the arithmetic the kernels run."""
     dtype = c.dtype
     d = int(c.shape[-1])
     dz = dc * (1.0 - c * c)
@@ -223,11 +296,19 @@ def cell_state_vjp(
         d_unit = weight * (dz @ consts.w_out)
     hid = hidden.to(dtype)
     # the executed unit's two layers, transposed: F = act(hid) @ W2_j + b2_j, hid = v @ W1_j + b1_j
-    d_act = _by_unit(d_unit, units, consts.w2.transpose(1, 2))  # […, K, H]
-    d_hid = d_act * activation_grad(consts.activation, hid)
     d_gate = db * b * (1.0 - b)
-    dv = _by_unit(d_hid, units, consts.w1_state.transpose(1, 2))  # […, K, 2d]
-    dv = dv + d_gate @ consts.gate_state
+    if layouts is None:
+        d_act = _by_unit(d_unit, units, consts.w2.transpose(1, 2))  # […, K, H]
+        d_hid = d_act * activation_grad(consts.activation, hid)
+        dv = _by_unit(d_hid, units, consts.w1_state.transpose(1, 2))  # […, K, 2d]
+        dv = dv + d_gate @ consts.gate_state
+    else:
+        fast = layouts.n_fast
+        d_act = _static_product(d_unit, units, layouts.w2_t, layouts.fast_w2_t, fast)
+        d_hid = d_act * activation_grad(consts.activation, hid)
+        dv = _static_product(
+            d_hid, units, layouts.w1_state_t, layouts.fast_w1_state_t, fast, extra=d_gate
+        )
     if consts.norm_gain_state is not None:
         if rms is None:
             raise ValueError("the cell norm's backward needs the recorded rms")
@@ -258,6 +339,7 @@ def state_gradient_backward(
     consts: CellConstants,
     trace: dict[str, Tensor] | None = None,
     initial: tuple[Tensor, Tensor] | None = None,
+    layouts: SweepLayouts | None = None,
 ) -> tuple[Tensor, Tensor]:
     """The reverse sweep of the module docstring in plain torch (any device and dtype): the
     total ``(dL/dc, dL/db)``, each ``[B, T, K, d]``.
@@ -282,7 +364,8 @@ def state_gradient_backward(
     ``initial`` is the cotangent ``(A [B, N, d], R [B, d])`` of the state after the last
     position. A window's final state is detached, so the window passes ``None`` (zeros); a
     test gives a single position the cotangent that autograd found for the state after it,
-    which checks one step of the sweep with nothing accumulated."""
+    which checks one step of the sweep with nothing accumulated. ``layouts``:
+    :func:`cell_state_vjp`'s (the transposed unit layers in a compiled sweep's layouts)."""
     B, T, K, d = (int(n) for n in c.shape)
     N = int(n_cells)
     D = int(consts.pad_src.shape[1])
@@ -331,6 +414,7 @@ def state_gradient_backward(
             m=record["m"][:, t],
             rms=None if rms is None else rms[:, t],
             consts=consts,
+            layouts=layouts,
         )
         dh = torch.where(ok, dh, zero)
         dvm = torch.where(ok, dvm, zero)

@@ -117,6 +117,16 @@ class WindowConsts(NamedTuple):
     #: serves both (:meth:`UnitBank.forward_static_chosen`'s rider). ``None``: two matmuls.
     w1_gate: Tensor | None = None
     b1_gate: Tensor | None = None
+    #: P2.10c (amendment A8 with ``model.fast_units = fixed``): the weights of the first ``F``
+    #: slots' fixed units, stacked per slot (:meth:`UnitBank.slot_layout`; ``fast_w1`` with the
+    #: gate's columns where ``w1_gate`` has them). With them the static rounds multiply a fast
+    #: slot's pairs with its own unit's weights instead of every unit's. ``None``: every slot
+    #: takes the all-units pass, as before. Only the split window's sweep sets them
+    #: (:meth:`PDGCell.window_consts` with ``fast_slots``).
+    fast_w1: Tensor | None = None
+    fast_b1: Tensor | None = None
+    fast_w2: Tensor | None = None
+    fast_b2: Tensor | None = None
 
 
 def _mix(alpha: Tensor, unit_out: Tensor) -> Tensor:
@@ -227,14 +237,20 @@ class PDGCell(nn.Module):
             finally:
                 self._in_window = previous
 
-    def window_consts(self) -> WindowConsts:
+    def window_consts(self, fast_slots: int = 0) -> WindowConsts:
         """The :class:`WindowConsts` of this window (P2.8): the same tensors the rounds of the
-        window read from the caches. Only inside :meth:`window`."""
+        window read from the caches. Only inside :meth:`window`. ``fast_slots = F > 0`` (P2.10c:
+        the split window's sweep of a model with ``model.fast_units = fixed``) adds the layouts
+        of the first ``F`` slots' fixed units; ``0`` (default): the constants as before."""
         if not self._in_window:
             raise RuntimeError("PDGCell.window_consts is only available inside PDGCell.window()")
-        return WindowConsts(
+        consts = WindowConsts(
             edge_weights=self.graph._padded_weights(), w1_flat=self.units._w1_flat()
         )
+        if not fast_slots:
+            return consts
+        fast_w1, fast_b1, fast_w2, fast_b2 = self.units.slot_layout(fast_slots)
+        return consts._replace(fast_w1=fast_w1, fast_b1=fast_b1, fast_w2=fast_w2, fast_b2=fast_b2)
 
     # ----------------------------------------------------------------------------------------------
     # The dense round
@@ -380,7 +396,20 @@ class PDGCell(nn.Module):
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
-                if static:  # P2.8: every unit on the pairs, then a gather (no histogram)
+                if static and consts is not None and consts.fast_w1 is not None:
+                    # P2.10c: the fast slots against their own unit's weights, the others as below
+                    assert consts.fast_b1 is not None
+                    assert consts.fast_w2 is not None and consts.fast_b2 is not None
+                    unit_out = self.units.forward_static_slots(
+                        v,
+                        units,
+                        consts.fast_w1,
+                        consts.fast_b1,
+                        consts.fast_w2,
+                        consts.fast_b2,
+                        w1_flat=w1_flat,
+                    )
+                elif static:  # P2.8: every unit on the pairs, then a gather (no histogram)
                     unit_out = native.grouped_unit_mlp(
                         v.reshape(B * K, in_dim),
                         units.reshape(B * K),
@@ -470,7 +499,26 @@ class PDGCell(nn.Module):
             v = self.norm(native.gather_concat(u_read, eps, h_read, m, cells))
             flat = v.reshape(B * K, self.in_dim)
             w2_flat = consts.w2_flat if consts.w2_flat is not None else self.units._w2_flat()
-            if consts.w1_gate is not None and consts.b1_gate is not None:
+            merged = consts.w1_gate is not None and consts.b1_gate is not None
+            if consts.fast_w1 is not None:
+                # P2.10c: the fast slots against their own unit's weights (WindowConsts)
+                assert consts.fast_b1 is not None
+                assert consts.fast_w2 is not None and consts.fast_b2 is not None
+                unit_out, rider = self.units.forward_static_chosen_slots(
+                    v,
+                    units,
+                    consts.fast_w1,
+                    consts.fast_b1,
+                    consts.fast_w2,
+                    consts.fast_b2,
+                    w1_flat=consts.w1_flat
+                    if consts.w1_gate is None or not merged
+                    else consts.w1_gate,
+                    w2_flat=w2_flat,
+                    b1_flat=consts.b1_gate if merged else None,
+                )
+                gate = (self.gate(v) if rider is None else rider).to(state.dtype)
+            elif consts.w1_gate is not None and consts.b1_gate is not None:
                 unit_out, rider = self.units.forward_static_chosen(
                     flat,
                     units.reshape(B * K),
@@ -524,14 +572,33 @@ class PDGCell(nn.Module):
             )
             u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
             v = self.norm(native.gather_concat(u_read, eps, h_read, m, cells))
-            unit_out, rider = self.units.forward_static_chosen(
-                v.reshape(B * K, self.in_dim),
-                units.reshape(B * K),
-                w1_flat=consts.w1_gate,
-                w2_flat=consts.w2_flat,
-                b1_flat=consts.b1_gate,
-            )
-            assert rider is not None
+            if consts.fast_w1 is not None:
+                # P2.10c: the fast slots against their own unit's weights; the gate is then a
+                # dense [B * K, d] tensor of the same values, not a view of one wider product
+                assert consts.fast_b1 is not None
+                assert consts.fast_w2 is not None and consts.fast_b2 is not None
+                unit_out, rider = self.units.forward_static_chosen_slots(
+                    v,
+                    units,
+                    consts.fast_w1,
+                    consts.fast_b1,
+                    consts.fast_w2,
+                    consts.fast_b2,
+                    w1_flat=consts.w1_gate,
+                    w2_flat=consts.w2_flat,
+                    b1_flat=consts.b1_gate,
+                )
+                assert rider is not None
+                rider = rider.reshape(B * K, d)
+            else:
+                unit_out, rider = self.units.forward_static_chosen(
+                    v.reshape(B * K, self.in_dim),
+                    units.reshape(B * K),
+                    w1_flat=consts.w1_gate,
+                    w2_flat=consts.w2_flat,
+                    b1_flat=consts.b1_gate,
+                )
+                assert rider is not None
             y: Tensor = self.W_out(unit_out.reshape(B, K, d))
         return rider, y
 
