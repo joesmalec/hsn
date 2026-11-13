@@ -121,6 +121,14 @@ unchanged by it:
 handed to the cell, which does not read it. :meth:`HSN.param_report` then matches the closed form
 of :func:`hsn.train.memory_plan.expected_param_count` at the ``3d`` width.
 
+Amendment A8 (``model.fast_cells = F``, ``docs/amendments/A8_fast_cells.md``; opt-in, ``topk``
+only): cells ``0 .. F − 1`` are selected at every position (:meth:`Router.select`'s ``reserved``)
+and the router fills the other ``k_select − F`` slots from the remaining cells. The cell, the
+units, the graph, the gate and the state layout are unchanged. With ``model.fast_readout`` the
+fast group has its own read ``f = mean_{i < F} h[i]``: ``u_t = S([z_t ; q_{t−1} ; ctx_t ;
+f_{t−1}])`` (a ``summary`` read under A6), ``D([q_t ; u_t ; r_t ; f_t])``, and the selected-cell
+readout ``r_t`` averages the routed slots only. The split and fused windows refuse both keys.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
@@ -410,7 +418,8 @@ class HSN(nn.Module):
                 "fixed_embedding, ema_encoder"
             )
         self.predictor = Predictor(cfg)
-        self.shared = SharedTransform(cfg)
+        # A8: the seed only draws the extra input columns of model.fast_readout
+        self.shared = SharedTransform(cfg, seed=seed) if cfg.fast_readout else SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
         self.cell.detach_state_read = "state" in self.feedback_detach  # A6
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
@@ -635,8 +644,20 @@ class HSN(nn.Module):
         z = self.encoder(emb)
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         eps = z - z_hat
-        u = self.shared(torch.cat([z, self._summary_read(q_prev), self.ctx_emb(ctx_t)], dim=-1))
+        u = self.shared(self._shared_input(z, q_prev, self.ctx_emb(ctx_t), state.h))
         return z_hat, z, z_target, eps, u
+
+    def _shared_input(self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor) -> Tensor:
+        """The input of ``S``: ``[z_t ; q_{t−1} ; ctx_t]``, and with ``model.fast_readout`` (A8)
+        the fast group's mean ``f_{t−1}`` after it. Both state reads are ``summary`` reads (A6)."""
+        parts = [z, self._summary_read(q_prev), ctx]
+        if self.cfg.fast_readout:
+            parts.append(self._summary_read(self._fast_read(h_prev)))
+        return torch.cat(parts, dim=-1)
+
+    def _fast_read(self, h: Tensor) -> Tensor:
+        """A8: ``f = mean_{i < F} h[i]``, ``[B, d]`` from ``h [B, N, d]``."""
+        return h[:, : self.cfg.fast_cells].mean(dim=1)
 
     # -- A6: the feedback reads (values unchanged; see the module docstring) ----------------------
 
@@ -710,6 +731,7 @@ class HSN(nn.Module):
             epsilon=epsilon,
             age=state.age if probes else None,
             dense_rows=dense_rows,
+            **({"reserved": cfg.fast_cells} if cfg.fast_cells else {}),  # A8
         )
 
     def _score(
@@ -1265,7 +1287,7 @@ class HSN(nn.Module):
         q_prev = state.q
         z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
         eps = z_t - z_hat
-        u = self.shared(torch.cat([z_t, self._summary_read(q_prev), ctx_t], dim=-1))
+        u = self.shared(self._shared_input(z_t, q_prev, ctx_t, state.h))
         # P1.7: see step. A6: the reads of the cell and the scorer (the same values)
         u_s, eps_s = u.to(state.dtype), self._eps_read(z_t, z_hat, eps).to(state.dtype)
         age = None if dense_counters is not None else state.age  # dense: a column of the scalars
@@ -1428,10 +1450,14 @@ class HSN(nn.Module):
         warm-up uses the normalised soft mask over all cells; fallback rows read all cells.
         No sequence attention, additional persistent state, or computation-path weight writes.
         """
+        # A8 (model.fast_readout): r averages the routed slots only and f follows it, [B, 2d]
+        fast = self.cfg.fast_cells if self.cfg.fast_readout else 0
         if selection is None:
-            return state.q
+            return torch.cat([state.q, self._fast_read(state.h)], dim=-1) if fast else state.q
         if mode == "masked" or (gate == "soft" and self.cfg.routing in SCORED_MODES):
             weights = selection.cell_mask.to(state.dtype)
+            if fast:  # the fast group has its own read
+                weights = torch.cat([torch.zeros_like(weights[:, :fast]), weights[:, fast:]], dim=1)
             readout = (state.h * weights[..., None]).sum(1) / weights.sum(
                 1, keepdim=True
             ).clamp_min(1e-6)
@@ -1440,13 +1466,19 @@ class HSN(nn.Module):
             safe_idx = selection.cell_idx.masked_fill(~selection.valid, 0)
             indices = safe_idx[..., None].expand(-1, -1, state.width)
             chosen = state.h.gather(1, indices)
-            weights = selection.valid.to(state.dtype)
+            valid = selection.valid
+            if fast:  # the reserved slots are the first `fast` slots (Router.select)
+                valid = torch.cat([torch.zeros_like(valid[:, :fast]), valid[:, fast:]], dim=1)
+            weights = valid.to(state.dtype)
             if gate == "ste":
                 mask = selection.cell_mask.gather(1, safe_idx).to(state.dtype)
                 weights = weights * (1.0 + mask - mask.detach())
             readout = (chosen * weights[..., None]).sum(1)
-            readout = readout / selection.valid.sum(1, keepdim=True).clamp_min(1).to(state.dtype)
-        return torch.where(selection.dense_fallback[:, None], state.q, readout)
+            readout = readout / valid.sum(1, keepdim=True).clamp_min(1).to(state.dtype)
+        readout = torch.where(selection.dense_fallback[:, None], state.q, readout)
+        if fast:
+            readout = torch.cat([readout, self._fast_read(state.h)], dim=-1)
+        return readout
 
     # -- accounting -------------------------------------------------------------------------------
 

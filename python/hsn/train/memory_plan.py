@@ -114,7 +114,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "ctx_emb": m.n_context * m.context_dim,
         "encoder": _mlp(d, h, d),
         "predictor": _mlp(d, h, d),
-        "shared": _mlp(2 * d + m.context_dim, h, d),
+        "shared": _mlp(2 * d + m.context_dim + (d if m.fast_readout else 0), h, d),  # A8: + f
         "units": m.n_units * _mlp(v_in, h, d),
         "w_out": d * d,
         "v_msg": d * d,
@@ -123,7 +123,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "cand_norm": d if m.cand_norm == "rms" else 0,  # P1.13 (amendment A4)
         "scorer": _scorer_params(m),
         "halting": 2 * d + 1,
-        "decoder": _mlp((3 if m.selected_readout else 2) * d, h, v),
+        "decoder": _mlp((2 + int(m.selected_readout) + int(m.fast_readout)) * d, h, v),
     }
     rows["total"] = sum(rows.values())
     return rows
@@ -165,7 +165,9 @@ def activations_per_token(m: ModelConfig) -> dict[str, int]:
     in ``shared`` (the scorer and the decoder read it).
     """
     return {
-        "shared": (5 if m.selected_readout else 4) * m.d + 4 * m.hidden + m.vocab_size,
+        "shared": (4 + int(m.selected_readout) + int(m.fast_readout)) * m.d
+        + 4 * m.hidden
+        + m.vocab_size,
         "per_cell": m.cell_input_width + m.hidden + 3 * m.d,
     }
 

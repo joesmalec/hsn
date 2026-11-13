@@ -1069,8 +1069,16 @@ class Router(nn.Module):
         epsilon: float = 0.0,
         age: Tensor | None = None,
         dense_rows: Tensor | None = None,
+        reserved: int = 0,
     ) -> Selection:
         """Select up to ``k_max`` (cell, unit) slots per row within ``budget`` (module docstring).
+
+        ``reserved`` (amendment A8, ``model.fast_cells``; ``topk`` without ``reinforce`` only):
+        cells ``0 .. reserved − 1`` take the first ``reserved`` slots at every call, each at its
+        best unit, and the scored decision fills the other ``k_max − reserved`` slots from the
+        remaining cells. The straight-through threshold is taken among the remaining cells, the
+        reserved cells' mask is the constant 1 (they have no selection gradient), and the probes
+        never replace a reserved slot. ``0``: the decision as before, bit for bit.
 
         ``logits`` are the scorer's ``[B, N, M]`` on the router's device; ``budget`` is ``B_t`` as
         a fraction of the dense step (finite, >= 0); ``0 <= k_min <= k_max <= N`` with
@@ -1103,6 +1111,16 @@ class Router(nn.Module):
         elif fixed is not None:
             raise ValueError(f"`fixed` is only used with mode='fixed', got mode={mode!r}")
         tau = self._check_gate_args(mode, gate, temperature, epsilon)
+        if isinstance(reserved, bool) or not isinstance(reserved, int) or reserved < 0:
+            raise ValueError(f"reserved must be an int >= 0, got {reserved!r}")
+        if reserved:
+            if mode != "topk" or gate == "reinforce":
+                raise ValueError(
+                    f"reserved={reserved} needs mode='topk' without gate='reinforce', got "
+                    f"mode={mode!r}, gate={gate!r}"
+                )
+            if reserved >= k_max:
+                raise ValueError(f"reserved={reserved} must be < k_max={k_max}")
         age_t = self._check_age(age, mode, B, N, logits.device)
         dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
         if generator is not None and not (mode == "random" or epsilon > 0.0 or gate == "reinforce"):
@@ -1120,6 +1138,8 @@ class Router(nn.Module):
         if mode == "topk":
             if gate == "reinforce":
                 cells, units, order = self._gumbel_topk(scores_d, k_max, tau, generator)
+            elif reserved:
+                cells, units = self._topk(scores_d, k_max, reserved)
             else:
                 cells, units = self._topk(scores_d, k_max)
             cells, units, valid = self._truncate(cells, units, budget_f)
@@ -1135,10 +1155,12 @@ class Router(nn.Module):
             cells, units, valid = self._fixed(scores_d, fixed_cells, k_max)
         scored = mode in SCORED_MODES
         # the straight-through threshold belongs to the scored decision, before the probes
-        threshold = self._ste_threshold(scores_d.amax(dim=-1), cells, valid) if scored else None
+        threshold = (
+            self._ste_threshold(scores_d.amax(dim=-1), cells, valid, reserved) if scored else None
+        )
         if scored and (age_t is not None or epsilon > 0.0):
             cells, units, explored, refreshed = self._post_process(
-                cells, units, valid, scores_d, age_t, epsilon, budget_f, dense, generator
+                cells, units, valid, scores_d, age_t, epsilon, budget_f, dense, generator, reserved
             )
         else:
             explored = torch.zeros(B, k_max, dtype=torch.bool, device=logits.device)
@@ -1157,6 +1179,7 @@ class Router(nn.Module):
             explored=explored,
             refreshed=refreshed,
             dense=dense,
+            reserved=reserved,
         )
         return self._tapped(selection)
 
@@ -1381,8 +1404,11 @@ class Router(nn.Module):
         )
 
     @staticmethod
-    def _topk(scores: Tensor, k_max: int) -> tuple[Tensor, Tensor]:
+    def _topk(scores: Tensor, k_max: int, reserved: int = 0) -> tuple[Tensor, Tensor]:
         cell_scores = scores.amax(dim=-1)  # [B, N]
+        if reserved:  # A8: the fast group sorts first, in index order (the sort is stable)
+            head = torch.full_like(cell_scores[:, :reserved], float("inf"))
+            cell_scores = torch.cat([head, cell_scores[:, reserved:]], dim=1)
         # stable: equal scores keep index order (never torch.topk, whose tie order is unspecified)
         order = torch.sort(cell_scores, dim=1, descending=True, stable=True).indices[:, :k_max]
         units = scores.argmax(dim=-1).gather(1, order)
@@ -1509,12 +1535,20 @@ class Router(nn.Module):
         K = int(valid.shape[1])
         return (terms[:, :K] * valid.to(terms.dtype)).sum(dim=1)
 
-    def _ste_threshold(self, cell_scores_d: Tensor, cells: Tensor, valid: Tensor) -> Tensor:
+    def _ste_threshold(
+        self, cell_scores_d: Tensor, cells: Tensor, valid: Tensor, reserved: int = 0
+    ) -> Tensor:
         """θ ``[B]``: the midpoint between the lowest selected and the highest unselected cell
-        score (``+inf`` when nothing is selected, ``−inf`` when everything is)."""
+        score (``+inf`` when nothing is selected, ``−inf`` when everything is). With ``reserved``
+        (A8) the lowest selected score is taken among the scored slots' cells only: the reserved
+        cells are selected whatever their score."""
         selected = self._selected(cells, valid, int(cell_scores_d.shape[1]))
         inf = float("inf")
         lowest_in = torch.where(selected, cell_scores_d, torch.full_like(cell_scores_d, inf))
+        if reserved:
+            lowest_in = torch.cat(
+                [torch.full_like(lowest_in[:, :reserved], inf), lowest_in[:, reserved:]], dim=1
+            )
         highest_out = torch.where(selected, torch.full_like(cell_scores_d, -inf), cell_scores_d)
         return 0.5 * (lowest_in.amin(dim=1) + highest_out.amax(dim=1))
 
@@ -1529,9 +1563,11 @@ class Router(nn.Module):
         budget: float,
         dense: Tensor | None,
         generator: torch.Generator | None,
+        reserved: int = 0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Refresh probes, then exploration, then the budget recheck (module docstring); returns
-        ``(cells, units, explored, refreshed)``. ``valid`` never changes."""
+        ``(cells, units, explored, refreshed)``. ``valid`` never changes. The first ``reserved``
+        slots (A8) are never replaced."""
         B, K = int(cells.shape[0]), int(cells.shape[1])
         N = self.n_cells
         device = cells.device
@@ -1546,7 +1582,7 @@ class Router(nn.Module):
         explored = torch.zeros(B, K, dtype=torch.bool, device=device)
         if age is not None:
             stale = (age > self.age_max) & ~self._selected(cells, valid, N)
-            n_force = torch.minimum(stale.sum(dim=1), n_valid)
+            n_force = torch.minimum(stale.sum(dim=1), (n_valid - reserved).clamp(min=0))
             key = torch.where(stale, age, torch.full_like(age, -1)).to(torch.float32)
             order = torch.sort(key, dim=1, descending=True, stable=True).indices  # stalest first
             j = n_valid[:, None] - 1 - slots  # the tail of the valid slots, lowest score first
@@ -1559,6 +1595,8 @@ class Router(nn.Module):
             draw = self._draw((B, N + 2), generator, device)  # one host-to-device copy
             u, r, keys = draw[:, 0], draw[:, 1], draw[:, 2:]
             candidate = valid & ~refreshed
+            if reserved:
+                candidate = candidate & (slots >= reserved)
             n_candidate = candidate.sum(dim=1)
             # never a cell the scorer chose, even one a refresh probe just evicted
             selected = self._selected(cells, valid, N) | self._selected(cells0, valid, N)
@@ -1595,6 +1633,7 @@ class Router(nn.Module):
         refreshed: Tensor,
         dense: Tensor | None,
         executed_scores: bool = False,
+        reserved: int = 0,
     ) -> Selection:
         """The gradient-path tensors of a sparse decision (module docstring) and the Selection.
 
@@ -1632,6 +1671,10 @@ class Router(nn.Module):
             if scored:
                 assert threshold is not None
                 soft_mask = torch.sigmoid((cell_scores - threshold[:, None]) / tau)
+                if reserved:  # A8: the fast group is always written; no selection gradient
+                    soft_mask = torch.cat(
+                        [torch.ones_like(soft_mask[:, :reserved]), soft_mask[:, reserved:]], dim=1
+                    )
             if gate == "soft":  # the relaxation; the controls (random, fixed) stay hard
                 unit_weights = soft_units if scored else unit_hard
                 cell_mask = soft_mask if scored else hard_mask

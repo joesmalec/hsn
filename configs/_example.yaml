@@ -52,6 +52,8 @@ model: # Appendix A.1
   predictor_target: fixed_embedding # fixed_embedding | ema_encoder (P1.6)
   disabled_cells: [] # test hook
   ablate_shared_u: false # ablation: remove u from v
+  fast_cells: 0 # amendment A8: cells 0..F-1 are selected at every position; the router fills the other k_select - F slots (topk only)
+  fast_readout: false # amendment A8: S and the decoder also read the fast cells' mean; r covers the routed slots only
   state_schema_version: 1 # bumped on any state layout change
 
 data: # Appendix A.2

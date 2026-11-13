@@ -263,6 +263,18 @@ class ModelConfig(_StrictModel):
     # (width 3d, :attr:`cell_input_width`) for the cell-input norm, the unit MLPs and the gate;
     # the scorer's features and the decoder still read u.
     ablate_shared_u: bool = False  # ablation: remove u from v
+    # --- Amendment A8 (docs/amendments/A8_fast_cells.md; opt-in, default off) ---
+    # fast_cells = F > 0: cells 0..F-1 are selected at every position (the "fast" group, written
+    # on every token), and the router chooses the remaining k_select - F slots among the other
+    # cells (the "slow" group) exactly as before. The cell equation, the units, the graph and the
+    # gate are unchanged; only the selection rule differs. Needs model.routing=topk and
+    # F < k_select. 0 (default): every slot is the router's.
+    fast_cells: int = Field(default=0, ge=0)
+    # fast_readout (needs fast_cells > 0 and selected_readout): the fast group gets its own read,
+    # f = mean of the fast cells. S reads [z; q; ctx; f_{t-1}], the decoder reads [q; u; r; f],
+    # and the selected-cell readout r covers the routed (slow) slots only.
+    fast_readout: bool = False
+    # --- end A8 ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -324,6 +336,29 @@ class ModelConfig(_StrictModel):
                 f"model.routing=greedy_budget needs model.budget > 0, got {self.budget}"
             )
         # --- end P2.1 ---
+        # --- Amendment A8: the fast group ---
+        if self.fast_cells:
+            if self.routing != "topk":
+                raise ValueError(
+                    f"model.fast_cells={self.fast_cells} needs model.routing=topk, got "
+                    f"{self.routing!r}"
+                )
+            if self.fast_cells >= self.k_select:
+                raise ValueError(
+                    f"model.fast_cells={self.fast_cells} must be < model.k_select="
+                    f"{self.k_select}: the router keeps at least one slot"
+                )
+            fast_disabled = [i for i in self.disabled_cells if i < self.fast_cells]
+            if fast_disabled:
+                raise ValueError(
+                    f"model.disabled_cells {fast_disabled} lie in the fast group "
+                    f"[0, {self.fast_cells})"
+                )
+        if self.fast_readout and not (self.fast_cells and self.selected_readout):
+            raise ValueError(
+                "model.fast_readout requires model.fast_cells > 0 and model.selected_readout=true"
+            )
+        # --- end A8 ---
         return self
 
 
@@ -1086,6 +1121,8 @@ class RunConfig(_StrictModel):
                 raise ValueError(
                     "model.key_address and model.selected_readout are HSN-only A5 features"
                 )
+            if self.model.fast_cells or self.model.fast_readout:
+                raise ValueError("model.fast_cells and model.fast_readout (A8) are HSN-only")
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.unit_credit != "softmax":
@@ -1124,6 +1161,17 @@ class RunConfig(_StrictModel):
         if routing in ("dense", "random", "fixed") and train.route_guard.enabled:
             raise ValueError("train.route_guard requires learned routing (topk or greedy_budget)")
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
+        # --- Amendment A8: the fast group is a rule of the scored hard/soft selection only ---
+        if self.model.fast_cells and train.gate_mode == "reinforce":
+            raise ValueError(
+                "model.fast_cells (A8) is not defined for train.gate_mode=reinforce (the sampled "
+                "order has no reserved slots)"
+            )
+        if self.model.fast_cells and train.lambda_u > 0.0:
+            raise ValueError(
+                "model.fast_cells (A8) with train.lambda_u > 0 is untested: the counterfactual "
+                "probes swap slots without regard to the reserved ones"
+            )
         if train.gate_mode == "reinforce" and routing != "topk":
             raise ValueError(
                 f"train.gate_mode=reinforce samples cells by Gumbel-top-k and needs "
@@ -1412,6 +1460,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "baseline.selective_ssm",
     "baseline.address_input",
     "baseline.address_dim",
+    "model.fast_cells",
+    "model.fast_readout",
 )
 
 
@@ -1446,6 +1496,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
     if model.disabled_cells:
         return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
+    if model.fast_cells:
+        return (
+            f"model.fast_cells={model.fast_cells} (A8): the reserved slots and the fast read "
+            "are not built into the split window; use hardware.window=autograd"
+        )
     if model.r_max != 1:
         return f"model.r_max={model.r_max}: one round per position only"
     if train.precision == "fp16":

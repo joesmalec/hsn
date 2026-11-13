@@ -155,6 +155,10 @@ def install_variant(
             f"variant {variant!r} with A5 is unsupported: use variant pdg and the "
             "key_address / selected_readout flags for the independent A5 ablations"
         )
+    if model.cfg.fast_cells:
+        raise ValueError(
+            f"variant {variant!r} with model.fast_cells (A8) is unsupported: use variant pdg"
+        )
     if model.cfg.ablate_shared_u:
         raise ValueError(
             f"variant {variant!r} with model.ablate_shared_u=true is refused: the variants' "
