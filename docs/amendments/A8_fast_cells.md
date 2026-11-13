@@ -1,6 +1,8 @@
 # Amendment A8: fast cells and slow cells (experimental)
 
-Status: **implemented as an opt-in experiment on 12 Nov 2026; not adopted, no result claimed.**
+Status: **implemented as an opt-in experiment on 12 Nov 2026; tested the same evening and not
+supported: the fast group adds nothing over the same number of slots (section "Results"). Not
+adopted.**
 - The user asked on 12 Nov 2026 (about 19:40 MST) for a worktree with the architecture changes
   discussed in the review of white paper v1.2, and for their tests at the front of the queue.
 - `model.fast_cells: F` (default 0) and `model.fast_readout: true` (default false). Both are
@@ -112,18 +114,36 @@ A fast group that learns is expected to need the state gradient (A6 without `sta
 `train.feedback_detach=[summary, eps, router]`), because under the full cut a cell is trained
 only for what the decoder reads at the same position. Both settings are run.
 
-## First results (12 Nov 2026, 21:15 MST; one seed each, 9,000 steps)
+## Results (12 Nov 2026, 22:25 MST; 9,000 steps): the kill rule applies
 
-| Arm | Result | Same slots, no fast group |
-| --- | --- | --- |
-| delayed, `F4R` + state gradient (`f4r_cutC`) | 99.2 %, later queries 98.4 % | `a_k12` 90.8 / 81.3 %; `a8_cutC` 91.7 % (3 seeds) |
-| TinyStories, `F4R` + state gradient | 1.060 bits per byte | `ts_k12` 1.130 |
-| TinyStories, `F4R`, full cut | 1.096 bits per byte | `ts_k12` 1.130 |
+The same-slots controls with the state gradient came in after the first arms, and they
+attribute the gain to twelve slots with the state gradient, not to the fast group.
 
-`gate_slow/p50` on TinyStories is 0.49 to 0.53 (0.63 without the fast group): point 3 of the
-kill rule is **not** met on text alone, as expected where nothing has to be held. The controls
-that separate the fast group from twelve slots with the state gradient (`k12_cutC`,
-`ts_k12_cutC`) were still running when this was written.
+| Task | Fast group (`F4R`) + state gradient | Twelve slots + state gradient, no fast group | Twelve slots, full cut |
+| --- | --- | --- | --- |
+| delayed | 99.2 / 99.2 % (later queries 98.4 / 98.5) | `k12_cutC` 98.5 % (later 97.6) | `a_k12` 90.8 / 81.3 % |
+| TinyStories, bits per byte | 1.060 (full cut: 1.096) | `ts_k12_cutC` 1.054 | `ts_k12` 1.130 |
+| arithmetic | 70.7 / 69.7 % | eight slots: 70.0 / 77.7 % | `arith_k12` 56.0 % |
+| story text with facts (`tf`) | full cut: 2.0 % (chance) | pending | 1.7 / 2.7 % (chance) |
+
+- **Point 1 (text improves over the same slots): not met.** 1.060 against 1.054.
+- **Point 2 (memory stays): met**, and the out-of-range evaluation of `f4r_cutC` is 99.4 %; but
+  the control is within 0.7 points, so this is the state gradient's doing.
+- **Point 3 (the slow cells act as memory on text): not met.** `gate_slow/p50` is 0.49 to 0.53
+  on TinyStories. The fast cells also hold almost one vector (`rank_pr_fast/answer` 1.1 to
+  1.25 of 4).
+- By the kill rule the fast group with routed units is dropped. The only open arms are the two
+  with `model.fast_units=fixed` on TinyStories (`ts_f4ru_cutC`, `ts_f8ru_cutC`): if neither
+  beats `ts_k12_cutC`, the amendment is closed.
+
+**What the story-text set showed instead.** Twelve slots without a fast group hold facts across
+real story text when the text is not supervised (`tfq_k12`: 92.5 % in range, 90.7 % with the
+facts 272 to 768 bytes back) and lose all of them when it is (`tf_k12`: answers at chance, text
+1.489 bits per byte; still at chance halfway with one text position in 128 supervised).
+Predicting the text opens the routed cells' gates (median 0.5), and a fast group does not
+stop that, because nothing makes writing a routed cell cost anything. A rule that lets the
+router select no routed cell at a position, with a cost on selecting one, is the change this
+points to. It is not part of this amendment.
 
 ## Tests
 
