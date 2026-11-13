@@ -670,6 +670,12 @@ class TrainConfig(_StrictModel):
     # scores are constants of that softmax): a unit that did not run gets no gradient from the
     # slot. Not adopted by any recipe: an amendment would have to do that.
     unit_credit: Literal["softmax", "executed"] = "softmax"
+    # Opt-in warm start (13 Nov 2026): the weights of a checkpoint written by another run whose
+    # model has the same parameters (strict key match); the run's weight average is taken when
+    # the checkpoint holds one (the model its evaluations scored). Training starts at step 0
+    # with a fresh optimiser, schedule, weight average and loader: nothing else of the
+    # checkpoint is used. null = the usual initialisation. Hashed when set.
+    init_from: Path | None = None
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -1483,6 +1489,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.fast_readout",
     "model.address_ngram",
     "model.fast_units",
+    "train.init_from",
 )
 
 

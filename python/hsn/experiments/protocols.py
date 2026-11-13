@@ -644,7 +644,7 @@ def _train(
         summarize_v3,
     )
     from hsn.experiments.variants import install_variant
-    from hsn.runner import build_model, load_datasets, make_trainer
+    from hsn.runner import build_model, load_datasets, make_trainer, warm_start
 
     t0 = time.perf_counter()
     cfg = arm.cfg
@@ -691,6 +691,8 @@ def _train(
     arm.record["data_selection"] = data_selection  # retained if setup or training fails
     seed_everything(cfg.seed)
     model = build_model(cfg)
+    if cfg.train.init_from is not None:  # opt-in warm start: another run's weights, step 0
+        arm.record["init_from"] = warm_start(model, cfg.train.init_from)
     variant = install_variant(model, arm.variant, cfg.seed, arm.variant_params)  # before compile
     arm.record["variant"] = variant
     timer = _EvalTimer()

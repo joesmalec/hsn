@@ -79,6 +79,7 @@ from hsn.profiler import (
     ProfileReport,
 )
 from hsn.train.amp import autocast_ctx
+from hsn.train.checkpoint import load_checkpoint
 from hsn.train.compile import compile_window
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
 from hsn.train.probes import choose_probe_position, probe_window, window_split
@@ -93,6 +94,7 @@ __all__ = [
     "main",
     "make_power_meter",
     "make_trainer",
+    "warm_start",
     "model_hash",
     "parse_seeds",
     "profile_run",
@@ -153,6 +155,21 @@ def make_trainer(
     if isinstance(model, HSN):
         return TBPTTTrainer(model, cfg, ctx, profiler, run_dir=run_dir)
     return Trainer(model, cfg, ctx, profiler, run_dir=run_dir)
+
+
+def warm_start(model: nn.Module, path: str | Path) -> dict[str, Any]:
+    """``train.init_from``: load the weights of another run's checkpoint into ``model`` (strict
+    key match; the run's weight average when the checkpoint holds one) and nothing else. Call it
+    before the trainer is built, so the optimiser, the schedule and the new weight average start
+    from these weights at step 0. Returns what was loaded, for the run record."""
+    loaded = load_checkpoint(path, model, averaged=True)
+    extra = loaded.get("extra") or {}
+    return {
+        "path": str(path),
+        "step": int(loaded["step"]),
+        "config_hash": extra.get("config_hash"),
+        "averaged": extra.get("weight_ema") is not None,
+    }
 
 
 def _detach(state: Any) -> Any:
@@ -575,6 +592,8 @@ def run_one(
         train_ds, dev_ds = load_datasets(cfg)
         seed_everything(cfg.seed)
         model = build_model(cfg)
+        if cfg.train.init_from is not None:
+            logger.info("warm start: %s", warm_start(model, cfg.train.init_from))
         trainer = make_trainer(model, cfg, ctx, run_dir=run_dir)
         history: History = trainer.fit(train_ds, dev_ds, cfg.train.steps)
         train_report, serve_report = profile_run(

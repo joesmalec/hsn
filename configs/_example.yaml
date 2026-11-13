@@ -177,6 +177,7 @@ train: # Appendix A.3
   temperature_end: 1.0 # must equal temperature_start when temperature_steps = 0
   temperature_steps: 0
   unit_credit: softmax # softmax | executed (opt-in): the units a slot's straight-through unit weight differentiates
+  init_from: null # opt-in warm start: checkpoint of another run with the same parameters; its weights only, step 0
   ste_scope: selected # selected | all (opt-in): all trains the routed window on the masked round (every cell and unit)
   epsilon_start: 0.0 # exploration: one selected cell replaced by a random one with probability eps
   epsilon_end: 0.0 # must equal epsilon_start when epsilon_steps = 0
