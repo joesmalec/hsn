@@ -56,6 +56,21 @@ r_t      = mean of the routed (slow) slots' updated states only
 Without the key the fast cells are read like any selected cell: through `r` (now the mean of
 F + routed cells) and `q`.
 
+**`model.fast_units = fixed`** (added 12 Nov 2026, 21:30 MST, after the first results; needs
+`fast_cells > 0`; default `routed`). Fast cell `i` always runs unit `i mod M` instead of the
+unit the scorer ranks highest for it, with a constant one-hot unit weight in every gate mode
+(soft warm-up included).
+- Why: in the first three finished arms (`f4r_cutC`, `ts_f4r`, `ts_f4r_cutC`) the four fast
+  cells hold almost one vector: `rank_pr_fast/answer` is 1.1 to 1.25 of 4. They receive the
+  same `u` and `ε`, are all written at every position, and settle on the same unit; the mean
+  read `f` then carries one cell's worth of state. This is the cell symmetry the review of
+  white paper v1.2 found for all cells, at its plainest.
+- With fixed units the fast cells compute different functions of the same input, so they
+  differ by construction. Nothing is added: no parameter, no identity vector, no new input.
+  The slow cells and their routing are untouched, and the units stay shared (a slow cell may
+  still be routed to a unit a fast cell runs).
+- The fast cells' unit choice then has no gradient into the scorer.
+
 **What stays.** The persistent cells, the fixed sparse graph, the unit bank, ε, the convex tanh
 gate, the router, the addresses and `q` are unchanged. There is no attention over the sequence,
 no new persistent state, no second kind of cell equation, and no weight written in the
@@ -96,6 +111,19 @@ the group costs memory and is not adopted as it stands.
 A fast group that learns is expected to need the state gradient (A6 without `state`:
 `train.feedback_detach=[summary, eps, router]`), because under the full cut a cell is trained
 only for what the decoder reads at the same position. Both settings are run.
+
+## First results (12 Nov 2026, 21:15 MST; one seed each, 9,000 steps)
+
+| Arm | Result | Same slots, no fast group |
+| --- | --- | --- |
+| delayed, `F4R` + state gradient (`f4r_cutC`) | 99.2 %, later queries 98.4 % | `a_k12` 90.8 / 81.3 %; `a8_cutC` 91.7 % (3 seeds) |
+| TinyStories, `F4R` + state gradient | 1.060 bits per byte | `ts_k12` 1.130 |
+| TinyStories, `F4R`, full cut | 1.096 bits per byte | `ts_k12` 1.130 |
+
+`gate_slow/p50` on TinyStories is 0.49 to 0.53 (0.63 without the fast group): point 3 of the
+kill rule is **not** met on text alone, as expected where nothing has to be held. The controls
+that separate the fast group from twelve slots with the state gradient (`k12_cutC`,
+`ts_k12_cutC`) were still running when this was written.
 
 ## Tests
 

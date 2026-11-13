@@ -738,6 +738,11 @@ class HSN(nn.Module):
         controls of this step (:meth:`_controls` unless given)."""
         cfg = self.cfg
         gate, tau, epsilon, probes = self._controls() if controls is None else controls
+        fast: dict[str, Any] = {}  # A8: only named when set, so wrappers of select keep working
+        if cfg.fast_cells:
+            fast["reserved"] = cfg.fast_cells
+        if cfg.fast_units == "fixed":
+            fast["reserved_units"] = True
         return self.router.select(
             unit_logits,
             budget=cfg.budget,
@@ -751,7 +756,7 @@ class HSN(nn.Module):
             epsilon=epsilon,
             age=state.age if probes else None,
             dense_rows=dense_rows,
-            **({"reserved": cfg.fast_cells} if cfg.fast_cells else {}),  # A8
+            **fast,
         )
 
     def _score(

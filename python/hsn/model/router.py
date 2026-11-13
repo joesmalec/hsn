@@ -1131,6 +1131,7 @@ class Router(nn.Module):
         age: Tensor | None = None,
         dense_rows: Tensor | None = None,
         reserved: int = 0,
+        reserved_units: bool = False,
     ) -> Selection:
         """Select up to ``k_max`` (cell, unit) slots per row within ``budget`` (module docstring).
 
@@ -1140,6 +1141,8 @@ class Router(nn.Module):
         remaining cells. The straight-through threshold is taken among the remaining cells, the
         reserved cells' mask is the constant 1 (they have no selection gradient), and the probes
         never replace a reserved slot. ``0``: the decision as before, bit for bit.
+        ``reserved_units`` (``model.fast_units = fixed``): reserved cell ``i`` runs unit ``i mod
+        M`` instead of its best unit, with a constant one-hot unit weight in every gate mode.
 
         ``logits`` are the scorer's ``[B, N, M]`` on the router's device; ``budget`` is ``B_t`` as
         a fraction of the dense step (finite, >= 0); ``0 <= k_min <= k_max <= N`` with
@@ -1182,6 +1185,8 @@ class Router(nn.Module):
                 )
             if reserved >= k_max:
                 raise ValueError(f"reserved={reserved} must be < k_max={k_max}")
+        elif reserved_units:
+            raise ValueError("reserved_units needs reserved > 0")
         age_t = self._check_age(age, mode, B, N, logits.device)
         dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
         if generator is not None and not (mode == "random" or epsilon > 0.0 or gate == "reinforce"):
@@ -1201,6 +1206,11 @@ class Router(nn.Module):
                 cells, units, order = self._gumbel_topk(scores_d, k_max, tau, generator)
             elif reserved:
                 cells, units = self._topk(scores_d, k_max, reserved)
+                if reserved_units:  # fast cell i runs unit i mod M
+                    fixed_units = torch.arange(reserved, device=units.device) % M
+                    units = torch.cat(
+                        [fixed_units[None, :].expand(B, reserved), units[:, reserved:]], dim=1
+                    )
             else:
                 cells, units = self._topk(scores_d, k_max)
             cells, units, valid = self._truncate(cells, units, budget_f)
@@ -1241,6 +1251,7 @@ class Router(nn.Module):
             refreshed=refreshed,
             dense=dense,
             reserved=reserved,
+            reserved_units=reserved_units,
         )
         return self._tapped(selection)
 
@@ -1695,6 +1706,7 @@ class Router(nn.Module):
         dense: Tensor | None,
         executed_scores: bool = False,
         reserved: int = 0,
+        reserved_units: bool = False,
     ) -> Selection:
         """The gradient-path tensors of a sparse decision (module docstring) and the Selection.
 
@@ -1751,6 +1763,10 @@ class Router(nn.Module):
                     hard_mask + (soft_mask - soft_mask.detach())
                     if scored and gate == "ste"
                     else hard_mask
+                )
+            if reserved_units:  # the fast cells' unit is fixed: a constant one-hot weight
+                unit_weights = torch.cat(
+                    [unit_hard[:, :reserved], unit_weights[:, reserved:]], dim=1
                 )
         cost = self._executed_cost(units, valid)
         dense_cost = self._dense_cost

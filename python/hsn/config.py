@@ -274,6 +274,11 @@ class ModelConfig(_StrictModel):
     # f = mean of the fast cells. S reads [z; q; ctx; f_{t-1}], the decoder reads [q; u; r; f],
     # and the selected-cell readout r covers the routed (slow) slots only.
     fast_readout: bool = False
+    # fast_units (needs fast_cells > 0): which unit a fast cell runs. "routed": the unit the
+    # scorer ranks highest for it, as for every cell. "fixed": fast cell i always runs unit
+    # i mod n_units, so the fast cells differ by construction (with "routed" they receive the
+    # same input, settle on one unit and hold one vector: rank 1.1 to 1.25 of 4, 12 Nov 2026).
+    fast_units: Literal["routed", "fixed"] = "routed"
     # --- end A8 ---
     # --- Amendment A9 (docs/amendments/A9_ngram_address.md; opt-in, needs key_address) ---
     # address_ngram = n > 1 adds, for every m in 2..n, two scorer features per cell: the
@@ -362,6 +367,8 @@ class ModelConfig(_StrictModel):
                     f"model.disabled_cells {fast_disabled} lie in the fast group "
                     f"[0, {self.fast_cells})"
                 )
+        if self.fast_units != "routed" and not self.fast_cells:
+            raise ValueError(f"model.fast_units={self.fast_units!r} requires model.fast_cells > 0")
         if self.address_ngram > 1 and not self.key_address:
             raise ValueError(
                 f"model.address_ngram={self.address_ngram} requires model.key_address=true"
@@ -1475,6 +1482,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.fast_cells",
     "model.fast_readout",
     "model.address_ngram",
+    "model.fast_units",
 )
 
 

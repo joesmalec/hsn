@@ -465,3 +465,147 @@ def test_trained_state_reports_the_gate_by_group() -> None:
     pooled = gates[written]
     pooled = pooled[~torch.isnan(pooled)]
     assert stats["gate/mean"] == pytest.approx(float(pooled.mean()), rel=1e-6)
+
+
+# --------------------------------------------------------------------------------------------------
+# model.fast_units = fixed: fast cell i runs unit i mod M
+# --------------------------------------------------------------------------------------------------
+
+PINNED = (*READ, "model.fast_units=fixed")
+
+
+def test_fast_units_is_opt_in_and_needs_fast_cells() -> None:
+    base = load_config(RECIPE_A6)
+    assert base.model.fast_units == "routed"
+    assert config_hash(load_config(RECIPE_A6, ["model.fast_units=routed"])) == config_hash(base)
+    on = ["model.k_select=12", "model.fast_cells=4"]
+    assert config_hash(load_config(RECIPE_A6, [*on, "model.fast_units=fixed"])) != config_hash(
+        load_config(RECIPE_A6, on)
+    )
+    with pytest.raises(ValueError, match="requires model.fast_cells"):
+        load_config(RECIPE_A6, ["model.fast_units=fixed"])
+
+
+@pytest.mark.parametrize("gate", [None, "ste", "soft"])
+def test_reserved_units_are_fixed_in_every_gate_mode(gate: str | None) -> None:
+    router = _router(_fast_cfg())
+    B, N, M, K = 7, 6, 3, 4
+    reserved = 3  # more than F on purpose: unit ids are i mod M
+    logits = _logits(B, N, M, seed=11).requires_grad_(gate is not None)
+    kw = dict(budget=1.0, k_max=K, k_min=1, mode="topk", gate=gate, reserved=reserved)
+    free = router.select(logits, **kw)
+    sel = router.select(logits, **kw, reserved_units=True)
+    want = torch.arange(reserved) % M
+    assert torch.equal(sel.unit_idx[:, :reserved], want.expand(B, reserved))
+    assert torch.equal(sel.cell_idx, free.cell_idx)  # the cells are chosen as before
+    assert torch.equal(sel.unit_idx[:, reserved:], free.unit_idx[:, reserved:])
+    one_hot = torch.nn.functional.one_hot(want, M).float().expand(B, reserved, M)
+    assert torch.equal(sel.unit_weights.detach()[:, :reserved], one_hot)
+    assert torch.equal(
+        sel.unit_weights.detach()[:, reserved:], free.unit_weights.detach()[:, reserved:]
+    )
+    assert torch.equal(sel.alpha.detach()[:, :reserved], torch.ones(B, reserved))
+    if gate is not None:
+        (grad,) = torch.autograd.grad(
+            sel.unit_weights[:, :reserved].sum(), logits, allow_unused=True, retain_graph=True
+        )
+        assert grad is None or float(grad.abs().max()) == 0.0
+    with pytest.raises(ValueError, match="reserved_units needs reserved"):
+        router.select(logits, budget=1.0, k_max=K, k_min=1, mode="topk", reserved_units=True)
+
+
+@pytest.mark.parametrize("phase", ["soft", "ste", "eval"])
+def test_pinned_fast_cells_run_their_units_and_differ(phase: str) -> None:
+    cfg = _cfg(*A5, *PINNED, "train.soft_until_step=5")
+    model = _model(cfg)
+    tokens, ctx, reset = _window(cfg)
+    if phase == "eval":
+        model.eval()
+    else:
+        model.set_train_step(0 if phase == "soft" else 10)
+    B, T = tokens.shape
+    with torch.no_grad():
+        _, _, info = model(tokens, ctx, model.init_state(B), reset, capture=True)
+    assert torch.equal(
+        info["unit_idx"][:, :, :F], (torch.arange(F) % cfg.model.n_units).expand(B, T, F)
+    )
+    assert bool(info["cell_written"][:, :, :F].all())
+    # from a zero state the routed fast cells of this model stay close; pinned ones do not
+    h = info["cell_states"][:, -1, :F]
+    assert float((h[:, 0] - h[:, 1]).abs().max()) > 1e-3
+
+
+def test_pinned_window_matches_stepping() -> None:
+    cfg = _cfg(*A5, *PINNED)
+    model = _model(cfg).eval()
+    tokens, ctx, reset = _window(cfg)
+    B, T = tokens.shape
+    with torch.no_grad():
+        logits, final, _ = model(tokens, ctx, _start(model, B), reset)
+        state, steps, prev = _start(model, B), [], None
+        for t in range(T):
+            state = state.reset(reset[:, t])
+            out = model.step(tokens[:, t], ctx[:, t], state, prev_tokens=prev)
+            state, prev = out.state, tokens[:, t]
+            steps.append(out.logits)
+    torch.testing.assert_close(torch.stack(steps, dim=1), logits, rtol=1e-9, atol=1e-11)
+
+
+def test_pinned_masked_round_equals_the_sparse_round() -> None:
+    """The soft warm-up runs the masked round; with hard gates both rounds must write the same
+    values, so the fixed unit is the same unit on both paths."""
+    cfg = _cfg(*A5, *PINNED)
+    model = _model(cfg).eval()
+    tokens, ctx, _ = _window(cfg)
+    state = _start(model, cfg.train.batch)
+    with torch.no_grad():
+        sparse = model.step(tokens[:, 0], ctx[:, 0], state, mode="sparse")
+        masked = model.step(tokens[:, 0], ctx[:, 0], state, mode="masked")
+    torch.testing.assert_close(sparse.state.h, masked.state.h, rtol=1e-9, atol=1e-11)
+    torch.testing.assert_close(sparse.logits, masked.logits, rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize("name", list(COMPILED))
+@pytest.mark.usefixtures("small_blocks")
+def test_pinned_compiled_window_equals_eager(name: str) -> None:
+    overrides, training = COMPILED[name]
+    cfg = p28._cfg(
+        "model.routing=topk",
+        "model.key_address=true",
+        "model.selected_readout=true",
+        *overrides,
+        *PINNED,
+    )
+    model = p28._model(cfg, training=training, scale=0.3)
+    ctx = p28._ctx()
+    window = p28._window(model, ctx)
+    tokens, cx, state, reset = p28._case_inputs(model, True)
+    ref = p28._run(lambda: model(tokens, cx, state, reset))
+    got = p28._run(lambda: window(tokens, cx, state, reset))
+    tol = p28.TOL[(ctx.device.type, "fp32")]
+    diff = p28._max_diff(got, ref)
+    assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], diff
+    if training:
+        assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"]
+
+
+def test_recipe_with_pinned_fast_cells_trains(tmp_path: Path) -> None:
+    steps = 30
+    cfg = hsn_config(
+        steps,
+        *A5,
+        ALL,
+        "model.cand_norm=rms",
+        "model.n_cells=6",
+        "model.k_select=4",
+        "train.soft_until_step=5",
+        "train.lr=3e-3",
+        "model.fast_cells=2",
+        "model.fast_readout=true",
+        "model.fast_units=fixed",
+    )
+    trainer = hsn_trainer(cfg, tmp_path / "run")
+    history = trainer.fit(*datasets(), steps)
+    losses = [s.loss for s in history.steps]
+    assert len(losses) == steps and all(math.isfinite(x) for x in losses)
+    assert sum(losses[-5:]) / 5 < sum(losses[:5]) / 5 - 0.05
