@@ -3,8 +3,8 @@
 # Why: the dev and the test keys of synthetic_hold (and of synthetic_v1 and synthetic_keys) have
 # been scored again and again while recipes and amendments were chosen. A number on them is a
 # development number. The user's review of the HSN-T white paper (14 Nov 2026) asks for a final
-# set that selection has never touched; the decision of the same day is to score it once per
-# gate claim (python -m hsn.eval.final_test keeps the ledger, docs/final_test_ledger.jsonl).
+# set that selection has never touched; it is scored in one preregistered campaign, after which
+# it is spent (python -m hsn.eval.final_test: freeze, then run; docs/final_test.md).
 #
 # What is new in it:
 #   the key alphabet   bytes 32 to 47 as the "test" keys. No key, value, filler or marker of
