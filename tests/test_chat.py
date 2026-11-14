@@ -270,6 +270,37 @@ def test_terminal_stop_and_overlap(session, monkeypatch):
         release.set()
 
 
+def test_terminal_status_refresh_stops_with_status_line(session):
+    """No status refresh may run once the status line has left the DOM.
+
+    App.run_test exits through App._shutdown, which prunes the screen's widgets while the App's
+    own timers still run (they stop afterwards, and Timer._tick skips only after App.exit). A
+    sibling that takes longer than the refresh interval to unmount holds the screen half-pruned
+    with #status already gone, as a slow or busy runner does for a few milliseconds: a refresh
+    timer that is not tied to #status then fails with NoMatches on exit.
+    """
+    pytest.importorskip("textual")
+    from hsn.chat.app import ChatApp
+    from textual.widgets import Static
+
+    class SlowToUnmount(Static):
+        async def on_unmount(self) -> None:
+            await asyncio.sleep(2 * ChatApp.STATUS_REFRESH)
+
+    class SlowExitApp(ChatApp):
+        def compose(self):
+            yield from super().compose()
+            yield SlowToUnmount()
+
+    async def exercise():
+        app = SlowExitApp(lambda: session)
+        async with app.run_test():
+            await app.workers.wait_for_complete()
+            assert app.session is session
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("device", ["cuda", "mps"])
 def test_accelerator_smoke(session, device):
     available = torch.cuda.is_available() if device == "cuda" else torch.backends.mps.is_available()
