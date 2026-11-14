@@ -719,6 +719,14 @@ class TrainConfig(_StrictModel):
     # text, where no position is marked as an answer; it shows whether a failure to bind is a
     # matter of loss balance. Hashed when set; the split and fused windows refuse it.
     answer_weight: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    # Opt-in diagnostic (14 Nov 2026), training only, needs model.address_gate (A12): the gate's
+    # weights ``G`` are trained for this many optimiser steps and keep their value from then on
+    # (every later step is undone for ``G`` alone, its weight decay included; everything else
+    # trains as before). It tests where a long run's fitting to the training keys sits: in the
+    # hold-out runs of 14 Nov the 18,000-step model with its 9,000-step ``G`` scored 94.7 % on
+    # unseen keys against 85.8 % with its own. null (default): off, bit for bit. Hashed when
+    # set.
+    address_gate_hold_step: int | None = Field(default=None, ge=0)
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -1230,6 +1238,11 @@ class RunConfig(_StrictModel):
             )
         if routing in ("dense", "random", "fixed") and train.route_guard.enabled:
             raise ValueError("train.route_guard requires learned routing (topk or greedy_budget)")
+        if train.address_gate_hold_step is not None and not self.model.address_gate:
+            raise ValueError(
+                "train.address_gate_hold_step holds the weights of model.address_gate (A12); "
+                "set model.address_gate=true or leave it at null"
+            )
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
         # --- Amendment A8: the fast group is a rule of the scored hard/soft selection only ---
         if self.model.fast_cells and train.gate_mode == "reinforce":
@@ -1568,6 +1581,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.cell_units",
     "model.scorer_position",
     "model.address_gate",
+    "train.address_gate_hold_step",
 )
 
 

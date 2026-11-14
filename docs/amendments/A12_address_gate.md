@@ -143,6 +143,64 @@ What the gate does not fix, and one cost:
 - The windows: the split and fused windows still refuse the key, so every run with it is on the
   autograd window (229 to 238 ms per step for the combined shape).
 
+## The hold-out runs of 14 Nov 2026: the fitting to the training keys sits in `G`
+
+Two runs on `synthetic_hold` (key-value with one-byte keys; delayed recall with two-byte keys,
+a quarter of all key pairs in no split): 8 fast + 12 routed slots, 64 cells, two-byte address,
+`wrap`, state gradient, 18,000 steps, autograd window. Checkpoints scored on fresh documents,
+600 per condition (`/home/joe/hsn-handoff/hold_eval.py`; about 1,400 answers each, so one
+standard error is 0.3 points near 99 % and 0.8 near 91 %):
+
+| Run, step | delayed: seen pairs | new pairs of seen bytes | never-seen bytes | kv: train keys | dev keys | test keys |
+| --- | --- | --- | --- | --- | --- | --- |
+| gate, 9,000 | 99.2 | 98.8 | 96.8 | 98.5 | 98.1 | 98.5 |
+| gate, 18,000 | 99.1 | 99.0 | 96.0 | 98.3 | 84.2 | 87.3 |
+| no gate, 9,000 | 90.8 | 92.7 | 92.0 | 91.9 | 91.9 | 91.5 |
+| no gate, 18,000 | 93.3 | 93.8 | 94.1 | 95.5 | 96.1 | 95.5 |
+
+- **New combinations of seen key bytes score like seen pairs**, with and without the gate. The
+  model does not learn the trained pairs by heart.
+- **With the gate, key-value recall on unseen keys loses 11 to 14 points between 9,000 and
+  18,000 steps while the training keys stay.** The run's dev curve (dev keys): 98.1 at 10,500,
+  96.7 at 15,000, then 91.7 and 87.6: the loss is in the last fifth of the schedule, where the
+  rate decays (from step 14,400). Without the gate there is no gap and no fall, at a lower level.
+- So the long runs have two different late events. Without the gate the writes drift to the
+  value's address and training keys and new keys fall alike ("Cause"). The gate stops that and
+  can fit the training keys.
+
+**Where the fitting sits.** The 18,000-step model of the gate run with single groups of
+parameters set to their 9,000-step values (key-value answers, 300 fresh documents each;
+`/home/joe/hsn-handoff/hold_overlap.py` for the measure):
+
+| The 18,000-step model with | Training keys | Unseen keys |
+| --- | --- | --- |
+| its own weights | 98.3 | 85.8 |
+| `G` of step 9,000 | 98.6 | 94.7 |
+| the scorer's weights and `G` of step 9,000 | 98.9 | 92.0 |
+| `G` half-way between the two steps | 99.3 | 92.5 |
+| the byte embedding of step 9,000 | 94.0 | 77.6 |
+| the decoder of step 9,000 | 97.2 | 84.5 |
+| `G` scaled to its norm at 9,000 | 98.3 | 87.7 |
+| `G` cut to rank 4 (rank 2, 8, 16) | 98.0 (96.3, 97.6, 98.3) | 91.3 (87.2, 87.9, 86.9) |
+| `G` set to zero | 35.6 | 46.3 |
+
+- About nine of the 12.5 points come back with the 2,048 weights of `G` alone. It is the
+  direction `G` moved in, not its size, and it is not a matter of rank (`G` has about 13 of 32
+  directions in use at both steps).
+- At the queried key the model selects fewer of the cells the fact was written to: for unseen
+  keys 71.7 % of the read cells at 9,000 steps and 58.6 % at 18,000 (training keys 75.7 and
+  68.3 %).
+- This is the limit of "nothing about any key is learned" (section "The change"): the addresses
+  are fixed, but `G` reads `u_t`, which carries the byte, and can weight an address feature
+  differently for the bytes it was trained on.
+
+**A diagnostic, not a fix yet: `train.address_gate_hold_step`** (default null: off, bit for
+bit; hashed when set; needs `model.address_gate`). `G` is trained for that many optimiser steps
+and keeps its value from then on: every later step is undone for `G` alone, everything else
+trains as before. Arms: the gate run with `G` held from step 9,000, and the gate run with the
+rate held constant to the end (the fall began where the decay begins). Either would be a
+training setting; a change of what `G` reads would be an amendment of its own.
+
 ## Tests
 
 `tests/test_a12_address_gate.py`: opt-in and hashing; scope (key address, linear scorer; the
@@ -151,4 +209,6 @@ other parameter starts as before; the logits against a direct computation and a 
 the linear scorer; a unit following an address at one content and not at another; a zero gate
 is the model without the key (evaluation and straight-through); the window against stepping
 and the masked round against the sparse one; the task loss reaches the gate; the compiled
-window against the eager one; thirty training steps.
+window against the eager one; thirty training steps; `train.address_gate_hold_step` (opt-in and
+hashing, needs the gate, the gate unchanged from its step bit for bit while the scorer's own
+weights go on, the run before the step equal to the run without the key, a hold at step 0).

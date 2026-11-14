@@ -243,3 +243,64 @@ def test_recipe_with_the_address_gate_trains(tmp_path: Path) -> None:
     model = trainer.model
     assert isinstance(model, HSN) and model.scorer.address_gate is not None
     assert float(model.scorer.address_gate.weight.abs().sum()) > 0.0  # it left its zero start
+
+
+# --- train.address_gate_hold_step (opt-in diagnostic): the gate's weights held from a step ---
+
+HOLD = "train.address_gate_hold_step"
+
+
+def test_gate_hold_is_opt_in_hashed_only_when_set_and_needs_the_gate() -> None:
+    base = load_config(RECIPE_A6, list(GATE))
+    assert base.train.address_gate_hold_step is None
+    assert config_hash(load_config(RECIPE_A6, [*GATE, f"{HOLD}=null"])) == config_hash(base)
+    assert config_hash(load_config(RECIPE_A6, [*GATE, f"{HOLD}=6"])) != config_hash(base)
+    with pytest.raises(ValueError, match="address_gate_hold_step"):
+        load_config(RECIPE_A6, [f"{HOLD}=6"])  # no gate to hold
+
+
+def _gate_run(run_dir: Path, steps: int, *extra: str) -> list[tuple[Tensor, Tensor]]:
+    """The gate's weights and the scorer's own weights after every optimiser step."""
+    cfg = hsn_config(
+        steps,
+        *A5,
+        ALL,
+        "model.cand_norm=rms",
+        "model.n_cells=6",
+        "model.k_select=4",
+        "train.soft_until_step=2",
+        "train.lr=3e-3",
+        *GATE,
+        *extra,
+    )
+    trainer = hsn_trainer(cfg, run_dir)
+    model = trainer.model
+    assert isinstance(model, HSN) and model.scorer.address_gate is not None
+    gate, own = model.scorer.address_gate.weight, model.scorer.net.weight
+    after: list[tuple[Tensor, Tensor]] = []
+    trainer.update_post_hooks.append(
+        lambda _: after.append((gate.detach().clone(), own.detach().clone()))
+    )
+    trainer.fit(*datasets(), steps)
+    assert len(after) == steps
+    return after
+
+
+def test_gate_hold_keeps_the_gate_from_its_step(tmp_path: Path) -> None:
+    steps, hold = 12, 6
+    held = _gate_run(tmp_path / "held", steps, f"{HOLD}={hold}")
+    free = _gate_run(tmp_path / "free", steps)
+    at_hold = held[hold - 1][0]
+    assert float(at_hold.abs().sum()) > 0.0  # trained up to the hold step ...
+    for gate, _ in held[hold:]:
+        assert torch.equal(gate, at_hold)  # ... and unchanged from it, bit for bit
+    assert not torch.equal(held[-1][1], held[hold - 1][1])  # the scorer's own weights go on
+    # up to the hold step the run is the run without the key; without it the gate goes on
+    for (gate, own), (gate_free, own_free) in zip(held[:hold], free[:hold], strict=True):
+        assert torch.equal(gate, gate_free) and torch.equal(own, own_free)
+    assert not torch.equal(free[-1][0], free[hold - 1][0])
+
+
+def test_gate_hold_at_zero_keeps_the_zero_start(tmp_path: Path) -> None:
+    after = _gate_run(tmp_path / "zero", 6, f"{HOLD}=0")
+    assert all(bool((gate == 0).all()) for gate, _ in after)
