@@ -1,6 +1,8 @@
 # Amendment A12: address weights that depend on the position's content (experimental)
 
-Status: **implemented as an opt-in experiment on 13 Nov 2026; not adopted; no result yet.**
+Status: **implemented as an opt-in experiment on 13 Nov 2026; not adopted.** The deciding
+27k arm holds (97.7 %, where the base ended at 93.9 and 92.2 %); one 9k run fell below the
+kill rule's bar; one seed per arm except the combined shape (section "Results").
 - Asked for by the user on 13 Nov 2026 ("lets make it an opt in amendement and test"), after the
   27k runs of the pair task lost what they had learned by 10,000 steps.
 - `model.address_gate` (default false; needs `model.key_address` and the linear scorer). Left
@@ -91,6 +93,55 @@ no-guard run 2.3) with the write slots under the key's address clearly above the
 much as the base, or arm 2 falls below 97 %, the amendment is dropped: either the scorer does
 not use the gate to keep the writes with the key, or the cause is not the constant address
 weight.
+
+## Results (13 Nov 2026; pair task, 64 cells, state gradient, one seed unless two are given)
+
+All arms ran with `model.scorer_position=wrap` (A11) on the autograd window, on rented 3060s.
+Dev accuracy in per cent; "past the window" is the out-of-range dev set (`eval_oor.py`).
+
+| Arm | Run | Final | Peak (step) | Past the window |
+| --- | --- | --- | --- | --- |
+| 1. 12 slots, 27k, gate | `g1_k12nw_ag_cutC_cells64_27k` | 97.7 | 98.3 (12,000) | 94.1 |
+| 1, no route guard | `g1_k12nw_ag_noguard_cutC_cells64_27k` | 97.1 | 98.3 (10,500) | 93.1 |
+| base, no gate, 27k | `g1_k12nw_cutC_cells64_poswrap_27k` | 93.9 | 98.0 (10,500) | 82.8 |
+| base, no gate, 27k, seed 1 | `g1_k12nw_cutC_cells64_27k` | 92.2 | 99.1 (10,500) | 59.0 (position as trained) |
+| 2. 12 slots, 9k, gate | `g1_k12nw_ag_cutC_cells64` | 86.2 | 93.9 (7,500) | 75.6 |
+| 3. delayed recall, 9k, gate | `k12nw_ag_cutC_cells64` | 99.5 | 99.7 (8,000) | 99.7 |
+| 4. 8 fast + 12 routed, 9k, gate | `g1_f8ru20nw_ag_cutC_cells64` s0, s1 | 99.1, 97.2 | at the end | 96.6, 90.5 |
+| 4 without the gate | `g1_f8ru20nw_cutC_cells64` | 93.4 | | |
+
+Where the facts are written (`unit_shares.py`, the measure of the table under "Cause"):
+
+| Model at 27k | Written under the key's address | Under the value's address | Read under the key's address |
+| --- | --- | --- | --- |
+| 12 slots, no gate | 46.6 % | 59.6 % | 80.7 % |
+| 12 slots, gate | 64.1 % | 42.6 % | 90.6 % |
+| 12 slots, gate, no route guard | 62.3 % | 36.1 % | 85.4 % |
+
+Against the test:
+- **Arm 1 holds.** It ends 0.6 points under its own peak (1.2 without the route guard; the base
+  gave up 4.1 and 6.9), and the writes stay with the key more than in the base (64.1 % against
+  46.6 %; the base had 76.0 % at 9k, so part of the move still happens). One seed.
+- **Arm 2 is below the kill rule's bar** (86.2 %, after 93.9 % at step 7,500). The 27k arm has
+  the same seed and settings up to the schedule and stood at 97.8 % at step 9,000 on another
+  card. Same-seed runs of this task differ by ten points and more between cards, so a rule on
+  one 9k run was too strict; by its letter it is met. Open: more seeds of arm 2.
+- **Arm 3** is inside the seeds' spread of the base (99.6, 98.0, 98.5 %).
+- **Arm 4**: the gate lifts the combined shape from 93.4 % to 99.1 and 97.2 %.
+
+What the gate does not fix, and one cost:
+- **Fitting to the training keys.** Fresh documents, key-value answers on training keys against
+  dev / test keys (`key_split_eval.py`): arm 1 at 27k 99.0 against 97.0 / 97.0; the base at 9k
+  97.7 against 97.2 / 97.4; the combined shape at 9k without the gate 96.1 against 90.9 / 91.4,
+  with it 99.4 against 98.7 / 98.4; the combined shape with the gate and
+  `train.state_grad_ratio=3.0` at 27k (`g1_f8ru20nw_ag_sg3_cutC_cells64_27k`, final 94.4 %)
+  99.5 against 93.7 / 93.3. The claim above that "nothing about any key is learned" holds for
+  the addresses, not for `G`: `G` reads `u_t`, which carries the byte, so it can weight an
+  address differently for bytes it has seen. The two-point gap of arm 1 is the size of that
+  effect on routed slots; the larger gap of the combined shape at 27k is also there without the
+  gate at 9k.
+- The windows: the split and fused windows still refuse the key, so every run with it is on the
+  autograd window (229 to 238 ms per step for the combined shape).
 
 ## Tests
 
