@@ -272,13 +272,33 @@ class DelayedParams(_Params):
     # that give ``n`` distinct keys), so keys of one document share their bytes and no single
     # byte identifies a key.
     key_len: int = Field(default=1, ge=1, le=4)
+    # Pair hold-out (13 Nov 2026; key_len = 2 only). hold_mod = m >= 2 divides the key pairs
+    # (k_1, k_2) by (k_1 + k_2) mod m. With hold_role "exclude" no key of a document has
+    # remainder 0; with "only" every key has. A model trained on "exclude" documents has seen
+    # every key byte in both positions and none of the held pairs, so "only" documents of the
+    # same split test new combinations of seen bytes, apart from bytes never seen at all (the
+    # dev and test key ranges). The grid is one symbol wider per position than without the
+    # hold-out. 0 (default): no hold-out, the documents of before, symbol for symbol.
+    hold_mod: int = Field(default=0, ge=0)
+    hold_role: Literal["exclude", "only"] = "exclude"
 
     @model_validator(mode="after")
     def _check(self) -> Self:
         _check_disjoint(
             [*_check_keys(self.keys), ("values", self.values), ("filler", self.filler)], []
         )
+        if self.hold_mod == 1 or (self.hold_mod and self.key_len != 2):
+            raise ValueError(
+                f"hold_mod={self.hold_mod} must be 0 or >= 2 and needs key_len=2, got "
+                f"key_len={self.key_len}"
+            )
+        if self.hold_role != "exclude" and not self.hold_mod:
+            raise ValueError(f"hold_role={self.hold_role!r} needs hold_mod >= 2")
         return self
+
+    def held(self, key: Sequence[int]) -> bool:
+        """Whether ``key`` (two symbols) is a held pair: ``(k_1 + k_2) mod hold_mod == 0``."""
+        return bool(self.hold_mod) and (int(key[0]) + int(key[1])) % self.hold_mod == 0
 
     def grid_side(self, n: int) -> int:
         """The fewest symbols per key position that give ``n`` distinct keys of ``key_len``."""
@@ -830,6 +850,8 @@ class _Delayed(_Generator[DelayedParams]):
     def validate(self, spec: TaskSpec, params: DelayedParams) -> None:
         super().validate(spec, params)
         need = params.max_facts if params.key_len == 1 else params.grid_side(params.max_facts)
+        if params.hold_mod:
+            need += 1  # the hold-out's grid is one symbol wider
         for split in SPLITS:
             lo, hi = params.keys[split]
             if hi - lo < need:
@@ -862,6 +884,8 @@ class _Delayed(_Generator[DelayedParams]):
         keys: list[list[int]]
         if klen == 1:  # synthetic_v1's draw, unchanged
             keys = [[k] for k in (key_lo + rng.choice(key_hi - key_lo, size=n, replace=False))]
+        elif params.hold_mod:  # pairs of one kind only: held ("only") or not held ("exclude")
+            keys = self._held_keys(params, rng, key_lo, key_hi, n)
         else:  # n distinct cells of a side^klen grid of key symbols (class docstring)
             side = params.grid_side(n)
             axes = [
@@ -920,6 +944,30 @@ class _Delayed(_Generator[DelayedParams]):
         if tokens.shape[0] != length:
             raise RuntimeError(f"delayed: assembled {tokens.shape[0]} symbols, wanted {length}")
         return tokens, positions, deps
+
+    @staticmethod
+    def _held_keys(
+        params: DelayedParams, rng: np.random.Generator, key_lo: int, key_hi: int, n: int
+    ) -> list[list[int]]:
+        """``n`` distinct key pairs of the hold-out's kind from one grid: the cells of a
+        ``side x side`` grid (``side`` one more than without the hold-out) that are held
+        (``hold_role = only``) or not held (``exclude``); the grid is redrawn until it has ``n``
+        such cells, so the keys of a document still share their bytes."""
+        side = params.grid_side(n) + 1
+        want = params.hold_role == "only"
+        for _ in range(10_000):
+            axes = [
+                (key_lo + rng.choice(key_hi - key_lo, size=side, replace=False)).tolist()
+                for _ in range(2)
+            ]
+            cells = [[a, b] for a in axes[0] for b in axes[1] if params.held((a, b)) == want]
+            if len(cells) >= n:
+                picked: list[int] = rng.choice(len(cells), size=n, replace=False).tolist()
+                return [cells[i] for i in picked]
+        raise RuntimeError(
+            f"delayed: no grid of side {side} with {n} {params.hold_role!r} pairs in "
+            f"[{key_lo}, {key_hi}) for hold_mod={params.hold_mod}"
+        )
 
     def solve(self, params: DelayedParams, tokens: U8) -> Solved:
         is_key = _byte_table(list(params.keys.values()))

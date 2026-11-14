@@ -89,6 +89,33 @@ arms hold past the window at their in-range level. **Kill rule:** if a bounded p
 more than 0.02 bits per byte on TinyStories with both `clamp` and `wrap`, the key stays an
 evaluation setting for document tasks and is not proposed for the base.
 
+## Results of the trained arms (13 Nov 2026)
+
+1. **TinyStories** (12 slots, 32 cells, state gradient, 9,000 steps; bits per byte):
+   `ts_k12_cutC_poswrap` 1.039, `ts_k12_cutC_posclamp` 1.041, against 1.054 / 1.067 with the
+   document position. A bounded position costs nothing on text; the kill rule is not met.
+2. **Longer training, 64 cells, 12 slots, `wrap`, 27,000 steps** (in range / past the window):
+   - delayed, `k12nw_cutC_cells64_poswrap_27k`: 99.8 / 99.9 %. Holds.
+   - pair, `g1_k12nw_cutC_cells64_poswrap_27k`: 93.9 / 82.8 % (key-value 78.8, delayed 97.3
+     past the window). The in-range score is the long-run fall of the pair task (peak 98.0 %
+     at step 10,500; A12's subject), not the position. With A12's gate and `wrap`:
+     97.7 / 94.1 %.
+3. **Training on both document lengths with `wrap`** (`g1_k12nw_cutC_cells64_both_poswrap`,
+   9,000 steps): 91.8 % on in-range documents, 82.4 % past the window, still rising at the
+   end. Slower than training in range only (98 %) and no better past the window than the
+   in-range models evaluated with `wrap` (92.8 %).
+4. **Removing the feature is not the fix.** Trained without it, in range:
+   `g1_a8nw_cutC_cells64_nopos` 60.6 %, `g1_k12nw_cutC_cells64_nopos` 84.2 % (with it 98 %);
+   delayed alone does not need it (`k12nw_cutC_cells64_nopos` 99.1 %).
+5. **What remains past the window with `wrap`** (key-value 88 to 96 % where in-range is 94 to
+   99 %): errors at numbers of later writes on other keys that no training document has
+   (`kv_errors.py`), not the position.
+
+The user's decision of 13 Nov: carry `wrap` forward in the candidate runs. Not adopted in a
+recipe file. The split and fused windows still refuse the key; a run trained on in-range
+documents is the same model with `document` and with `wrap`, so it can train with the default
+and be evaluated with `wrap`.
+
 ## Tests
 
 `tests/test_a11_position_bound.py`: opt-in and hashing; the split and fused windows refuse the

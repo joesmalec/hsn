@@ -135,6 +135,31 @@ out of range (facts 272 to 768 bytes back; trained in range only), per cent:
   windows implement. Open: `k2_a8_cutC` (eight slots, state gradient, one byte; queued) and
   three-byte keys with the state gradient.
 
+## Width with twelve slots and the state gradient (13 Nov 2026; 9,000 steps)
+
+The user's decision of 13 Nov: A9 goes into the base, the width after a test of three bytes.
+Dev accuracy in per cent, one seed unless more are given:
+
+| Task | 1 byte | 2 bytes | 3 bytes |
+| --- | --- | --- | --- |
+| Delayed, one-byte keys (`k12_cutC`, `k12_ng2_cutC`, `k12_ng3_cutC`) | 98.5 / 99.1 / 95.5 | 98.6 | 99.1 |
+| `delayed2`, two-byte keys (`k2_k12_…`) | 91.6 | 92.3 | 97.3 |
+| `delayed3`, three-byte keys (`k3_k12_…`) | 79.6 | 94.0 | 95.8 |
+| Pair task, 64 cells (`g1_k12nw_cutC_cells64…`) | 98.0 / 98.6 / 98.3 | 97.4 | 65.4 |
+| TinyStories, bits per byte (`ts_k12_…`) | 1.054 / 1.067 | 1.046 | not run |
+
+- Eight slots, state gradient, one-byte address on two-byte keys (`k2_a8_cutC`, open above):
+  88.9 %.
+- **Two bytes cost nothing that shows** (delayed, pair, text) and lift three-byte keys from
+  79.6 to 94.0 %.
+- **Three bytes** are best on keys of two and three bytes and end at 65.4 % on the pair task at
+  64 cells (one seed; delayed 75.6, key-value 61.5). Until that is understood or repeated, two
+  bytes is the width to carry.
+- Past the window, pair task with two bytes: 83.5 % with the position as trained, 91.5 %
+  wrapped (A11); the one-byte address wrapped: 92.8 / 93.0 / 93.0 %.
+- Open: arithmetic with two bytes (`arith_k12_ng2_cutC`, queued), a second seed of the
+  three-byte pair run. Nothing is adopted in a recipe file yet.
+
 ## Tests
 
 `tests/test_a9_ngram_address.py`: opt-in and hashing; A5's buffers, columns and every other

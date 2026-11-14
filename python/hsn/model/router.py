@@ -451,6 +451,11 @@ class Scorer(nn.Module):
             self.address_gate = nn.Linear(cfg.d, cfg.n_units * len(address_names), bias=False)
             torch.set_rng_state(rng)
             nn.init.zeros_(self.address_gate.weight)
+        #: A13 (``model.address_gate_input``): with another input than ``u`` the gate's input
+        #: ``[B, d]`` rides behind the features, in columns ``[in_features, in_features + d)``
+        #: of what :meth:`_assemble` returns. The scorer's own map never reads those columns.
+        self.gate_input: str = cfg.address_gate_input if cfg.address_gate else "u"
+        self._gate_extra = cfg.d if self.gate_input != "u" else 0
 
         excluded = torch.zeros(self.in_features, dtype=torch.bool)
         for name in self.exclude:
@@ -527,8 +532,11 @@ class Scorer(nn.Module):
         tokens: Tensor | None = None,
         prev_tokens: Tensor | None = None,
         older: Tensor | None = None,
+        gate_in: Tensor | None = None,
     ) -> Tensor:
         """The ``[B, N, 3d+8]`` feature tensor in the module's layout, in ``u``'s dtype.
+        With A13 (``model.address_gate_input`` other than ``u``) ``gate_in [B, d]`` is what the
+        address gate reads, and the result is ``d`` columns wider (:meth:`_assemble`).
 
         ``u``, ``eps`` are ``[B, d]`` (the dtype and device of ``state.h``); ``ctx`` the context ids
         ``[B]`` (int64/int32); ``budget_frac`` a finite number >= 0; ``round_idx`` an int in
@@ -561,7 +569,7 @@ class Scorer(nn.Module):
             if addresses.shape != (B, N, 2 * self.address_ngram):
                 raise ValueError("key-address step tokens and prev_tokens must have shape [B]")
             scalars = torch.cat([scalars, addresses.to(u.dtype)], dim=-1)
-        return self._assemble(u, eps, state.h, state.age, scalars)
+        return self._assemble(u, eps, state.h, state.age, scalars, gate_in)
 
     def window_scalars(
         self,
@@ -710,7 +718,13 @@ class Scorer(nn.Module):
         )  # [B, T, N, 7] in _SCALAR_FEATURES[1:] order
 
     def _assemble(
-        self, u: Tensor, eps: Tensor, h: Tensor, age: Tensor | None, scalars: Tensor
+        self,
+        u: Tensor,
+        eps: Tensor,
+        h: Tensor,
+        age: Tensor | None,
+        scalars: Tensor,
+        gate_in: Tensor | None = None,
     ) -> Tensor:
         """``[B, N, 3d+8]`` from ``u``, ``eps`` ``[B, d]``, ``h [B, N, d]``, ``age [B, N]`` and the
         other scalars ``[B, N, 7]`` (:meth:`_scalars` at one position), unchecked: the callers
@@ -725,6 +739,13 @@ class Scorer(nn.Module):
         feats = torch.cat(parts, dim=-1)
         if self.exclude:
             feats = feats.masked_fill(self._excluded, 0)
+        if self._gate_extra:  # A13: the gate's own input, behind the scorer's features
+            if gate_in is None:
+                raise ValueError(
+                    f"model.address_gate_input={self.gate_input!r} (A13): the gate's input "
+                    "gate_in [B, d] is missing"
+                )
+            feats = torch.cat([feats, gate_in.to(feats.dtype)[:, None, :].expand(B, N, d)], dim=-1)
         return feats
 
     def _check_round(self, round_idx: int) -> None:
@@ -750,16 +771,19 @@ class Scorer(nn.Module):
         """``feats [B, N, 3d+8] -> logits [B, N, M]``, one score per (cell, unit)."""
         if not isinstance(feats, Tensor):
             raise TypeError(f"feats must be a torch.Tensor, got {type(feats).__name__}")
-        if feats.ndim != 3 or feats.shape[-1] != self.in_features:
-            raise ValueError(
-                f"feats must have shape [B, N, {self.in_features}], got {tuple(feats.shape)}"
-            )
+        width = self.in_features + self._gate_extra
+        if feats.ndim != 3 or feats.shape[-1] != width:
+            raise ValueError(f"feats must have shape [B, N, {width}], got {tuple(feats.shape)}")
+        read: Tensor | None = None
+        if self._gate_extra:  # A13: the gate's input rides behind the features
+            read, feats = feats[:, 0, self.in_features :], feats[:, :, : self.in_features]
         out: Tensor = self.net(feats)
         if self.address_gate is not None:  # A12: address weights that depend on the content u_t
             B, N, _ = feats.shape
-            u = feats[:, 0, self.feature_slices["u"]]  # [B, d]: the same in every cell's row
+            if read is None:
+                read = feats[:, 0, self.feature_slices["u"]]  # [B, d]: the same in every row
             address = feats[:, :, self._address_start :]  # [B, N, A]
-            gate = self.address_gate(u).view(B, self.n_units, -1)  # [B, M, A]
+            gate = self.address_gate(read).view(B, self.n_units, -1)  # [B, M, A]
             out = out + torch.einsum("bna,bma->bnm", address, gate.to(address.dtype))
         return out
 

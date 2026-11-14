@@ -305,6 +305,15 @@ class ModelConfig(_StrictModel):
     # addresses are A5's fixed codes; nothing about a key is learned.
     address_gate: bool = False
     # --- end A12 ---
+    # --- Amendment A13 (docs/amendments/A13_gate_input.md; opt-in, needs address_gate) ---
+    # address_gate_input: what A12's gate reads. "u" (default): the position's content u_t,
+    # A12 as it is. "summary": the carried summary q_{t-1} as S reads it, which does not hold
+    # the current byte. "u_no_fast" (needs fast_readout): S's output with the fast cells' read
+    # left out of its input. G keeps its shape (d -> n_units * address features) and its zero
+    # start; only its input changes. Under train.feedback_detach with "router" the input is a
+    # constant in the backward, like the scorer's u.
+    address_gate_input: Literal["u", "summary", "u_no_fast"] = "u"
+    # --- end A13 ---
     # --- Amendment A11 (docs/amendments/A11_position_bound.md; opt-in) ---
     # The position the scorer's ``pos`` feature reads. "document" (default): the position in the
     # document, pos / unroll, which grows past 1 in a document longer than the training window.
@@ -396,6 +405,16 @@ class ModelConfig(_StrictModel):
             raise ValueError(
                 "model.address_gate (A12) needs model.key_address=true and model.scorer=linear, "
                 f"got key_address={self.key_address}, scorer={self.scorer!r}"
+            )
+        if self.address_gate_input != "u" and not self.address_gate:
+            raise ValueError(
+                f"model.address_gate_input={self.address_gate_input!r} (A13) says what "
+                "model.address_gate reads; set model.address_gate=true or leave it at 'u'"
+            )
+        if self.address_gate_input == "u_no_fast" and not self.fast_readout:
+            raise ValueError(
+                "model.address_gate_input=u_no_fast (A13) leaves the fast cells' read out of "
+                "the gate's input; without model.fast_readout there is none (use 'u')"
             )
         if self.cell_units != "routed" and self.routing != "topk":
             raise ValueError(
@@ -719,6 +738,14 @@ class TrainConfig(_StrictModel):
     # text, where no position is marked as an answer; it shows whether a failure to bind is a
     # matter of loss balance. Hashed when set; the split and fused windows refuse it.
     answer_weight: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    # Opt-in diagnostic (14 Nov 2026), training only, needs model.address_gate (A12): the gate's
+    # weights ``G`` are trained for this many optimiser steps and keep their value from then on
+    # (every later step is undone for ``G`` alone, its weight decay included; everything else
+    # trains as before). It tests where a long run's fitting to the training keys sits: in the
+    # hold-out runs of 14 Nov the 18,000-step model with its 9,000-step ``G`` scored 94.7 % on
+    # unseen keys against 85.8 % with its own. null (default): off, bit for bit. Hashed when
+    # set.
+    address_gate_hold_step: int | None = Field(default=None, ge=0)
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -1230,6 +1257,11 @@ class RunConfig(_StrictModel):
             )
         if routing in ("dense", "random", "fixed") and train.route_guard.enabled:
             raise ValueError("train.route_guard requires learned routing (topk or greedy_budget)")
+        if train.address_gate_hold_step is not None and not self.model.address_gate:
+            raise ValueError(
+                "train.address_gate_hold_step holds the weights of model.address_gate (A12); "
+                "set model.address_gate=true or leave it at null"
+            )
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
         # --- Amendment A8: the fast group is a rule of the scored hard/soft selection only ---
         if self.model.fast_cells and train.gate_mode == "reinforce":
@@ -1568,6 +1600,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.cell_units",
     "model.scorer_position",
     "model.address_gate",
+    "train.address_gate_hold_step",
+    "model.address_gate_input",
 )
 
 
@@ -1649,6 +1683,12 @@ def split_window_scope_error(
             f"model.fast_cells={model.fast_cells} (A8): the fast read of the decoder is part of "
             "the state-gradient sweep only (train.feedback_detach=[summary, eps, router]); "
             "with the full cut use hardware.window=autograd"
+        )
+    if model.address_gate_input != "u":
+        return (
+            f"model.address_gate_input={model.address_gate_input!r} (A13): the split window's "
+            "replay and compiled sweeps compute the gate's term from u; use "
+            "hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

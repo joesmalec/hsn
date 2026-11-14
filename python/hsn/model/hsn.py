@@ -591,6 +591,11 @@ class HSN(nn.Module):
                     budget_frac=cfg.budget,
                     round_idx=0,
                     ema=None,
+                    gate_in=(
+                        self._gate_read(z, state.q, self.ctx_emb(ctx_t), state.h, state.dtype)
+                        if self.scorer.gate_input != "u"
+                        else None
+                    ),
                     **(
                         {
                             "tokens": x_t,
@@ -674,6 +679,26 @@ class HSN(nn.Module):
         if self.cfg.fast_readout:
             parts.append(self._summary_read(self._fast_read(h_prev)))
         return torch.cat(parts, dim=-1)
+
+    def _gate_read(
+        self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor, dtype: torch.dtype
+    ) -> Tensor | None:
+        """A13 (``model.address_gate_input``): what A12's address gate reads when it is not
+        ``u_t``, ``[B, d]`` in the state's dtype, or ``None`` for ``u``. ``summary``: the carried
+        summary ``q_{t−1}`` as ``S`` reads it. ``u_no_fast``: ``S``'s output with the fast
+        group's read left out of its input. ``ctx`` is the embedded context. A constant in the
+        backward with ``router`` (A6), like the scorer's ``u``."""
+        kind = self.scorer.gate_input
+        if kind == "u":
+            return None
+        if kind == "summary":
+            read = self._summary_read(q_prev)
+        else:  # u_no_fast
+            carried = self._summary_read(q_prev)
+            nothing = torch.zeros_like(self._fast_read(h_prev))
+            read = self.shared(torch.cat([z, carried, ctx, nothing], dim=-1))
+        read = read.to(dtype)
+        return read.detach() if self._cut_router else read
 
     def _fast_read(self, h: Tensor) -> Tensor:
         """A8: ``f = mean_{i < F} h[i]``, ``[B, d]`` from ``h [B, N, d]``."""
@@ -1328,12 +1353,17 @@ class HSN(nn.Module):
         # P1.7: see step. A6: the reads of the cell and the scorer (the same values)
         u_s, eps_s = u.to(state.dtype), self._eps_read(z_t, z_hat, eps).to(state.dtype)
         age = None if dense_counters is not None else state.age  # dense: a column of the scalars
+        gate_in = (  # A13: what the address gate reads when it is not u
+            self._gate_read(z_t, q_prev, ctx_t, state.h, state.dtype)
+            if self.scorer.gate_input != "u"
+            else None
+        )
         if self._cut_router:
             feats = self.scorer._assemble(
-                u_s.detach(), eps_s.detach(), state.h.detach(), age, scalars_t
+                u_s.detach(), eps_s.detach(), state.h.detach(), age, scalars_t, gate_in
             )
         else:
-            feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalars_t)
+            feats = self.scorer._assemble(u_s, eps_s, state.h, age, scalars_t, gate_in)
         unit_logits, alpha, selection = self._score(
             feats, state, mode, dense_rows, controls=controls
         )
