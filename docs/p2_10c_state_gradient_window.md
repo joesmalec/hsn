@@ -814,7 +814,7 @@ is the state-columns identity: the first layer's transposed product costs 37.8 Â
 4. A12's `model.address_gate` (not on main) is one more scorer term: the forward sweep's
    scorer product only.
 5. The card tests of the four-op cell driver, where its artifacts exist.
-6. Accuracy runs.
+6. Accuracy runs: prepared, "Accuracy runs" below.
 
 ### Step 3: amendment A6's per-row limit, as a reference only (13 Nov, evening)
 
@@ -872,6 +872,42 @@ compiled before the decision arrived. It was never run on a card and is not in t
 repository: `/home/joe/hsn-experiments/cutc-speed/scratch/ratio_kernels_wip/` (a patch against
 this step's first commit, its card tests, a note). Should the limit return, that is one more
 launch per position and a card session of tests.
+
+### Accuracy runs (prepared 13 Nov, to run when the card returns)
+
+Equal gradients on one window do not show that a run trains the same: the trained models
+amplify rounding, so two windows part within a run however equal they are. What can be shown
+is that the fused window's runs are not distinguishable from the autograd window's by more
+than seeds are.
+
+**The runs** (`p2_10c_accuracy.yaml`, a sweep spec kept with the results, outside the
+repository like the campaign's TinyStories specs: the repository's tests expand every spec
+under `configs/sweeps` against a tree without that dataset): the approved shape (64 cells, 20
+slots of which 8 fast cells at fixed units with their own read, the state gradient, executed
+credit, no soft warm-up) with `hardware.window=fused` and on the autograd window, the one key
+that differs; TinyStories, delayed recall, arithmetic; seeds 0 and 1; the first 3,000 steps of the
+recipe's 9,000-step schedule (`train.steps` stays 9000: the peak rate throughout, and the
+autograd arm is the first third of the campaign's run of the same arm); dev evaluation every
+500 steps. Twelve runs, one at a time on the local card (their step times are then
+measurements of real runs). Queue order: seed 0 of the three tasks, then seed 1. Last, for
+information only, one seed per window on the pair task (kv + delayed), on which two runs of
+one seed and configuration differ by more than ten points.
+
+**Where.** A database and run folder of their own:
+`/home/joe/hsn-experiments/cutc-speed/accuracy/` (the spec, `experiments.sqlite`, `runs/`,
+`logs/`), driven by `run.sh` there (`enqueue`, `worker`, `status`, `compare`).
+
+**How they are compared** (`accuracy/compare.py`). The score is dev bits per byte for
+TinyStories and dev accuracy for the other two, at every evaluation and at the end. The bar
+that was set: each fused seed within the spread of the two autograd seeds. Two seeds give
+that bar little power in either direction: a third draw from one distribution lies between
+the first two with probability one third, so for equivalent windows a fused seed falls
+outside two times in three. The tables therefore also give what two seeds can support: the
+difference of the windows' means beside the seed-to-seed gap inside each window, and the
+same-seed differences between the windows (one initialisation and data order, two windows).
+A difference between the windows that is no larger than the gaps between seeds is the
+finding "not distinguishable at two seeds"; a difference several times the gaps, with one
+sign on every task, would be a finding against the window.
 
 ## Files
 
