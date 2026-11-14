@@ -587,18 +587,25 @@ sensitive to it.
 
 **Measured step times.**
 
-| Shape | Autograd window, state gradient | Fused window, full cut, the same number of routed slots | Fused window, state gradient |
-| --- | ---: | ---: | ---: |
-| 4 slots, 32 cells (the recipe) | | 43.7 ms (load 1.3) | |
-| 12 slots, 64 cells (routed candidate) | 159.2 ms (load 1.4) | 73.8 ms (load 1.0) | 96.1 ms (load 4 to 5); 96.9 ms (load 7.5) |
-| 20 slots of which 8 fast, 64 cells (the approved shape) | 202.5 ms (load 1.9) | 100.1 ms (20 routed slots; load 0.5) | 133.6 ms (load 0.4 at the start, 3.9 at the end); 133.5 ms (load 7) |
+| Shape | Autograd window, state gradient | Fused window, full cut, the same number of routed slots | Fused window, state gradient | Gain |
+| --- | ---: | ---: | ---: | ---: |
+| 4 slots, 32 cells (the recipe) | 101.7 ms (load 8.6 falling to 2.5) | 43.8 ms (load 0.9) | 55.9 ms (load 1.1) | 1.82 |
+| 8 slots, 32 cells | 123.9 ms (load 2.5 falling to 1.3) | | 72.6 ms (load 1.1) | 1.71 |
+| 12 slots, 64 cells (routed candidate) | 159.2 ms (load 1.4) | 73.8 ms (load 1.0) | 95.2 ms (load 0.9) | 1.67 |
+| 20 slots of which 8 fast, 64 cells (the approved shape) | 202.5 ms (load 1.9) | 100.1 ms (20 routed slots; load 0.5) | 131.5 ms (load 1.0) | 1.54 |
 
-So the state-gradient window is 1.66 times faster than the autograd window at the routed
-candidate and 1.52 times at the approved shape. The fused timings do not move with the host's
-load in the range met here (other sessions' CPU evaluations came and went: a fully quiet
-host for a whole run was not available, and the two runs of each shape agree within 1 %).
-With the first kernels the two steps were 130.0 and 185.9 ms, after their rewrite 98.6 and
-137.5 ms, and with the middle kernel's wide reads the figures of the table.
+So the state-gradient window is 1.5 to 1.8 times faster than the autograd window, less at the
+larger shapes, as estimated ("Expected step time": 76 to 105 and 110 to 147 ms for the two
+64-cell shapes, pointing to their upper halves). The 4-slot estimate (48 to 51 ms, "surprised
+by more than 55") was 5 to 8 ms low, and not through the reverse sweep, which costs the 10 ms
+expected (10.1 ms per window and 0.9 ms of loading): the full-cut fused step it was built on
+is 43.8 ms at this base commit, on the base's own export as on this branch, not the 40.5 ms
+of P2.10b's note.
+
+Under host load (other sessions' CPU evaluations, load 4 to 9) the same steps took 58.6, 75.4,
+96.1 to 96.9 and 133.5 to 133.6 ms: about 3 ms more at the 32-cell shapes, 1 to 2 ms at the
+64-cell ones. With the first kernels the two 64-cell steps were 130.0 and 185.9 ms, after
+their rewrite 98.6 and 137.5 ms (both at load 9).
 
 Phases (`bench_window.py phases`, synchronised, medians):
 
