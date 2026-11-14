@@ -55,7 +55,8 @@ and there is no position parameter.
 - the bytes `x_s`, `s ≤ t`, of the same window and the same document (a reset column starts a
   document for the reader as it does for the cells);
 - with `model.reader_span = n` only the last `n` of them at each layer: the short-sighted
-  reader. Two layers reach `2 (n − 1)` bytes back at most;
+  reader. Its complete receptive field is `1 + L (n − 1)` bytes for `L` blocks: 63 bytes for
+  the two blocks and span 32 that are run, not 32;
 - nothing of an earlier window, no cell state, no context symbol.
 
 So global rule 2 holds as before (`ẑ_t = P(q_{t−1})` reads the carried summary only), and
@@ -71,6 +72,16 @@ the decoder and through `S`.
 
 **With fast cells kept** (`model.fast_cells > 0`, allowed; the variant to try only if
 arithmetic fails with the reader alone): `S([z ; q ; ctx ; c ; f])`, `D([q ; u ; r ; f ; c])`.
+
+**What the address gate reads.** A13's `summary` (the carried summary `q_{t−1}`) is what the
+runs use. Without fast cells the summary holds less of the last bytes than it does in the
+candidate, so one more value of `model.address_gate_input` exists for this model, built on
+14 Nov and not run: `reader_prev`, the reader's output of the position before, `c_{t−1}` (zero at
+a document's first position and at a window's first column; needs `reader_width = d`). Like
+the summary it holds the bytes up to `t − 1` and not the current byte. It is a second path
+from the reader into routing, direct where the summary's is indirect (reader → `S` → cell
+state → summary → later gate): fixed address features do not make routing independent of
+the reader in either form.
 
 ## Size
 

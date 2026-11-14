@@ -39,6 +39,8 @@ W = 8  # the reader's width on the six-cell model of the A6 tests (d = 8)
 READER = ("model.reader=transformer", f"model.reader_width={W}", "model.reader_heads=2")
 SPAN = 4
 SHORT = (*READER, f"model.reader_span={SPAN}")
+#: the address gate reading the reader's output of the position before (W equals d here)
+PREV = (*READER, "model.address_gate=true", "model.address_gate_input=reader_prev")
 #: the candidate's cut: the cell's read of the state keeps its gradient
 CUT_C = "train.feedback_detach=[summary,eps,router]"
 
@@ -91,6 +93,16 @@ def test_keys_are_opt_in_and_the_default_keeps_its_hash() -> None:
         (["model.reader=transformer", "model.reader_width=30"], "multiple of"),
         (["model.reader=transformer", "model.reader_width=12"], "even width per head"),
         (["model.reader=transformer", "model.reader_span=0"], "reader_span"),
+        (["model.address_gate=true", "model.address_gate_input=reader_prev"], "reads the reader"),
+        (
+            [
+                "model.reader=transformer",
+                "model.reader_width=32",
+                "model.address_gate=true",
+                "model.address_gate_input=reader_prev",
+            ],
+            "must equal it",
+        ),
     ],
 )
 def test_configuration_refusals(overrides: list[str], message: str) -> None:
@@ -262,7 +274,7 @@ def test_model_with_zeroed_reader_columns_is_the_model_without_it(cut: tuple[str
     assert _gap(new_state.q, ref_state.q) <= 1e-12
 
 
-@pytest.mark.parametrize("extra", [READER, SHORT])
+@pytest.mark.parametrize("extra", [READER, SHORT, PREV])
 def test_logits_read_no_later_byte_and_no_earlier_document(extra: tuple[str, ...]) -> None:
     cfg = _cfg(*A5, *extra)
     model = _model(cfg)
@@ -362,6 +374,74 @@ def test_fast_cells_may_stay_beside_the_reader() -> None:
     assert all(float(p.grad.abs().sum()) > 0.0 for p in model.reader.parameters())
 
 
+# -- the address gate reading the reader (model.address_gate_input = reader_prev) ---------------
+
+
+def test_gate_reads_the_readers_output_of_the_position_before() -> None:
+    """``c_{t−1}``, and zeros where the document or the window holds no byte before ``t``."""
+    cfg = _cfg(*A5, "train.gate_mode=ste", *PREV)
+    model = _model(cfg).eval()
+    assert model.reader is not None
+    tokens, ctx, reset = _window(cfg)
+    B, T = tokens.shape
+    reset[:, 0] = False  # the window continues a document: nothing is known of the byte before
+    reset[1, 5] = True
+    seen: list[Tensor] = []
+    assemble = model.scorer._assemble
+
+    def spy(u: Tensor, eps: Tensor, h: Tensor, age: Tensor, scalars: Tensor, gate_in: Tensor):  # type: ignore[no-untyped-def]
+        seen.append(gate_in.detach().clone())
+        return assemble(u, eps, h, age, scalars, gate_in)
+
+    model.scorer._assemble = spy  # type: ignore[method-assign]
+    with torch.no_grad():
+        model(tokens, ctx, _start(model, B), reset)
+        c = model.reader(tokens, reset)
+    assert len(seen) == T
+    read = torch.stack(seen, dim=1)  # [B, T, d]
+    assert not bool(read[:, 0].any()) and not bool(read[1, 5].any())
+    for t in range(1, T):
+        rows = [b for b in range(B) if not (b == 1 and t == 5)]
+        assert _gap(read[rows, t], c[rows, t - 1]) <= 1e-12, t
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_zero_gate_on_the_reader_is_the_model_with_the_summary_gate(training: bool) -> None:
+    """``G`` starts at zero, so the gate's input does not matter until it has trained."""
+    summary = (*READER, "model.address_gate=true", "model.address_gate_input=summary")
+    seed_everything(0)
+    model = HSN.from_config(_cfg(*A5, "train.gate_mode=ste", *PREV)).double()
+    seed_everything(0)
+    other = HSN.from_config(_cfg(*A5, "train.gate_mode=ste", *summary)).double()
+    gate = model.scorer.address_gate
+    assert gate is not None and not bool(gate.weight.any())
+    for (name, p), (_, q) in zip(model.named_parameters(), other.named_parameters(), strict=True):
+        assert torch.equal(p, q), name
+    model.train(training)
+    other.train(training)
+    model.set_train_step(10)
+    other.set_train_step(10)
+    cfg = _cfg(*A5, "train.gate_mode=ste", *PREV)
+    tokens, ctx, reset = _window(cfg)
+    B = tokens.shape[0]
+    with torch.no_grad():
+        got, state, _ = model(tokens, ctx, _start(model, B), reset)
+        ref, ref_state, _ = other(tokens, ctx, _start(other, B), reset)
+    assert _gap(got, ref) <= 1e-12 and _gap(state.h, ref_state.h) <= 1e-12
+
+
+def test_gate_on_the_reader_gets_a_gradient_under_the_candidates_cut() -> None:
+    cfg = _cfg(*A5, "train.gate_mode=ste", CUT_C, *PREV)
+    model = _model(cfg)
+    model.set_train_step(10)
+    tokens, ctx, reset = _window(cfg)
+    logits, _, _ = model(tokens, ctx, _start(model, tokens.shape[0]), reset)
+    logits.square().mean().backward()
+    gate = model.scorer.address_gate
+    assert gate is not None and gate.weight.grad is not None
+    assert float(gate.weight.grad.abs().sum()) > 0.0
+
+
 def test_window_under_bf16_autocast_is_finite() -> None:
     cfg = _reader_cfg("train.gate_mode=ste")
     model = _model(cfg, torch.float32)
@@ -380,7 +460,7 @@ def test_window_under_bf16_autocast_is_finite() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("extra", [READER, SHORT])
+@pytest.mark.parametrize("extra", [READER, SHORT, PREV])
 @pytest.mark.parametrize("name", list(COMPILED))
 @pytest.mark.usefixtures("small_blocks")
 def test_compiled_window_equals_eager(name: str, extra: tuple[str, ...]) -> None:
@@ -405,7 +485,7 @@ def test_compiled_window_equals_eager(name: str, extra: tuple[str, ...]) -> None
         assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"]
 
 
-@pytest.mark.parametrize("extra", [READER, SHORT])
+@pytest.mark.parametrize("extra", [READER, SHORT, PREV])
 def test_recipe_with_the_reader_trains(extra: tuple[str, ...], tmp_path: Path) -> None:
     """Thirty TBPTT steps of the small A6 recipe with the candidate's cut on the tiny CPU
     configuration of the trainer tests: finite losses that fall."""

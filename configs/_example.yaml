@@ -57,7 +57,7 @@ model: # Appendix A.1
   fast_units: routed # amendment A8: routed = a fast cell runs its best unit; fixed = fast cell i always runs unit i mod n_units
   cell_units: routed # opt-in control for A8: fixed = every cell i runs unit i mod n_units (the router still chooses the cells; topk only)
   address_gate: false # amendment A12: a unit's weight on each address feature also depends on the position's content u (needs key_address, linear scorer)
-  address_gate_input: u # A13 (opt-in, needs address_gate): what the gate reads: u | summary (the carried summary, not the current byte) | u_no_fast (u without the fast cells' read)
+  address_gate_input: u # A13 (opt-in, needs address_gate): what the gate reads: u | summary (the carried summary, not the current byte) | u_no_fast (u without the fast cells' read) | reader_prev (the reader's output of the position before; needs reader, reader_width = d)
   scorer_position: document # amendment A11: document | clamp | wrap, the position the scorer's pos feature reads (equal while pos < unroll)
   write_gate: false # amendment A10: a selected routed cell is written only where the write logit of its unit is positive (topk, linear scorer)
   write_init: 2.0 # amendment A10: the write output's initial bias (positive: every selected cell is written at the start)

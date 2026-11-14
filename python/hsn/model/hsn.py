@@ -464,6 +464,9 @@ class HSN(nn.Module):
         #: A14 (``model.reader``): the window reader, or ``None``. Built last and from its own
         #: generator: no other parameter's initialisation depends on it.
         self.reader: Reader | None = Reader(cfg, seed=seed) if cfg.reader != "none" else None
+        #: ``model.address_gate_input = reader_prev``: the width of ``c_{t−1}`` at the end of a
+        #: window's context columns (behind ``c_t``), which only the address gate reads; else 0.
+        self._gate_rides: int = cfg.reader_width if self.scorer.gate_input == "reader_prev" else 0
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
         self._fixed_route: Tensor | None = (
             torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
@@ -715,6 +718,8 @@ class HSN(nn.Module):
         the fast group's mean ``f_{t−1}`` after it. Both state reads are ``summary`` reads (A6).
         With ``model.reader`` (A14) a window's ``ctx`` already ends in the reader's ``c_t``
         (:meth:`_window_prologue`), which is not a state read and keeps its gradient."""
+        if self._gate_rides:  # the last columns are the address gate's c_{t−1}, not S's
+            ctx = ctx[..., : -self._gate_rides]
         parts = [z, self._summary_read(q_prev), ctx]
         if self.cfg.fast_readout:
             parts.append(self._summary_read(self._fast_read(h_prev)))
@@ -727,12 +732,15 @@ class HSN(nn.Module):
         ``u_t``, ``[B, d]`` in the state's dtype, or ``None`` for ``u``. ``summary``: the carried
         summary ``q_{t−1}`` as ``S`` reads it. ``u_no_fast``: ``S``'s output with the fast
         group's read left out of its input. ``ctx`` is the embedded context. A constant in the
-        backward with ``router`` (A6), like the scorer's ``u``."""
+        backward with ``router`` (A6), like the scorer's ``u``. ``reader_prev`` (HSN-T): the
+        reader's output of the position before, which a window's ``ctx`` ends in."""
         kind = self.scorer.gate_input
         if kind == "u":
             return None
         if kind == "summary":
             read = self._summary_read(q_prev)
+        elif kind == "reader_prev":  # HSN-T: c_{t−1}, the last columns of a window's context
+            read = ctx[..., -self._gate_rides :]
         else:  # u_no_fast
             carried = self._summary_read(q_prev)
             nothing = torch.zeros_like(self._fast_read(h_prev))
@@ -1324,6 +1332,11 @@ class HSN(nn.Module):
             # position with the loop, the compiled block and _position unchanged
             reader_out = self.reader(tokens, reset)  # [B, T, w]
             context = torch.cat([context, reader_out], dim=-1)
+            if self._gate_rides:
+                # address_gate_input=reader_prev: c_{t−1} behind c_t, for the address gate alone;
+                # zero where the document has no byte before t, or the window does not hold it
+                before = torch.cat([torch.zeros_like(reader_out[:, :1]), reader_out[:, :-1]], 1)
+                context = torch.cat([context, before.masked_fill(reset[:, :, None], 0.0)], dim=-1)
         positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
         previous_window: Tensor | None = None
         if cfg.key_address:
