@@ -95,6 +95,7 @@ __all__ = [
     "generate",
     "load_dataset_spec",
     "main",
+    "recall_sum_kinds",
     "reference_targets",
 ]
 
@@ -1703,6 +1704,15 @@ class _RecallSum(_Generator[RecallSumParams]):
         return tokens, positions, deps
 
     def solve(self, params: RecallSumParams, tokens: U8) -> Solved:
+        positions, targets, deps, _ = self.read(params, tokens)
+        return _sorted_solution(positions, targets, deps)
+
+    def read(
+        self, params: RecallSumParams, tokens: U8
+    ) -> tuple[list[int], list[int], list[int], list[int]]:
+        """The document as its symbols give it, item by item: the loss positions (ascending),
+        their targets and dependency distances, and for each of them how many of its item's
+        two operands are recalled (0, 1 or 2)."""
         is_key = _byte_table(list(params.keys.values()))
         is_filler = _byte_table([params.filler])
         d_lo, d_hi = params.digits
@@ -1731,10 +1741,11 @@ class _RecallSum(_Generator[RecallSumParams]):
             positions: list[int] = []
             targets: list[int] = []
             deps: list[int] = []
+            kinds: list[int] = []
             while t[i] != EOS:
                 if t[i] != QRY or t[i + 2] != plus or t[i + 4] != eq:
                     raise ValueError(f"recall_sum: malformed item at position {i}")
-                total, source = 0, len(t)
+                total, source, recalled = 0, len(t), 0
                 for at in (i + 1, i + 3):
                     if d_lo <= t[at] < d_hi:  # a written digit
                         total += t[at] - d_lo
@@ -1742,6 +1753,7 @@ class _RecallSum(_Generator[RecallSumParams]):
                     elif t[at] in value_of:  # a stated key: its digit is recalled
                         total += value_of[t[at]]
                         source = min(source, value_pos[t[at]])
+                        recalled += 1
                     else:
                         raise ValueError(f"recall_sum: operand at {at} is no digit or stated key")
                 answer = [d_lo + x for x in self._sum(total, 0)] + [SEP]
@@ -1749,12 +1761,13 @@ class _RecallSum(_Generator[RecallSumParams]):
                     positions.append(i + 4 + j)
                     targets.append(target)
                     deps.append(i + 4 + j - source)
+                    kinds.append(recalled)
                 i += 4 + len(answer) + 1
         except IndexError as exc:
             raise ValueError("recall_sum: truncated document") from exc
         if i != len(t) - 1:
             raise ValueError("recall_sum: symbols after EOS")
-        return _sorted_solution(positions, targets, deps)
+        return positions, targets, deps, kinds
 
 
 _FAMILIES: dict[str, _Generator[Any]] = {
@@ -1808,6 +1821,18 @@ def reference_targets(spec: TaskSpec, tokens: U8) -> Solved:
     """
     generator = _FAMILIES[spec.family]
     return generator.solve(generator.params(spec), np.ascontiguousarray(tokens, dtype=np.uint8))
+
+
+def recall_sum_kinds(spec: TaskSpec, tokens: U8) -> I64:
+    """For a ``recall_sum`` document, how many of its item's two operands each loss position
+    recalls (0, 1 or 2), in position order: aligned with ``loss_mask``'s True entries, with
+    :func:`reference_targets` and with ``meta["deps"]``. The three kinds are scored apart: 0
+    needs no memory, 1 and 2 compute on recalled digits."""
+    generator = _FAMILIES[spec.family]
+    if not isinstance(generator, _RecallSum):
+        raise ValueError(f"{spec.key}: family {spec.family} has no item kinds (recall_sum only)")
+    read = generator.read(generator.params(spec), np.ascontiguousarray(tokens, dtype=np.uint8))
+    return np.asarray(read[3], dtype=np.int64)
 
 
 def check_example(spec: TaskSpec, example: Example) -> None:

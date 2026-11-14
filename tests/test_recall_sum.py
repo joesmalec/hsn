@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from hsn.data.dataset import ByteDataset
 from hsn.data.splits import SplitManifest, write_shard
 from hsn.data.synthetic import (
     EOS,
@@ -23,8 +24,11 @@ from hsn.data.synthetic import (
     check_example,
     generate,
     load_dataset_spec,
+    recall_sum_kinds,
     reference_targets,
 )
+from p1_11_support import restore_determinism  # noqa: F401
+from p1_15_support import UNROLL, hsn_config, hsn_trainer
 
 REPO = Path(__file__).resolve().parents[1]
 DATASET = load_dataset_spec(REPO / "configs" / "data" / "synthetic_sum.yaml")
@@ -96,6 +100,8 @@ def test_documents_agree_with_an_independent_reading(task: TaskSpec, split: str)
         assert list(example.meta["deps"]) == expected_deps
         solved = reference_targets(task, example.tokens)
         assert solved[0].tolist() == positions and solved[1].tolist() == expected_targets
+        kinds = [item["recalled"] for item in items for _ in item["answer"]]
+        assert recall_sum_kinds(task, example.tokens).tolist() == kinds
         # the splits' keys are disjoint by range, and every stated key lies in this split's
         assert value_pos and all(lo <= key < hi for key in value_pos)
 
@@ -172,6 +178,41 @@ def test_spec_validation_rejects(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _with(IN_RANGE, top, **params)
+
+
+def test_kinds_are_for_this_family_only() -> None:
+    kv = load_dataset_spec(REPO / "configs" / "data" / "synthetic_v1.yaml").task("kv", "in_range")
+    with pytest.raises(ValueError, match="recall_sum only"):
+        recall_sum_kinds(kv, generate(kv, "dev", 0).tokens)
+
+
+@pytest.mark.usefixtures("restore_determinism")
+def test_the_task_trains_and_is_scored_under_its_own_name(tmp_path: Path) -> None:
+    """Documents of the family go through the dataset, the window trainer and the evaluation:
+    finite losses, and a dev score reported for ``recall_sum/in_range``."""
+    tiny = _with(
+        IN_RANGE,
+        {
+            "n_train": 32,
+            "n_dev": 8,
+            "n_test": 8,
+            "length_range": [16, UNROLL],
+            "dep_len_range": [8, 20],
+            "unroll": UNROLL,
+        },
+        min_gap=0,
+        max_facts=3,
+    )
+    train = ByteDataset([generate(tiny, "train", i) for i in range(32)])
+    dev = ByteDataset([generate(tiny, "dev", i) for i in range(8)])
+    steps = 6
+    trainer = hsn_trainer(hsn_config(steps, "train.eval_every=3"), tmp_path / "run")
+    history = trainer.fit(train, dev, steps)
+    assert len(history.steps) == steps and all(np.isfinite(s.loss) for s in history.steps)
+    groups = history.evals[-1]["per_group"]
+    assert set(groups) == {"recall_sum/in_range"}
+    assert 0.0 <= groups["recall_sum/in_range"]["accuracy"] <= 1.0
+    assert np.isfinite(groups["recall_sum/in_range"]["loss"])
 
 
 def test_golden_manifest_matches(tmp_path: Path) -> None:
