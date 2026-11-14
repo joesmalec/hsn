@@ -18,6 +18,7 @@ from hsn.chat.session import Session, safe_text
 
 class ChatApp(App[None]):
     TITLE = "HSN · local chat"
+    STATUS_REFRESH = 0.2  # seconds between status-line refreshes
     CSS = """
     #transcript { height: 1fr; padding: 1 2; }
     #composer { height: 6; margin: 0 2; }
@@ -52,7 +53,11 @@ class ChatApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.set_interval(0.2, self.refresh_status)
+        # The status line owns its refresh timer. Textual stops a widget's timers before the
+        # widget leaves the DOM, so no tick can query a status line that is gone. A timer on the
+        # App outlives the screen's widgets when App._shutdown prunes the screen first and stops
+        # the App's timers only afterwards, as App.run_test does on exit.
+        self.query_one("#status", Static).set_interval(self.STATUS_REFRESH, self.refresh_status)
         self.load_model()
 
     @work(thread=True, exit_on_error=False)
