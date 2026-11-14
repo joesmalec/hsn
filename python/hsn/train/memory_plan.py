@@ -41,6 +41,7 @@ __all__ = [
     "format_bytes",
     "macs_per_token",
     "memory_plan",
+    "reader_param_count",
     "value_bytes_for",
 ]
 
@@ -91,7 +92,8 @@ def _scorer_params(m: ModelConfig) -> int:
     if m.scorer == "linear":
         # A12: the address gate, d -> n_units * (address features), no bias
         gate = m.d * m.n_units * 2 * m.address_ngram if m.address_gate else 0
-        return d_in * m.n_units + m.n_units + gate
+        # A10: the write output is a second linear layer of the same shape
+        return (2 if m.write_gate else 1) * (d_in * m.n_units + m.n_units) + gate
     return _mlp(d_in, m.scorer_hidden, m.n_units)
 
 
@@ -112,12 +114,14 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
     """
     d, h, v = m.d, m.hidden, m.vocab_size
     v_in = m.cell_input_width  # 4d: [u; eps; h_i; m_i]; 3d with model.ablate_shared_u
+    c = m.reader_width if m.reader != "none" else 0  # HSN-T: S and D read the reader's output
     rows = {
         "byte_emb": v * d,
         "ctx_emb": m.n_context * m.context_dim,
         "encoder": _mlp(d, h, d),
         "predictor": _mlp(d, h, d),
-        "shared": _mlp(2 * d + m.context_dim + (d if m.fast_readout else 0), h, d),  # A8: + f
+        # A8: + f; HSN-T: + c
+        "shared": _mlp(2 * d + m.context_dim + (d if m.fast_readout else 0) + c, h, d),
         "units": m.n_units * _mlp(v_in, h, d),
         "w_out": d * d,
         "v_msg": d * d,
@@ -126,10 +130,22 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "cand_norm": d if m.cand_norm == "rms" else 0,  # P1.13 (amendment A4)
         "scorer": _scorer_params(m),
         "halting": 2 * d + 1,
-        "decoder": _mlp((2 + int(m.selected_readout) + int(m.fast_readout)) * d, h, v),
+        "decoder": _mlp((2 + int(m.selected_readout) + int(m.fast_readout)) * d + c, h, v),
     }
     rows["total"] = sum(rows.values())
     return rows
+
+
+def reader_param_count(m: ModelConfig) -> int:
+    """HSN-T: the parameters of the window reader (:class:`hsn.model.reader.Reader`),
+    outside Appendix C like the edge logits; 0 without ``model.reader``. The byte embedding
+    ``V w``, per block ``12 w² + 13 w`` (two LayerNorms ``4 w``, the attention's ``w → 3w`` and
+    ``w → w`` maps, the MLP ``w → 4w → w``) and the final LayerNorm ``2 w``: 116,480 for the
+    default reader (``w`` 64, two blocks) at ``V`` 256."""
+    if m.reader == "none":
+        return 0
+    w = m.reader_width
+    return m.vocab_size * w + m.reader_layers * (12 * w * w + 13 * w) + 2 * w
 
 
 def macs_per_token(m: ModelConfig) -> dict[str, int]:

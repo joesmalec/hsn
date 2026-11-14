@@ -57,8 +57,15 @@ model: # Appendix A.1
   fast_units: routed # amendment A8: routed = a fast cell runs its best unit; fixed = fast cell i always runs unit i mod n_units
   cell_units: routed # opt-in control for A8: fixed = every cell i runs unit i mod n_units (the router still chooses the cells; topk only)
   address_gate: false # amendment A12: a unit's weight on each address feature also depends on the position's content u (needs key_address, linear scorer)
-  address_gate_input: u # A13 (opt-in, needs address_gate): what the gate reads: u | summary (the carried summary, not the current byte) | u_no_fast (u without the fast cells' read)
+  address_gate_input: u # A13 (opt-in, needs address_gate): what the gate reads: u | summary (the carried summary, not the current byte) | u_no_fast (u without the fast cells' read) | reader_prev (the reader's output of the position before; needs reader, reader_width = d)
   scorer_position: document # amendment A11: document | clamp | wrap, the position the scorer's pos feature reads (equal while pos < unroll)
+  write_gate: false # amendment A10: a selected routed cell is written only where the write logit of its unit is positive (topk, linear scorer)
+  write_init: 2.0 # amendment A10: the write output's initial bias (positive: every selected cell is written at the start)
+  reader: none # HSN-T: none | transformer, a small causal Transformer over the window's bytes whose output c_t takes the fast read's place in S and the decoder (needs selected_readout)
+  reader_width: 64 # HSN-T: the width of the reader and of c_t (a multiple of reader_heads, even per head)
+  reader_layers: 2 # HSN-T: the reader's blocks
+  reader_heads: 4 # HSN-T: attention heads per block
+  reader_span: null # HSN-T: n = a position reads itself and the n - 1 bytes before it only (short-sighted); null = the document up to the position, inside the window
   address_ngram: 1 # amendment A9: longest byte n-gram with an address feature pair (needs key_address); 1 = A5 only
   state_schema_version: 1 # bumped on any state layout change
 
@@ -173,6 +180,7 @@ train: # Appendix A.3
   lambda_g: 0.0 # graph
   lambda_u: 0.0 # utility target
   lambda_ponder: 0.0 # halting
+  lambda_w: 0.0 # amendment A10 (needs model.write_gate): weight of the write cost, the share of routed slots that may write
   aux_enabled: [] # which of cost / balance / graph are on (<= 1 unless justified)
   allow_multiple_aux: "" # written justification enabling more than one auxiliary term
   gate_mode: soft # soft | ste | reinforce (P2.2): the estimator after the soft warm-up

@@ -138,6 +138,18 @@ the bytes further back than that one read as BOS. A document that starts at a wi
 exact. :meth:`step` takes ``prev_tokens`` as ``[B, n]`` (``x_{t−1}`` first) for exact features;
 ``[B]`` means the older bytes are BOS.
 
+HSN-T (``model_name: hsn_t``, ``model.reader = transformer``, ``docs/hsn_t.md``): a
+small causal Transformer (:class:`~hsn.model.reader.Reader`) reads the window's bytes once, in
+the prologue, and its output ``c_t`` takes the place of A8's fast read: ``u_t = S([z_t ; q_{t−1} ;
+ctx_t ; c_t])`` and ``D([q_t ; u_t ; r_t ; c_t])``. ``c_t`` is a function of the document's bytes
+up to ``t`` inside the window (the last ``model.reader_span`` of them with a span) and of nothing
+else, so global rule 2 holds as before (``ẑ_t`` reads ``q_{t−1}`` only). The cell, the units, the
+graph, the gate, the router, the addresses and the state layout are unchanged. In a window
+``c_t`` travels behind the context embedding (:meth:`HSN._window_prologue`), so the loop, the
+compiled block and :meth:`_position` are the code they were. :meth:`step` has no window to read
+and refuses the key; the split and fused windows refuse it too. With ``model.fast_cells`` kept
+beside the reader, ``S`` reads ``[z ; q ; ctx ; c ; f]`` and ``D`` reads ``[q ; u ; r ; f ; c]``.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
@@ -159,6 +171,7 @@ from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.gradclip import clip_row_grad
 from hsn.model.halting import HaltingHead
+from hsn.model.reader import Reader
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.profiler import Profiler
@@ -266,6 +279,9 @@ SELECTION_RECORD_KEYS: tuple[str, ...] = (
     "refreshed",
     "dense_fallback",
 )
+#: A10 (``model.write_gate``): the extra record of a routed window, the batch-mean share of the
+#: valid routed slots that may write, per position (:attr:`HSN.selection_record_keys`).
+WRITE_RECORD_KEY = "write_fraction"
 
 
 def _gate_of_written(b: Tensor, written: Tensor) -> Tensor:
@@ -308,6 +324,9 @@ class _Prologue(NamedTuple):
     ctx_steps: tuple[Tensor, ...]
     scalar_steps: tuple[Tensor, ...]
     counters: tuple[Tensor, Tensor, Tensor, Tensor] | None
+    #: HSN-T (``model.reader``): the reader's output ``c [B, T, w]``, which ``context`` also ends
+    #: in and the decoder reads after the loop; ``None`` without the key.
+    reader: Tensor | None = None
 
     def dense_counters(self, t: int) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         """The P1.10b dense window's ``(age, pos)`` before and after position ``t`` (``None``
@@ -338,6 +357,10 @@ class HSN(nn.Module):
     docstring; empty: full backpropagation through time) and ``state_grad_clip`` its
     ``train.state_grad_clip`` (``None``: off)."""
 
+    #: Whether this class may own a window reader (``model.reader``). ``False`` here: the HSN
+    #: has no sequence attention. :class:`hsn.model.hsn_t.HSNT` is the family that does.
+    _takes_reader: bool = False
+
     def __init__(
         self,
         cfg: ModelConfig,
@@ -353,6 +376,11 @@ class HSN(nn.Module):
         ste_scope: str = "selected",
     ) -> None:
         super().__init__()
+        if cfg.reader != "none" and not self._takes_reader:
+            raise ValueError(
+                f"model.reader={cfg.reader!r} belongs to the HSN-T family "
+                "(hsn.model.hsn_t.HSNT, model_name: hsn_t): the HSN has no sequence attention"
+            )
         if ste_scope not in ("selected", "all"):
             raise ValueError(f"ste_scope must be 'selected' or 'all', got {ste_scope!r}")
         #: ``train.ste_scope`` (opt-in): "all" trains the routed window on the masked round.
@@ -427,15 +455,27 @@ class HSN(nn.Module):
                 "fixed_embedding, ema_encoder"
             )
         self.predictor = Predictor(cfg)
-        # A8: the seed only draws the extra input columns of model.fast_readout
-        self.shared = SharedTransform(cfg, seed=seed) if cfg.fast_readout else SharedTransform(cfg)
+        # A8 / HSN-T: the seed only draws the extra input columns of model.fast_readout / reader
+        widened = cfg.fast_readout or cfg.reader != "none"
+        self.shared = SharedTransform(cfg, seed=seed) if widened else SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
         self.cell.detach_state_read = "state" in self.feedback_detach  # A6
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
         self.router = Router.from_config(cfg, unroll=unroll, seed=seed)
         self.router.set_unit_credit(unit_credit)  # train.unit_credit (opt-in)
+        #: The per-position routed records a window stacks: :data:`SELECTION_RECORD_KEYS`, and
+        #: with ``model.write_gate`` (A10) the write fraction after them.
+        self.selection_record_keys: tuple[str, ...] = SELECTION_RECORD_KEYS + (
+            (WRITE_RECORD_KEY,) if cfg.write_gate else ()
+        )
         self.halting = HaltingHead(cfg)
         self.decoder = Decoder(cfg, seed=seed)
+        #: HSN-T (``model.reader``): the window reader, or ``None``. Built last and from its own
+        #: generator: no other parameter's initialisation depends on it.
+        self.reader: Reader | None = Reader(cfg, seed=seed) if cfg.reader != "none" else None
+        #: ``model.address_gate_input = reader_prev``: the width of ``c_{t−1}`` at the end of a
+        #: window's context columns (behind ``c_t``), which only the address gate reads; else 0.
+        self._gate_rides: int = cfg.reader_width if self.scorer.gate_input == "reader_prev" else 0
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
         self._fixed_route: Tensor | None = (
             torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
@@ -524,6 +564,7 @@ class HSN(nn.Module):
         ``None`` records nothing and never synchronises.
         """
         cfg = self.cfg
+        self._refuse_step_with_reader()
         if mode is None:
             mode = "dense" if cfg.routing == "dense" else "sparse"
         elif mode in ("sparse", "masked"):
@@ -570,6 +611,7 @@ class HSN(nn.Module):
         serving step of :func:`hsn.train.compile.compile_step`) runs the capturable sparse
         round."""
         cfg = self.cfg
+        self._refuse_step_with_reader()
         B = state.batch_size
         controls = self._controls()
         state = self._clip_state_grad(state)  # A6: what this position passes back is limited
@@ -658,6 +700,14 @@ class HSN(nn.Module):
             selection=selection,
         )
 
+    def _refuse_step_with_reader(self) -> None:
+        """HSN-T: one position has no window for the reader to read."""
+        if self.reader is not None:
+            raise ValueError(
+                f"model.reader={self.cfg.reader!r} (HSN-T) reads the bytes of a window: a single "
+                "position has none. Run windows through forward (tokens [B, T])"
+            )
+
     def _shared_path(
         self, x_t: Tensor, ctx_t: Tensor, state: CellGraphState
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -674,7 +724,11 @@ class HSN(nn.Module):
 
     def _shared_input(self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor) -> Tensor:
         """The input of ``S``: ``[z_t ; q_{t−1} ; ctx_t]``, and with ``model.fast_readout`` (A8)
-        the fast group's mean ``f_{t−1}`` after it. Both state reads are ``summary`` reads (A6)."""
+        the fast group's mean ``f_{t−1}`` after it. Both state reads are ``summary`` reads (A6).
+        With ``model.reader`` (HSN-T) a window's ``ctx`` already ends in the reader's ``c_t``
+        (:meth:`_window_prologue`), which is not a state read and keeps its gradient."""
+        if self._gate_rides:  # the last columns are the address gate's c_{t−1}, not S's
+            ctx = ctx[..., : -self._gate_rides]
         parts = [z, self._summary_read(q_prev), ctx]
         if self.cfg.fast_readout:
             parts.append(self._summary_read(self._fast_read(h_prev)))
@@ -687,12 +741,15 @@ class HSN(nn.Module):
         ``u_t``, ``[B, d]`` in the state's dtype, or ``None`` for ``u``. ``summary``: the carried
         summary ``q_{t−1}`` as ``S`` reads it. ``u_no_fast``: ``S``'s output with the fast
         group's read left out of its input. ``ctx`` is the embedded context. A constant in the
-        backward with ``router`` (A6), like the scorer's ``u``."""
+        backward with ``router`` (A6), like the scorer's ``u``. ``reader_prev`` (HSN-T): the
+        reader's output of the position before, which a window's ``ctx`` ends in."""
         kind = self.scorer.gate_input
         if kind == "u":
             return None
         if kind == "summary":
             read = self._summary_read(q_prev)
+        elif kind == "reader_prev":  # HSN-T: c_{t−1}, the last columns of a window's context
+            read = ctx[..., -self._gate_rides :]
         else:  # u_no_fast
             carried = self._summary_read(q_prev)
             nothing = torch.zeros_like(self._fast_read(h_prev))
@@ -758,9 +815,11 @@ class HSN(nn.Module):
         state: CellGraphState,
         dense_rows: Tensor | None,
         controls: _Controls | None = None,
+        write_logits: Tensor | None = None,
     ) -> Selection:
         """The selection of this model's ``model.routing`` for one round, with the P2.2 gate and
-        controls of this step (:meth:`_controls` unless given)."""
+        controls of this step (:meth:`_controls` unless given). ``write_logits`` (A10): the
+        scorer's write logits of this position, with ``model.write_gate``."""
         cfg = self.cfg
         gate, tau, epsilon, probes = self._controls() if controls is None else controls
         fast: dict[str, Any] = {}  # A8: only named when set, so wrappers of select keep working
@@ -768,6 +827,8 @@ class HSN(nn.Module):
             fast["reserved"] = cfg.fast_cells
         if cfg.fast_units == "fixed":
             fast["reserved_units"] = True
+        if write_logits is not None:  # A10: named only when set, as the A8 keywords are
+            fast["write_logits"] = write_logits
         return self.router.select(
             unit_logits,
             budget=cfg.budget,
@@ -799,7 +860,12 @@ class HSN(nn.Module):
         unit_logits = self.router(feats).to(state.dtype)  # [B, N, M]
         if mode == "dense":
             return unit_logits, torch.softmax(unit_logits, dim=-1), None
-        return unit_logits, None, self._select(unit_logits, state, dense_rows, controls)
+        write_logits = self.scorer.write_logits(feats) if self.cfg.write_gate else None  # A10
+        return (
+            unit_logits,
+            None,
+            self._select(unit_logits, state, dense_rows, controls, write_logits),
+        )
 
     def _update(
         self,
@@ -993,6 +1059,8 @@ class HSN(nn.Module):
         alpha = selection.unit_weights.to(state.dtype)
         h_cand, info = self._cell_dense(u_s, eps_s, state, alpha, consts)
         mask = selection.cell_mask.to(state.dtype)[:, :, None]
+        if selection.write_mask is not None:  # A10: h + m·w·b·(c − h), the gate times w
+            mask = mask * selection.write_mask.to(state.dtype)[:, :, None]
         # P1.10c: m·h_cand + (1 − m)·h_prev in one op; exactly h_cand / h_prev at m = 1 / 0
         h_new = torch.lerp(state.h, h_cand, mask)
         if self.cell.disabled_cells:  # a soft m would move a disabled cell by an ulp
@@ -1182,7 +1250,7 @@ class HSN(nn.Module):
                 "window runs the same mode (the dense fallback is a flag on the selection)"
             )
         routed = (
-            {key: _stack_record([r[key] for r in records]) for key in SELECTION_RECORD_KEYS}
+            {key: _stack_record([r[key] for r in records]) for key in self.selection_record_keys}
             if records
             else None
         )
@@ -1267,6 +1335,17 @@ class HSN(nn.Module):
         z = self.encoder(emb)
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         context = self.ctx_emb(ctx)  # [B, T, context_dim]
+        reader_out: Tensor | None = None
+        if self.reader is not None:
+            # HSN-T: c_t travels behind the context embedding, so S reads [z; q; ctx; c] at every
+            # position with the loop, the compiled block and _position unchanged
+            reader_out = self.reader(tokens, reset)  # [B, T, w]
+            context = torch.cat([context, reader_out], dim=-1)
+            if self._gate_rides:
+                # address_gate_input=reader_prev: c_{t−1} behind c_t, for the address gate alone;
+                # zero where the document has no byte before t, or the window does not hold it
+                before = torch.cat([torch.zeros_like(reader_out[:, :1]), reader_out[:, :-1]], 1)
+                context = torch.cat([context, before.masked_fill(reset[:, :, None], 0.0)], dim=-1)
         positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
         previous_window: Tensor | None = None
         if cfg.key_address:
@@ -1313,6 +1392,7 @@ class HSN(nn.Module):
             ctx_steps=context.unbind(1),
             scalar_steps=scalars.unbind(1),
             counters=counters,
+            reader=reader_out,
         )
 
     def _position(
@@ -1394,7 +1474,7 @@ class HSN(nn.Module):
         detached indices and slot masks, the logits (autograd intact; P2.4's balance input), the
         per-row cost (detached), the batch-mean expected cost, the REINFORCE log-probability, and
         the exploration, refresh and dense-fallback rates of the position."""
-        return {
+        record = {
             "cell_idx": sel.cell_idx,
             "unit_idx": sel.unit_idx,
             "valid": sel.valid,
@@ -1406,6 +1486,9 @@ class HSN(nn.Module):
             "refreshed": sel.refreshed.float().sum(dim=1).mean(),
             "dense_fallback": sel.dense_fallback.float().mean(),
         }
+        if sel.write_fraction is not None:  # A10: the batch-mean share of slots that may write
+            record[WRITE_RECORD_KEY] = sel.write_fraction.mean()
+        return record
 
     def _window_epilogue(
         self,
@@ -1435,6 +1518,10 @@ class HSN(nn.Module):
             state = CellGraphState._make(
                 h=state.h, q=state.q, age=state.age, pos=positions_after[:, -1].contiguous()
             )
+        if pro.reader is not None:  # HSN-T: the decoder reads c_t after [q; u; r] (and A8's f)
+            if readouts is None:
+                raise ValueError("HSN-T's reader needs A5's per-position readouts")
+            readouts = torch.cat([readouts, pro.reader], dim=-1)
         logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
             "z": pro.z,
@@ -1466,6 +1553,8 @@ class HSN(nn.Module):
             info["explored"] = routed["explored"]
             info["refreshed"] = routed["refreshed"]
             info["dense_fallback"] = routed["dense_fallback"]
+            if WRITE_RECORD_KEY in routed:  # A10: [T], differentiable (the write cost's input)
+                info[WRITE_RECORD_KEY] = routed[WRITE_RECORD_KEY]
         if gates is not None and written is not None:
             assert hs is not None
             info["cell_states"] = hs
@@ -1566,8 +1655,9 @@ class HSN(nn.Module):
     def param_report(self) -> dict[str, int]:
         """Measured parameter counts: the Appendix C.1 rows in table order and their ``total``
         (the closed form of :func:`hsn.train.memory_plan.expected_param_count`), then ``edges``
-        (the P1.4 edge logits, outside Appendix C) and ``total_trainable`` (every parameter of
-        this module; the run manifest's ``param_count``)."""
+        (the P1.4 edge logits, outside Appendix C), with ``model.reader`` (HSN-T) ``reader``
+        (:func:`hsn.train.memory_plan.reader_param_count`), and ``total_trainable`` (every
+        parameter of this module; the run manifest's ``param_count``)."""
         modules: dict[str, nn.Module] = {
             "byte_emb": self.byte_emb,
             "ctx_emb": self.ctx_emb,
@@ -1588,12 +1678,17 @@ class HSN(nn.Module):
         report = {name: sum(p.numel() for p in m.parameters()) for name, m in modules.items()}
         report["total"] = sum(report.values())
         report["edges"] = self.cell.graph.edge_logit.numel()
+        accounted = report["total"] + report["edges"]
+        if self.reader is not None:  # HSN-T: outside Appendix C, like the edge logits
+            report["reader"] = sum(p.numel() for p in self.reader.parameters())
+            accounted += report["reader"]
         report["total_trainable"] = sum(p.numel() for p in self.parameters())
-        if report["total_trainable"] != report["total"] + report["edges"]:
+        if report["total_trainable"] != accounted:
             raise RuntimeError(
                 f"param_report: {report['total_trainable']} trainable parameters, but the Appendix "
-                f"C rows ({report['total']}) plus the edge logits ({report['edges']}) give "
-                f"{report['total'] + report['edges']}; a submodule carries unaccounted parameters"
+                f"C rows ({report['total']}), the edge logits ({report['edges']}) and HSN-T's "
+                f"reader ({report.get('reader', 0)}) give {accounted}; a submodule carries "
+                "unaccounted parameters"
             )
         return report
 

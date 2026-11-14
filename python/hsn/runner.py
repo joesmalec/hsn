@@ -69,6 +69,7 @@ from hsn.eval.results import (
     evidence_package,
 )
 from hsn.model.hsn import HSN
+from hsn.model.hsn_t import HSNT
 from hsn.model.router import SCORED_MODES
 from hsn.profiler import (
     NullMeter,
@@ -118,6 +119,7 @@ MODEL_REGISTRY: dict[str, ModelFactory] = {
     "transformer": TransformerBaseline,
     "selective_ssm": MambaBaseline,  # the paper's selective-memory control (plan P2.13)
     "hsn": HSN.from_config,  # P1.9: the dense predictive cell (P1.5) trained by TBPTTTrainer (P1.7)
+    "hsn_t": HSNT.from_config,  # HSN-T: the HSN's memory core behind a reader (docs/hsn_t.md)
 }
 
 
@@ -157,19 +159,37 @@ def make_trainer(
     return Trainer(model, cfg, ctx, profiler, run_dir=run_dir)
 
 
+#: A10: the state-dict keys of the write output (``model.write_gate``). A warm start may take a
+#: checkpoint written without them: the output then keeps its initial value (every write open).
+WRITE_OUTPUT_KEYS: tuple[str, ...] = (
+    "router.scorer.write_net.weight",
+    "router.scorer.write_net.bias",
+)
+
+
 def warm_start(model: nn.Module, path: str | Path) -> dict[str, Any]:
     """``train.init_from``: load the weights of another run's checkpoint into ``model`` (strict
     key match; the run's weight average when the checkpoint holds one) and nothing else. Call it
     before the trainer is built, so the optimiser, the schedule and the new weight average start
-    from these weights at step 0. Returns what was loaded, for the run record."""
-    loaded = load_checkpoint(path, model, averaged=True)
+    from these weights at step 0. Returns what was loaded, for the run record.
+
+    One exception to the strict match: a model with A10's write output
+    (:data:`WRITE_OUTPUT_KEYS`) accepts a checkpoint without it; the record then lists those
+    keys under ``not_loaded``."""
+    own = set(model.state_dict())
+    allow = tuple(key for key in WRITE_OUTPUT_KEYS if key in own)
+    loaded = load_checkpoint(path, model, averaged=True, allow_missing=allow)
     extra = loaded.get("extra") or {}
-    return {
+    record: dict[str, Any] = {
         "path": str(path),
         "step": int(loaded["step"]),
         "config_hash": extra.get("config_hash"),
         "averaged": extra.get("weight_ema") is not None,
     }
+    not_loaded = [key for key in allow if key not in loaded["model"]]
+    if not_loaded:
+        record["not_loaded"] = not_loaded
+    return record
 
 
 def _detach(state: Any) -> Any:

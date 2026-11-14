@@ -67,6 +67,7 @@ __all__ = [
     "AUX_TERMS",
     "HARDWARE_PROFILE_DIR",
     "HASH_OMIT_AT_DEFAULT",
+    "HSN_MODEL_NAMES",
     "RETIRED_KEYS",
     "MEASURED_KEYS",
     "PROFILES",
@@ -134,7 +135,11 @@ CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
 #: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
 WindowMode = Literal["autograd", "split", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
-ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
+ModelName = Literal["hsn", "hsn_t", "gru", "transformer", "selective_ssm", "moe"]
+#: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
+#: a Transformer reader in front of the HSN's memory core (``model.reader``, ``docs/hsn_t.md``).
+#: Everything "HSN-only" in this schema applies to both; ``model.reader`` separates them.
+HSN_MODEL_NAMES: tuple[str, ...] = ("hsn", "hsn_t")
 
 #: Auxiliary loss terms that ``train.aux_enabled`` may name (Appendix A.3: cost / balance / graph).
 #: P2.4 registers its term names here.
@@ -312,7 +317,11 @@ class ModelConfig(_StrictModel):
     # left out of its input. G keeps its shape (d -> n_units * address features) and its zero
     # start; only its input changes. Under train.feedback_detach with "router" the input is a
     # constant in the backward, like the scorer's u.
-    address_gate_input: Literal["u", "summary", "u_no_fast"] = "u"
+    # "reader_prev" (HSN-T: needs model.reader and reader_width = d): the reader's output for the
+    # position before, c_{t-1} (zero at a document's first position and at a window's first
+    # column). It holds the bytes up to t - 1 and not the current byte, which without fast cells
+    # the carried summary does not.
+    address_gate_input: Literal["u", "summary", "u_no_fast", "reader_prev"] = "u"
     # --- end A13 ---
     # --- Amendment A11 (docs/amendments/A11_position_bound.md; opt-in) ---
     # The position the scorer's ``pos`` feature reads. "document" (default): the position in the
@@ -322,6 +331,37 @@ class ModelConfig(_StrictModel):
     # model with any of them.
     scorer_position: Literal["document", "clamp", "wrap"] = "document"
     # --- end A11 ---
+    # --- Amendment A10 (docs/amendments/A10_write_decision.md; opt-in, default off) ---
+    # write_gate: the scorer gets a second linear output of the same features, one write logit
+    # per (cell, unit). A selected routed cell is executed and read as before, but it is written
+    # only where the write logit of its chosen unit is positive: the cell's gate b is multiplied
+    # by w in {0, 1} (straight-through sigmoid(logit / tau) in training; the soft warm-up uses
+    # the sigmoid itself). The fast cells of A8 are always written. Selection, units, graph, the
+    # convex tanh gate and q are unchanged. Needs model.routing=topk and the linear scorer.
+    write_gate: bool = False
+    # The write output starts with zero weights and this bias: positive, so that every selected
+    # cell is written at the start, as without the key.
+    write_init: float = Field(default=2.0, allow_inf_nan=False)
+    # --- end A10 ---
+    # --- HSN-T (docs/hsn_t.md): the reader of the model family hsn_t; default off ---
+    # reader = "transformer": a small causal Transformer reads the bytes of the current window,
+    # all positions at once, and its output c_t (width reader_width) enters where the HSN's fast
+    # cells are read: S reads [z; q; ctx; c_t] and the decoder reads [q; u; r; c_t]. c_t depends
+    # on the bytes up to t of the same document inside the window and on nothing else (no
+    # earlier window, no cell state). The cells and their carried state, the fixed addresses,
+    # the router, the units, the gate, the graph and q are the HSN's, unchanged. This is
+    # sequence attention, which the HSN does not have: only model_name=hsn_t may set the key
+    # (RunConfig), and an HSN refuses it. Needs selected_readout. "none": no reader. The fast
+    # cells may be kept beside it (fast_cells > 0).
+    reader: Literal["none", "transformer"] = "none"
+    reader_width: int = Field(default=64, ge=8)
+    reader_layers: int = Field(default=2, ge=1)
+    reader_heads: int = Field(default=4, ge=1)
+    # reader_span = n: a position reads itself and the n - 1 bytes before it only (the
+    # short-sighted reader, which must leave everything further back to the memory).
+    # null (default): every byte of the document up to the position, inside the window.
+    reader_span: int | None = Field(default=None, ge=1)
+    # --- end HSN-T ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -401,6 +441,11 @@ class ModelConfig(_StrictModel):
                     f"model.disabled_cells {fast_disabled} lie in the fast group "
                     f"[0, {self.fast_cells})"
                 )
+        if self.write_gate and (self.routing != "topk" or self.scorer != "linear"):
+            raise ValueError(
+                "model.write_gate (A10) needs model.routing=topk and model.scorer=linear, got "
+                f"routing={self.routing!r}, scorer={self.scorer!r}"
+            )
         if self.address_gate and not (self.key_address and self.scorer == "linear"):
             raise ValueError(
                 "model.address_gate (A12) needs model.key_address=true and model.scorer=linear, "
@@ -432,6 +477,37 @@ class ModelConfig(_StrictModel):
                 "model.fast_readout requires model.fast_cells > 0 and model.selected_readout=true"
             )
         # --- end A8 ---
+        # --- HSN-T: the window reader ---
+        if self.reader == "none":
+            if self.address_gate_input == "reader_prev":
+                raise ValueError(
+                    "model.address_gate_input=reader_prev reads the reader's output; set "
+                    "model.reader=transformer"
+                )
+            if self.reader_span is not None:
+                raise ValueError(
+                    f"model.reader_span={self.reader_span} (HSN-T) is the span of model.reader; "
+                    "set model.reader=transformer or leave it null"
+                )
+        else:
+            if not self.selected_readout:
+                raise ValueError(
+                    "model.reader (HSN-T) requires model.selected_readout=true: the decoder reads "
+                    "[q; u; r; c]"
+                )
+            if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
+                raise ValueError(
+                    f"model.address_gate_input=reader_prev: the gate's map reads width d = "
+                    f"{self.d}; model.reader_width={self.reader_width} must equal it"
+                )
+            per_head, rest = divmod(self.reader_width, self.reader_heads)
+            if rest or per_head % 2:
+                raise ValueError(
+                    f"model.reader_width={self.reader_width} must be a multiple of "
+                    f"model.reader_heads={self.reader_heads} with an even width per head (the "
+                    "positions rotate pairs of the attention's query and key)"
+                )
+        # --- end HSN-T ---
         return self
 
 
@@ -709,6 +785,9 @@ class TrainConfig(_StrictModel):
     lambda_g: float = 0.0
     lambda_u: float = 0.0
     lambda_ponder: float = 0.0
+    # A10 (needs model.write_gate): weight of the write cost, the share of the routed slots that
+    # may write, averaged over the window. 0 (default): no cost term.
+    lambda_w: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     aux_enabled: list[str] = []  # which of cost / balance / graph are on (<= 1 unless justified)
     allow_multiple_aux: str = ""  # written justification enabling > 1
     gate_mode: GateMode = "soft"  # P2.2
@@ -1112,6 +1191,14 @@ class HardwareConfig(_StrictModel):
     # the model's own compiled blocks, which cast at every position and whose fused arithmetic
     # rounds as the autograd window's does: about 11 ms per step slower, kept to compare the two.
     sweep_twin: bool = True
+    # Opt-in (14 Nov 2026): record compiled CUDA graphs with an index for PyTorch's alias check
+    # (hsn.train.compile.install_graph_alias_index). torch 2.15 checks every output of a newly
+    # recorded graph against every live output of the earlier graphs of the window by walking
+    # them all, which is quadratic in the number of tensors a training block returns: minutes
+    # at the start of every compiled autograd window and no end in useful time for larger
+    # graphs. The index gives the same answers by dictionary lookup. Bookkeeping only: no
+    # tensor value changes. false (default): PyTorch as it is.
+    graph_alias_index: bool = False
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1202,13 +1289,24 @@ class RunConfig(_StrictModel):
                     f"hardware.window={self.hardware.window!r} is not available for this "
                     f"configuration: {reason}"
                 )
-        if self.baseline.address_input and self.model_name == "hsn":
+        if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
                 "baseline.address_input is an input of the baselines; the HSN's own address "
                 "features are model.key_address"
             )
+        # --- HSN-T: the reader is what separates the two families built on the HSN's cells ---
+        if self.model.reader != "none" and self.model_name != "hsn_t":
+            raise ValueError(
+                f"model.reader={self.model.reader!r} belongs to the HSN-T family (model_name: "
+                f"hsn_t), got model_name={self.model_name!r}: the HSN has no sequence attention"
+            )
+        if self.model_name == "hsn_t" and self.model.reader == "none":
+            raise ValueError(
+                "model_name=hsn_t is the HSN's memory core behind a reader: set "
+                "model.reader=transformer (without one the model is the HSN, model_name: hsn)"
+            )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
-        if self.model_name != "hsn":
+        if self.model_name not in HSN_MODEL_NAMES:
             ignored = []
             if self.train.router_lr_mult != 1.0 or self.train.readout_lr_mult != 1.0:
                 raise ValueError("train.router_lr_mult and train.readout_lr_mult are HSN-only")
@@ -1220,6 +1318,8 @@ class RunConfig(_StrictModel):
                 raise ValueError("model.fast_cells and model.fast_readout (A8) are HSN-only")
             if self.model.cell_units != "routed":
                 raise ValueError("model.cell_units is HSN-only")
+            if self.model.write_gate or self.train.lambda_w > 0.0:
+                raise ValueError("model.write_gate and train.lambda_w (A10) are HSN-only")
             if self.train.feedback_detach:
                 raise ValueError("train.feedback_detach (A6) is HSN-only")
             if self.train.unit_credit != "softmax":
@@ -1264,6 +1364,20 @@ class RunConfig(_StrictModel):
             )
         explores = train.epsilon_start > 0.0 or train.epsilon_end > 0.0
         # --- Amendment A8: the fast group is a rule of the scored hard/soft selection only ---
+        if train.lambda_w > 0.0 and not self.model.write_gate:
+            raise ValueError(
+                f"train.lambda_w={train.lambda_w} (A10) requires model.write_gate=true"
+            )
+        if self.model.write_gate and train.gate_mode == "reinforce":
+            raise ValueError(
+                "model.write_gate (A10) is not defined for train.gate_mode=reinforce (the write "
+                "decision trains through the straight-through mask)"
+            )
+        if self.model.write_gate and train.lambda_u > 0.0:
+            raise ValueError(
+                "model.write_gate (A10) with train.lambda_u > 0 is untested: the counterfactual "
+                "probes edit a selection without its write mask"
+            )
         if self.model.fast_cells and train.gate_mode == "reinforce":
             raise ValueError(
                 "model.fast_cells (A8) is not defined for train.gate_mode=reinforce (the sampled "
@@ -1483,12 +1597,10 @@ def _resolve_hardware(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
 #: that meant "off". A resolved configuration written by a tree that carried them holds them at
 #: that value; it is the same run without them (they were left out of the configuration hash at
 #: their defaults), so :func:`load_config` removes them from the file's content. Any other value
-#: needs the tree that had the code and is refused.
-RETIRED_KEYS: dict[str, tuple[Any, str]] = {
-    "model.write_gate": (False, "amendment A10, dropped 13 Nov 2026"),
-    "model.write_init": (2.0, "amendment A10, dropped 13 Nov 2026"),
-    "train.lambda_w": (0.0, "amendment A10, dropped 13 Nov 2026"),
-}
+#: needs the tree that had the code and is refused. Empty at present: amendment A10's three keys
+#: (``model.write_gate``, ``model.write_init``, ``train.lambda_w``), retired on 13 Nov 2026, are
+#: schema keys again since 14 Nov 2026, so run folders that hold them load as they are.
+RETIRED_KEYS: dict[str, tuple[Any, str]] = {}
 
 
 def _drop_retired_keys(raw: dict[str, Any], path: Path) -> None:
@@ -1502,7 +1614,7 @@ def _drop_retired_keys(raw: dict[str, Any], path: Path) -> None:
         if block[key] != off:
             raise ValueError(
                 f"{path}: {dotted}={block[key]!r} belongs to {what}; its code is not in this "
-                "tree (docs/amendments/A10_write_decision.md names the commit that has it)"
+                "tree (the amendment's document names the commit that has it)"
             )
         del block[key]
 
@@ -1602,6 +1714,15 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_gate",
     "train.address_gate_hold_step",
     "model.address_gate_input",
+    "model.write_gate",
+    "model.write_init",
+    "train.lambda_w",
+    "hardware.graph_alias_index",
+    "model.reader",
+    "model.reader_width",
+    "model.reader_layers",
+    "model.reader_heads",
+    "model.reader_span",
 )
 
 
@@ -1643,7 +1764,7 @@ def split_window_scope_error(
     sweep would cost more than the autograd window, and the configuration is never offered
     it."""
     model, train = cfg.model, cfg.train
-    if cfg.model_name != "hsn":
+    if cfg.model_name != "hsn":  # HSN-T too: its reader is not built into the split window
         return f"model_name={cfg.model_name!r} is not the HSN"
     if model.routing != "topk":
         return f"model.routing={model.routing!r}: the split window needs topk"
@@ -1689,6 +1810,11 @@ def split_window_scope_error(
             f"model.address_gate_input={model.address_gate_input!r} (A13): the split window's "
             "replay and compiled sweeps compute the gate's term from u; use "
             "hardware.window=autograd"
+        )
+    if model.write_gate:
+        return (
+            "model.write_gate (A10): the write decision is not built into the split window; "
+            "use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

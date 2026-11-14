@@ -1,0 +1,146 @@
+"""HSN-T (``model_name: hsn_t``, ``model.reader = transformer``, ``docs/hsn_t.md``): the
+window reader.
+
+A small causal Transformer over the byte ids of one window, all positions at once. Its output at
+position ``t``, ``c_t`` (width ``model.reader_width``), takes the place of the fast cells' read of
+amendment A8 in the two places the model reads it: ``u_t = S([z_t ; q_{t−1} ; ctx_t ; c_t])`` and
+``D([q_t ; u_t ; r_t ; c_t])``. The cells and their carried state, the fixed addresses, the
+router, the units, the convex tanh gate, the graph and the summary ``q`` are unchanged: the memory
+is the HSN's, the reading of the current window is the reader's. This is the one module of the
+model with sequence attention, which A5's readout text excludes; the key is off by default.
+
+What ``c_t`` may depend on (tested in ``tests/test_a14_reader.py``):
+
+* the bytes ``x_s`` with ``s ≤ t`` of the same window and the same document (``reset`` splits a
+  row into documents, as it resets the cells; the attention mask is block-diagonal over them);
+* with ``model.reader_span = n`` only the last ``n`` of them (``t − n < s ≤ t``): the
+  short-sighted reader, which has to leave everything further back to the memory;
+* nothing of an earlier window, no cell state, no context symbol.
+
+Layout: byte embedding → ``model.reader_layers`` pre-norm blocks (LayerNorm → causal multi-head
+self-attention → residual; LayerNorm → GELU MLP of width ``4 w`` → residual) → LayerNorm. The
+position enters as a rotation of the attention's queries and keys by the position in the window
+(rotary embedding), so only the distance ``t − s`` is read and there is no position parameter:
+with a span the output is a function of the last ``n`` bytes alone, wherever they sit in the
+window.
+
+The parameters are drawn from the module's own generator (``seed``) inside a forked RNG, so
+building a reader neither changes another parameter's initialisation nor consumes the global
+random stream.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from hsn.config import ModelConfig
+
+__all__ = ["Reader"]
+
+_ROTARY_BASE = 10_000.0
+_INIT_STD = 0.02
+
+
+def _rotate(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Rotate the pairs ``(x[..., i], x[..., i + half])`` of ``x [B, H, T, 2·half]`` by the
+    position's angles ``cos`` / ``sin [T, half]``."""
+    half = x.shape[-1] // 2
+    first, second = x[..., :half], x[..., half:]
+    return torch.cat([first * cos - second * sin, first * sin + second * cos], dim=-1)
+
+
+class _ReaderBlock(nn.Module):
+    """One pre-norm block: causal multi-head self-attention with rotary positions and a GELU
+    MLP, both residual."""
+
+    def __init__(self, width: int, heads: int) -> None:
+        super().__init__()
+        self.heads = heads
+        self.norm_attn = nn.LayerNorm(width)
+        self.qkv = nn.Linear(width, 3 * width)
+        self.proj = nn.Linear(width, width)
+        self.norm_mlp = nn.LayerNorm(width)
+        self.fc_in = nn.Linear(width, 4 * width)
+        self.fc_out = nn.Linear(4 * width, width)
+
+    def forward(self, x: Tensor, mask: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        B, T, w = x.shape
+        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
+        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
+        k = k.view(B, T, self.heads, -1).transpose(1, 2)
+        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        cos, sin = cos.to(q.dtype), sin.to(q.dtype)
+        attn = F.scaled_dot_product_attention(
+            _rotate(q, cos, sin), _rotate(k, cos, sin), v, attn_mask=mask
+        )
+        x = x + self.proj(attn.transpose(1, 2).reshape(B, T, w))
+        out: Tensor = x + self.fc_out(F.gelu(self.fc_in(self.norm_mlp(x))))
+        return out
+
+
+class Reader(nn.Module):
+    """``c = Reader(tokens, reset)``: ``[B, T] → [B, T, model.reader_width]`` (module docstring)."""
+
+    def __init__(self, cfg: ModelConfig, *, seed: int = 0) -> None:
+        super().__init__()
+        if cfg.reader != "transformer":
+            raise ValueError(f"Reader needs model.reader=transformer, got {cfg.reader!r}")
+        width, heads = cfg.reader_width, cfg.reader_heads
+        self.width = width
+        self.heads = heads
+        self.span: int | None = cfg.reader_span
+        with torch.random.fork_rng(devices=[]):
+            generator = torch.Generator(device="cpu").manual_seed((seed + 0xA14EAD) % (2**63 - 1))
+            torch.set_rng_state(generator.get_state())
+            self.emb = nn.Embedding(cfg.vocab_size, width)
+            self.blocks = nn.ModuleList(
+                _ReaderBlock(width, heads) for _ in range(cfg.reader_layers)
+            )
+            self.norm = nn.LayerNorm(width)
+            for module in self.modules():
+                if isinstance(module, nn.Linear | nn.Embedding):
+                    nn.init.normal_(module.weight, std=_INIT_STD)
+                if isinstance(module, nn.Linear):
+                    nn.init.zeros_(module.bias)
+
+    def attention_mask(self, reset: Tensor) -> Tensor:
+        """Bool ``[B, 1, T, T]``, True where position ``t`` (row) may read position ``s``
+        (column): ``s ≤ t``, the same document of the row (``reset [B, T]`` starts a document at
+        its True columns), and with a span ``t − s < span``. Every row holds its own position."""
+        T = int(reset.shape[1])
+        segment = reset.to(torch.int64).cumsum(dim=1)  # the document index of every position
+        same = segment[:, :, None] == segment[:, None, :]
+        index = torch.arange(T, device=reset.device)
+        distance = index[:, None] - index[None, :]  # t − s
+        near = distance >= 0
+        if self.span is not None:
+            near = near & (distance < self.span)
+        return (same & near)[:, None]
+
+    def forward(self, tokens: Tensor, reset: Tensor) -> Tensor:
+        if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
+            raise ValueError(
+                f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
+                f"{tuple(tokens.shape)} and {reset.dtype} {tuple(reset.shape)}"
+            )
+        T = int(tokens.shape[1])
+        half = self.width // self.heads // 2
+        # the angles in float64 where the device has it, so that a rotation by t against one by
+        # s is the rotation by t − s to the working precision at every window position
+        wide = torch.float32 if tokens.device.type == "mps" else torch.float64
+        exponent = torch.arange(half, device=tokens.device, dtype=wide) / half
+        angles = torch.arange(T, device=tokens.device, dtype=wide)[:, None] * (
+            _ROTARY_BASE**-exponent
+        )  # [T, half]
+        x = self.emb(tokens)
+        cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+        mask = self.attention_mask(reset)
+        for block in self.blocks:
+            x = block(x, mask, cos, sin)
+        out: Tensor = self.norm(x)
+        return out
+
+    def extra_repr(self) -> str:
+        return f"width={self.width}, heads={self.heads}, span={self.span}"

@@ -194,7 +194,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from hsn.config import GradNormPrecision, RunConfig
+from hsn.config import HSN_MODEL_NAMES, GradNormPrecision, RunConfig
 from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, memory_stats, reset_peak, synchronize
 from hsn.eval.evaluate import Metric
@@ -221,7 +221,7 @@ from hsn.train.checkpoint import (
     save_checkpoint,
     unpack_cell_state,
 )
-from hsn.train.compile import CompiledWindow, compile_window
+from hsn.train.compile import CompiledWindow, compile_window, install_graph_alias_index
 from hsn.train.grad_norm import clip_grad_norm_, norm_float64
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices, active_units_packed
 from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
@@ -406,10 +406,10 @@ class TBPTTTrainer(Trainer):
                 f"TBPTTTrainer trains the HSN module, got {type(model).__name__}; the baselines "
                 "use hsn.train.loop.Trainer"
             )
-        if cfg.model_name != "hsn":
+        if cfg.model_name not in HSN_MODEL_NAMES:
             raise ValueError(
-                f"model_name={cfg.model_name!r}: TBPTTTrainer needs model_name=hsn (the "
-                "configuration and the model must agree)"
+                f"model_name={cfg.model_name!r}: TBPTTTrainer needs model_name=hsn or hsn_t "
+                "(the configuration and the model must agree)"
             )
         super().__init__(model, cfg, ctx, profiler, run_dir=run_dir)
         self.hsn: HSN = model
@@ -468,6 +468,8 @@ class TBPTTTrainer(Trainer):
         # (a compiled window keeps one fixed T)
         self._compiled: CompiledWindow | None = None
         if ctx.compile_enabled:
+            if cfg.hardware.graph_alias_index:  # opt-in: PyTorch's alias check by index
+                install_graph_alias_index()
             window = compile_window(
                 model, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
             )
