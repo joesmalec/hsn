@@ -10,14 +10,15 @@ from __future__ import annotations
 import pytest
 import torch
 from hsn.config import RunConfig
+from hsn.model.hsn import HSN
 from hsn.train import state_gradient
 from hsn.train.compile import fixed_fast_slots
 from hsn.train.split import SplitWindow
-from hsn.train.state_gradient import cell_constants
+from hsn.train.state_gradient import RowLimits, cell_constants
 from hsn.train.state_sweep import ReverseSweep, out_adjacency, sweep_shape
 from p1_11_support import restore_determinism  # noqa: F401
 from test_a6_feedback_detach import _cfg, _model
-from test_p2_10c_state_gradient import BASE, FAST, PINNED, READ, _case, _objective
+from test_p2_10c_state_gradient import BASE, FAST, PINNED, READ, ROWS, _case, _objective
 from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
@@ -45,12 +46,20 @@ def sweep_arguments(cfg: RunConfig, monkeypatch: pytest.MonkeyPatch) -> tuple[tu
     return given[0], fixed_fast_slots(model), n_read
 
 
-def buffered(args: tuple, n_fast: int, n_read: int) -> ReverseSweep:
+def buffered(
+    args: tuple, n_fast: int, n_read: int, limits: RowLimits | None = None
+) -> ReverseSweep:
     c, _, _, _, _, _, _, n_cells, *_, record, consts = args
     shape = sweep_shape(c, record, consts, n_cells, n_fast, n_read)
     return ReverseSweep(
-        shape, consts, device=c.device, state_dtype=c.dtype, product_dtype=c.dtype, kernels=False
-    )
+        shape, consts, device=c.device, state_dtype=c.dtype, product_dtype=c.dtype,
+        kernels=False, limits=limits,
+    )  # fmt: skip
+
+
+def row_limits(cfg: RunConfig) -> RowLimits | None:
+    """The limits the window of ``cfg`` hands its sweep (the model's)."""
+    return SplitWindow(HSN.from_config(cfg), cfg, None, state_gradient=True).row_limits
 
 
 def load(sweep: ReverseSweep, args: tuple, initial: tuple[Tensor, Tensor] | None = None) -> None:
@@ -134,6 +143,62 @@ def test_buffered_sweep_is_the_reference_sweep(name: str, monkeypatch: pytest.Mo
         torch.testing.assert_close(dc, want[0], **tol)
         torch.testing.assert_close(db, want[1], **tol)
     assert float(want[0].abs().max()) > 1e-6
+
+
+#: amendment A6's per-row limit, sixteen rows (tests/test_p2_10c_state_gradient.py, ROWS)
+LIMITED = {
+    "ratio": ("train.state_grad_ratio=1.02",),
+    "clip": ("train.state_grad_clip=0.02",),
+    "ratio_fast": (*PINNED, "train.state_grad_ratio=1.02"),
+    "ratio_and_clip_fast": (*PINNED, "train.state_grad_ratio=1.5", "train.state_grad_clip=0.05"),
+}
+
+
+@pytest.mark.parametrize("name", list(LIMITED))
+def test_buffered_sweep_with_the_row_limit(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the limit the buffered sweep (the tail hands the limit's step the rows' norms and
+    the reset) is the reference sweep with the limit, position by position, and not the sweep
+    without it. The rows of a position that reset are limited before they are zeroed."""
+    cfg = _cfg(*BASE, *ROWS, *LIMITED[name])
+    args, n_fast, n_read = sweep_arguments(cfg, monkeypatch)
+    limits = row_limits(cfg)
+    assert limits is not None
+    trace: dict[str, Tensor] = {}
+    with torch.no_grad():
+        want = state_gradient.state_gradient_backward(*args, trace=trace, limits=limits)
+        free = state_gradient.state_gradient_backward(*args)
+        sweep = buffered(args, n_fast, n_read, limits)
+        load(sweep, args)
+        reset = args[6]
+        tol = {"rtol": 1e-11, "atol": 1e-13}
+        for t in range(sweep.shape.T - 1, -1, -1):
+            sweep.head(t)
+            sweep.products_second()
+            sweep.middle(t)
+            sweep.products_first()
+            sweep.tail(t)
+            # the tail left the reset to the limit's step, and took the rows' norms
+            torch.testing.assert_close(sweep.norms[0], sweep.A.flatten(1).norm(dim=1), **tol)
+            torch.testing.assert_close(sweep.norms[1], sweep.R.norm(dim=1), **tol)
+            sweep.limit(t)
+            keep = ~reset[:, t]
+            torch.testing.assert_close(
+                sweep.A, torch.where(keep[:, None, None], trace["A"][:, t], 0.0), **tol
+            )
+            torch.testing.assert_close(
+                sweep.R, torch.where(keep[:, None], trace["R"][:, t], 0.0), **tol
+            )
+        torch.testing.assert_close(sweep.dc, want[0], **tol)
+        torch.testing.assert_close(sweep.db, want[1], **tol)
+        load(sweep, args)
+        dc, db = sweep.run()  # run() takes the limit's step itself
+        torch.testing.assert_close(dc, want[0], **tol)
+        torch.testing.assert_close(db, want[1], **tol)
+    assert bool(trace["limited_h"].any()) and bool(trace["limited_q"].any())
+    if name != "ratio_fast":  # (there the ratio happens to act on no row that resets)
+        resetting = (trace["limited_h"] | trace["limited_q"]) & reset
+        assert bool(resetting[:, 1:].any())
+    assert float((want[0] - free[0]).abs().max()) > 1e-3 * float(free[0].abs().max())
 
 
 @pytest.mark.parametrize("name", ["routed", "fast_fixed_units"])

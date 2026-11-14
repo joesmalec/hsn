@@ -1526,8 +1526,10 @@ def split_window_scope_error(cfg: RunConfig, *, state_gradient: bool | None = No
     (P2.10c, "the state gradient": ``docs/p2_10c_state_gradient_window.md``) the recurrence's
     reverse sweep also carries the cell's read of the state position by position
     (:mod:`hsn.train.state_gradient`, :mod:`hsn.train.state_sweep`); that sweep also takes
-    amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and ``fast_readout``),
-    which the full cut's recurrence does not.
+    amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and ``fast_readout``)
+    and amendment A6's per-row limit on what a position passes back
+    (``train.state_grad_clip``, ``train.state_grad_ratio``), which the full cut's recurrence
+    does not.
 
     A soft warm-up (``train.soft_until_step``) is inside the scope: its steps run every cell
     with autograd, which is the autograd window's work, so they take that window and the split
@@ -1568,8 +1570,13 @@ def split_window_scope_error(cfg: RunConfig, *, state_gradient: bool | None = No
         return "train.epsilon_*: exploration draws are not replayed"
     if train.lambda_u > 0.0:
         return "train.lambda_u > 0: the counterfactual probes are untested with the split window"
-    if train.state_grad_clip is not None or train.state_grad_ratio is not None:
-        return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
+    limited = train.state_grad_clip is not None or train.state_grad_ratio is not None
+    if limited and not sweeps_state:
+        return (
+            "train.state_grad_clip / state_grad_ratio change the state recurrence's backward: "
+            "only the state-gradient sweep applies them "
+            "(train.feedback_detach=[summary, eps, router])"
+        )
     if model.disabled_cells:
         return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
     if model.fast_cells and not sweeps_state:

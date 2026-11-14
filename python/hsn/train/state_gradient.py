@@ -41,6 +41,7 @@ of the decoder)::
         A[cell_k] = (1 − b_k) ⊙ A[cell_k] − b_k ⊙ R / N + dh_k
         A[src_{k,e}] += a_{cell_k,e} · Vᵀ dm_k           every source e of cell_k's messages
         R += P_t
+        A, R = limit(A), limit(R)                        row by row (A6's limit; off by default)
         A, R = 0 on the rows that reset at t
 
 The cell at a selected slot (``x = [u; ε; h_i; m_i]`` of width ``n``, unit ``j``, slot weight
@@ -66,6 +67,16 @@ hid − b1_j`` and ``G v = gate_pre − b_g``, that product is ``σ`` and the sw
 input columns. Without the cell norm ``ds = dv_s``; without the candidate norm ``y = W_out(α
 F)`` and ``dF = α W_outᵀ dz``.
 
+The limit (``train.state_grad_clip`` / ``train.state_grad_ratio``, :class:`RowLimits`): the
+model limits the gradient of ``h`` and of ``q`` at the entry of every position, after the
+position's reset and before any of its reads. At that point of the sweep ``A`` and ``R`` are the
+whole cotangent of the state position ``t`` reads, so the sweep applies
+:func:`hsn.model.gradclip.limit_row_grad` to each there. The rows that reset at ``t`` are
+limited like the others and count in the batch's typical row (they carry what the position
+passes back to the zeroed state), and are zeroed after it, as the reset's backward does. What
+the decoder and the losses read of the state *after* position ``t − 1`` (``D``, ``G``, ``S``)
+joins after the limit of position ``t``, as in the model.
+
 Scope (:func:`hsn.config.split_window_scope_error` with ``state_gradient=True``): the split
 window's, with ``summary``, ``eps`` and ``router`` cut and ``state`` not; amendment A8's fast
 cells and A9's address n-grams are inside it. A window with dense-fallback rows
@@ -83,9 +94,11 @@ from torch import Tensor, nn
 from torch.autograd.function import FunctionCtx, once_differentiable
 
 from hsn.model.cell import PDGCell
+from hsn.model.gradclip import limit_row_grad
 
 __all__ = [
     "CellConstants",
+    "RowLimits",
     "StateGradientRecurrence",
     "SweepLayouts",
     "activation_grad",
@@ -99,6 +112,18 @@ __all__ = [
 #: What :meth:`hsn.model.cell.PDGCell.replay_sparse` records for the sweep (``rms`` only with
 #: the cell norm), each ``[B, T, K, …]`` when the sweep reads it.
 RECORD_KEYS: tuple[str, ...] = ("y", "alpha", "hidden", "gate_pre", "m", "rms")
+
+
+class RowLimits(NamedTuple):
+    """Amendment A6's per-row limit on what a position passes back into the state
+    (``train.state_grad_clip``, ``train.state_grad_ratio``; :mod:`hsn.model.gradclip`), as the
+    model applies it at the entry of every position: the absolute limits of a row of ``dL/dh``
+    and of ``dL/dq`` (``None``: none) and the multiple of the batch's typical live row that
+    bounds both (``None``: none)."""
+
+    h: float | None
+    q: float | None
+    ratio: float | None
 
 
 class CellConstants(NamedTuple):
@@ -344,6 +369,7 @@ def state_gradient_backward(
     trace: dict[str, Tensor] | None = None,
     initial: tuple[Tensor, Tensor] | None = None,
     layouts: SweepLayouts | None = None,
+    limits: RowLimits | None = None,
 ) -> tuple[Tensor, Tensor]:
     """The reverse sweep of the module docstring in plain torch (any device and dtype): the
     total ``(dL/dc, dL/db)``, each ``[B, T, K, d]``.
@@ -362,8 +388,13 @@ def state_gradient_backward(
 
     ``trace`` (tests, and the oracle of a kernel's intermediate values) receives, stacked over
     the positions at dim 1: ``A [B, T, N, d]`` and ``R [B, T, d]``, the cotangents of the state
-    that position ``t`` reads (after its reset; before they are zeroed on the rows that reset),
-    and ``dh`` / ``dvm`` ``[B, T, K, d]``, :func:`cell_state_vjp`'s results on the valid slots.
+    that position ``t`` reads (after its reset; before they are zeroed on the rows that reset;
+    with ``limits``, as limited: what the position passes back), and ``dh`` / ``dvm``
+    ``[B, T, K, d]``, :func:`cell_state_vjp`'s results on the valid slots; with ``limits`` also
+    ``limited_h`` / ``limited_q``, bool ``[B, T]``: the rows the limit changed.
+
+    ``limits``: amendment A6's per-row limit (:class:`RowLimits`; module docstring), ``None``
+    without one.
 
     ``initial`` is the cotangent ``(A [B, N, d], R [B, d])`` of the state after the last
     position. A window's final state is detached, so the window passes ``None`` (zeros); a
@@ -384,6 +415,8 @@ def state_gradient_backward(
     zero = c.new_zeros(())
     rms = record.get("rms")
     steps: dict[str, list[Tensor]] = {"A": [], "R": [], "dh": [], "dvm": []}
+    if limits is not None:
+        steps.update(limited_h=[], limited_q=[])
     for t in range(T - 1, -1, -1):
         ok = valid[:, t, :, None]
         safe = torch.where(valid[:, t], cells[:, t], torch.zeros_like(cells[:, t]))
@@ -428,6 +461,13 @@ def state_gradient_backward(
         A = A.scatter_add(1, source, weighted.reshape(B, K * D, d))
         if d_q_pre is not None:
             R = R + d_q_pre[:, t]
+        if limits is not None:  # A6: what position t passes back, row by row
+            free_h, free_q = A[:, :N], R
+            A = torch.cat([limit_row_grad(free_h, limits.h, limits.ratio), A[:, N:]], dim=1)
+            R = limit_row_grad(free_q, limits.q, limits.ratio)
+            if trace is not None:
+                steps["limited_h"].append((A[:, :N] != free_h).flatten(1).any(dim=1))
+                steps["limited_q"].append((R != free_q).any(dim=1))
         if trace is not None:
             steps["A"].append(A[:, :N])
             steps["R"].append(R)
@@ -466,7 +506,8 @@ class StateGradientRecurrence(torch.autograd.Function):
     exact for the recorded trajectory. ``tape`` holds that node's entries and ``h_fast``, the
     recorded ``units`` and the replay's record (:data:`RECORD_KEYS`, ``[B, T, K, …]``);
     ``consts`` are the cell's weights (:func:`cell_constants`); ``n_fast`` leading slots have a
-    fixed unit (what a faster sweep, :func:`set_fast_sweep`, lays out apart)."""
+    fixed unit (what a faster sweep, :func:`set_fast_sweep`, lays out apart); ``limits`` is
+    amendment A6's per-row limit (:class:`RowLimits`), ``None`` without one."""
 
     @staticmethod
     def forward(
@@ -477,12 +518,14 @@ class StateGradientRecurrence(torch.autograd.Function):
         consts: CellConstants,
         n_cells: int,
         n_fast: int = 0,
+        limits: RowLimits | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ctx.save_for_backward(c, b)
         ctx.tape = tape  # type: ignore[attr-defined]
         ctx.consts = consts  # type: ignore[attr-defined]
         ctx.n_cells = n_cells  # type: ignore[attr-defined]
         ctx.n_fast = n_fast  # type: ignore[attr-defined]
+        ctx.limits = limits  # type: ignore[attr-defined]
         ctx.set_materialize_grads(False)  # a read without a gradient arrives as None
         # fresh tensors: the tape's own are read as constants elsewhere in the replay
         return (
@@ -500,11 +543,12 @@ class StateGradientRecurrence(torch.autograd.Function):
         d_q_post: Tensor | None,
         d_h_sel: Tensor | None,
         d_h_fast: Tensor | None,
-    ) -> tuple[Tensor, Tensor, None, None, None, None]:
+    ) -> tuple[Tensor, Tensor, None, None, None, None, None]:
         c, b = ctx.saved_tensors  # type: ignore[attr-defined]
         tape: dict[str, Tensor] = ctx.tape  # type: ignore[attr-defined]
         consts: CellConstants = ctx.consts  # type: ignore[attr-defined]
         n_cells: int = ctx.n_cells  # type: ignore[attr-defined]
+        limits: RowLimits | None = ctx.limits  # type: ignore[attr-defined]
         args = (
             c,
             b,
@@ -524,7 +568,9 @@ class StateGradientRecurrence(torch.autograd.Function):
         result = None
         if _fast_sweep is not None:
             n_fast: int = ctx.n_fast  # type: ignore[attr-defined]
-            result = _fast_sweep(*args, n_fast=n_fast, n_read=int(tape["h_fast"].shape[2]))
+            result = _fast_sweep(
+                *args, n_fast=n_fast, n_read=int(tape["h_fast"].shape[2]), limits=limits
+            )
         if result is None:
-            result = state_gradient_backward(*args)
-        return result[0], result[1], None, None, None, None
+            result = state_gradient_backward(*args, limits=limits)
+        return result[0], result[1], None, None, None, None, None

@@ -21,9 +21,42 @@ Phase 1 delivers:
    equal to the autograd window's parameter gradients in float64 on the CPU, without and with
    amendment A8's fast cells. It is the oracle for the kernels of phase 2.
 
-Nothing is switched on: no configuration key selects the new path, `hardware.window` is checked
-against the same scope as before, and the existing split and autograd windows are bit-identical
-to `09db900` (section "How equal it is").
+In phase 1 nothing was switched on: no configuration key selected the new path and
+`hardware.window` was checked against the same scope as before. Phase 2 changed that; what the
+branch changes for existing configurations is listed next.
+
+## Behaviour changes of the branch (for the reviewer)
+
+No existing configuration changes its results or its hash. The evidence: 41 windows on the CPU
+bit for bit against `09db900` (the split and autograd windows in float64 and fp32, 18 of them
+the autograd window with A6's per-row limit); on the card the fused window bit for bit in 8
+cases and over 40 training steps under `train.deterministic=true`, and the split and compiled
+autograd windows bit for bit on one compile cache ("The existing windows on the card, against
+the base commit"); the recipe's fused step takes the same time (43.8 ms).
+
+What does change:
+
+1. **`hardware.window=split` and `fused` accept configurations they refused**
+   (`hsn.config.split_window_scope_error`). A run that failed at load with one of these now
+   trains:
+   - `train.feedback_detach=[summary, eps, router]` (the state gradient): this work.
+   - amendment A8's fast cells (`model.fast_cells`, with `fast_units` and `fast_readout`), with
+     the state gradient only; under the full cut they are refused as before.
+   - amendment A9's `model.address_ngram`, under **both** cuts. So the *existing* full-cut
+     split and fused windows now take address n-grams. No kernel changed for it (the scorer's
+     scalars pass through the sweep at any width); the refusal had been a scope statement for
+     an untested combination, and the combination is now tested (CPU and card).
+   - amendment A6's `train.state_grad_clip` / `train.state_grad_ratio`, with the state gradient
+     only ("Step 3"); under the full cut they are refused as before.
+2. **`hsn.model.gradclip`**: the limit's arithmetic moved from the autograd function's
+   backward into `limit_row_grad`, which that backward calls and the reverse sweep shares. The
+   same operations in the same order.
+3. **Kernel arguments** (private to `kernels/cuda/hsn_window.cu` and its wrappers; the
+   kernels must be rebuilt): `hsn_win_select` takes the reserved slots, `hsn_win_cell_update`
+   the number of fast slots; with the defaults both do what they did.
+4. **`SplitWindow(model, cfg, compiled, state_gradient=None)`** and
+   `split_window_scope_error(cfg, state_gradient=None)`: the new argument only asserts which
+   cut the caller expects.
 
 **The short version of the design.** The forward sweep and the batched replay stay as they
 are. Only the state recurrence node changes: its reverse sweep gains, per position, the
@@ -775,15 +808,55 @@ is the state-columns identity: the first layer's transposed product costs 37.8 �
 2. The first layer's transposed product is now the sweep's largest part (34 µs of 87 per
    position); seven eighths of its operand are the zeros of the units a slot did not run. No
    cheaper form of it has been measured yet.
-3. `train.state_grad_ratio` / `state_grad_clip` (A6's per-row limit on what a position passes
-   back; a result of 13 Nov suggests it for the base): a per-row rescale of `A` and `R`
-   between one position's tail and the next position's head, with the batch's typical live
-   row as the autograd window computes it; first in the float64 reference, then as a fourth
-   glue step. The buffers and the step order leave that place.
+3. `train.state_grad_ratio` / `state_grad_clip`: "Step 3" below.
 4. A12's `model.address_gate` (not on main) is one more scorer term: the forward sweep's
    scorer product only.
 5. The card tests of the four-op cell driver, where its artifacts exist.
 6. Accuracy runs.
+
+### Step 3: amendment A6's per-row limit (13 Nov, evening)
+
+`train.state_grad_ratio` and `train.state_grad_clip` limit, row by row, the gradient a position
+passes back into the state (`hsn.model.gradclip`): a row of `dL/dh` and a row of `dL/dq` may be
+at most `ratio` times the batch's typical live row at that position (the 90th percentile of
+the rows that carry a gradient), and at most an absolute number. The campaign's candidate
+base carries a ratio of 3, so the window has to apply it.
+
+**Where it sits.** The model limits `h` and `q` at the entry of every position, after the
+position's reset and before any of its reads. In the reverse sweep that is the end of a
+position's tail: `A` and `R` are then the whole cotangent of the state the position reads. So
+the sweep limits each there, and zeroes the rows that reset afterwards. Two details follow
+from the model's order and are tested:
+
+- a row that resets at the position is limited, and counted in the batch's typical row, before
+  it is zeroed (it carries what the position passes back to the zeroed state);
+- what the decoder and the losses read of the state *after* position `t − 1` joins after the
+  limit of position `t` (the head of `t − 1`), so it is not limited by it.
+
+**CPU (done).** `state_gradient_backward(limits=RowLimits(h, q, ratio))` and the recurrence
+node; `SplitWindow.row_limits` (the model's: `clip / sqrt(n_cells)` for a row of `h`, `clip`
+for a row of `q`, the ratio for both); the buffered sweep's step `limit_reference`, for which
+the tail leaves the reset to it and hands it the rows' norms; the scope.
+
+| Comparison (float64, sixteen rows; a ratio of 1.02, an absolute limit of 0.02, and both) | Result |
+| --- | --- |
+| The window's parameter gradients against the autograd window's, routed and with fast cells | rtol 1e-9; and 1e-3 or more away from the gradients without the limit |
+| The sweep's `A` and `R` against autograd's gradient of the state each position reads, at every position and one step at a time, against the model's eager and capturable rounds | rtol 1e-9 |
+| The buffered sweep (tail, norms, limit step) against the reference sweep, every position | rtol 1e-11 |
+| The autograd window with the limit, this branch against `09db900` (18 cases, float64 and fp32, three cuts) | bit for bit |
+
+The ratio acts on about one row per position (11 of 192 row-positions of `h`), the absolute
+limit on most (162 of 192), on rows that reset among them. With fewer than ten live rows a
+ratio never acts (the typical row is then the largest), which is why these tests have sixteen
+rows. At ten to twelve rows this test window's scorer gradient is ill-conditioned (the window
+and the model agree on it to 1e-9 only, with or without a limit, every other parameter to
+1e-14): a property of the test's rows, noted because it cost a detour.
+
+**Card (pending).** Until the limit's step is a kernel, `SweepRunner` leaves a window with a
+limit to the PyTorch sweep, so such a run is correct on the card and slow. The kernel side is
+written and compiled, not yet run: the tail kernel takes the rows' norms (summed in double),
+and a fourth kernel, `hsn_win_back_limit`, ranks the batch's norms in every block, scales its
+row and applies the reset: one more launch per position.
 
 ## Files
 

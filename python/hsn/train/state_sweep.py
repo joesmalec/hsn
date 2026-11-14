@@ -17,6 +17,9 @@ with the cell's two transposed unit layers between them::
              and V folded in
     tail     the cell norm's backward, the scatter into the cell and into the sources of its
              messages, R, the reset
+    limit    only with amendment A6's per-row limit (train.state_grad_clip / _ratio): the tail
+             then leaves the reset to this step and hands it the rows' norms; a row over its
+             bound is scaled, then the reset
 
 No glue step multiplies a matrix. ``W_out`` is folded into the second layer's transposed
 weights (per unit ``W_out · W2_jᵀ``), so the head hands the product the candidate's cotangent
@@ -39,6 +42,10 @@ device and dtype; the reference a kernel is tested against, step by step) and, o
 window kernels built, a kernel (``hsn_win_back_head`` / ``_mid`` / ``_tail``,
 :mod:`hsn.kernels.window`). On CUDA the loop over the positions can be captured once per shape
 in a CUDA graph (:meth:`ReverseSweep.capture`) and replayed for every window.
+
+The limit (:class:`hsn.train.state_gradient.RowLimits`) is a property of the run, fixed when
+the sweep is built. Its step has the PyTorch implementation only: a sweep with a limit does
+not take the kernels yet, and :class:`SweepRunner` leaves such a window to the PyTorch sweep.
 """
 
 from __future__ import annotations
@@ -48,7 +55,8 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from hsn.train.state_gradient import CellConstants, activation_grad, sweep_layouts
+from hsn.model.gradclip import limit_row_grad, row_norm
+from hsn.train.state_gradient import CellConstants, RowLimits, activation_grad, sweep_layouts
 
 __all__ = ["ReverseSweep", "SweepRunner", "SweepShape", "out_adjacency", "sweep_shape"]
 
@@ -106,7 +114,8 @@ class ReverseSweep:
     the next ``load`` overwrites them). ``kernels`` chooses the glue steps' implementation
     (``None``: the kernels when the buffers are on a prepared CUDA device and the shape fits
     them, else PyTorch). ``state_dtype`` is the state's dtype, ``product_dtype`` the dtype of
-    the two products and of their operands (bf16 under autocast, else the state's)."""
+    the two products and of their operands (bf16 under autocast, else the state's).
+    ``limits``: amendment A6's per-row limit on what a position passes back (``None``: none)."""
 
     def __init__(
         self,
@@ -117,8 +126,10 @@ class ReverseSweep:
         state_dtype: torch.dtype,
         product_dtype: torch.dtype,
         kernels: bool | None = None,
+        limits: RowLimits | None = None,
     ) -> None:
         self.shape = shape
+        self.limits = limits
         self.device = device
         self.state_dtype = state_dtype
         self.product_dtype = product_dtype
@@ -141,8 +152,9 @@ class ReverseSweep:
         def index(*size: int) -> Tensor:
             return torch.zeros(*size, dtype=torch.int64, device=device)
 
-        # the state's cotangent
+        # the state's cotangent, and its rows' norms for the limit (of A's rows, of R's rows)
         self.A, self.R = state(B, N, d), state(B, d)
+        self.norms = state(2, B)
         # the window's record (the replay's values, the tape's decisions)
         self.c, self.b, self.h_old = state(B, T, K, d), state(B, T, K, d), state(B, T, K, d)
         self.y, self.gate_pre = state(B, T, K, d), state(B, T, K, d)
@@ -192,6 +204,8 @@ class ReverseSweep:
         from hsn.kernels import window as window_kernels
 
         if self.device.type != "cuda" or self.state_dtype != torch.float32:
+            return False
+        if self.limits is not None:  # the limit's step is not a kernel yet
             return False
         if self.product_dtype not in (torch.float32, torch.bfloat16):
             return False
@@ -340,12 +354,15 @@ class ReverseSweep:
         self.op2.zero_()
 
     def step(self, t: int) -> None:
-        """Position ``t``: the three glue steps and the two transposed products between them."""
+        """Position ``t``: the three glue steps and the two transposed products between them,
+        and with a limit its step."""
         self.head(t)
         self.products_second()
         self.middle(t)
         self.products_first()
         self.tail(t)
+        if self.limits is not None:
+            self.limit(t)
 
     def products_second(self) -> None:
         """``W_out`` and the second layer, transposed: ``act = op1 · (W_out W2ᵀ)``."""
@@ -386,6 +403,9 @@ class ReverseSweep:
             window_kernels.back_tail(self, t)
         else:
             self.tail_reference(t)
+
+    def limit(self, t: int) -> None:
+        self.limit_reference(t)
 
     # -- the glue steps in PyTorch (the kernels' reference) ---------------------------------------
 
@@ -498,6 +518,24 @@ class ReverseSweep:
                 (slot >= 0)[:, :, None], self.out_w[:, j][None, :, None] * taken, zero
             )
         R = self.R + self.d_q_pre[:, t]
+        if self.limits is not None:  # the limit's step takes the rows' norms and the reset
+            self.A.copy_(A)
+            self.R.copy_(R)
+            self.norms[0] = row_norm(A)[:, 0]
+            self.norms[1] = row_norm(R)[:, 0]
+            return
+        row = self.reset[:, t]
+        self.A.copy_(A.masked_fill(row[:, None, None], 0))
+        self.R.copy_(R.masked_fill(row[:, None], 0))
+
+    def limit_reference(self, t: int) -> None:
+        """Amendment A6's limit on what position ``t`` passes back
+        (:func:`hsn.model.gradclip.limit_row_grad` with the norms the tail took), then the
+        reset: the rows that reset are limited and counted like the others, and zeroed."""
+        limits = self.limits
+        assert limits is not None
+        A = limit_row_grad(self.A, limits.h, limits.ratio, norm=self.norms[0][:, None])
+        R = limit_row_grad(self.R, limits.q, limits.ratio, norm=self.norms[1][:, None])
         row = self.reset[:, t]
         self.A.copy_(A.masked_fill(row[:, None, None], 0))
         self.R.copy_(R.masked_fill(row[:, None], 0))
@@ -540,7 +578,8 @@ class SweepRunner:
     :func:`hsn.train.state_gradient.state_gradient_backward`'s arguments (installed with
     :func:`hsn.train.state_gradient.set_fast_sweep`); returns ``None`` for what it does not
     take (another device, a dtype or shape the kernels do not handle), and the caller keeps
-    the PyTorch sweep."""
+    the PyTorch sweep. ``limits`` (amendment A6's per-row limit) belongs to the run: a sweep
+    and its graph are built for one."""
 
     def __init__(self, *, graph: bool = True) -> None:
         self.graph = graph
@@ -569,11 +608,14 @@ class SweepRunner:
         *,
         n_fast: int = 0,
         n_read: int = 0,
+        limits: RowLimits | None = None,
     ) -> tuple[Tensor, Tensor] | None:
         from hsn.kernels import window as window_kernels
 
         device = c.device
         if device.type != "cuda" or c.dtype != torch.float32:
+            return None
+        if limits is not None:  # the limit's step is not a kernel yet: the PyTorch sweep
             return None
         if not window_kernels.available() or not window_kernels.prepared(device):
             return None
@@ -590,6 +632,7 @@ class SweepRunner:
             consts.activation,
             consts.cand_gain is not None,
             consts.norm_gain_state is not None,
+            limits,
         )
         sweep = self.sweeps.get(key)
         if sweep is None:
@@ -600,6 +643,7 @@ class SweepRunner:
                 state_dtype=c.dtype,
                 product_dtype=product_dtype,
                 kernels=True,
+                limits=limits,
             )
             self.sweeps[key] = sweep
         sweep.load(

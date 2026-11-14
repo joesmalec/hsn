@@ -89,7 +89,12 @@ from hsn.train.compile import (
     fixed_fast_slots,
     run_tape,
 )
-from hsn.train.state_gradient import StateGradientRecurrence, cell_constants, set_fast_sweep
+from hsn.train.state_gradient import (
+    RowLimits,
+    StateGradientRecurrence,
+    cell_constants,
+    set_fast_sweep,
+)
 from hsn.train.state_sweep import SweepRunner
 
 __all__ = [
@@ -387,6 +392,15 @@ class SplitWindow:
         self.compiled = compiled
         self.fallback: Callable[..., WindowOut] = compiled if compiled is not None else model
         self.calls = 0
+        #: A6's per-row limit on what a position passes back into the state, as the model
+        #: applies it (``train.state_grad_clip`` / ``state_grad_ratio``; ``None``: neither).
+        #: Only the state gradient has such a gradient to limit.
+        limited = model.state_grad_clip is not None or model.state_grad_ratio is not None
+        self.row_limits: RowLimits | None = (
+            RowLimits(h=model._clip_h, q=model.state_grad_clip, ratio=model.state_grad_ratio)
+            if limited and self.state_gradient
+            else None
+        )
         #: ``hardware.window=fused``: the sweep's cell round is the fused CUDA op.
         self.fused = cfg.hardware.window == "fused"
         #: ``hardware.sweep_twin``: the compiled sweep runs the pre-cast twin of the model.
@@ -668,6 +682,7 @@ class SplitWindow:
                 consts,
                 N,
                 fixed_fast_slots(model),
+                self.row_limits,
             )
         else:
             q_pre_n, q_post_n, h_sel_n = StateRecurrence.apply(

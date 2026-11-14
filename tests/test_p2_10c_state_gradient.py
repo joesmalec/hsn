@@ -539,7 +539,14 @@ def test_sweeps_state_cotangent_is_autograds(
     Against the model's capturable round the window's forward sweep is the same arithmetic
     position by position, so the two passes follow one trajectory (the logits then differ only
     by the replay's batched ``S`` and decoder)."""
-    cfg = _cfg(*BASE, *extra)
+    _cotangents_by_position(_cfg(*BASE, *extra), static, monkeypatch)
+
+
+def _cotangents_by_position(
+    cfg: RunConfig, static: bool, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict[str, Tensor], Tensor]:
+    """The comparison of :func:`test_sweeps_state_cotangent_is_autograds` for ``cfg``; returns
+    the sweep's trace and the window's resets."""
     model, inputs, mask = _case(cfg)
     tokens, ctx, state, reset = inputs
     logits, d_h, d_q = _autograd_by_position(model, inputs, mask, static=static)
@@ -551,8 +558,10 @@ def test_sweeps_state_cotangent_is_autograds(
 
     def traced(*args: object, **kwargs: object) -> tuple[Tensor, Tensor]:
         given.append(args)
+        limits.append(kwargs.get("limits"))
         return sweep(*args, **kwargs, trace=trace)  # type: ignore[arg-type]
 
+    limits: list[object] = []
     monkeypatch.setattr(state_gradient, "state_gradient_backward", traced)
     window = SplitWindow(model, cfg, None, state_gradient=True)
     s_logits, _, s_info = window(tokens, ctx, state, reset)
@@ -593,12 +602,14 @@ def test_sweeps_state_cotangent_is_autograds(
             consts,
             trace=step,
             initial=(after[0].to(torch.float64), after[1].to(torch.float64)),
+            limits=limits[0],  # type: ignore[arg-type]
         )
         keep = ~reset[:, t]
         got_h = torch.where(keep[:, None, None], step["A"][:, 0], 0.0)
         got_q = torch.where(keep[:, None], step["R"][:, 0], 0.0)
         torch.testing.assert_close(got_h, d_h[t], **tol, msg=lambda m, t=t: f"step h {t}{m}")
         torch.testing.assert_close(got_q, d_q[t], **tol, msg=lambda m, t=t: f"step q {t}{m}")
+    return trace, reset
 
 
 def test_without_the_cells_backward_the_gradients_are_wrong(
@@ -621,6 +632,84 @@ def test_without_the_cells_backward_the_gradients_are_wrong(
     }
     assert max(apart.values()) > 1e-2, apart
     assert sum(gap > 1e-4 for gap in apart.values()) >= 6, apart
+
+
+# --------------------------------------------------------------------------------------------------
+# Amendment A6's per-row limit on what a position passes back (train.state_grad_clip / _ratio)
+# --------------------------------------------------------------------------------------------------
+
+#: sixteen rows: with fewer than ten live rows the batch's typical row is its largest and a
+#: ratio never acts (hsn.model.gradclip.typical_row). (Not ten to twelve: in this window's
+#: rows 9 to 11 the scorer's own gradient is ill-conditioned, and the window and the model
+#: then agree on it to 1e-9 only, with or without a limit; every other parameter to 1e-14.)
+ROWS = ("train.batch=16", "train.micro_batch=16")
+#: limits that act on this model's window: a ratio just over 1, an absolute limit under the
+#: rows' norms, and both (the smaller applies)
+LIMITS = {
+    "ratio": ("train.state_grad_ratio=1.02",),
+    "clip": ("train.state_grad_clip=0.02",),
+    "ratio_and_clip": ("train.state_grad_ratio=1.5", "train.state_grad_clip=0.05"),
+}
+
+
+@pytest.mark.parametrize("extra", [(), PINNED], ids=["routed", "fast_cells"])
+@pytest.mark.parametrize("name", list(LIMITS))
+def test_window_gradients_with_the_row_limit(name: str, extra: tuple[str, ...]) -> None:
+    """The window with the limit gives the autograd window's gradients with the limit, and
+    they are not the gradients without it."""
+    cfg = _cfg(*BASE, *ROWS, *extra, *LIMITS[name])
+    ref, got, _, _ = _both(cfg)
+    _assert_same_grads(ref, got)
+    free, _, _, _ = _both(_cfg(*BASE, *ROWS, *extra))
+    apart = {
+        n: float((ref[n] - g).abs().max() / g.abs().max())
+        for n, g in free.items()
+        if g is not None and float(g.abs().max()) > 0
+    }
+    assert max(apart.values()) > 1e-3, apart
+
+
+@pytest.mark.parametrize("static", [False, True], ids=["eager_round", "sweeps_round"])
+@pytest.mark.parametrize("extra", [(), PINNED], ids=["routed", "fast_cells"])
+@pytest.mark.parametrize("name", list(LIMITS))
+def test_sweeps_limited_state_cotangent_is_autograds(
+    name: str, extra: tuple[str, ...], static: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the limit the sweep's ``A`` and ``R`` are what each position passes back in the
+    autograd window, at every position and one step at a time. The limit acts on rows of both
+    (``limited_h``, ``limited_q``) and, with a ratio, at positions where a row resets: such a
+    row is limited and counted in the batch's typical row before it is zeroed, as in the model
+    (reset, then limit, then the position's reads); counted otherwise, the typical row and
+    every limited row of that position would differ."""
+    cfg = _cfg(*BASE, *ROWS, *extra, *LIMITS[name])
+    trace, reset = _cotangents_by_position(cfg, static, monkeypatch)
+    limited_h, limited_q = trace["limited_h"], trace["limited_q"]
+    assert limited_h.shape == reset.shape and limited_h.dtype == torch.bool
+    assert int(limited_h.sum()) >= 5 and int(limited_q.sum()) >= 5
+    assert not bool(limited_h.all()) and not bool(limited_q.all())
+    interior = reset[:, 1:].any(dim=0)  # positions after the first where some row resets
+    assert int(interior.sum()) == 3
+    acted = (limited_h | limited_q)[:, 1:] & ~reset[:, 1:]
+    assert bool(acted[:, interior].any(dim=0).all())
+
+
+def test_the_row_limit_is_the_models() -> None:
+    """The window hands the sweep the model's limits: the absolute limit of ``dL/dq``, that of
+    ``dL/dh`` (``limit / sqrt(n_cells)``) and the ratio; none without the keys, and none under
+    the full cut (whose window the scope refuses with them)."""
+    cfg = _cfg(*BASE, "train.state_grad_clip=0.5", "train.state_grad_ratio=3.0")
+    limits = SplitWindow(HSN.from_config(cfg), cfg, None).row_limits
+    assert limits is not None
+    assert limits.q == 0.5 and limits.ratio == 3.0
+    assert limits.h == pytest.approx(0.5 / cfg.model.n_cells**0.5, rel=1e-15)
+    ratio = _cfg(*BASE, "train.state_grad_ratio=3.0")
+    only = SplitWindow(HSN.from_config(ratio), ratio, None).row_limits
+    assert only is not None and (only.h, only.q, only.ratio) == (None, None, 3.0)
+    plain = _cfg(*BASE)
+    assert SplitWindow(HSN.from_config(plain), plain, None).row_limits is None
+    with pytest.raises(ValueError, match="state_grad_clip"):
+        full = _cfg(*A5, ALL, "train.state_grad_ratio=3.0")
+        SplitWindow(HSN.from_config(full), full, None)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -681,13 +770,17 @@ def test_the_scope_with_the_state_gradient() -> None:
     assert scope_error(_cfg(*BASE, *PINNED), state_gradient=True) is None
     assert scope_error(_cfg(*BASE, "model.address_ngram=2"), state_gradient=True) is None
     assert scope_error(_cfg(*BASE, "train.p_dense=0.25"), state_gradient=True) is None
+    # A6's per-row limit: the state-gradient sweep applies it, the full cut's recurrence not
+    for limit in ("train.state_grad_clip=1.0", "train.state_grad_ratio=3.0"):
+        assert scope_error(_cfg(*BASE, limit), state_gradient=True) is None
+        reason = scope_error(_cfg(*A5, ALL, limit))
+        assert reason is not None and "state_grad_clip" in reason
     for overrides, message in (
         ((*A5, ALL), "holds every path"),
         ((*A5, "train.feedback_detach=[summary,eps]"), "lacks"),
         ((*A5, "train.feedback_detach=[eps,router]"), "lacks"),
         ((*A5,), "lacks"),
         ((*BASE, "train.epsilon_start=0.1", "train.epsilon_end=0.1"), "epsilon"),
-        ((*BASE, "train.state_grad_clip=1.0"), "state_grad_clip"),
         ((*BASE, "model.cell_units=fixed"), "cell_units"),
         (("model.routing=topk", "train.gate_mode=soft", CUT), "ste"),
     ):
