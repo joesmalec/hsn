@@ -1,8 +1,12 @@
 # Amendment A12: address weights that depend on the position's content (experimental)
 
 Status: **implemented as an opt-in experiment on 13 Nov 2026; not adopted.** The deciding
-27k arm holds (97.7 %, where the base ended at 93.9 and 92.2 %); one 9k run fell below the
-kill rule's bar; one seed per arm except the combined shape (section "Results").
+27k arm holds (97.7 %, where the base ended at 93.9 and 92.2 %). **Its weakness, found on
+14 Nov: with the gate a run can fit the bytes of the training keys** and lose keys of bytes it
+has never seen (training keys 98 %, unseen keys from 99 % down to 39 %, by the run and not by
+the configuration); keys made of seen bytes, new combinations included, stay at 98 to 99 %.
+The 9k run below the kill rule's bar was such a run (sections "Results" and "The hold-out
+runs").
 - Asked for by the user on 13 Nov 2026 ("lets make it an opt in amendement and test"), after the
   27k runs of the pair task lost what they had learned by 10,000 steps.
 - `model.address_gate` (default false; needs `model.key_address` and the linear scorer). Left
@@ -124,8 +128,10 @@ Against the test:
   46.6 %; the base had 76.0 % at 9k, so part of the move still happens). One seed.
 - **Arm 2 is below the kill rule's bar** (86.2 %, after 93.9 % at step 7,500). The 27k arm has
   the same seed and settings up to the schedule and stood at 97.8 % at step 9,000 on another
-  card. Same-seed runs of this task differ by ten points and more between cards, so a rule on
-  one 9k run was too strict; by its letter it is met. Open: more seeds of arm 2.
+  card. By the rule's letter it is met. What the run was (measured on 14 Nov,
+  `key_split_eval.py`): key-value answers 98.0 % on training keys against 81.5 / 87.9 % on
+  dev / test keys. It did not lose what it had learned; it had fitted the training keys' bytes
+  (next section), without fast cells.
 - **Arm 3** is inside the seeds' spread of the base (99.6, 98.0, 98.5 %).
 - **Arm 4**: the gate lifts the combined shape from 93.4 % to 99.1 and 97.2 %.
 
@@ -194,12 +200,47 @@ parameters set to their 9,000-step values (key-value answers, 300 fresh document
   are fixed, but `G` reads `u_t`, which carries the byte, and can weight an address feature
   differently for the bytes it was trained on.
 
-**A diagnostic, not a fix yet: `train.address_gate_hold_step`** (default null: off, bit for
-bit; hashed when set; needs `model.address_gate`). `G` is trained for that many optimiser steps
-and keeps its value from then on: every later step is undone for `G` alone, everything else
-trains as before. Arms: the gate run with `G` held from step 9,000, and the gate run with the
-rate held constant to the end (the fall began where the decay begins). Either would be a
-training setting; a change of what `G` reads would be an amendment of its own.
+**It is the path of a run, not its configuration.** Three runs of the gate run's arm that are
+one configuration and one seed for their first 9,000 steps (exp 580; exp 584, whose rate stays
+constant after step 14,400; exp 585, whose `G` is held after step 9,000), at step 9,000:
+
+| Run | kv: training keys | dev keys | delayed: seen pairs | new pairs | never-seen bytes |
+| --- | --- | --- | --- | --- | --- |
+| exp 580 | 98.5 | 98.1 | 99.2 | 98.8 | 96.8 |
+| exp 584 | 97.9 | 95.8 | 99.2 | 99.2 | 83.1 |
+| exp 585 | 97.9 | 48.0 | 98.9 | 98.6 | 59.0 |
+
+Under bf16 a rounding at the third digit reroutes every row within its first positions
+(`docs/p2_10c_state_gradient_window.md` on the speed branch), so equal runs part at once. They
+end in solutions that are equal on the bytes they trained on and far apart on bytes they never
+saw. Exp 585 fits the training bytes from the start (step 6,000: 97.1 against 67.5 %); exp 580
+after step 15,000; exp 584 keeps a gap of two to four points to the end (18,000 steps: 97.9
+against 95.8 / 97.1; never-seen bytes 98.7).
+
+**Every run split by keys so far** (key-value answers, fresh documents, training keys against
+dev keys; pair task of synthetic_v1 unless "hold"):
+
+| Model | Runs: training keys / unseen keys |
+| --- | --- |
+| routed only, no gate | 97.7 / 97.2 (9k); 92.2 / 92.6 and 94.7 / 94.8 (27k) |
+| routed only, gate | 98.0 / 81.5 (9k, arm 2); 99.0 / 97.0 and 98.8 / 95.6 (27k); 99.2 / 99.1 (hold, 18k) |
+| fast cells, no gate | 96.1 / 90.9 (9k); 95.5 / 96.1 (hold, 18k) |
+| fast cells, gate | 99.4 / 98.7 and 98.5 / 96.3 (9k); 99.5 / 93.7 (27k); hold: 98.3 / 84.2, 97.9 / 95.8, 98.3 / 38.9 |
+
+- Without the gate and without fast cells no run has a gap. The gate opens one in some runs
+  with and without fast cells; the largest are with both.
+- **What does not move:** keys made of bytes the model has trained on. New pairs of seen bytes
+  score like seen pairs in every checkpoint of every hold-out run (98.6 against 98.9 % in exp
+  585 at 9,000 steps, where never-seen bytes are at 59 %).
+
+**Two diagnostics of the hold-out runs, and what they showed.**
+- `train.address_gate_hold_step` (default null: off, bit for bit; hashed when set; needs
+  `model.address_gate`): `G` is trained for that many optimiser steps and keeps its value from
+  then on. Its first run (exp 585, held from 9,000) says nothing about holding: that run's `G`
+  was fitted to the training bytes before the hold.
+- The rate held constant to the end (exp 584): no late fall, on one path.
+Neither is a fix. What `G` may read (it reads `u_t`, which carries the byte, and with A8's
+`fast_readout` the fast cells' read) would be an amendment of its own.
 
 ## Tests
 
