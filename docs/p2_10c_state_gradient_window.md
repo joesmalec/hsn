@@ -900,9 +900,12 @@ one seed and configuration differ by more than ten points.
 **How they are compared** (`accuracy/compare.py`). The score is dev bits per byte for
 TinyStories and dev accuracy for the other two, at every evaluation and at the end. The bar
 that was set: each fused seed within the spread of the two autograd seeds. Two seeds give
-that bar little power in either direction: a third draw from one distribution lies between
-the first two with probability one third, so for equivalent windows a fused seed falls
-outside two times in three. The tables therefore also give what two seeds can support: the
+that bar little power in either direction. A fused run starts from its autograd twin's
+initialisation and data order, so early in a run it sits on that seed and is inside
+trivially; once the two have parted (the amplification of rounding makes that certain within
+a run) it is a third draw from one distribution, which lies between two others with
+probability one third, so for equivalent windows a fused seed then falls outside two times
+in three. The tables therefore also give what two seeds can support: the
 difference of the windows' means beside the seed-to-seed gap inside each window, and the
 same-seed differences between the windows (one initialisation and data order, two windows).
 A difference between the windows that is no larger than the gaps between seeds is the
