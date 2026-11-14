@@ -1,0 +1,96 @@
+# synthetic_final: the untouched final test set of the hold-out data (14 Nov 2026).
+#
+# Why: the dev and the test keys of synthetic_hold (and of synthetic_v1 and synthetic_keys) have
+# been scored again and again while recipes and amendments were chosen. A number on them is a
+# development number. The user's review of the HSN-T white paper (14 Nov 2026) asks for a final
+# set that selection has never touched; the decision of the same day is to score it once per
+# gate claim (python -m hsn.eval.final_test keeps the ledger, docs/final_test_ledger.jsonl).
+#
+# What is new in it:
+#   the key alphabet   bytes 32 to 47 as the "test" keys. No key, value, filler or marker of
+#                      synthetic_hold's tasks (or of the kv / delayed tasks of synthetic_v1 and
+#                      synthetic_keys) uses them, so a model trained on the hold-out data has
+#                      never seen these bytes and no run has been scored on them as keys.
+#                      (The brackets task of synthetic_v1 uses 32 to 39 as bracket symbols: for
+#                      a model trained on the five-task mix those eight are seen bytes in another
+#                      role. The set is defined for models trained on the hold-out data.)
+#   the documents      fresh seeds, so no document occurs in any other set or in the fresh
+#                      documents of the development scoring scripts.
+#
+# The tasks are synthetic_hold's, parameter for parameter, apart from the test keys and seeds:
+#   kv             train split: fresh documents with TRAINING keys (the gate compares unseen
+#                  keys with training keys, so that side must be fresh too);
+#                  test split: the final keys.
+#   delayed2h      two-byte keys, pair hold-out as in training (held pairs excluded):
+#                  train split: fresh documents, seen pairs of training bytes;
+#                  test split: keys of the final bytes.
+#   delayed2h_new  the held pairs only (hold_role: only), train split: new pairs of seen bytes.
+# There is no dev split and nothing here is for training: never select a recipe, a checkpoint
+# or a seed on these documents.
+#
+# Golden manifest: configs/data/synthetic_final.manifest.json.
+
+name: synthetic_final
+unroll: 256
+
+tasks:
+  - name: kv
+    variant: in_range
+    family: kv
+    context_id: 1
+    seed: 9001001
+    n_train: 2000
+    n_dev: 0
+    n_test: 2000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      markers: { ins: 16, ovr: 17, del: 18 }
+      keys: { train: [64, 112], dev: [112, 128], test: [32, 48] }
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 8
+      op_rate: 0.15
+      p_del: 0.25
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 }
+      max_queries: 8
+
+  - name: delayed2h
+    variant: in_range
+    family: delayed
+    context_id: 2
+    seed: 9044001
+    n_train: 2000
+    n_dev: 0
+    n_test: 2000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      keys: { train: [64, 112], dev: [112, 128], test: [32, 48] }
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
+      key_len: 2
+      hold_mod: 4
+      hold_role: exclude
+
+  - name: delayed2h_new
+    variant: in_range
+    family: delayed
+    context_id: 2
+    seed: 9044002
+    n_train: 2000
+    n_dev: 0
+    n_test: 0
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      keys: { train: [64, 112], dev: [112, 128], test: [32, 48] }
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
+      key_len: 2
+      hold_mod: 4
+      hold_role: only
