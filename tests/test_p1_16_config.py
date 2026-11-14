@@ -91,6 +91,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.init_from",
         "train.answer_weight",
         "model.cell_units",
+        "model.scorer_position",
     )
 
 

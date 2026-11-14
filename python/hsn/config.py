@@ -67,6 +67,7 @@ __all__ = [
     "AUX_TERMS",
     "HARDWARE_PROFILE_DIR",
     "HASH_OMIT_AT_DEFAULT",
+    "RETIRED_KEYS",
     "MEASURED_KEYS",
     "PROFILES",
     "REPO_ROOT",
@@ -295,6 +296,14 @@ class ModelConfig(_StrictModel):
     # codes; nothing about a key is learned. 1 (default): A5's two features only.
     address_ngram: int = Field(default=1, ge=1, le=3)
     # --- end A9 ---
+    # --- Amendment A11 (docs/amendments/A11_position_bound.md; opt-in) ---
+    # The position the scorer's ``pos`` feature reads. "document" (default): the position in the
+    # document, pos / unroll, which grows past 1 in a document longer than the training window.
+    # "clamp": min(pos, unroll - 1) / unroll. "wrap": (pos mod unroll) / unroll. All three are
+    # equal while pos < unroll, so a model trained on documents that fit the window is the same
+    # model with any of them.
+    scorer_position: Literal["document", "clamp", "wrap"] = "document"
+    # --- end A11 ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -1424,6 +1433,34 @@ def _resolve_hardware(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
     )
 
 
+#: Keys of an experiment that was dropped and whose code is not in this tree, each with the value
+#: that meant "off". A resolved configuration written by a tree that carried them holds them at
+#: that value; it is the same run without them (they were left out of the configuration hash at
+#: their defaults), so :func:`load_config` removes them from the file's content. Any other value
+#: needs the tree that had the code and is refused.
+RETIRED_KEYS: dict[str, tuple[Any, str]] = {
+    "model.write_gate": (False, "amendment A10, dropped 13 Nov 2026"),
+    "model.write_init": (2.0, "amendment A10, dropped 13 Nov 2026"),
+    "train.lambda_w": (0.0, "amendment A10, dropped 13 Nov 2026"),
+}
+
+
+def _drop_retired_keys(raw: dict[str, Any], path: Path) -> None:
+    """Remove the :data:`RETIRED_KEYS` that ``raw`` (a configuration file's content) holds at
+    their off value; raise for one that is switched on."""
+    for dotted, (off, what) in RETIRED_KEYS.items():
+        section, key = dotted.split(".")
+        block = raw.get(section)
+        if not isinstance(block, dict) or key not in block:
+            continue
+        if block[key] != off:
+            raise ValueError(
+                f"{path}: {dotted}={block[key]!r} belongs to {what}; its code is not in this "
+                "tree (docs/amendments/A10_write_decision.md names the commit that has it)"
+            )
+        del block[key]
+
+
 def load_config(path: str | Path, overrides: Sequence[str] = ()) -> RunConfig:
     """Load and validate a run configuration.
 
@@ -1435,6 +1472,7 @@ def load_config(path: str | Path, overrides: Sequence[str] = ()) -> RunConfig:
     """
     config_path = Path(path)
     raw = _read_yaml_mapping(config_path)
+    _drop_retired_keys(raw, config_path)
     parsed = [_parse_override(item) for item in overrides]
 
     for parts, value in parsed:
@@ -1514,6 +1552,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.init_from",
     "train.answer_weight",
     "model.cell_units",
+    "model.scorer_position",
 )
 
 
@@ -1557,6 +1596,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
             "has A5's two address columns only; use hardware.window=autograd"
+        )
+    if model.scorer_position != "document":
+        return (
+            f"model.scorer_position={model.scorer_position!r} (A11) has not been checked "
+            "against the split window's tape; use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

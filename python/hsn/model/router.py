@@ -356,6 +356,8 @@ class Scorer(nn.Module):
         self.r_max = cfg.r_max
         self.n_context = cfg.n_context
         self.unroll = unroll
+        #: A11 (``model.scorer_position``): how the ``pos`` feature reads the position
+        self.position = cfg.scorer_position
         self.kind = cfg.scorer
         self.key_address = cfg.key_address
         #: A9: the longest byte n-gram with an address (1: A5's a_cur and a_prev only)
@@ -676,6 +678,10 @@ class Scorer(nn.Module):
             ema = self.ema  # P2.3: the scorer's own averages (zeros until updated)
         ema_utility = self._check_ema(ema.utility, "utility", B, N, device).to(dtype)
         ema_selected = self._check_ema(ema.selected, "selected", B, N, device).to(dtype)
+        if self.position == "clamp":  # A11: the feature never leaves the trained range
+            pos = pos.clamp(max=self.unroll - 1)
+        elif self.position == "wrap":
+            pos = pos.remainder(self.unroll)
         position = (pos.to(dtype) / self.unroll)[:, :, None].expand(B, T, N)
         one = torch.ones(B, T, N, dtype=dtype, device=device)
         return torch.stack(
