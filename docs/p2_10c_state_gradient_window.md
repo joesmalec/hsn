@@ -577,6 +577,155 @@ the float64 reference sweep went from 11.2 s to 7.9 s per window and the reverse
 static layouts from 7.3 s to 5.6 s, which shows the arithmetic is gone, not what the card
 will do.
 
+### Step 2: on the card (13 Nov, from 17:12 MST)
+
+The local RTX 3060, alone on the card (the campaign's queue paused), torch 2.15.0+cu132, the
+A6 recipe at B32 and T256 under bf16 unless said. Step times are
+`scripts/bench_window.py time` (60 warm-up and 300 timed steps; 40 and 200 for the autograd
+window), medians; the host's load average is given because a step bound by kernel count is
+sensitive to it.
+
+**Measured step times.**
+
+| Shape | Autograd window, state gradient | Fused window, full cut, the same number of routed slots | Fused window, state gradient |
+| --- | ---: | ---: | ---: |
+| 4 slots, 32 cells (the recipe) | | 43.7 ms (load 1.3) | |
+| 12 slots, 64 cells (routed candidate) | 159.2 ms (load 1.4) | 73.8 ms (load 1.0) | 98.6 ms (load 9: to be repeated) |
+| 20 slots of which 8 fast, 64 cells (the approved shape) | 202.5 ms (load 1.9) | 100.1 ms (20 routed slots; load 0.5) | 137.5 ms (load 9: to be repeated) |
+
+So the state-gradient window is 1.61 times faster than the autograd window at the routed
+candidate and 1.47 times at the approved shape, with the kernels as they stand ("What is
+left"). Phases of the fused full-cut step at 20 routed slots and 64 cells
+(`bench_window.py phases`, synchronised): prologue 1.5, forward sweep 43.3, replay forward
+20.6, backward 29.6 ms. The estimates of phase 1 for that shape (40 to 50, 18 to 27, 22 to
+35) hold; half of the step is the batched replay and its backward, which this work does not
+touch.
+
+**The forward sweep for the approved shape.**
+
+- `hsn_win_select` takes the reserved cells (`reserved`, `reserved_units`): they hold the
+  first slots in index order, the threshold's lowest selected score is taken among the scored
+  slots, the probes replace scored slots only, and with fixed units slot `k` runs unit
+  `k mod M`. Against `Router.select` on the card: identical cells, units, valid slots,
+  refreshed slots and threshold in 30 configurations (1 to 3 reserved cells, routed and fixed
+  units, probes, a budget that cuts reserved slots, exact ties).
+- `hsn_win_cell_update` (folded) writes the fast read `f` into the next position's row of the
+  first product's input; the fused block assembles `[z; q; ctx; f]` where it assembles its
+  own. The sweep twin's merged `S`/`P` layout takes the wider `S` as it is.
+- The per-slot products of step 1 run in the fused and folded blocks.
+- A9 needed no kernel change: the scorer's scalars pass through the sweep at whatever width
+  (the merged scorer layout is sized from the scorer's input). The refusal was a scope
+  statement for an untested combination, and is lifted with tests.
+- Tapes on the card, fp32, the recipe's widths at 64 cells: the fused sweep and the folded
+  sweep against the split sweep (which runs `HSN._position`) for fast cells with routed
+  units, fixed units, the fast read, refresh probes, A9 with and without fast cells. Every
+  decision and age identical and the values within rounding wherever the decisions so far
+  had a margin (78 to 99 % of the positions). Under bf16 the folded and fused sweeps select
+  identical cells on all three windows.
+- *A margin is needed.* Two sweeps compute a score through different matrix products and
+  agree to a few units in the last place. One of the six cases had two cells with different
+  states whose scores are the same fp32 value in the split sweep and one unit apart in the
+  fused sweep, exactly at the cut: the sweeps select different cells there and the row's
+  trajectories differ until its next reset. The test compares a row up to its first decision
+  with a margin under 1e-4.
+
+**The reverse sweep as built.** Not compiled blocks: an eager loop over the positions,
+captured once per window shape in a CUDA graph (`torch.cuda.CUDAGraph`), and replayed. Inductor
+would add nothing here (the glue is kernels; its CUDA-graph mode copies every non-static
+input per replay just the same) and would bring compile time and the known stall. Per
+position: three glue kernels (`hsn_win_back_head`, `_mid`, `_tail`) and the two transposed
+products; five graph nodes for the routed shape, seven with fast slots.
+
+- Everything lives in static buffers (`ReverseSweep`): the window's record and cotangents are
+  copied in (`load`), the operands of the all-units products keep one unit block per slot
+  (written, and the previous position's cleared, by the kernels), and `dL/dc`, `dL/db` are
+  copied out for autograd.
+- No kernel multiplies a matrix. `W_out` is folded into the transposed second layer's weights
+  and the cell norm's gain with `V` into the transposed first layer's, so the products deliver
+  what the kernels need; `m V` is taken once per window.
+- A source's cotangent is gathered by the source from the selected cells it feeds
+  (`out_adjacency`), in a fixed order: no atomics, the result does not depend on scheduling.
+- Each glue step has a PyTorch implementation with the same contract
+  (`head_reference`, `middle_reference`, `tail_reference`), which is what a kernel is tested
+  against and what runs on other devices and dtypes. `SweepRunner` is what the recurrence
+  node calls on the card.
+
+**How equal, on the card.**
+
+| Comparison | Result |
+| --- | --- |
+| Buffered sweep with the PyTorch steps against the phase-1 reference, CPU float64, ten configurations, every position | rtol 1e-11 |
+| Each kernel against its PyTorch step from identical buffers at every position, fp32, nine small-model configurations | within 3e-5 of the buffer's largest entry |
+| The same at the recipe's widths, routed candidate and approved shape | fp32: 1e-7 to 2e-7; bf16 operands: within 2e-6 |
+| Whole windows: the kernels' sweep against the PyTorch steps and against the phase-1 reference; the captured graph against the eager kernels | within 2e-4 (fp32); the graph bit for bit |
+| The fused window through the kernels' sweep against the same window through the PyTorch sweep (one tape, one replay), three shapes | fp32: 5e-8 to 9e-8, cosine 1.00000000; bf16: 1.2e-3 to 1.7e-3, cosine above 0.999998 |
+| The fused window against the compiled autograd window, fp32, an initial model | identical routing decisions; gradients 7e-8 (routed candidate) and 2e-7 (approved shape) apart |
+| Every card test of the repository (`-m cuda`, `HSN_REQUIRE_CUDA=1`) with the changed kernels | 279 pass, 2 skip; 109 could not run (below) |
+
+The 109 are the tests of the four-op cell driver (`tests/kernels/test_p2_10_cuda.py`, 106; two
+of `test_p1_17_a5.py` and one of `test_p2_8_profile_attribution.py`): its artifacts
+(`build/hsn_ops.fatbin`, `scripts/build_kernels.py --target cuda`) are not built in this
+worktree, and their build is prescribed through `scripts/run_when_idle.py`, which waits on
+the experiment queue. This work changes neither those kernels nor their wrappers; the hooks
+it added to `cell.py` and `units.py` are off by default and the CPU suite passes. They remain
+to be run where the artifacts exist.
+
+**What the kernels cost, and the first version's lesson.** Per position at the approved
+shape (a CUDA graph of each part alone, `scratch/bench_sweep.py`):
+
+| Part | First version | Now |
+| --- | ---: | ---: |
+| Head | 102 µs | 9.5 µs |
+| Second layer, transposed | 23.6 µs | 15.2 µs |
+| Middle | 33.9 µs | 33.7 µs |
+| First layer's state rows, transposed | 34.5 µs | 34.3 µs |
+| Tail | 104 µs | 12.8 µs |
+| A window's sweep | 77 ms | 27.7 ms |
+| Loading a window into the buffers; copying the result out | 3.2 ms; 0.5 ms | the same |
+
+The first head and tail each multiplied a `d × d` matrix in the kernel, reading a transposed
+tile with a stride that put a warp's lanes on one shared-memory bank, and reduced each slot's
+sums in one thread: the faults P2.10's notes warn of. Folding those products into the cuBLAS
+products' weights and reducing by warp shuffles removed them. The second product got faster
+by a different call: `torch.mm` and `torch.addmm` reach different cuBLAS paths for one shape
+(at 384 rows of width 512, 20.0 against 11.7 µs; at 640 rows 20.1 against 24.5), so the sweep
+picks by a fixed rule.
+
+**Step 1's estimate, corrected by measurement.** Per position (bf16, a CUDA graph of the
+product alone):
+
+| Product | Every slot through all units | Routed slots | Fast slots, batched | Saved by the split |
+| --- | ---: | ---: | ---: | ---: |
+| Forward, first layer with the gate | 64.9 µs | 42.3 µs | 17.7 µs | 4.9 µs |
+| Forward, second layer | 24.6 µs | 11.8 µs | 8.5 µs | 4.3 µs |
+| Reverse, second layer | 20.2 µs | 11.7 µs | 3.7 µs | 4.8 µs |
+| Reverse, first layer's state rows | 37.8 µs | 25.6 µs | 7.5 µs | 4.7 µs |
+
+The arithmetic is gone as counted (a third), but a batched product over eight small matrices
+runs about five times less efficiently on this card than one large product, so the split
+saves about 9 µs per position in each sweep (2.4 ms per window each), a quarter of the 10 to
+14 ms per step that the arithmetic suggested. The larger measured gain in the reverse sweep
+is the state-columns identity: the first layer's transposed product costs 37.8 µs on its
+`2d` state columns and 72.4 µs on all `4d`.
+
+**What is left** (in the order of what the measurements say it is worth):
+
+1. The middle kernel: 21 of its 34 µs are its reads (the product's output, the hidden values,
+   the bias, one bf16 value per load), 6 the arithmetic, 7 the stores; the GELU derivative
+   costs nothing measurable. Reads and stores of four values at a time should bring it to
+   about 12 µs (5 ms per step).
+2. Loading a window: the hidden values through the replay's permutation instead of a copy,
+   and the slots' old states gathered straight into the buffer (about 1.5 of 3.3 ms).
+3. Timings repeated on a quiet host.
+4. `train.state_grad_ratio` / `state_grad_clip` (A6's per-row limit on what a position passes
+   back; a result of 13 Nov suggests it for the base): a per-row rescale of `A` and `R`
+   between one position's tail and the next position's head, with the batch's typical live
+   row as the autograd window computes it; first in the float64 reference, then as a fourth
+   glue step. The buffers and the step order leave that place.
+5. A12's `model.address_gate` (not on main) is one more scorer term: the forward sweep's
+   scorer product only.
+6. Accuracy runs.
+
 ## Files
 
 - `python/hsn/train/state_gradient.py`: the cell's backward into the state, the sweep, the
@@ -584,6 +733,15 @@ will do.
 - `python/hsn/model/units.py`, `cell.py`, `python/hsn/train/compile.py`: the fixed slots' unit
   products in the static rounds and the sweep twin (phase 2, step 1);
   `tests/test_p2_10c_fast_slots.py`.
+- `python/hsn/train/state_sweep.py`: the reverse sweep on static buffers, its PyTorch steps,
+  the CUDA graph, the runner (phase 2, step 2); `tests/test_p2_10c_state_sweep.py`.
+- `kernels/cuda/hsn_window.cu`, `python/hsn/kernels/window.py`: the reserved slots in
+  `hsn_win_select`, the fast read in `hsn_win_cell_update`, and `hsn_win_back_head` / `_mid` /
+  `_tail`; `tests/kernels/test_p2_10c_window.py`, `test_p2_10c_sweep.py`,
+  `test_p2_10c_fused_window.py` (on the card).
+- Card measurements (outside the repository): `/home/joe/hsn-experiments/cutc-speed/card/`
+  (step times, phases, product and sweep-part timings, the card suites' logs) with
+  `scratch/bench_products.py`, `bench_mm.py`, `bench_sweep.py`, `diag_fused_fast.py`.
 - `python/hsn/train/split.py`: `SplitWindow(state_gradient=)`, the fast read and the reserved
   slots in the replay.
 - `python/hsn/model/cell.py`, `units.py`, `router.py`, `python/hsn/config.py`: the default-off

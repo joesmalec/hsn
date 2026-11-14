@@ -56,13 +56,14 @@ Scope (:func:`scope_error`; anything else keeps the autograd window): routed ``t
 ``ste`` gate at every step, all four feedback paths cut, no exploration, no counterfactual
 probes, no state-gradient clip, no disabled cells, one round, no loss scaler.
 
-P2.10c (``docs/p2_10c_state_gradient_window.md``; ``SplitWindow(..., state_gradient=True)``,
-no configuration key yet): the same window without the ``state`` cut
-(``train.feedback_detach = [summary, eps, router]``). The sweep and the replay are the ones
-above; the recurrence node is :class:`hsn.train.state_gradient.StateGradientRecurrence`, whose
-reverse sweep also carries the cell's read of the state position by position. It takes
-amendment A8's fast cells (the reserved slots of the recorded decision, the fast read of ``S``
-as a constant and of the decoder as a fourth output of the node) and A9's address n-grams.
+P2.10c (``docs/p2_10c_state_gradient_window.md``): the same window without the ``state`` cut
+(``train.feedback_detach = [summary, eps, router]``, selected by the configuration). The sweep
+and the replay are the ones above; the recurrence node is
+:class:`hsn.train.state_gradient.StateGradientRecurrence`, whose reverse sweep also carries the
+cell's read of the state position by position (on the card: the kernels and the CUDA graph of
+:mod:`hsn.train.state_sweep`). It takes amendment A8's fast cells (the reserved slots of the
+recorded decision, the fast read of ``S`` as a constant and of the decoder as a fourth output
+of the node); A9's address n-grams are in both windows' scope.
 """
 
 from __future__ import annotations
@@ -81,8 +82,15 @@ from hsn.kernels import window as window_kernels
 from hsn.model.hsn import HSN, _Prologue
 from hsn.model.router import Scorer, Selection
 from hsn.model.state import CellGraphState
-from hsn.train.compile import CompiledWindow, WindowOut, _tape_block, run_tape
-from hsn.train.state_gradient import StateGradientRecurrence, cell_constants
+from hsn.train.compile import (
+    CompiledWindow,
+    WindowOut,
+    _tape_block,
+    fixed_fast_slots,
+    run_tape,
+)
+from hsn.train.state_gradient import StateGradientRecurrence, cell_constants, set_fast_sweep
+from hsn.train.state_sweep import SweepRunner
 
 __all__ = [
     "SplitWindow",
@@ -96,11 +104,11 @@ __all__ = [
 DENSE_BYTES = 4 << 30
 
 
-def scope_error(cfg: RunConfig, *, state_gradient: bool = False) -> str | None:
+def scope_error(cfg: RunConfig, *, state_gradient: bool | None = None) -> str | None:
     """Why ``cfg`` cannot train with the split window, or ``None`` when it can (module
     docstring, "Scope"): :func:`hsn.config.split_window_scope_error`, which the configuration
-    itself applies when ``hardware.window`` asks for the split window. ``state_gradient``: the
-    scope of the window with the state gradient (P2.10c) instead."""
+    itself applies when ``hardware.window`` asks for the split window. ``state_gradient``
+    narrows it to the window with the state gradient (P2.10c) or to the full cut's."""
     return split_window_scope_error(cfg, state_gradient=state_gradient)
 
 
@@ -348,10 +356,13 @@ class SplitWindow:
     ``capture``, the steps of a soft warm-up — go to ``fallback`` (the compiled window, or the
     model's forward).
 
-    ``state_gradient`` (P2.10c, module docstring; default False: the window of P2.10): the
-    window for a model without the ``state`` cut, with the reverse sweep of
-    :mod:`hsn.train.state_gradient`. The reference of that work's phase 1: the eager sweep
-    only (``compiled=None``), and a window with dense-fallback rows goes to the fallback."""
+    P2.10c (module docstring): a configuration without the ``state`` cut
+    (``train.feedback_detach = [summary, eps, router]``) gets the window with the state
+    gradient: the same sweep and replay, the recurrence node of
+    :mod:`hsn.train.state_gradient`, and on the card its reverse sweep as kernels
+    (:class:`hsn.train.state_sweep.SweepRunner`). A window with dense-fallback rows then goes
+    to the fallback. ``state_gradient`` (``None``: what the configuration says) only asserts
+    which of the two windows the caller expects."""
 
     def __init__(
         self,
@@ -359,26 +370,21 @@ class SplitWindow:
         cfg: RunConfig,
         compiled: CompiledWindow | None,
         *,
-        state_gradient: bool = False,
+        state_gradient: bool | None = None,
     ) -> None:
         reason = scope_error(cfg, state_gradient=state_gradient)
         if reason is not None:
             raise ValueError(f"hardware.window=split is not available for this run: {reason}")
-        if state_gradient and compiled is not None:
+        #: P2.10c: the recurrence's reverse sweep carries the cell's read of the state.
+        self.state_gradient = "state" not in cfg.train.feedback_detach
+        if self.state_gradient and model.cell.detach_state_read:
             raise ValueError(
-                "the split window with the state gradient is the eager reference of P2.10c: "
-                "it has no compiled sweep yet (compiled=None)"
-            )
-        if state_gradient and model.cell.detach_state_read:
-            raise ValueError(
-                "state_gradient=True does not match the model: its cell cuts the read of the "
-                "state (it was built with `state` in train.feedback_detach)"
+                "the configuration keeps the state gradient but the model does not: its cell "
+                "cuts the read of the state (it was built with `state` in train.feedback_detach)"
             )
         self.model = model
         self.cfg = cfg
         self.compiled = compiled
-        #: P2.10c: the recurrence's reverse sweep carries the cell's read of the state.
-        self.state_gradient = state_gradient
         self.fallback: Callable[..., WindowOut] = compiled if compiled is not None else model
         self.calls = 0
         #: ``hardware.window=fused``: the sweep's cell round is the fused CUDA op.
@@ -406,12 +412,19 @@ class SplitWindow:
             )
             if reason is not None:
                 raise ValueError(f"hardware.window=fused is not available for this run: {reason}")
+        #: P2.10c: the reverse sweep's runner on the card (``None``: the PyTorch sweep).
+        self.sweep_runner: SweepRunner | None = None
         if device.type == "cuda" and window_kernels.available():
             # the recurrence's backward as one kernel launch per window (fp32 state)
             window_kernels.prepare(device.index or 0)
             set_fast_recurrence(
                 window_kernels.recurrence_backward, window_kernels.dense_recurrence_backward
             )
+            if self.state_gradient:
+                # the state-gradient sweep as three kernels and two products per position,
+                # captured in a CUDA graph at a shape's first window
+                self.sweep_runner = SweepRunner()
+                set_fast_sweep(self.sweep_runner)
         #: Wall seconds of the last call's phases (forward sweep, replay), for the measurements.
         self.last_phase_seconds: dict[str, float] = {}
 
@@ -649,7 +662,12 @@ class SplitWindow:
                 fast_valid, tape["tape_hsel"][:, :, :n_fast], tape["tape_h"][:, :, :n_fast]
             )
             q_pre_n, q_post_n, h_sel_n, h_fast_n = StateGradientRecurrence.apply(
-                c.reshape(B, T, K, d), b.reshape(B, T, K, d), recurrence_tape, consts, N
+                c.reshape(B, T, K, d),
+                b.reshape(B, T, K, d),
+                recurrence_tape,
+                consts,
+                N,
+                fixed_fast_slots(model),
             )
         else:
             q_pre_n, q_post_n, h_sel_n = StateRecurrence.apply(

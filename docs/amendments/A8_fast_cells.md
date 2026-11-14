@@ -93,9 +93,12 @@ new columns are drawn from their own generator, so every other parameter starts 
 the round's cost follows `k_select`. The soft warm-up executes every cell and is unchanged.
 
 **Windows.** Supported on the eager and the compiled autograd window (`hardware.window =
-autograd`). The split and fused windows refuse the key (`split_window_scope_error`): their
-replay and kernels do not know the reserved slots or the fast read. So an A8 arm runs at the
-autograd window's step time.
+autograd`). Since P2.10c (13 Nov 2026, `docs/p2_10c_state_gradient_window.md`) the split and
+fused windows take the fast group with the state gradient
+(`train.feedback_detach=[summary, eps, router]`): the selection kernel knows the reserved
+slots, the sweep and the replay the fast read, and the reverse sweep carries the decoder's
+read of the fast cells. With the full cut they still refuse the key
+(`split_window_scope_error`): that cut's recurrence has no fast read.
 
 **Refused:** dense, greedy, random and fixed routing; `train.gate_mode = reinforce`;
 `train.lambda_u > 0` (the counterfactual probes swap slots); a disabled cell inside the fast

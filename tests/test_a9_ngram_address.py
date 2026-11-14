@@ -70,13 +70,15 @@ def test_refusals() -> None:
         load_config(REF_A1, ["model.routing=topk", "model.address_ngram=2"])
     with pytest.raises(ValueError):
         load_config(RECIPE_A6, ["model.address_ngram=4"])
+    # P2.10c: the split and fused windows take the wider address scalars (they refused the key
+    # as untested before; tests/test_p2_10c_state_gradient.py and, on the card,
+    # tests/kernels/test_p2_10c_window.py hold them to the autograd window)
     cfg = load_config(RECIPE_A6, ["train.gate_mode=ste", "model.address_ngram=2"])
-    reason = split_window_scope_error(cfg)
-    assert reason is not None and "address_ngram" in reason
-    with pytest.raises(ValueError, match="address_ngram"):
-        load_config(
-            RECIPE_A6, ["train.gate_mode=ste", "model.address_ngram=2", "hardware.window=fused"]
-        )
+    assert split_window_scope_error(cfg) is None
+    fused = load_config(
+        RECIPE_A6, ["train.gate_mode=ste", "model.address_ngram=2", "hardware.window=fused"]
+    )
+    assert fused.hardware.window == "fused"
 
 
 # --------------------------------------------------------------------------------------------------

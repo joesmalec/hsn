@@ -695,30 +695,55 @@ def test_the_scope_with_the_state_gradient() -> None:
         assert reason is not None and message in reason, overrides
 
 
-def test_the_window_refuses_what_it_does_not_cover() -> None:
+def test_the_window_follows_the_configurations_cut() -> None:
+    """The configuration decides which window is built: without the ``state`` cut the one
+    with the state gradient, with it P2.10's. ``state_gradient`` only asserts the caller's
+    expectation, and a model built with another cut than the configuration's is refused."""
     cut = _cfg(*BASE)
-    with pytest.raises(ValueError, match="hardware.window=split"):
-        SplitWindow(HSN.from_config(cut), cut, None)  # P2.10's window needs the full cut
+    assert SplitWindow(HSN.from_config(cut), cut, None).state_gradient is True
+    assert SplitWindow(HSN.from_config(cut), cut, None, state_gradient=True).state_gradient
+    with pytest.raises(ValueError, match="lacks \\['state'\\]"):
+        SplitWindow(HSN.from_config(cut), cut, None, state_gradient=False)
     full = _cfg(*A5, ALL, "model.cand_norm=rms")
+    assert SplitWindow(HSN.from_config(full), full, None).state_gradient is False
     with pytest.raises(ValueError, match="holds every path"):
         SplitWindow(HSN.from_config(full), full, None, state_gradient=True)
-    with pytest.raises(ValueError, match="no compiled sweep"):
-        SplitWindow(HSN.from_config(cut), cut, object(), state_gradient=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="cuts the read of the state"):
-        SplitWindow(HSN.from_config(full), cut, None, state_gradient=True)
+    with pytest.raises(ValueError, match="the model does not"):
+        SplitWindow(HSN.from_config(full), cut, None)
 
 
 @pytest.mark.parametrize("window", ["split", "fused"])
-def test_no_configuration_key_selects_it_yet(window: str) -> None:
-    """Phase 1 is the reference only: ``hardware.window`` is refused without the full cut as
-    before, the scope a configuration is checked against is unchanged, and the configuration
-    hashes with it."""
-    with pytest.raises(ValueError, match="hardware.window"):
-        _cfg(*BASE, f"hardware.window={window}")
+def test_the_configuration_key_selects_it(window: str) -> None:
+    """``hardware.window`` = ``split`` / ``fused`` accepts the state gradient, and with it the
+    fast cells; the full cut with fast cells stays refused (its recurrence has no fast read);
+    A9's address n-grams are accepted under both cuts. The key is opt-in as before: a
+    configuration without it keeps its hash."""
+    base = _cfg(*BASE)
+    keyed = _cfg(*BASE, f"hardware.window={window}")
+    assert keyed.hardware.window == window and config_hash(keyed) != config_hash(base)
+    assert _cfg(*BASE, *PINNED, f"hardware.window={window}").model.fast_cells == 2
+    assert _cfg(*BASE, "model.address_ngram=2", f"hardware.window={window}").hardware.window
+    assert _cfg(*A5, ALL, "model.address_ngram=2", f"hardware.window={window}").hardware.window
     with pytest.raises(ValueError, match="fast_cells"):
         _cfg(*A5, ALL, *FAST, f"hardware.window={window}")
-    assert split_window_scope_error(_cfg(*BASE)) is not None
+    with pytest.raises(ValueError, match="hardware.window"):
+        _cfg(*A5, "train.feedback_detach=[summary,eps]", f"hardware.window={window}")
+    assert split_window_scope_error(_cfg(*BASE)) is None
     assert split_window_scope_error(_cfg(*A5, ALL)) is None
     recipe = load_config(RECIPE_A6)
     assert split_window_scope_error(recipe) is None
     assert config_hash(recipe) == config_hash(load_config(RECIPE_A6, ["hardware.window=autograd"]))
+
+
+def test_full_cut_window_with_address_ngrams() -> None:
+    """A9's ``model.address_ngram`` under the full cut (P2.10's window, which refused it as
+    untested): the scorer's wider scalars pass through the replay as they are, and the
+    window's gradients are :meth:`HSN.forward`'s."""
+    import test_p2_10_split_window as p210
+
+    cfg = _cfg(*p210.RECIPE, "model.address_ngram=2")
+    assert scope_error(cfg) is None and scope_error(cfg, state_gradient=False) is None
+    ref, got, ref_info, s_info = p210._both(cfg)
+    p210._assert_same_grads(ref, got)
+    for key in ("cell_idx", "unit_idx", "valid"):
+        assert torch.equal(s_info[key], ref_info[key])

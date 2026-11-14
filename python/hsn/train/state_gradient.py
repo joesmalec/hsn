@@ -75,6 +75,7 @@ cells and A9's address n-grams are inside it. A window with dense-fallback rows
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
@@ -90,6 +91,7 @@ __all__ = [
     "activation_grad",
     "cell_constants",
     "cell_state_vjp",
+    "set_fast_sweep",
     "state_gradient_backward",
     "sweep_layouts",
 ]
@@ -119,6 +121,7 @@ class CellConstants(NamedTuple):
     edge_weights: Tensor  # [N, D_max]: a_ij in the padded view, 0 on padding
     pad_src: Tensor  # int64 [N, D_max]: the source of every padded slot
     activation: str
+    pad_mask: Tensor | None = None  # bool [N, D_max]: the slots that hold an edge
 
 
 def cell_constants(cell: PDGCell, dtype: torch.dtype) -> CellConstants:
@@ -154,6 +157,7 @@ def cell_constants(cell: PDGCell, dtype: torch.dtype) -> CellConstants:
         edge_weights=cell.graph._padded_weights_as(dtype).detach(),
         pad_src=cell.graph._pad_src,
         activation=units.activation_name,
+        pad_mask=cell.graph._pad_mask,
     )
 
 
@@ -438,6 +442,20 @@ def state_gradient_backward(
     return dc, db
 
 
+#: A faster :func:`state_gradient_backward` (:class:`hsn.train.state_sweep.SweepRunner`: the
+#: kernels on the card), called with its arguments and ``n_fast`` / ``n_read``; it returns
+#: ``None`` for inputs it does not take.
+FastSweep = Callable[..., "tuple[Tensor, Tensor] | None"]
+_fast_sweep: FastSweep | None = None
+
+
+def set_fast_sweep(fn: FastSweep | None) -> None:
+    """Install (or, with ``None``, remove) a faster implementation of
+    :func:`state_gradient_backward` for :class:`StateGradientRecurrence`."""
+    global _fast_sweep
+    _fast_sweep = fn
+
+
 class StateGradientRecurrence(torch.autograd.Function):
     """The state recurrence of a window with the state gradient, as one autograd node (module
     docstring): :class:`hsn.train.split.StateRecurrence` with :func:`state_gradient_backward`
@@ -447,7 +465,8 @@ class StateGradientRecurrence(torch.autograd.Function):
     ``dL/dĉ`` and ``dL/db̂``. As there, the outputs are recorded values, and the backward is
     exact for the recorded trajectory. ``tape`` holds that node's entries and ``h_fast``, the
     recorded ``units`` and the replay's record (:data:`RECORD_KEYS`, ``[B, T, K, …]``);
-    ``consts`` are the cell's weights (:func:`cell_constants`)."""
+    ``consts`` are the cell's weights (:func:`cell_constants`); ``n_fast`` leading slots have a
+    fixed unit (what a faster sweep, :func:`set_fast_sweep`, lays out apart)."""
 
     @staticmethod
     def forward(
@@ -457,11 +476,13 @@ class StateGradientRecurrence(torch.autograd.Function):
         tape: dict[str, Tensor],
         consts: CellConstants,
         n_cells: int,
+        n_fast: int = 0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ctx.save_for_backward(c, b)
         ctx.tape = tape  # type: ignore[attr-defined]
         ctx.consts = consts  # type: ignore[attr-defined]
         ctx.n_cells = n_cells  # type: ignore[attr-defined]
+        ctx.n_fast = n_fast  # type: ignore[attr-defined]
         ctx.set_materialize_grads(False)  # a read without a gradient arrives as None
         # fresh tensors: the tape's own are read as constants elsewhere in the replay
         return (
@@ -479,12 +500,12 @@ class StateGradientRecurrence(torch.autograd.Function):
         d_q_post: Tensor | None,
         d_h_sel: Tensor | None,
         d_h_fast: Tensor | None,
-    ) -> tuple[Tensor, Tensor, None, None, None]:
+    ) -> tuple[Tensor, Tensor, None, None, None, None]:
         c, b = ctx.saved_tensors  # type: ignore[attr-defined]
         tape: dict[str, Tensor] = ctx.tape  # type: ignore[attr-defined]
         consts: CellConstants = ctx.consts  # type: ignore[attr-defined]
         n_cells: int = ctx.n_cells  # type: ignore[attr-defined]
-        dc, db = state_gradient_backward(
+        args = (
             c,
             b,
             tape["h_old"],
@@ -500,4 +521,10 @@ class StateGradientRecurrence(torch.autograd.Function):
             {key: tape[key] for key in RECORD_KEYS if key in tape},
             consts,
         )
-        return dc, db, None, None, None
+        result = None
+        if _fast_sweep is not None:
+            n_fast: int = ctx.n_fast  # type: ignore[attr-defined]
+            result = _fast_sweep(*args, n_fast=n_fast, n_read=int(tape["h_fast"].shape[2]))
+        if result is None:
+            result = state_gradient_backward(*args)
+        return result[0], result[1], None, None, None, None

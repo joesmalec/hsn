@@ -594,6 +594,20 @@ def fixed_fast_slots(model: HSN) -> int:
     return int(cfg.fast_cells) if cfg.fast_cells and cfg.fast_units == "fixed" else 0
 
 
+def _fast_group(model: HSN) -> tuple[int, bool, int]:
+    """Amendment A8 in the fused sweep: ``(reserved, reserved_units, n_read)``, the fast cells
+    that hold the first slots (:meth:`hsn.model.router.Router.select`'s ``reserved``), whether
+    their units are fixed, and the fast cells ``S`` reads the mean of (``model.fast_readout``;
+    0 without it). All zero without fast cells."""
+    cfg = model.cfg
+    reserved = int(cfg.fast_cells)
+    return (
+        reserved,
+        bool(reserved and cfg.fast_units == "fixed"),
+        reserved if cfg.fast_readout else 0,
+    )
+
+
 def sweep_merge_error(model: HSN) -> str | None:
     """Why the fused sweep keeps its matrix products separate for this model (``None``: it
     merges them, :class:`SweepTwin`). The merged layouts assume the reference shapes: ``S`` and
@@ -653,6 +667,8 @@ def _fused_tape_block(
     B, n = int(z_b.shape[0]), int(z_b.shape[1])
     N, d = int(h.shape[1]), int(h.shape[2])
     K = int(model.cfg.k_select)
+    # P2.10c, amendment A8: the fast cells' reserved slots, and their read into S's input
+    reserved, reserved_units, n_read = _fast_group(model)
     front_w1 = model._buffers.get("sweep_front_w1")
     front_b1 = model._buffers.get("sweep_front_b1")
     front_w2 = model._buffers.get("sweep_front_w2")
@@ -681,7 +697,10 @@ def _fused_tape_block(
     for i in range(n):
         h_i, q_i, age_i = tape_h[:, i], tape_q[:, i], tape_age[:, i]
         z_t = z_b[:, i]
-        x = torch.cat([z_t, q_i, c_b[:, i]], dim=-1)
+        if n_read:  # [z; q; ctx; f], f the fast cells' mean before the round
+            x = torch.cat([z_t, q_i, c_b[:, i], model._fast_read(h_i)], dim=-1)
+        else:
+            x = torch.cat([z_t, q_i, c_b[:, i]], dim=-1)
         if front_w1 is not None and front_b1 is not None:
             assert front_w2 is not None and front_b2 is not None
             hidden = model.shared.act(torch.addmm(front_b1, x, front_w1))
@@ -715,6 +734,8 @@ def _fused_tape_block(
             cell_overhead=float(router.cell_overhead),
             shared_cost=float(router.shared_cost),
             limit=limit,
+            reserved=reserved,
+            reserved_units=reserved_units,
         )
         state_i = CellGraphState._make(h=h_i, q=q_i, age=age_i, pos=pos)
         gate, y = model.cell.sparse_products(
@@ -794,6 +815,8 @@ def _folded_tape_block(
     B, n = int(z_b.shape[0]), int(z_b.shape[1])
     N, d = int(h.shape[1]), int(h.shape[2])
     K = int(model.cfg.k_select)
+    # P2.10c, amendment A8: the fast cells' reserved slots, and their read into S's input
+    reserved, reserved_units, n_read = _fast_group(model)
     front_w1 = model.get_buffer("sweep_front_w1")
     front_b1 = model.get_buffer("sweep_front_b1")
     front_w2 = model.get_buffer("sweep_front_w2")
@@ -828,12 +851,22 @@ def _folded_tape_block(
         # through a row of the usual layout, like the tapes: the compiler then leaves it the
         # layout the kernel indexes (given position-major sources it lays the buffer out
         # batch-major and copies it in and out of every kernel call).
-        x_all = front_w1.new_empty((n, B, int(z_b.shape[2]) + d + int(c_b.shape[2])))
-        x_all[0] = torch.cat([z_b[:, 0], q_first, c_b[:, 0]], dim=-1)
+        width = int(z_b.shape[2]) + d + int(c_b.shape[2]) + (d if n_read else 0)
+        x_all = front_w1.new_empty((n, B, width))
+        if n_read:  # [z; q; ctx; f]: the kernel writes the later rows' f as well
+            f_first = model._fast_read(h.masked_fill(first[:, None, None], 0))
+            x_all[0] = torch.cat([z_b[:, 0], q_first, c_b[:, 0], f_first], dim=-1)
+        else:
+            x_all[0] = torch.cat([z_b[:, 0], q_first, c_b[:, 0]], dim=-1)
     for i in range(n):
         h_i, q_i, age_i = tape_h[:, i], tape_q[:, i], tape_age[:, i]
         z_t = z_b[:, i]
-        x = torch.cat([z_t, q_i, c_b[:, i]], dim=-1) if x_all is None else x_all[i]
+        if x_all is not None:
+            x = x_all[i]
+        elif n_read:
+            x = torch.cat([z_t, q_i, c_b[:, i], model._fast_read(h_i)], dim=-1)
+        else:
+            x = torch.cat([z_t, q_i, c_b[:, i]], dim=-1)
         hidden = model.shared.act(torch.addmm(front_b1, x, front_w1))
         both = torch.addmm(front_b2, hidden, front_w2)
         u, z_hat = both[:, :d_u], both[:, d_u:]
@@ -859,6 +892,8 @@ def _folded_tape_block(
                 cell_overhead=float(router.cell_overhead),
                 shared_cost=float(router.shared_cost),
                 limit=limit,
+                reserved=reserved,
+                reserved_units=reserved_units,
             )
         else:
             logits = scored[:, :n_units].reshape(B, N, n_units).to(h.dtype)
@@ -878,6 +913,8 @@ def _folded_tape_block(
                 cell_overhead=float(router.cell_overhead),
                 shared_cost=float(router.shared_cost),
                 limit=limit,
+                reserved=reserved,
+                reserved_units=reserved_units,
             )
         state_i = CellGraphState._make(h=h_i, q=q_i, age=age_i, pos=pos)
         if x_all is None:
@@ -895,7 +932,7 @@ def _folded_tape_block(
             )  # fmt: skip
             window_kernels.update_fold(
                 cell, y, gate, tape_h, tape_q, tape_age, cells, valid, reset, h_sel, h_max, qs,
-                x_all, z_b, c_b, t=i,
+                x_all, z_b, c_b, t=i, n_fast=n_read,
             )  # fmt: skip
     steps = torch.arange(1, n + 1, device=pos.device, dtype=pos.dtype)
     last = (reset.to(pos.dtype) * steps).amax(dim=1)
