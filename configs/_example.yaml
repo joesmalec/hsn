@@ -67,6 +67,7 @@ model: # Appendix A.1
   reader_heads: 4 # HSN-T: attention heads per block
   reader_span: null # HSN-T: n = a position reads itself and the n - 1 bytes before it only (short-sighted); null = the document up to the position, inside the window
   address_ngram: 1 # amendment A9: longest byte n-gram with an address feature pair (needs key_address); 1 = A5 only
+  address_history: byte # A9 across windows: byte = one byte carried (every run before 14 Nov 2026; the older bytes read as BOS at a continuing window's first column) | ngram = the last address_ngram bytes carried (needs address_ngram > 1)
   state_schema_version: 1 # bumped on any state layout change
 
 data: # Appendix A.2

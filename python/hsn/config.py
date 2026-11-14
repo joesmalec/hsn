@@ -300,6 +300,15 @@ class ModelConfig(_StrictModel):
     # its fact's value and at its query. The codes are fixed products of per-position byte
     # codes; nothing about a key is learned. 1 (default): A5's two features only.
     address_ngram: int = Field(default=1, ge=1, le=3)
+    # address_history (opt-in, 14 Nov 2026; needs address_ngram > 1): what is carried from one
+    # window to the next of the same document for the n-gram addresses. "byte" (default, every
+    # run so far): the window's last byte only, so at the first column of a window that
+    # continues a document the bytes further back read as BOS, and a value written there under
+    # a key of two bytes that ended the window before gets another address than its key has
+    # anywhere else. "ngram": the last address_ngram bytes are carried and the features are the
+    # same as inside a window. BOS stands only where the document has no such byte. Runs with
+    # "ngram" are repaired runs and are reported apart from the runs before them.
+    address_history: Literal["byte", "ngram"] = "byte"
     # --- end A9 ---
     # --- Amendment A12 (docs/amendments/A12_address_gate.md; opt-in, needs key_address) ---
     # address_gate: the weight a unit puts on each address feature becomes a function of the
@@ -471,6 +480,11 @@ class ModelConfig(_StrictModel):
         if self.address_ngram > 1 and not self.key_address:
             raise ValueError(
                 f"model.address_ngram={self.address_ngram} requires model.key_address=true"
+            )
+        if self.address_history != "byte" and self.address_ngram < 2:
+            raise ValueError(
+                f"model.address_history={self.address_history!r} carries the bytes of A9's "
+                "n-gram addresses across windows; it needs model.address_ngram > 1"
             )
         if self.fast_readout and not (self.fast_cells and self.selected_readout):
             raise ValueError(
@@ -1723,6 +1737,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.reader_layers",
     "model.reader_heads",
     "model.reader_span",
+    "model.address_history",
 )
 
 

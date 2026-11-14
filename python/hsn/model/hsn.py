@@ -132,11 +132,13 @@ readout ``r_t`` averages the routed slots only. The split and fused windows refu
 Amendment A9 (``model.address_ngram = n > 1``, ``docs/amendments/A9_ngram_address.md``; opt-in,
 needs ``model.key_address``): the scorer also gets the address of the last ``m`` bytes and of the
 ``m`` bytes before the current one, for ``m = 2 .. n`` (:meth:`Scorer.address_features`). A
-window derives the older bytes from its own tokens; the trainer carries one byte across windows
-(A5's ``prev_tokens``), so at the first ``n − 1`` positions of a window that continues a document
-the bytes further back than that one read as BOS. A document that starts at a window boundary is
-exact. :meth:`step` takes ``prev_tokens`` as ``[B, n]`` (``x_{t−1}`` first) for exact features;
-``[B]`` means the older bytes are BOS.
+window derives the older bytes from its own tokens. What crosses a window boundary is
+``model.address_history``: ``byte`` (default) carries one byte (A5's ``prev_tokens``), so at the
+first ``n − 1`` positions of a window that continues a document the bytes further back than
+that one read as BOS; ``ngram`` carries the last ``n`` bytes (:func:`address_history`) and every
+feature is the one a single long window computes. A document that starts at a window boundary
+is exact in both. :meth:`step` and :meth:`forward` take ``prev_tokens`` as ``[B, n]``
+(``x_{t−1}`` first) for exact features; ``[B]`` means the older bytes are BOS.
 
 HSN-T (``model_name: hsn_t``, ``model.reader = transformer``, ``docs/hsn_t.md``): a
 small causal Transformer (:class:`~hsn.model.reader.Reader`) reads the window's bytes once, in
@@ -177,7 +179,7 @@ from hsn.model.state import CellGraphState
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
-__all__ = ["PARAM_REPORT_ROWS", "HSN", "StepMode", "StepOutput"]
+__all__ = ["PARAM_REPORT_ROWS", "HSN", "StepMode", "StepOutput", "address_history"]
 
 StepMode = Literal["dense", "masked", "sparse"]
 _INDEX_DTYPES = (torch.int64, torch.int32)
@@ -336,6 +338,29 @@ class _Prologue(NamedTuple):
         start_age, zero_age, positions, positions_after = self.counters
         age = start_age if t == 0 else zero_age
         return age, positions[:, t], zero_age, positions_after[:, t]
+
+
+def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = None) -> Tensor:
+    """What a caller carries from the window ``tokens [B, T]`` to the next window of the same
+    rows, as that window's ``prev_tokens`` (A5 / A9's address features).
+
+    ``model.address_history = byte`` (default): the window's last byte, ``[B]``. ``ngram``: its
+    last ``n = model.address_ngram`` bytes, newest first, ``[B, n]``; a window shorter than ``n``
+    is completed from ``previous`` (what was carried into it; BOS where there is nothing). The
+    receiving window masks whatever a row's document does not reach back to, so bytes of an
+    earlier document in the carry are never read."""
+    if cfg.address_history == "byte":
+        return tokens[:, -1].detach().clone()
+    n = cfg.address_ngram
+    newest = tokens.detach().flip(1)[:, :n]
+    if newest.shape[1] < n:
+        if previous is None:
+            older = newest.new_full((newest.shape[0], 0), BOS)
+        else:
+            older = previous if previous.ndim == 2 else previous[:, None]
+        fill = newest.new_full((newest.shape[0], n), BOS)
+        newest = torch.cat([newest, older.to(newest.device), fill], dim=1)[:, :n]
+    return newest.clone()
 
 
 def _stack_record(values: Sequence[Tensor]) -> Tensor:
@@ -1348,18 +1373,32 @@ class HSN(nn.Module):
                 context = torch.cat([context, before.masked_fill(reset[:, :, None], 0.0)], dim=-1)
         positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
         previous_window: Tensor | None = None
+        carried: Tensor | None = None  # x_{-2} .. x_{-n} of the window before, when carried
         if cfg.key_address:
+            if prev_tokens is not None and prev_tokens.ndim == 2:  # [B, n], x_{-1} first
+                if prev_tokens.shape != (B, cfg.address_ngram):
+                    raise ValueError(
+                        f"prev_tokens must be [B] or [B, model.address_ngram] = "
+                        f"{(B, cfg.address_ngram)}, got {tuple(prev_tokens.shape)}"
+                    )
+                prev_tokens, carried = prev_tokens[:, 0], prev_tokens[:, 1:]
             previous = self._previous_tokens(tokens[:, 0], prev_tokens)
             shifted = torch.cat([previous[:, None], tokens[:, :-1]], dim=1)
             previous_window = shifted.masked_fill(reset, BOS)
         older_window: dict[str, Any] = {}
         if cfg.key_address and cfg.address_ngram > 1:
-            # A9: x_{t-2} .. x_{t-n} from the window's own bytes; BOS where the document has
-            # none, and before column 0 beyond the one carried byte (module docstring)
+            # A9: x_{t-2} .. x_{t-n} from the window's own bytes and, before column 0, from the
+            # bytes carried into the window (model.address_history=ngram; with one carried
+            # byte they read as BOS there). BOS where the document has no such byte.
             assert previous_window is not None
             lag, lags = previous_window, []
             for back in range(2, cfg.address_ngram + 1):
-                lag = torch.cat([torch.full_like(lag[:, :1], BOS), lag[:, :-1]], dim=1)
+                first = (
+                    torch.full_like(lag[:, :1], BOS)
+                    if carried is None
+                    else carried[:, back - 2 : back - 1].to(lag.dtype)
+                )
+                lag = torch.cat([first, lag[:, :-1]], dim=1)
                 lag = lag.masked_fill(positions < back, BOS)
                 lags.append(lag)
             older_window = {"older": torch.stack(lags, dim=-1)}

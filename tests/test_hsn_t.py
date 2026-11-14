@@ -225,6 +225,24 @@ def test_span_limits_the_reader_to_its_last_bytes() -> None:
     assert bool(reader.attention_mask(reset)[..., torch.arange(T), torch.arange(T)].all())
 
 
+@pytest.mark.parametrize("extra", [(), (f"model.reader_span={SPAN}",)])
+def test_reader_output_equals_the_prefix_recomputed_through_each_position(
+    extra: tuple[str, ...],
+) -> None:
+    """Streaming equality: ``c_t`` from the whole window is ``c_t`` of the window cut after
+    ``t``, at every position and across a document boundary inside the window. An independent
+    reference for the window computation, which has no stepping form."""
+    reader, cfg = _reader(*extra)
+    B, T = 2, 12
+    tokens = _bytes(cfg, B, T, 7)
+    reset = torch.zeros(B, T, dtype=torch.bool)
+    reset[0, 5] = True
+    whole = reader(tokens, reset)
+    for t in range(T):
+        prefix = reader(tokens[:, : t + 1], reset[:, : t + 1])
+        assert _gap(prefix[:, t], whole[:, t]) <= 1e-12, t
+
+
 def test_reader_reads_distances_not_window_positions() -> None:
     """Rotary positions: the same bytes give the same output wherever they sit in the window,
     once the span no longer reaches the bytes before them."""

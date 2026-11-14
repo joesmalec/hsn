@@ -16,7 +16,7 @@ import pytest
 import test_p2_8_compile as p28
 import torch
 from hsn.config import RunConfig, config_hash, load_config, split_window_scope_error
-from hsn.losses import assemble_terms
+from hsn.losses import assemble_loss, assemble_terms
 from hsn.model.hsn import HSN
 from hsn.train.memory_plan import expected_param_count
 from p1_11_support import restore_determinism  # noqa: F401
@@ -369,6 +369,115 @@ def test_cost_term_is_the_weighted_mean_write_fraction() -> None:
     net = model.scorer.write_net
     assert net is not None and net.bias.grad is not None
     assert float(net.bias.grad.abs().sum()) > 0.0  # the cost lowers the write logits
+
+
+# --------------------------------------------------------------------------------------------------
+# The objective and the surrogate, computed by hand (the review of 14 Nov 2026, item 04a-1)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_write_weight_enters_the_total_once() -> None:
+    """``L = L_task + lambda_w * R_write`` with ``R_write`` the unweighted open-write share: the
+    total with a weight ``a`` exceeds the total without the term by ``a * R``, not ``a * a * R``."""
+    weight = 0.1
+    cfg = _cfg(*A5, "train.gate_mode=ste", *MIXED, f"train.lambda_w={weight}", "train.lambda_p=0.0")
+    without = _cfg(*A5, "train.gate_mode=ste", *MIXED, "train.lambda_p=0.0")
+    model = _model(cfg)
+    model.set_train_step(10)
+    tokens, ctx, reset = _window(cfg)
+    logits, _, info = model(tokens, ctx, _start(model, tokens.shape[0]), reset)
+    batch = {
+        "targets": tokens,
+        "loss_mask": torch.ones_like(tokens, dtype=torch.bool),
+        "doc": torch.zeros_like(tokens),
+    }
+    out = {"logits": logits, **info}
+    total, parts = assemble_loss(out, batch, cfg)
+    plain, plain_parts = assemble_loss(out, batch, without)
+    share = float(info["write_fraction"].float().mean())
+    assert 0.0 < share < 1.0 and "write" not in plain_parts
+    assert parts["write"] == pytest.approx(weight * share, rel=1e-6)
+    assert float(total - plain) == pytest.approx(weight * share, rel=1e-5)
+    assert abs(float(total - plain) - weight * weight * share) > 1e-3
+
+
+@pytest.mark.parametrize("tau", [1.0, 2.0])
+@pytest.mark.parametrize("bias", [-1.0, 1.0], ids=["closed", "open"])
+def test_task_gradient_to_a_write_logit_is_the_surrogate_on_the_computed_candidate(
+    bias: float, tau: float
+) -> None:
+    """One position, every write logit equal to ``bias``. A write adds ``b * (c - h)`` to its
+    cell, which a forward with every write open shows. With the writes closed the state does not
+    move, and the gradient of a function of the new state with respect to the write logits is
+    still ``b * (c - h) * p * (1 - p) / tau`` with ``p = sigmoid(bias / tau)``: the candidate of
+    a closed write is computed, and it is where the reopening gradient comes from."""
+    cfg = _cfg(
+        *A5,
+        "train.gate_mode=ste",
+        *WRITE,
+        f"train.temperature_start={tau}",
+        f"train.temperature_end={tau}",
+    )
+    model = _set_write(_model(cfg), bias)
+    model.set_train_step(10)
+    tokens, ctx, _ = _window(cfg)
+    tokens, ctx = tokens[:, :1], ctx[:, :1]
+    reset = torch.zeros_like(tokens, dtype=torch.bool)  # the start state is kept
+    start = _start(model, tokens.shape[0])
+    opened = _set_write(copy.deepcopy(model), 5.0)
+    with torch.no_grad():
+        _, open_state, _ = opened(tokens, ctx, start, reset)
+    added = open_state.h - start.h  # b * (c - h) at the selected cells, zero at the others
+    assert float(added.abs().max()) > 1e-3
+    probe = torch.randn(start.h.shape, generator=torch.Generator().manual_seed(3)).double()
+    _, state, _ = model(tokens, ctx, start, reset)
+    if bias < 0:
+        assert torch.equal(state.h, start.h)  # closed: nothing is written
+    else:
+        torch.testing.assert_close(state.h, open_state.h, rtol=0, atol=1e-12)
+    (probe * state.h).sum().backward()
+    net = model.scorer.write_net
+    assert net is not None and net.bias.grad is not None
+    p = torch.sigmoid(torch.tensor(bias / tau, dtype=torch.float64))
+    want = float((probe * added).sum() * p * (1 - p) / tau)
+    assert abs(want) > 1e-6
+    assert float(net.bias.grad.sum()) == pytest.approx(want, rel=1e-6)
+
+
+@pytest.mark.parametrize("tau", [1.0, 2.0])
+@pytest.mark.parametrize("bias", [-1.0, 1.0], ids=["closed", "open"])
+def test_cost_gradient_is_the_surrogate_slope_while_its_value_is_the_hard_share(
+    bias: float, tau: float
+) -> None:
+    """Every write logit equal to ``bias``: the cost's value is the hard share (0 or 1) times
+    the weight, and its gradient with respect to the logits sums to ``weight * p * (1 - p) / tau``
+    (each row and position contributes its valid routed slots' mean)."""
+    weight = 0.25
+    cfg = _cfg(
+        *A5,
+        "train.gate_mode=ste",
+        *WRITE,
+        f"train.lambda_w={weight}",
+        "train.lambda_p=0.0",
+        f"train.temperature_start={tau}",
+        f"train.temperature_end={tau}",
+    )
+    model = _set_write(_model(cfg), bias)
+    model.set_train_step(10)
+    tokens, ctx, reset = _window(cfg)
+    logits, _, info = model(tokens, ctx, _start(model, tokens.shape[0]), reset)
+    batch = {
+        "targets": tokens,
+        "loss_mask": torch.ones_like(tokens, dtype=torch.bool),
+        "doc": torch.zeros_like(tokens),
+    }
+    terms = assemble_terms({"logits": logits, **info}, batch, cfg)
+    assert float(terms["write"]) == pytest.approx(weight * (1.0 if bias > 0 else 0.0))
+    terms["write"].backward()
+    net = model.scorer.write_net
+    assert net is not None and net.bias.grad is not None
+    p = float(torch.sigmoid(torch.tensor(bias / tau)))
+    assert float(net.bias.grad.sum()) == pytest.approx(weight * p * (1 - p) / tau, rel=1e-5)
 
 
 def _trained(tmp_path: Path, *extra: str, steps: int = 30) -> tuple[RunConfig, HSN, list[float]]:

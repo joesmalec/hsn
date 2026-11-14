@@ -68,7 +68,7 @@ from hsn.eval.results import (
     RunRecord,
     evidence_package,
 )
-from hsn.model.hsn import HSN
+from hsn.model.hsn import HSN, address_history
 from hsn.model.hsn_t import HSNT
 from hsn.model.router import SCORED_MODES
 from hsn.profiler import (
@@ -433,7 +433,7 @@ def profile_run(
                     **({"prev_tokens": prev_tokens} if key_address else {}),
                 )
             if key_address:
-                prev_tokens = window["tokens"][:, -1].clone()
+                prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens)
             _window_loss(logits, window).backward()  # type: ignore[no-untyped-call]
         optimizer.zero_grad(set_to_none=True)
     counterfactual = isinstance(replica, HSN) and cfg.train.lambda_u > 0.0
@@ -455,7 +455,7 @@ def profile_run(
                 **({"prev_tokens": prev_tokens} if key_address else {}),
             )
             if key_address:
-                prev_tokens = window["tokens"][:, -1].clone()
+                prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens)
             loss = _window_loss(logits, window)
         with train_prof.segment("backward", tokens=tokens):
             loss.backward()  # type: ignore[no-untyped-call]
@@ -495,7 +495,7 @@ def profile_run(
                     **({"prev_tokens": prev_tokens} if key_address else {}),
                 )
                 if key_address:
-                    prev_tokens = window["tokens"][:, -1].clone()
+                    prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens)
     synchronize(device)
     return train_prof.report(), serve_prof.report()
 

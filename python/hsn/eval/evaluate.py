@@ -31,6 +31,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from hsn.model.hsn import address_history
+
 __all__ = [
     "DEFAULT_METRICS",
     "Metric",
@@ -234,7 +236,7 @@ def evaluate_windows(
                     kwargs = {"prev_tokens": prev_tokens} if key_address else {}
                     logits, state, _info = model(tokens, context, state, reset, **kwargs)
                 if key_address:
-                    prev_tokens = tokens[:, -1].clone()
+                    prev_tokens = address_history(underlying.cfg, tokens, prev_tokens)
                 group_ids: Tensor | None = None
                 if groups is not None:
                     doc = window["doc"].to(device)

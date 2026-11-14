@@ -76,6 +76,30 @@ h_i'    = (1 − w_i·b_i) ⊙ h_i + w_i·b_i ⊙ c_i          (b_i, c_i as befo
   `w = 1`, averaged over the window (`info["write_fraction"]`, differentiable through the
   straight-through `w`). It is a term of its own (`write`), not one of the P2.4 auxiliary terms.
 
+**The objective as executed** (checked against the code on 14 Nov 2026 for the review's item
+04a-1; `tests/test_a10_write_decision.py` computes each line by hand):
+
+```
+p_i     = sigmoid(ω_i / τ)                      τ = the selection temperature (1 in every run so far)
+g_i     = 1[ω_i > 0]
+w_i     = g_i + (p_i − stopgrad(p_i))           hard training; w_i = p_i in a soft warm-up; g_i at evaluation
+R_write = mean over positions of mean over rows of  Σ_i mask_i w_i / max(1, Σ_i mask_i)
+L_total = L_task + λ_p L_pred + λ_w R_write
+```
+
+- `i` runs over the selected slots of one row at one position; `mask_i` is 1 for a valid
+  routed slot. Fast cells and the slots of a dense-fallback row are written always and are
+  outside the share.
+- `λ_w` is applied once. `R_write` is a mean of per-row ratios, not one ratio over all valid
+  slots of the window; the two differ when rows have unequal valid counts. Padding positions
+  are inside the mean.
+- The same `w_i` multiplies the cell's gate and enters the cost.
+- The task gradient to a write logit is `Σ b_i ⊙ (c_i − h_i) ⊙ ∂L/∂h'_i · p_i (1 − p_i) / τ`,
+  whether the write is open or closed: the candidate of a closed write is computed, and that
+  is where its reopening gradient comes from. The cost's gradient is `λ_w p_i (1 − p_i) / τ`
+  over the valid routed slots' count, while its value is the hard share.
+- `write/permitted` in a run record is `R_write` on the dev windows with `w = g`.
+
 **What stays.** Cells, graph, units, ε, the convex tanh gate, the router and its linear scorer,
 A5's address and `q`. No attention over the sequence, no new state, nothing learned about any
 key.

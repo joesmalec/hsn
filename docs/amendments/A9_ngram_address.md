@@ -61,6 +61,25 @@ a_prev<m>[i] = √d · ⟨code_m(x_{t−m}   .. x_{t−1}), A_i⟩
   as BOS. A document that starts at a window boundary (`data.align_docs`, in-range tasks) is
   exact. `HSN.step` takes `prev_tokens` as `[B, n]` for exact features; `[B]` means BOS for the
   older bytes.
+- **`model.address_history` (14 Nov 2026; opt-in, default `byte`).** The sentence above is a
+  defect at one position: with two-byte addresses, a value written at the first column of a
+  window under a key that was the last two bytes of the window before gets the address of
+  `(BOS, k_2)`, not of `(k_1, k_2)`. Measured on the features: in a continuing window exactly
+  one feature differs from a long window's, `a_prev2` at column 0; `a_cur2` (a key that spans
+  the split) is exact. The user's review of the HSN-T white paper found it from the equations
+  (item 04a-2). With `model.address_history=ngram` the trainer, the evaluation, the probes and
+  the profiler carry the last `n` bytes (`hsn.model.hsn.address_history`) and a window's
+  features are those of one long window; two windows of a document then compute what one
+  window of twice the length computes (float64, 1e-9). BOS stands only where the document has
+  no such byte: a reset removes the carried bytes with everything else.
+  - **What it does not touch:** every run on in-range synthetic data with `data.align_docs`
+    (the hold-out, pair, arithmetic and five-task runs), where no window continues a document.
+  - **What it touches:** TinyStories, the story-text facts sets and every out-of-range
+    evaluation, at one column per continuing window.
+  - Runs with `ngram` are repaired runs and are reported apart from the runs before them. The
+    default stays `byte` so that every earlier run reproduces; whether `ngram` becomes the
+    setting is decided by tests on data that crosses windows (the user, 14 Nov 2026: "if
+    tests prove useful for two byte carry then lets adopt it").
 
 **What stays.** Cells, graph, units, ε, the convex tanh gate, the router and its linear scorer,
 A5's features and `q` are unchanged. No attention over the sequence, no new state, nothing
