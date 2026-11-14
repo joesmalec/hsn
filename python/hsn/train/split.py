@@ -323,7 +323,23 @@ def _scorer_logits(
     dtype = h.dtype  # the state's dtype: the partial products are summed in it, not in bf16
     cells = F.linear(h, weight[:, 2 * d : 3 * d]).to(dtype)  # [R, N, M]
     cells = cells + F.linear(tail, weight[:, 3 * d :], net.bias).to(dtype)
-    return cells + row.to(dtype)[:, None, :]
+    out = cells + row.to(dtype)[:, None, :]
+    if scorer.address_gate is not None:
+        # A12: the address weights' part that depends on the position's content,
+        # sum_a (G u)[j, a] * address_a[i] (Scorer.forward); the address features are the
+        # features' last columns, so the scalars' last. Summed feature by feature (two of
+        # them, four with A9). On the RTX 3060 that costs what one einsum over the window's
+        # rows cost before it: the key adds about 10 ms to the fused step in either form
+        # (docs/amendments/A12_address_gate.md, "Windows").
+        n_address = scorer.in_features - scorer._address_start
+        gate = scorer.address_gate(u).view(u.shape[0], -1, n_address)  # [R, M, A]
+        gate = gate.to(scalars.dtype)
+        first = scalars.shape[-1] - n_address
+        term = scalars[:, :, first, None] * gate[:, None, :, 0]  # [R, N, M]
+        for a in range(1, n_address):
+            term = term + scalars[:, :, first + a, None] * gate[:, None, :, a]
+        out = out + term.to(dtype)
+    return out
 
 
 def _readout_of_slots(
@@ -373,7 +389,12 @@ class SplitWindow:
     which of the two windows the caller expects. ``row_limit=True`` admits a configuration
     with amendment A6's per-row limit (``train.state_grad_clip`` / ``state_grad_ratio``): its
     reverse sweep is the PyTorch reference's (no kernel applies the limit), which is for
-    tests, not for training on the card."""
+    tests, not for training on the card.
+
+    Amendment A12's ``model.address_gate`` is inside the scope: the replay adds the gate's
+    term to the scorer's logits (:func:`_scorer_logits`), the eager sweep runs the model's own
+    scorer, and the compiled sweeps hold the gate in their merged scorer product
+    (:func:`hsn.train.compile.gated_features`)."""
 
     def __init__(
         self,

@@ -49,7 +49,10 @@ def test_gate_input_is_opt_in_hashed_only_when_set_and_scoped() -> None:
         load_config(RECIPE_A6, [*GATE, "model.address_gate_input=u_no_fast"])  # no fast read
     recipe = ["model.k_select=8", "train.gate_mode=ste"]
     assert split_window_scope_error(load_config(RECIPE_A6, recipe)) is None
-    assert split_window_scope_error(load_config(RECIPE_A6, [*recipe, *SUMMARY])) is not None
+    # the windows take A12's gate and compute its term from u: another input is outside
+    assert split_window_scope_error(load_config(RECIPE_A6, [*recipe, *GATE])) is None
+    reason = split_window_scope_error(load_config(RECIPE_A6, [*recipe, *SUMMARY]))
+    assert reason is not None and "address_gate_input" in reason
 
 
 @pytest.mark.parametrize("variant", list(VARIANTS))

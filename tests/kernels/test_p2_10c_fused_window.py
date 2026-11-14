@@ -41,6 +41,12 @@ SHAPES = {
         "model.n_cells=64", "model.k_select=20", "model.fast_cells=8", "model.fast_units=fixed",
         "model.fast_readout=true", "model.address_ngram=2",
     ),
+    # amendment A12's address gate (the moved model's gate is not zero)
+    "candidate_routed_gate": ("model.n_cells=64", "model.k_select=12", "model.address_gate=true"),
+    "approved_shape_gate": (
+        "model.n_cells=64", "model.k_select=20", "model.fast_cells=8", "model.fast_units=fixed",
+        "model.fast_readout=true", "model.address_gate=true",
+    ),
 }  # fmt: skip
 
 
@@ -179,7 +185,9 @@ def test_fused_window_through_the_kernels_sweep_and_through_the_reference_sweep(
 
 
 @pytest.mark.usefixtures("small_blocks")
-@pytest.mark.parametrize("name", ["candidate_routed", "approved_shape"])
+@pytest.mark.parametrize(
+    "name", ["candidate_routed", "approved_shape", "candidate_routed_gate", "approved_shape_gate"]
+)
 def test_fused_window_against_the_compiled_autograd_window_in_fp32(
     device: torch.device, name: str
 ) -> None:

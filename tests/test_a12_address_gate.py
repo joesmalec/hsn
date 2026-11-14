@@ -1,7 +1,14 @@
 """Amendment A12 (``docs/amendments/A12_address_gate.md``; opt-in): address weights that depend on
 the position's content. ``model.address_gate``: the scorer adds ``(G u_t)[j, a] * address_a[i]`` to
 the logit of cell ``i`` and unit ``j``. ``G`` is zero at the start, so the model starts as the model
-without the key; with the key off nothing changes."""
+without the key; with the key off nothing changes.
+
+The split and fused windows (P2.10, P2.10c) take the key: the replay adds the gate's term to the
+scorer's logits, the eager sweep runs the model's own scorer, and the compiled sweeps hold the
+gate in their merged scorer product. Here, on the CPU in float64: the split window against the
+autograd window, and that merged product as a layout. On the card
+(``tests/kernels/test_p2_10c_window.py``, ``test_p2_10c_fused_window.py``): the compiled sweeps'
+tapes and the fused window against the autograd window."""
 
 from __future__ import annotations
 
@@ -14,10 +21,19 @@ import torch
 from hsn.config import config_hash, load_config, split_window_scope_error
 from hsn.model.hsn import HSN
 from hsn.train.memory_plan import expected_param_count
+from hsn.train.split import SplitWindow
 from p1_11_support import restore_determinism  # noqa: F401
 from p1_15_support import datasets, hsn_config, hsn_trainer
 from test_a6_feedback_detach import A5, ALL, _cfg, _model, _start, _window
 from test_p2_8_compile import _release_compiled_state, small_blocks  # noqa: F401
+from test_p2_10c_state_gradient import (
+    BASE,
+    PINNED,
+    _assert_same_grads,
+    _case,
+    _objective,
+    _one_gate_sigmoid,
+)
 from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
@@ -40,10 +56,134 @@ def test_address_gate_scope() -> None:
         load_config(REF_A1, list(GATE))  # no key address
     with pytest.raises(ValueError, match="address_gate"):
         load_config(RECIPE_A6, [*GATE, "model.scorer=mlp"])
+    # the split and fused windows take the key, under the full cut (the recipe's) and with
+    # the state gradient
     recipe = ["model.k_select=8", "train.gate_mode=ste"]
-    assert split_window_scope_error(load_config(RECIPE_A6, recipe)) is None
-    reason = split_window_scope_error(load_config(RECIPE_A6, [*recipe, *GATE]))
-    assert reason is not None and "address_gate" in reason
+    cut = "train.feedback_detach=[summary,eps,router]"
+    for extra in ((), (cut,)):
+        assert split_window_scope_error(load_config(RECIPE_A6, [*recipe, *extra, *GATE])) is None
+        for window in ("split", "fused"):
+            cfg = load_config(RECIPE_A6, [*recipe, *extra, *GATE, f"hardware.window={window}"])
+            assert cfg.model.address_gate and cfg.hardware.window == window
+
+
+#: the split window's two cuts (P2.10's full cut, P2.10c's state gradient), the latter also
+#: with A8's fast cells at fixed units and their read
+WINDOW_CUTS = {
+    "full_cut": (*A5, ALL, "model.cand_norm=rms"),
+    "state_gradient": BASE,
+    "state_gradient_fast_cells": (*BASE, *PINNED),
+}
+
+
+def _windows(model: HSN, cfg: object, call: object, mask_from: tuple) -> tuple:
+    """One window through ``call`` and its parameter gradients, with the router's float32 gate
+    taken from one sigmoid (:func:`test_p2_10c_state_gradient._one_gate_sigmoid`: torch's
+    float32 kernel is not the same function at the forward's and the replay's tensor sizes,
+    which would leave the scorer's and the address gate's gradients equal to 1e-7 only)."""
+    (tokens, ctx, state, reset), mask = mask_from
+    names = [n for n, _ in model.named_parameters()]
+    params = [p for _, p in model.named_parameters()]
+    with _one_gate_sigmoid():
+        logits, final, info = call(tokens, ctx, state, reset)  # type: ignore[operator]
+        grads = torch.autograd.grad(_objective(logits, info, mask), params, allow_unused=True)
+    return logits.detach(), final, info, dict(zip(names, grads, strict=True))
+
+
+@pytest.mark.parametrize("ngram", [1, 2])
+@pytest.mark.parametrize("cut", list(WINDOW_CUTS))
+def test_split_window_with_the_gate_equals_autograd(cut: str, ngram: int) -> None:
+    """The split window with a gate that is not zero (the perturbed model), float64: the
+    autograd window's decisions, logits, final state and parameter gradients, the gate's own
+    among them, under the full cut and with the state gradient, for A5's two address features
+    and A9's four. And the window reads the gate: with the gate's weights set to zero its
+    logits are others."""
+    cfg = _cfg(*WINDOW_CUTS[cut], *GATE, f"model.address_ngram={ngram}")
+    model, inputs, mask = _case(cfg)
+    gate = model.scorer.address_gate
+    assert gate is not None and float(gate.weight.detach().abs().max()) > 0.1
+    assert gate.weight.shape == (cfg.model.n_units * 2 * ngram, cfg.model.d)
+    logits, final, info, ref = _windows(model, cfg, model, (inputs, mask))
+    split = SplitWindow(model, cfg, None)
+    s_logits, s_final, s_info, got = _windows(model, cfg, split, (inputs, mask))
+    assert split.calls == 1
+    for key in ("cell_idx", "unit_idx", "valid"):
+        assert torch.equal(s_info[key], info[key]), key
+    torch.testing.assert_close(s_logits, logits, rtol=1e-10, atol=1e-12)
+    for field in ("h", "q"):
+        torch.testing.assert_close(
+            getattr(s_final, field), getattr(final, field), rtol=1e-10, atol=1e-12
+        )
+    for key in ("unit_logits", "route_log_prob", "expected_cost"):
+        torch.testing.assert_close(s_info[key], info[key], rtol=1e-9, atol=1e-12)
+    _assert_same_grads(ref, got)
+    name = next(n for n in ref if n.endswith("address_gate.weight"))
+    assert float(ref[name].abs().max()) > 1e-6  # the gate is trained through this window
+    # the same window without the gate's term
+    with torch.no_grad():
+        kept = gate.weight.clone()
+        gate.weight.zero_()
+    z_logits, _, z_info, _ = _windows(model, cfg, split, (inputs, mask))
+    with torch.no_grad():
+        gate.weight.copy_(kept)
+    assert float((z_info["unit_logits"] - s_info["unit_logits"]).detach().abs().max()) > 1e-3
+    assert not torch.equal(z_info["cell_idx"], s_info["cell_idx"]) or not torch.equal(
+        z_info["unit_idx"], s_info["unit_idx"]
+    )
+
+
+@pytest.mark.parametrize("ngram", [1, 2])
+def test_merged_scorer_product_holds_the_gate(ngram: int) -> None:
+    """The fused sweep's merged scorer product (float64, CPU): with the gate as more input
+    rows of the merged weight and ``u_k · address_a[i]`` as more input columns
+    (:func:`hsn.train.compile.gated_features`), one matmul returns the scorer's logits with
+    the gate's term and ``V``'s outputs, before and after the weights change. Without the key
+    the features and the weight are the ones without it."""
+    from hsn.train.compile import SweepTwin, gated_features, sweep_merge_error
+
+    cfg = _cfg(*A5, ALL, "model.cand_norm=rms", *GATE, f"model.address_ngram={ngram}")
+    model = _model(cfg)
+    assert sweep_merge_error(model) is None
+    sweep = SweepTwin(model, torch.float64, fused=True)
+    assert sweep.merged
+    scorer, cell = model.scorer, model.cell
+    net = scorer.net
+    d, M, A = cfg.model.d, cfg.model.n_units, 2 * ngram
+    score_w = sweep.twin.get_buffer("sweep_score_w")
+    assert score_w.shape == (net.in_features + A * d, M + d)
+    g = torch.Generator().manual_seed(3)
+    B, N = 5, cfg.model.n_cells
+    for _ in range(2):
+        with torch.no_grad(), cell.window():
+            sweep.refresh()
+            u = torch.randn(B, d, generator=g, dtype=torch.float64)
+            eps = torch.randn(B, d, generator=g, dtype=torch.float64)
+            h = torch.randn(B, N, d, generator=g, dtype=torch.float64)
+            age = torch.randint(0, 9, (B, N), generator=g)
+            scalars = torch.randn(
+                B, N, net.in_features - 3 * d - 1, generator=g, dtype=torch.float64
+            )
+            feats = scorer._assemble(u, eps, h, age, scalars)
+            wide = gated_features(scorer, feats, u)
+            assert wide.shape == (B, N, net.in_features + A * d)
+            scored = torch.addmm(
+                sweep.twin.get_buffer("sweep_score_b"), wide.reshape(B * N, -1), score_w
+            )
+            torch.testing.assert_close(
+                scored[:, :M].reshape(B, N, M), scorer(feats), rtol=1e-11, atol=1e-12
+            )
+            torch.testing.assert_close(
+                scored[:, M:].reshape(B, N, d), cell.V(h), rtol=1e-11, atol=1e-12
+            )
+            # the gate's term is in it: the plain linear map alone is another value
+            assert float((scored[:, :M].reshape(B, N, M) - net(feats)).abs().max()) > 1e-3
+            for p in model.parameters():  # the next round: other weights
+                p.add_(0.1 * torch.randn(p.shape, generator=g, dtype=p.dtype))
+    plain = _model(_cfg(*A5, ALL, "model.cand_norm=rms", f"model.address_ngram={ngram}"))
+    twin = SweepTwin(plain, torch.float64, fused=True)
+    assert twin.twin.get_buffer("sweep_score_w").shape == (plain.scorer.net.in_features, M + d)
+    feats = torch.randn(2, N, plain.scorer.net.in_features, generator=g, dtype=torch.float64)
+    assert gated_features(plain.scorer, feats, feats[:, 0, :d]) is feats
 
 
 @pytest.mark.parametrize("ngram", [1, 2])

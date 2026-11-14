@@ -103,7 +103,7 @@ from hsn.model.hsn import (
     _Prologue,
     _stack_record,
 )
-from hsn.model.router import BUDGET_SLACK
+from hsn.model.router import BUDGET_SLACK, Scorer
 from hsn.model.state import CellGraphState
 
 __all__ = [
@@ -393,6 +393,22 @@ SWEEP_CAST_PREFIXES: tuple[str, ...] = (
 )
 
 
+def gated_features(scorer: Scorer, feats: Tensor, u: Tensor) -> Tensor:
+    """The input of a merged scorer product with amendment A12's address gate: ``feats
+    [B, N, F]`` (:meth:`Scorer._assemble`'s) with ``A · d`` more columns, ``u_k ·
+    address_a[i]`` at column ``a · d + k``, for ``u [B, d]`` the content the features were
+    assembled from and ``address`` their last ``A`` columns. Against ``G`` as rows of the
+    merged weight (:meth:`SweepTwin.refresh`) the product then holds the gate's term,
+    ``Σ_a (G u)[j, a] · address_a[i]`` (:meth:`Scorer.forward`), in the same matmul. Without
+    the gate: ``feats`` itself."""
+    if scorer.address_gate is None:
+        return feats
+    B, N, _ = feats.shape
+    address = feats[:, :, scorer._address_start :]  # [B, N, A]
+    outer = address[:, :, :, None] * u.to(feats.dtype)[:, None, None, :]  # [B, N, A, d]
+    return torch.cat([feats, outer.reshape(B, N, -1)], dim=-1)
+
+
 #: The cast parameters a sweep on merged layouts still reads itself (:class:`SweepTwin`): the
 #: unit bank's second bias (:meth:`~hsn.model.units.UnitBank.forward_static_chosen`) and
 #: ``W_out``. Every other one is read through a layout.
@@ -421,7 +437,8 @@ class SweepTwin:
     * ``sweep_front_w1/b1/w2/b2``: ``S`` and ``P`` as one two-layer map of ``[z; q; ctx]``
       (``P`` reads ``q`` only; the second layer is block-diagonal);
     * ``sweep_score_w/b``: the scorer's linear with ``V`` as ``d`` more outputs (``V`` reads
-      the state columns of the scorer's features);
+      the state columns of the scorer's features); with amendment A12's address gate, ``G`` as
+      ``A · d`` more input rows (:func:`gated_features`);
     * ``sweep_w1_gate`` / ``sweep_b1_gate``: the unit bank's first layer with the gate's linear
       as ``d`` more outputs (:class:`~hsn.model.cell.WindowConsts`).
 
@@ -515,8 +532,12 @@ class SweepTwin:
             twin.register_buffer(
                 "sweep_front_b2", zeros(shared.out_dim + pred.out_dim), persistent=False
             )
+            gate = model.router.scorer.address_gate  # A12: G as more input rows
+            gate_rows = 0 if gate is None else int(gate.weight.numel()) // int(net.out_features)
             twin.register_buffer(
-                "sweep_score_w", zeros(net.in_features, net.out_features + cell.d), persistent=False
+                "sweep_score_w",
+                zeros(net.in_features + gate_rows, net.out_features + cell.d),
+                persistent=False,
             )
             twin.register_buffer(
                 "sweep_score_b", zeros(net.out_features + cell.d), persistent=False
@@ -573,8 +594,16 @@ class SweepTwin:
         b2[du:].copy_(pred.fc2.bias)
         m = int(net.out_features)
         score_w = twin.get_buffer("sweep_score_w")
-        score_w[:, :m].copy_(net.weight.t())
+        n_feats = int(net.in_features)
+        score_w[:n_feats, :m].copy_(net.weight.t())
         score_w[2 * d : 3 * d, m:].copy_(cell.V.weight.t())  # the features are [u; eps; h; ...]
+        gate = model.router.scorer.address_gate
+        if gate is not None:
+            # A12: (G u)[j, a] = sum_k W[j A + a, k] u_k, against the column a d + k of
+            # gated_features: row n_feats + a d + k, output j
+            width = int(gate.in_features)
+            rows = gate.weight.view(m, -1, width).permute(1, 2, 0).reshape(-1, m)
+            score_w[n_feats:, :m].copy_(rows)
         twin.get_buffer("sweep_score_b")[:m].copy_(net.bias)
         mh = units.n_units * units.hidden
         w1_gate = twin.cell.units.get_buffer("sweep_w1_gate")
@@ -713,6 +742,7 @@ def _fused_tape_block(
         feats = model.scorer._assemble(u_s, eps_s, h_i, age_i, s_b[:, i])
         vh: Tensor | None = None
         if score_w is not None and score_b is not None:
+            feats = gated_features(model.scorer, feats, u_s)  # A12 (the features without it)
             scored = torch.addmm(score_b, feats.reshape(B * N, -1), score_w)
             logits = scored[:, :n_units].reshape(B, N, n_units).to(h.dtype)
             vh = scored[:, n_units:].reshape(B, N, d)
@@ -872,6 +902,7 @@ def _folded_tape_block(
         u, z_hat = both[:, :d_u], both[:, d_u:]
         u_s, eps_s = u.to(h.dtype), (z_t - z_hat).to(h.dtype)
         feats = model.scorer._assemble(u_s, eps_s, h_i, age_i, s_b[:, i])
+        feats = gated_features(model.scorer, feats, u_s)  # A12 (the features without it)
         scored = torch.addmm(score_b, feats.reshape(B * N, -1), score_w)
         vh = scored[:, n_units:].reshape(B, N, d)
         if fold & FOLD_SCORES:

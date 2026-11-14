@@ -1619,6 +1619,13 @@ def split_window_scope_error(
     amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and ``fast_readout``),
     which the full cut's recurrence does not.
 
+    What the scorer reads of a position apart from the state comes from the window's prologue
+    and passes through the sweep and the replay as it is: amendment A9's address n-grams
+    (``model.address_ngram``) and amendment A11's bounded position
+    (``model.scorer_position``) are inside the scope under both cuts. So is amendment A12's
+    address gate (``model.address_gate``), one more term of the scorer's logits, which the
+    replay adds and the compiled sweeps hold in their merged scorer product.
+
     A soft warm-up (``train.soft_until_step``) is inside the scope: its steps run every cell
     with autograd, which is the autograd window's work, so they take that window and the split
     window takes over at the first hard-gate step
@@ -1677,20 +1684,11 @@ def split_window_scope_error(
             "the state-gradient sweep only (train.feedback_detach=[summary, eps, router]); "
             "with the full cut use hardware.window=autograd"
         )
-    if model.address_gate:
-        return (
-            "model.address_gate (A12): the split window's scorer has no content-dependent "
-            "address weights; use hardware.window=autograd"
-        )
     if model.address_gate_input != "u":
         return (
-            f"model.address_gate_input={model.address_gate_input!r} (A13): the split window "
-            "has no gate input apart from u; use hardware.window=autograd"
-        )
-    if model.scorer_position != "document":
-        return (
-            f"model.scorer_position={model.scorer_position!r} (A11) has not been checked "
-            "against the split window's tape; use hardware.window=autograd"
+            f"model.address_gate_input={model.address_gate_input!r} (A13): the split window's "
+            "replay and compiled sweeps compute the gate's term from u; use "
+            "hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (
