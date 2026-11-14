@@ -76,10 +76,20 @@ P2.10c) under the full cut and with the state gradient (`hardware.window=split|f
 key since 14 Nov).
 - *The replay* adds the gate's term to the scorer's logits (`hsn.train.split._scorer_logits`),
   with `u` the constant the router cut makes it, so `G` gets its gradient from the replay's
-  graph like the scorer's other weights. The term is summed feature by feature; as one einsum
-  over the window's rows it was a batched product of tiny matrices and cost 9.3 ms of a
-  140.3 ms step on the RTX 3060 (131.0 ms without the key). The step time with the plain sum
-  is still to be taken on the card.
+  graph like the scorer's other weights. The term is summed feature by feature.
+- *Step time* (fused window, the approved shape, bf16, batch 32, alone on the RTX 3060,
+  150 steps after 40 of warm-up, median):
+
+  | | With the key | Without it | Difference |
+  | --- | ---: | ---: | ---: |
+  | The term as a plain sum, 14 Nov 08:27 MST, round 1 (host load 4.3 to 5.6) | 143.1 ms | 132.2 ms | 10.9 ms |
+  | The same, round 2 | 142.6 ms | 133.7 ms | 8.9 ms |
+  | The term as one einsum over the window's rows, 14 Nov 01:37 MST | 140.3 ms | 131.0 ms | 9.3 ms |
+
+  The key costs about 10 ms a step in either form. An earlier version of this paragraph said
+  the einsum was that cost; the plain sum was written to remove it and did not. Where the
+  10 ms sit (the replay's term and its backward, or the sweeps' merged product with its
+  `A · d` more columns at every position) is not measured.
 - *The eager sweep* runs the model's own scorer. *The compiled sweeps* (the fused and the
   folded block) take their scorer's logits from one merged product (the scorer's linear with
   `V` as `d` more outputs); the gate enters it as `A · d` more input columns,
@@ -98,8 +108,10 @@ key since 14 Nov).
   PyTorch sweep, 5e-8 and 9e-8 in fp32, 9e-4 and 1.5e-3 under bf16; the fused window against
   the compiled autograd window in fp32, identical cells and gradients 6e-8 (12 routed slots)
   and 2.5e-7 (the approved shape) apart. Those runs used the einsum form of the replay's
-  term; the plain sum is the same values in another order (the CPU tests above) and its card
-  run is the timing's.
+  term. With the plain sum (14 Nov 08:27 MST) the six gate cases of
+  `test_p2_10c_fused_window.py` passed on the card: the window through its kernels against its
+  own PyTorch sweep in fp32 and under bf16, and against the compiled autograd window in fp32,
+  each at 12 routed slots and at the approved shape.
 
 ## The smallest test, and its kill rule
 

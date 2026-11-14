@@ -328,8 +328,9 @@ def _scorer_logits(
         # A12: the address weights' part that depends on the position's content,
         # sum_a (G u)[j, a] * address_a[i] (Scorer.forward); the address features are the
         # features' last columns, so the scalars' last. Summed feature by feature (two of
-        # them, four with A9): as one einsum over the window's rows it is a batched product
-        # of tiny matrices, which cost 9 ms of a 140 ms step on the RTX 3060.
+        # them, four with A9). On the RTX 3060 that costs what one einsum over the window's
+        # rows cost before it: the key adds about 10 ms to the fused step in either form
+        # (docs/amendments/A12_address_gate.md, "Windows").
         n_address = scorer.in_features - scorer._address_start
         gate = scorer.address_gate(u).view(u.shape[0], -1, n_address)  # [R, M, A]
         gate = gate.to(scalars.dtype)

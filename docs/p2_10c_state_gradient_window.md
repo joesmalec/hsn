@@ -55,7 +55,9 @@ What does change:
    - amendment A12's `model.address_gate`, under both cuts (on `claude/cutc-a11-a12`). The
      replay adds the gate's term to the scorer's logits and the compiled sweeps hold it in
      their merged scorer product; equal to the autograd window in float64 on the CPU and in
-     fp32 on the card (`docs/amendments/A12_address_gate.md`, "Windows").
+     fp32 on the card (`docs/amendments/A12_address_gate.md`, "Windows"). The key adds about
+     10 ms to the fused step at the approved shape (142.6 to 143.1 ms against 132.2 to
+     133.7 ms, 14 Nov).
 
    Amendment A6's `train.state_grad_clip` / `train.state_grad_ratio` are refused as before,
    under both cuts ("Step 3": a reference exists, no kernel).
@@ -1107,13 +1109,78 @@ ulp at a fifth of them). There is seldom more than one unselected cell within bf
 of the cut, and no exact tie in fp32; but one such cell at an eighth to a half of the
 positions is enough for the selection to go the other way at 8 to 18 % of the positions, and
 so within the first ten positions of every row. The last column is from the routings of all
-24 batches a block, both windows alike.
+24 batches a block, both windows alike (the probability is 1 over the mean first differing
+position plus one, a rough figure).
+
+Not explained by these margins: TinyStories at the trained weights. In the other five blocks
+the measured rate is of the size the margins suggest: bf16 selects otherwise at 8 to 15 % of
+the positions, where 13 to 37 % have a gap under half an ulp. On TinyStories at the trained
+weights the gap is 28 ulps at the median and 13 % of the positions are under half an ulp, as
+at the initial weights, and yet bf16 selects otherwise most often (18 % of the positions;
+35 % of the rows at the first position already, against 0 to 4 % in the other blocks). bf16
+also rounds the scorer's inputs and weights, which can move a score by more than one ulp of
+the score; that was not measured.
 
 **Two things the diagnostic's own script taught.** `model.load_state_dict` between blocks made
 every block cost 90 to 100 s of CPU on the card (by all appearances the compiled window was
 built again); copying the tensors in place took a six-block pass from ten minutes to one. And
 the last step of every `fit` call is a statistics step, which costs the autograd window extra
 passes; a `fit` stopped by its callback has none.
+
+### The router's float32 gate and torch's float32 sigmoid (14 Nov, CI of pull request 58)
+
+The CPU tests compare the window's parameter gradients with `HSN.forward`'s in float64, at
+1e-9. On GitHub's runners (torch 2.15.0) the scorer's weight gradient was outside that in 11
+cases of `tests/test_p2_10c_state_gradient.py` on Ubuntu and in one on macOS, by up to 1.9e-6
+absolute; on the development machine in none. Every other gradient held 1e-9 on all three.
+The window's arithmetic is not the cause:
+
+- **The gate is float32 by design.** `Router.scores` casts the scorer's logits to float32
+  whatever the model's dtype, and the straight-through gate (the cell mask's sigmoid, the unit
+  weights' softmax) is computed from them in float32, in a float64 model as in a run.
+- **torch's float32 sigmoid is not one function of its input.** Its vectorized loop
+  (`ATen/native/cpu/Loops.h`) takes two vectors per step and leaves the remainder to the
+  scalar kernel. The vector kernel's `exp` is SLEEF's, the scalar one's the C library's, and
+  they round differently: on the development machine at 4 % of the inputs, by one ulp.
+- **The two paths evaluate it at different sizes:** `HSN.forward` per position at `[B, N]`,
+  the replay once at `[B·T, N]`. An element in the remainder of one and in the vector part of
+  the other gets a mask one float32 ulp apart. The gate's forward value is the hard mask and
+  does not move; the mask's derivative does, by about 1e-7, and with it that element's share
+  of the scorer's gradient (the only gradient behind the gate under the router cut).
+- **Which elements, by machine** (the tests have `B = 3`, `N = 6`: 18 elements, 216 in the
+  replay). Vectors of 16, the Ubuntu runner: all 18 are scalar and the replay's first 192
+  vector. Vectors of 4, the macOS runner: elements 16 and 17 are scalar, the replay has no
+  remainder. Vectors of 8, the development machine: the same two elements, and with its values
+  no case left the tolerance.
+- **Reproduced on the development machine.** With the float32 sigmoid evaluated in the
+  pattern of vectors of 16, the same 11 cases fail and no other, with CI's figures (the fast
+  cells' third case: 30 of 102 entries, 1.907e-6, 1.165e-7 relative, in both). Moving element
+  17 of the forward's mask at position 5 gives the macOS case's figures (25 of 102 entries,
+  1.0296e-7 at (1, 32), 8.18e-8 relative at (1, 13)). The runner's vector size of 16 is
+  inferred from that agreement.
+- **Size.** In the Ubuntu pattern, over the file's cases: at most 1.6e-8 of the tensor's
+  largest entry.
+
+**The tests** now take the gate's sigmoid from one kernel in both paths
+(`_one_gate_sigmoid`: a float32 `torch.sigmoid` is evaluated in float64 and rounded, which
+is one function of its input on every machine), so the comparisons stay at 1e-9 on every
+tensor; `test_window_gradients_under_torchs_float32_sigmoid` keeps torch's kernel and holds
+the scorer's gradient to 1e-6 of its largest entry. The A11 and A12 window tests use the same
+helper (three of the A12 cases failed in the Ubuntu pattern without it). Checked in the
+patterns of vectors of 16, 4 and 8, for float32 and with float64 put through them as well.
+
+**The P2.10 tests on main are exposed to it too.** `tests/test_p2_10_split_window.py`
+compares the scorer's gradient between the two paths in the same way, with torch's kernel.
+They pass on both runners today. Commit d8a2045 (11 Nov) widened one of them,
+`test_split_window_without_loss_positions`, for a difference of 7e-10 of the tensor's scale
+on the runners against 6e-16 on the development machine, and put it down to cancellation; the
+matching case of the P2.10c file shows 8.0e-10 in the Ubuntu pattern, so it was in all
+likelihood this. Those tests are not changed here. If one of them fails on a runner on the
+scorer's gradient alone, this is the first thing to check.
+
+**What it does not say.** Nothing about a run: a step uses one window, and either window's
+gate is a valid float32 evaluation. It is a limit on comparing two evaluations of the gate
+at 1e-9, on the CPU.
 
 ## Files
 
@@ -1136,12 +1203,20 @@ passes; a `fit` stopped by its callback has none.
   analysis), `bf16_diag.sh` (the card driver), `margin.py` (the margin at the selection cut),
   and under `accuracy/bf16/` the raw gradients, routings and tapes of every pass, the card
   log, the fp32 timings, `analysis.txt` and `margin.txt`.
+- The CI diagnosis of 14 Nov (outside the repository):
+  `/home/joe/hsn-experiments/cutc-speed/scratch/ci_macos/` (`diag1.py` to `diag5.py`, and
+  `plug/pattern_sigmoid.py`, a pytest plugin that evaluates `torch.sigmoid` in the pattern of
+  a given vector size: `SIGMOID_LANES=16|4|8`, `-p pattern_sigmoid`).
 - Card measurements (outside the repository): `/home/joe/hsn-experiments/cutc-speed/card/`
   (step times, phases, product and sweep-part timings, the card suites' logs) with
   `scratch/bench_products.py`, `bench_mm.py`, `bench_sweep.py`, `diag_fused_fast.py`; the
   base-against-head comparisons on the card with `scratch/card_bitwise.py`,
   `card_bitwise_pairs.py`, `card_train_bitwise.py`, `card_train_compare.py` (outputs under
   `scratch/out/`, the exported base under `scratch/base_card/`).
+- Card measurements with A11 and A12 (outside the repository):
+  `/home/joe/hsn-experiments/cutc-speed/card_a11/` (the card suites' logs, the gate timings
+  `time_fused_a12_*`, the slot of 14 Nov 08:27 in `slot_gate_sum.log`), taken with
+  `scratch/time_gate.py` and `scratch/gate_slot.sh`.
 - `python/hsn/train/split.py`: `SplitWindow(state_gradient=)`, the fast read and the reserved
   slots in the replay.
 - `python/hsn/model/cell.py`, `units.py`, `router.py`, `python/hsn/config.py`: the default-off
