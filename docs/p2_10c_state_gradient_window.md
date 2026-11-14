@@ -985,6 +985,135 @@ recipe (bf16 with the state gradient), and it is there on the autograd window al
   start with the same gradient, to see whether bf16's error in the state gradient matters to
   the outcome at all. The second question is the campaign's as much as this window's.
 
+### Why a bf16 gradient is far from its fp32 gradient: the routing path (14 Nov)
+
+The accuracy runs left a question: under bf16 each window's gradient is 5 to 96 % from its own
+fp32 gradient. Is that arithmetic in the backward, or something else? Measured on the card
+(14 Nov, 01:03 to 01:29 MST, alone; `accuracy/bf16_diag.py`): the trainer at a learning rate
+of 1e-12, the approved shape, six blocks of 24 batches (TinyStories, delayed recall and
+arithmetic at the initial weights and at the end-of-run weights of the autograd seed-0 runs),
+each window in fp32 and in bf16, every window started from the state the fp32 autograd pass
+started it from. Per batch: the raw gradient, the routing, the loss. For three batches of each
+block the fused window's forward tape was kept, and replayed under the other precision: the
+replay takes its selections and its trajectory from the tape, so that is one precision's
+arithmetic along the other's discrete path.
+
+**The two windows in fp32.** The same gradient on all six blocks: relative distance 1.5e-6 to
+2.2e-5 at the median, cosine 0.9996 or better on every batch. A few batches reach 1e-3 to
+3e-2: at the trained weights fp32's own rounding flips a routing decision between the two
+windows at 3.5 to 6 % of the positions (16 to 25 % of the rows).
+
+**The routing under bf16 is another routing.** Routed slots (the fast slots are fixed), median
+over 24 batches:
+
+| Block | Positions whose selected set differs, bf16 against fp32 (either window) | The two bf16 windows against each other | Selected cells not in the other's set, bf16 against fp32 | First differing position (median row) |
+| --- | ---: | ---: | ---: | ---: |
+| TinyStories, initial weights | 68 % | 55 % | 9 % | 4 to 7 |
+| Delayed recall, initial | 85 % | 71 % | 17 % | 8 |
+| Arithmetic, initial | 88 % | 73 % | 20 % | 7 |
+| TinyStories, trained | 98 % | 94 % | 50 % | 1 |
+| Delayed recall, trained | 37 % | 20 % | 4 % | 4 |
+| Arithmetic, trained | 77 % | 68 % | 14 % | 6 |
+
+No row keeps one routing over a window. The two windows move alike against fp32 (within a
+point).
+
+**The distance is the path, not the arithmetic.** On the 18 batches with kept tapes: bf16
+arithmetic along the fp32 path is 0.4 to 1.5 % from the fp32 gradient (cosine 0.9999 or
+better) at the initial and at the trained weights, while the whole bf16 window is 11 to 95 %
+away on 16 of them (and about 1 % on two, where the arithmetic is then all of it). The other
+way round, fp32 arithmetic along the bf16 path is 0.3 to 1.6 % from the bf16 gradient. Keeping
+the reverse sweep's products in fp32 changes nothing. Before a row's first differing decision
+the two trajectories' states differ by at most 0.5 %; after it by 8 to 86 %.
+
+**The two bf16 windows are the same kind of estimate.** Against the fp32 gradient, 72 batches
+at the initial weights and 72 at the trained ones:
+
+| | Cosine: median [quartiles], worst | Norm ratio: median [quartiles] |
+| --- | --- | --- |
+| Initial weights, autograd window | 0.9891 [0.8771, 0.9958], 0.149 | 0.998 [0.987, 1.005] |
+| Initial weights, fused window | 0.9909 [0.8866, 0.9954], −0.414 | 0.997 [0.985, 1.002] |
+| Trained weights, autograd window | 0.9713 [0.9549, 0.9758], 0.707 | 1.002 [0.988, 1.046] |
+| Trained weights, fused window | 0.9723 [0.9565, 0.9756], 0.701 | 1.005 [0.992, 1.043] |
+
+The fused window is the closer of the two on 71 of 144 batches. On the batches with a large
+gradient (16, all on delayed recall and arithmetic) both windows' norms lie on both sides of
+the fp32 norm at the trained weights and both below it at the initial ones: the asymmetry
+noted after the accuracy runs on three batches does not hold up.
+
+**Does it harm training?** Three checks on the kept data say no. The loss is the same on
+average (mean over 24 batches at the trained weights, fp32 / bf16: 0.8456 / 0.8449, 0.0571 /
+0.0572, 0.8963 / 0.8965), though a delayed-recall batch moves by 12 %. Averaged over a
+block's 24 batches the bf16 gradient is closer to the fp32 one than per batch (cosine 0.996,
+0.959, 0.997 at the trained weights). And that is well inside the gradient's own sampling
+noise (the fp32 mean of 12 batches against that of the other 12: cosine 0.77, 0.31, 0.89).
+
+**What it means.**
+
+- The fused window is cleared by it: in fp32 it is the autograd window, under bf16 it is the
+  same kind of estimate, and its backward arithmetic is within about 1 % along a path. The
+  same-seed twins of the accuracy runs part because each window's bf16 forward rounds
+  differently and takes another route within the first positions.
+- The finding is about the routing, which bf16 only exposes: a perturbation at the 1e-3 level
+  changes which cells and units are selected in every row, and at the trained weights fp32's
+  1e-7 does so in a sixth of the rows. Holding part of the computation in fp32 would not help:
+  the backward needs none, and the forward in fp32 costs twice the step (below) and still
+  leaves two implementations on different routes.
+- For comparing windows or arms: in fp32 with the routing checked, or on one tape; never by
+  same-seed twins; otherwise by enough seeds.
+
+**fp32 step times** at the approved shape, alone on the card: fused 253.5 ms, autograd
+383.6 ms (1.51 times), against 131.5 and 202.5 ms under bf16.
+
+**Limits.** Trained weights are those of the autograd runs only (three blocks at the fused
+runs' weights were dropped to keep the card slot). The split by tape is on 18 batches and on
+the fused window (the autograd window has no tape to hold); it is unanimous, and the autograd
+window's routing moves as the fused one's does. One model seed; one run's weights per task.
+The routing shares overstate the functional difference where cells are interchangeable: on
+TinyStories at the trained weights the fp32 windows differ at 6 % of the positions and their
+gradients agree to 1.5e-6.
+
+**How close the selection is at the cut** (`accuracy/margin.py`, CPU, from the kept fp32
+tapes: the scores are recomputed as the replay computes them from the taped state and the
+redrawn batch; at every position without a stale cell the 12 highest recomputed scores are
+the tape's 12 routed cells). Per position, over 24,576 positions a block: the gap between the
+last selected and the first unselected of the 56 routed cells' scores, against the spread of
+those scores (their standard deviation) and against bf16's spacing at the cut's score (one
+ulp):
+
+| Block | Gap / spread, median | Gap in ulps, median [quartiles] | Positions with a gap under 1 ulp; under ½ | Unselected cells within 1 ulp of the cut, mean (90th percentile) | Measured: positions until bf16 first selects otherwise, median (flip probability per position) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TinyStories, initial | 0.05 | 2.6 [1.0, 5.2] | 24 %; 13 % | 0.3 (1) | 11 (8 %) |
+| Delayed recall, initial | 0.05 | 2.5 [1.0, 5.5] | 25 %; 14 % | 0.3 (1) | 10 (8 %) |
+| Arithmetic, initial | 0.05 | 2.8 [1.1, 6.3] | 23 %; 13 % | 0.3 (1) | 10 (8 %) |
+| TinyStories, trained | 0.73 | 28 [1.7, 108] | 20 %; 13 % | 0.4 (1) | 2 (18 %) |
+| Delayed recall, trained | 0.04 | 1.0 [0.4, 2.2] | 50 %; 31 % | 0.8 (2) | 4 (15 %) |
+| Arithmetic, trained | 0.06 | 0.9 [0.3, 2.9] | 53 %; 37 % | 1.4 (4) | 6 (13 %) |
+
+The cut falls where the scores are dense: the gap is a twentieth of their spread (except on
+TinyStories at the trained weights, where it is wide at most positions and still under one
+ulp at a fifth of them). There is seldom more than one unselected cell within bf16's rounding
+of the cut, and no exact tie in fp32; but one such cell at an eighth to a half of the
+positions is enough for the selection to go the other way at 8 to 18 % of the positions, and
+so within the first ten positions of every row. The last column is from the routings of all
+24 batches a block, both windows alike (the probability is 1 over the mean first differing
+position plus one, a rough figure).
+
+Not explained by these margins: TinyStories at the trained weights. In the other five blocks
+the measured rate is of the size the margins suggest: bf16 selects otherwise at 8 to 15 % of
+the positions, where 13 to 37 % have a gap under half an ulp. On TinyStories at the trained
+weights the gap is 28 ulps at the median and 13 % of the positions are under half an ulp, as
+at the initial weights, and yet bf16 selects otherwise most often (18 % of the positions;
+35 % of the rows at the first position already, against 0 to 4 % in the other blocks). bf16
+also rounds the scorer's inputs and weights, which can move a score by more than one ulp of
+the score; that was not measured.
+
+**Two things the diagnostic's own script taught.** `model.load_state_dict` between blocks made
+every block cost 90 to 100 s of CPU on the card (by all appearances the compiled window was
+built again); copying the tensors in place took a six-block pass from ten minutes to one. And
+the last step of every `fit` call is a statistics step, which costs the autograd window extra
+passes; a `fit` stopped by its callback has none.
+
 ## Files
 
 - `python/hsn/train/state_gradient.py`: the cell's backward into the state, the sweep, the
@@ -1002,6 +1131,10 @@ recipe (bf16 with the state gradient), and it is there on the autograd window al
   (`p2_10c_accuracy.yaml`, `run.sh`, `compare.py` and its output `comparison.txt`, `twins.py`
   and `twins.txt` for the same-seed twins' training records, `step1_grads.py` with its
   gradients and comparisons under `step1/`, the database, `runs/`, `logs/host_load.log`).
+- The bf16 diagnostic (outside the repository): `accuracy/bf16_diag.py` (the passes and the
+  analysis), `bf16_diag.sh` (the card driver), `margin.py` (the margin at the selection cut),
+  and under `accuracy/bf16/` the raw gradients, routings and tapes of every pass, the card
+  log, the fp32 timings, `analysis.txt` and `margin.txt`.
 - Card measurements (outside the repository): `/home/joe/hsn-experiments/cutc-speed/card/`
   (step times, phases, product and sweep-part timings, the card suites' logs) with
   `scratch/bench_products.py`, `bench_mm.py`, `bench_sweep.py`, `diag_fused_fast.py`; the
