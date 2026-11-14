@@ -67,6 +67,7 @@ __all__ = [
     "AUX_TERMS",
     "HARDWARE_PROFILE_DIR",
     "HASH_OMIT_AT_DEFAULT",
+    "HSN_MODEL_NAMES",
     "RETIRED_KEYS",
     "MEASURED_KEYS",
     "PROFILES",
@@ -134,7 +135,11 @@ CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
 #: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
 WindowMode = Literal["autograd", "split", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
-ModelName = Literal["hsn", "gru", "transformer", "selective_ssm", "moe"]
+ModelName = Literal["hsn", "hsn_t", "gru", "transformer", "selective_ssm", "moe"]
+#: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
+#: a Transformer reader in front of the HSN's memory core (``model.reader``, ``docs/hsn_t.md``).
+#: Everything "HSN-only" in this schema applies to both; ``model.reader`` separates them.
+HSN_MODEL_NAMES: tuple[str, ...] = ("hsn", "hsn_t")
 
 #: Auxiliary loss terms that ``train.aux_enabled`` may name (Appendix A.3: cost / balance / graph).
 #: P2.4 registers its term names here.
@@ -338,15 +343,16 @@ class ModelConfig(_StrictModel):
     # cell is written at the start, as without the key.
     write_init: float = Field(default=2.0, allow_inf_nan=False)
     # --- end A10 ---
-    # --- Amendment A14 (docs/amendments/A14_reader.md; opt-in, default off) ---
+    # --- HSN-T (docs/hsn_t.md): the reader of the model family hsn_t; default off ---
     # reader = "transformer": a small causal Transformer reads the bytes of the current window,
-    # all positions at once, and its output c_t (width reader_width) takes the place of the fast
-    # cells' read: S reads [z; q; ctx; c_t] and the decoder reads [q; u; r; c_t]. c_t depends on
-    # the bytes up to t of the same document inside the window and on nothing else (no earlier
-    # window, no cell state). The cells and their carried state, the fixed addresses, the
-    # router, the units, the gate, the graph and q are unchanged. This is sequence attention,
-    # which A5's text excludes: the key changes that line on purpose. Needs selected_readout.
-    # "none" (default): no reader. The fast cells may be kept beside it (fast_cells > 0).
+    # all positions at once, and its output c_t (width reader_width) enters where the HSN's fast
+    # cells are read: S reads [z; q; ctx; c_t] and the decoder reads [q; u; r; c_t]. c_t depends
+    # on the bytes up to t of the same document inside the window and on nothing else (no
+    # earlier window, no cell state). The cells and their carried state, the fixed addresses,
+    # the router, the units, the gate, the graph and q are the HSN's, unchanged. This is
+    # sequence attention, which the HSN does not have: only model_name=hsn_t may set the key
+    # (RunConfig), and an HSN refuses it. Needs selected_readout. "none": no reader. The fast
+    # cells may be kept beside it (fast_cells > 0).
     reader: Literal["none", "transformer"] = "none"
     reader_width: int = Field(default=64, ge=8)
     reader_layers: int = Field(default=2, ge=1)
@@ -355,7 +361,7 @@ class ModelConfig(_StrictModel):
     # short-sighted reader, which must leave everything further back to the memory).
     # null (default): every byte of the document up to the position, inside the window.
     reader_span: int | None = Field(default=None, ge=1)
-    # --- end A14 ---
+    # --- end HSN-T ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -471,7 +477,7 @@ class ModelConfig(_StrictModel):
                 "model.fast_readout requires model.fast_cells > 0 and model.selected_readout=true"
             )
         # --- end A8 ---
-        # --- Amendment A14: the window reader ---
+        # --- HSN-T: the window reader ---
         if self.reader == "none":
             if self.address_gate_input == "reader_prev":
                 raise ValueError(
@@ -480,13 +486,13 @@ class ModelConfig(_StrictModel):
                 )
             if self.reader_span is not None:
                 raise ValueError(
-                    f"model.reader_span={self.reader_span} (A14) is the span of model.reader; "
+                    f"model.reader_span={self.reader_span} (HSN-T) is the span of model.reader; "
                     "set model.reader=transformer or leave it null"
                 )
         else:
             if not self.selected_readout:
                 raise ValueError(
-                    "model.reader (A14) requires model.selected_readout=true: the decoder reads "
+                    "model.reader (HSN-T) requires model.selected_readout=true: the decoder reads "
                     "[q; u; r; c]"
                 )
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
@@ -501,7 +507,7 @@ class ModelConfig(_StrictModel):
                     f"model.reader_heads={self.reader_heads} with an even width per head (the "
                     "positions rotate pairs of the attention's query and key)"
                 )
-        # --- end A14 ---
+        # --- end HSN-T ---
         return self
 
 
@@ -1283,13 +1289,24 @@ class RunConfig(_StrictModel):
                     f"hardware.window={self.hardware.window!r} is not available for this "
                     f"configuration: {reason}"
                 )
-        if self.baseline.address_input and self.model_name == "hsn":
+        if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
                 "baseline.address_input is an input of the baselines; the HSN's own address "
                 "features are model.key_address"
             )
+        # --- HSN-T: the reader is what separates the two families built on the HSN's cells ---
+        if self.model.reader != "none" and self.model_name != "hsn_t":
+            raise ValueError(
+                f"model.reader={self.model.reader!r} belongs to the HSN-T family (model_name: "
+                f"hsn_t), got model_name={self.model_name!r}: the HSN has no sequence attention"
+            )
+        if self.model_name == "hsn_t" and self.model.reader == "none":
+            raise ValueError(
+                "model_name=hsn_t is the HSN's memory core behind a reader: set "
+                "model.reader=transformer (without one the model is the HSN, model_name: hsn)"
+            )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
-        if self.model_name != "hsn":
+        if self.model_name not in HSN_MODEL_NAMES:
             ignored = []
             if self.train.router_lr_mult != 1.0 or self.train.readout_lr_mult != 1.0:
                 raise ValueError("train.router_lr_mult and train.readout_lr_mult are HSN-only")
@@ -1747,7 +1764,7 @@ def split_window_scope_error(
     sweep would cost more than the autograd window, and the configuration is never offered
     it."""
     model, train = cfg.model, cfg.train
-    if cfg.model_name != "hsn":
+    if cfg.model_name != "hsn":  # HSN-T too: its reader is not built into the split window
         return f"model_name={cfg.model_name!r} is not the HSN"
     if model.routing != "topk":
         return f"model.routing={model.routing!r}: the split window needs topk"
@@ -1798,11 +1815,6 @@ def split_window_scope_error(
         return (
             "model.write_gate (A10): the write decision is not built into the split window; "
             "use hardware.window=autograd"
-        )
-    if model.reader != "none":
-        return (
-            f"model.reader={model.reader!r} (A14): the reader is not built into the split "
-            "window; use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

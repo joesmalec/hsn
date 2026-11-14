@@ -1,4 +1,4 @@
-"""Amendment A14 (``model.reader = transformer``, ``docs/amendments/A14_reader.md``; opt-in): the
+"""HSN-T (``model_name: hsn_t``, ``model.reader = transformer``, ``docs/hsn_t.md``): the
 window reader.
 
 A small causal Transformer over the byte ids of one window, all positions at once. Its output at
