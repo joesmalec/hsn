@@ -5,7 +5,11 @@ carries the cell's read of the state, and the window's gradients are :meth:`HSN.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
 import pytest
 import torch
@@ -296,14 +300,62 @@ def _case(
     return model, (tokens, ctx, state, reset), mask
 
 
+@contextmanager
+def _one_gate_sigmoid() -> Iterator[None]:
+    """Inside, a float32 ``torch.sigmoid`` is evaluated in float64 and rounded.
+
+    The router's straight-through gate is float32 whatever the model's dtype
+    (``Router.scores``), and torch's float32 sigmoid is not one function of its input: the
+    vectorized loop takes two vectors per step and leaves the remainder to the scalar kernel,
+    and the two kernels' ``exp`` round differently (at 4 % of the inputs on x86-64, SLEEF
+    against glibc). :meth:`HSN.forward` evaluates the gate's cell mask per position, at
+    ``[B, N]``, and the window's replay once, at ``[B*T, N]``; an element that takes the scalar
+    kernel in one and the vector kernel in the other gives a mask one float32 ulp apart, and the
+    scorer's gradient (the only one behind the gate under the router cut) then differs by about
+    1e-7 of the terms that element reaches. 1e-9 cannot be held there, whatever the model's
+    dtype.
+
+    Which elements depends on the machine's vectors. With ``B = 3`` and ``N = 6`` (18 elements;
+    216 in the replay), on 14 Nov (pull request 58):
+
+    - GitHub's Ubuntu runner, vectors of 16: the forward's 18 elements are all scalar, the
+      replay's first 192 vector. 11 cases of this file failed, by up to 1.6e-8 of the
+      tensor's largest entry (1.9e-6 absolute).
+    - GitHub's macOS runner, vectors of 4: elements 16 and 17 of the forward are scalar, the
+      replay has no remainder. One case failed (the fast cells' first), by 1.0e-7.
+    - The development machine, vectors of 8: the same two elements; no case was outside the
+      tolerance.
+
+    Both were reproduced on the development machine: evaluating the float32 sigmoid in the
+    Ubuntu runner's pattern fails the same 11 cases with the same figures, and moving element
+    17 of the forward's mask at position 5 gives the macOS case's figures.
+
+    In float64 the two kernels differ as well, by one float64 ulp, which the rounding to
+    float32 drops (but for a value within 1e-16 of a rounding boundary). So inside this context
+    the gate is one function of its input in both paths and on every machine, and what the
+    comparisons below test is the window's arithmetic, not that kernel.
+    :func:`test_window_gradients_under_torchs_float32_sigmoid` holds the kernel as it is."""
+    kernel = torch.sigmoid
+
+    def sigmoid(x: Tensor, *args: Any, **kwargs: Any) -> Tensor:
+        if x.dtype == torch.float32:
+            return kernel(x.double(), *args, **kwargs).to(torch.float32)
+        return kernel(x, *args, **kwargs)
+
+    with mock.patch.object(torch, "sigmoid", sigmoid):
+        yield
+
+
 def _both(
     cfg: RunConfig,
     *,
     loss_positions: bool = True,
     train_step: int = 0,
     model: HSN | None = None,
+    float32_kernel: bool = False,
 ) -> tuple[dict, dict, dict, dict]:
-    """(reference grads, window grads, reference info, window info) at ``train_step``."""
+    """(reference grads, window grads, reference info, window info) at ``train_step``. The
+    gate's sigmoid is :func:`_one_gate_sigmoid`'s in both unless ``float32_kernel``."""
     model, (tokens, ctx, state, reset), mask = _case(cfg, model)
     model.set_train_step(train_step)
     if not loss_positions:
@@ -311,12 +363,13 @@ def _both(
     names = [n for n, _ in model.named_parameters()]
     params = [p for _, p in model.named_parameters()]
 
-    logits, ref_state, ref_info = model(tokens, ctx, state, reset)
-    ref = torch.autograd.grad(_objective(logits, ref_info, mask), params, allow_unused=True)
+    with nullcontext() if float32_kernel else _one_gate_sigmoid():
+        logits, ref_state, ref_info = model(tokens, ctx, state, reset)
+        ref = torch.autograd.grad(_objective(logits, ref_info, mask), params, allow_unused=True)
 
-    window = SplitWindow(model, cfg, None, state_gradient=True, row_limit=_limited(cfg))
-    s_logits, s_state, s_info = window(tokens, ctx, state, reset)
-    got = torch.autograd.grad(_objective(s_logits, s_info, mask), params, allow_unused=True)
+        window = SplitWindow(model, cfg, None, state_gradient=True, row_limit=_limited(cfg))
+        s_logits, s_state, s_info = window(tokens, ctx, state, reset)
+        got = torch.autograd.grad(_objective(s_logits, s_info, mask), params, allow_unused=True)
     assert window.calls == 1
 
     torch.testing.assert_close(s_logits, logits, rtol=1e-10, atol=1e-12)
@@ -370,6 +423,33 @@ def test_window_gradients_equal_autograd(extra: tuple[str, ...]) -> None:
         torch.testing.assert_close(s_info[key], ref_info[key], rtol=1e-10, atol=1e-12)
     for key in ("eps_abs_mean", "alpha_entropy", "expected_cost", "route_log_prob"):
         torch.testing.assert_close(s_info[key], ref_info[key], rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "extra", [(), ("model.age_max=2",), PINNED], ids=["routed", "probes", "fast"]
+)
+def test_window_gradients_under_torchs_float32_sigmoid(extra: tuple[str, ...]) -> None:
+    """The comparison with the gate's sigmoid as a run has it (:func:`_one_gate_sigmoid` says
+    what that changes): every gradient but the scorer's is equal as everywhere in this file, and
+    the scorer's to the rounding of its float32 gate, held here to 1e-6 of the tensor's largest
+    entry. Measured in the Ubuntu runner's pattern, where every element of the forward's mask
+    takes the other kernel: at most 1.6e-8 of it over this file's cases (these three: 2e-12,
+    1.6e-8 and 1.0e-8). 1e-6 is eight float32 epsilons; a wrong term in the window's backward
+    is of the order of the entry itself."""
+    cfg = _cfg(*BASE, *extra)
+    ref, got, _, _ = _both(cfg, float32_kernel=True)
+    assert {n for n, g in ref.items() if g is None} == {n for n, g in got.items() if g is None}
+    behind_the_gate = 0
+    for name, want in ref.items():
+        if want is None:
+            continue
+        gated = name.startswith("router.scorer.")
+        behind_the_gate += int(gated)
+        atol = 1e-6 * float(want.abs().max()) if gated else 1e-12
+        torch.testing.assert_close(
+            got[name], want, rtol=1e-9, atol=atol, msg=lambda m, n=name: n + m
+        )
+    assert behind_the_gate == 2  # the scorer's weight and bias
 
 
 def test_window_gradients_with_refresh_probes() -> None:
@@ -850,7 +930,8 @@ def test_full_cut_window_with_address_ngrams() -> None:
 
     cfg = _cfg(*p210.RECIPE, "model.address_ngram=2")
     assert scope_error(cfg) is None and scope_error(cfg, state_gradient=False) is None
-    ref, got, ref_info, s_info = p210._both(cfg)
+    with _one_gate_sigmoid():  # the scorer's gradient at 1e-9 needs one sigmoid in both paths
+        ref, got, ref_info, s_info = p210._both(cfg)
     p210._assert_same_grads(ref, got)
     for key in ("cell_idx", "unit_idx", "valid"):
         assert torch.equal(s_info[key], ref_info[key])

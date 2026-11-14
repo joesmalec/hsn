@@ -23,7 +23,13 @@ from hsn.train.split import SplitWindow
 from p1_11_support import restore_determinism  # noqa: F401
 from test_a6_feedback_detach import A5, ALL, _cfg, _model, _start, _window
 from test_p2_8_compile import _release_compiled_state, small_blocks  # noqa: F401
-from test_p2_10c_state_gradient import BASE, PINNED, _assert_same_grads, _objective
+from test_p2_10c_state_gradient import (
+    BASE,
+    PINNED,
+    _assert_same_grads,
+    _objective,
+    _one_gate_sigmoid,
+)
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
 
@@ -88,8 +94,11 @@ def _across_the_bound(cfg: object, mode: str) -> tuple:
     params = [p for _, p in model.named_parameters()]
     out = []
     for call in (model, SplitWindow(model, cfg, None)):  # type: ignore[arg-type]
-        logits, final, info = call(tokens, ctx, state, reset)
-        grads = torch.autograd.grad(_objective(logits, info, mask), params, allow_unused=True)
+        # one sigmoid for the router's float32 gate in both (torch's float32 kernel is not the
+        # same function at the two tensor sizes: test_p2_10c_state_gradient._one_gate_sigmoid)
+        with _one_gate_sigmoid():
+            logits, final, info = call(tokens, ctx, state, reset)
+            grads = torch.autograd.grad(_objective(logits, info, mask), params, allow_unused=True)
         out.append((logits.detach(), final, info, dict(zip(names, grads, strict=True))))
     return tuple(out)
 

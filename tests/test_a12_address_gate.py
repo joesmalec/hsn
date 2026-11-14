@@ -26,7 +26,14 @@ from p1_11_support import restore_determinism  # noqa: F401
 from p1_15_support import datasets, hsn_config, hsn_trainer
 from test_a6_feedback_detach import A5, ALL, _cfg, _model, _start, _window
 from test_p2_8_compile import _release_compiled_state, small_blocks  # noqa: F401
-from test_p2_10c_state_gradient import BASE, PINNED, _assert_same_grads, _case, _objective
+from test_p2_10c_state_gradient import (
+    BASE,
+    PINNED,
+    _assert_same_grads,
+    _case,
+    _objective,
+    _one_gate_sigmoid,
+)
 from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
@@ -70,11 +77,16 @@ WINDOW_CUTS = {
 
 
 def _windows(model: HSN, cfg: object, call: object, mask_from: tuple) -> tuple:
+    """One window through ``call`` and its parameter gradients, with the router's float32 gate
+    taken from one sigmoid (:func:`test_p2_10c_state_gradient._one_gate_sigmoid`: torch's
+    float32 kernel is not the same function at the forward's and the replay's tensor sizes,
+    which would leave the scorer's and the address gate's gradients equal to 1e-7 only)."""
     (tokens, ctx, state, reset), mask = mask_from
     names = [n for n, _ in model.named_parameters()]
     params = [p for _, p in model.named_parameters()]
-    logits, final, info = call(tokens, ctx, state, reset)  # type: ignore[operator]
-    grads = torch.autograd.grad(_objective(logits, info, mask), params, allow_unused=True)
+    with _one_gate_sigmoid():
+        logits, final, info = call(tokens, ctx, state, reset)  # type: ignore[operator]
+        grads = torch.autograd.grad(_objective(logits, info, mask), params, allow_unused=True)
     return logits.detach(), final, info, dict(zip(names, grads, strict=True))
 
 
