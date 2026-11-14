@@ -41,6 +41,14 @@ SHAPES = {
         "model.n_cells=64", "model.k_select=20", "model.fast_cells=8", "model.fast_units=fixed",
         "model.fast_readout=true", "model.address_ngram=2",
     ),
+    # amendment A12's address gate (the moved model's gate is not zero). The configuration is
+    # still refused the key on the fused window until these have passed on a card: _case admits
+    # it for the test.
+    "candidate_routed_gate": ("model.n_cells=64", "model.k_select=12", "model.address_gate=true"),
+    "approved_shape_gate": (
+        "model.n_cells=64", "model.k_select=20", "model.fast_cells=8", "model.fast_units=fixed",
+        "model.fast_readout=true", "model.address_gate=true",
+    ),
 }  # fmt: skip
 
 
@@ -80,6 +88,25 @@ def _release_compiled_state() -> object:
 
 
 def _case(
+    precision: str, *overrides: str, scale: float = 0.05
+) -> tuple[RunConfig, HSN, CompiledWindow, object]:
+    if "model.address_gate=true" in overrides:
+        # A12 on the fused window is what these tests are to establish: admit the key at load
+        # (hsn.config.split_window_scope_error refuses it until they have passed on a card)
+        import hsn.config as config_module
+
+        refusing = config_module.split_window_scope_error
+        config_module.split_window_scope_error = lambda cfg, **kw: refusing(  # type: ignore[assignment]
+            cfg, **{**kw, "address_gate": True}
+        )
+        try:
+            return _case_admitted(precision, *overrides, scale=scale)
+        finally:
+            config_module.split_window_scope_error = refusing  # type: ignore[assignment]
+    return _case_admitted(precision, *overrides, scale=scale)
+
+
+def _case_admitted(
     precision: str, *overrides: str, scale: float = 0.05
 ) -> tuple[RunConfig, HSN, CompiledWindow, object]:
     cfg = load_config(
@@ -162,7 +189,7 @@ def test_fused_window_through_the_kernels_sweep_and_through_the_reference_sweep(
     gradients agree to the rounding of the sweep's own arithmetic."""
     cfg, model, compiled, ctx = _case(precision, *SHAPES[name])
     inputs = _inputs(cfg, device)
-    split = SplitWindow(model, cfg, compiled)
+    split = SplitWindow(model, cfg, compiled, address_gate=cfg.model.address_gate)
     assert split.state_gradient and split.fused and split.sweep_runner is not None
     got, slots = _grads(model, split, ctx, inputs)
     assert split.sweep_runner.calls == 3 and split.sweep_runner.captures == 1
@@ -179,7 +206,9 @@ def test_fused_window_through_the_kernels_sweep_and_through_the_reference_sweep(
 
 
 @pytest.mark.usefixtures("small_blocks")
-@pytest.mark.parametrize("name", ["candidate_routed", "approved_shape"])
+@pytest.mark.parametrize(
+    "name", ["candidate_routed", "approved_shape", "candidate_routed_gate", "approved_shape_gate"]
+)
 def test_fused_window_against_the_compiled_autograd_window_in_fp32(
     device: torch.device, name: str
 ) -> None:
@@ -191,7 +220,7 @@ def test_fused_window_against_the_compiled_autograd_window_in_fp32(
     cfg, model, compiled, ctx = _case("fp32", *SHAPES[name], scale=0.02)
     inputs = _inputs(cfg, device)
     want, slots_ref = _grads(model, compiled, ctx, inputs)
-    split = SplitWindow(model, cfg, compiled)
+    split = SplitWindow(model, cfg, compiled, address_gate=cfg.model.address_gate)
     got, slots = _grads(model, split, ctx, inputs)
     same = float((slots["cell_idx"] == slots_ref["cell_idx"]).float().mean())
     distance, cosine = _compare(got, want)

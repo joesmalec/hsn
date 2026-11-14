@@ -55,8 +55,9 @@ What does change:
    Amendment A6's `train.state_grad_clip` / `train.state_grad_ratio` are refused as before,
    under both cuts ("Step 3": a reference exists, no kernel). Amendment A12's
    `model.address_gate` is refused as before too (on `claude/cutc-a11-a12` the replay and
-   the eager sweep carry the gate, as a float64 reference behind `address_gate=True`; the
-   compiled sweeps do not yet: `docs/amendments/A12_address_gate.md`, "Windows").
+   the eager sweep carry the gate, as a float64 reference behind `address_gate=True`, and the
+   compiled sweeps hold it in their merged scorer product, which has not run on a card:
+   `docs/amendments/A12_address_gate.md`, "Windows").
 2. **`hsn.model.gradclip`**: the limit's arithmetic moved from the autograd function's
    backward into `limit_row_grad`, which that backward calls and the reference sweep shares.
    The same operations in the same order.

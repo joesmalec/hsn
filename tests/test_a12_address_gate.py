@@ -5,8 +5,9 @@ without the key; with the key off nothing changes.
 
 The split window (P2.10, P2.10c): its replay adds the gate's term to the scorer's logits and its
 eager sweep runs the model's own scorer, so with ``address_gate=True`` it is the reference for the
-compiled sweeps, which do not carry the gate yet (the configuration is still refused the key on
-``hardware.window=split|fused``)."""
+compiled sweeps. Those hold the gate in their merged scorer product (tested here as a layout,
+on the CPU); they have not run on a card with it, so the configuration is still refused the key
+on ``hardware.window=split|fused``."""
 
 from __future__ import annotations
 
@@ -112,26 +113,72 @@ def test_split_window_with_the_gate_equals_autograd(cut: str, ngram: int) -> Non
     z_logits, _, z_info, _ = _windows(model, cfg, split, (inputs, mask))
     with torch.no_grad():
         gate.weight.copy_(kept)
-    assert float((z_info["unit_logits"] - s_info["unit_logits"]).abs().max()) > 1e-3
+    assert float((z_info["unit_logits"] - s_info["unit_logits"]).detach().abs().max()) > 1e-3
     assert not torch.equal(z_info["cell_idx"], s_info["cell_idx"]) or not torch.equal(
         z_info["unit_idx"], s_info["unit_idx"]
     )
 
 
-def test_a_compiled_sweep_is_refused_the_gate() -> None:
-    """The compiled sweeps do not add the gate to their scorer product yet: the split window
-    over a compiled window is refused with the key, whatever the caller asks."""
-    cfg = p28._cfg(
-        "model.routing=topk", "model.key_address=true", "model.selected_readout=true",
-        "train.gate_mode=ste", ALL, *GATE,
-    )  # fmt: skip
-    model = p28._model(cfg, training=True, scale=0.3)
-    compiled = p28._window(model, p28._ctx())
-    with pytest.raises(ValueError, match="compiled sweeps"):
-        SplitWindow(model, cfg, compiled, address_gate=True)
+def test_the_split_window_takes_the_gate_on_request_only() -> None:
+    cfg = _cfg(*A5, ALL, "model.cand_norm=rms", *GATE)
+    model = _model(cfg)
     with pytest.raises(ValueError, match="address_gate"):
         SplitWindow(model, cfg, None)
     assert SplitWindow(model, cfg, None, address_gate=True).compiled is None
+
+
+@pytest.mark.parametrize("ngram", [1, 2])
+def test_merged_scorer_product_holds_the_gate(ngram: int) -> None:
+    """The fused sweep's merged scorer product (float64, CPU): with the gate as more input
+    rows of the merged weight and ``u_k · address_a[i]`` as more input columns
+    (:func:`hsn.train.compile.gated_features`), one matmul returns the scorer's logits with
+    the gate's term and ``V``'s outputs, before and after the weights change. Without the key
+    the features and the weight are the ones without it."""
+    from hsn.train.compile import SweepTwin, gated_features, sweep_merge_error
+
+    cfg = _cfg(*A5, ALL, "model.cand_norm=rms", *GATE, f"model.address_ngram={ngram}")
+    model = _model(cfg)
+    assert sweep_merge_error(model) is None
+    sweep = SweepTwin(model, torch.float64, fused=True)
+    assert sweep.merged
+    scorer, cell = model.scorer, model.cell
+    net = scorer.net
+    d, M, A = cfg.model.d, cfg.model.n_units, 2 * ngram
+    score_w = sweep.twin.get_buffer("sweep_score_w")
+    assert score_w.shape == (net.in_features + A * d, M + d)
+    g = torch.Generator().manual_seed(3)
+    B, N = 5, cfg.model.n_cells
+    for _ in range(2):
+        with torch.no_grad(), cell.window():
+            sweep.refresh()
+            u = torch.randn(B, d, generator=g, dtype=torch.float64)
+            eps = torch.randn(B, d, generator=g, dtype=torch.float64)
+            h = torch.randn(B, N, d, generator=g, dtype=torch.float64)
+            age = torch.randint(0, 9, (B, N), generator=g)
+            scalars = torch.randn(
+                B, N, net.in_features - 3 * d - 1, generator=g, dtype=torch.float64
+            )
+            feats = scorer._assemble(u, eps, h, age, scalars)
+            wide = gated_features(scorer, feats, u)
+            assert wide.shape == (B, N, net.in_features + A * d)
+            scored = torch.addmm(
+                sweep.twin.get_buffer("sweep_score_b"), wide.reshape(B * N, -1), score_w
+            )
+            torch.testing.assert_close(
+                scored[:, :M].reshape(B, N, M), scorer(feats), rtol=1e-11, atol=1e-12
+            )
+            torch.testing.assert_close(
+                scored[:, M:].reshape(B, N, d), cell.V(h), rtol=1e-11, atol=1e-12
+            )
+            # the gate's term is in it: the plain linear map alone is another value
+            assert float((scored[:, :M].reshape(B, N, M) - net(feats)).abs().max()) > 1e-3
+            for p in model.parameters():  # the next round: other weights
+                p.add_(0.1 * torch.randn(p.shape, generator=g, dtype=p.dtype))
+    plain = _model(_cfg(*A5, ALL, "model.cand_norm=rms", f"model.address_ngram={ngram}"))
+    twin = SweepTwin(plain, torch.float64, fused=True)
+    assert twin.twin.get_buffer("sweep_score_w").shape == (plain.scorer.net.in_features, M + d)
+    feats = torch.randn(2, N, plain.scorer.net.in_features, generator=g, dtype=torch.float64)
+    assert gated_features(plain.scorer, feats, feats[:, 0, :d]) is feats
 
 
 @pytest.mark.parametrize("ngram", [1, 2])

@@ -1612,9 +1612,10 @@ def split_window_scope_error(
     it.
 
     Amendment A12's ``model.address_gate`` is outside the scope for now: ``address_gate=True``
-    admits it for the eager sweep and the replay, which carry the gate (the replay adds its
-    term to the scorer's logits; float64 tests against the autograd window). The compiled
-    sweeps do not add it to their scorer product yet, so the configuration is not offered it."""
+    admits it for the tests. The replay adds the gate's term to the scorer's logits and the
+    eager sweep runs the model's scorer (float64 tests against the autograd window); the
+    compiled sweeps hold the gate in their merged scorer product, which is tested as a layout
+    on the CPU and has not run on a card. Until it has, the configuration is not offered it."""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn":
         return f"model_name={cfg.model_name!r} is not the HSN"
@@ -1659,8 +1660,9 @@ def split_window_scope_error(
         )
     if model.address_gate and not address_gate:
         return (
-            "model.address_gate (A12): the split window's compiled sweeps do not add the "
-            "content-dependent address weights yet; use hardware.window=autograd"
+            "model.address_gate (A12): the split window's compiled sweeps have not been "
+            "checked on a card with the content-dependent address weights; use "
+            "hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

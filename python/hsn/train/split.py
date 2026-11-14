@@ -390,9 +390,10 @@ class SplitWindow:
     with amendment A6's per-row limit (``train.state_grad_clip`` / ``state_grad_ratio``): its
     reverse sweep is the PyTorch reference's (no kernel applies the limit), which is for
     tests, not for training on the card. ``address_gate=True`` admits amendment A12's
-    ``model.address_gate``: the replay adds the gate's term to the scorer's logits and the
-    eager sweep runs the model's own scorer; the compiled sweeps do not carry it yet, so a
-    compiled window is refused with it."""
+    ``model.address_gate``: the replay adds the gate's term to the scorer's logits, the eager
+    sweep runs the model's own scorer, and the compiled sweeps hold the gate in their merged
+    scorer product (:func:`hsn.train.compile.gated_features`). The compiled sweeps' part has
+    not run on a card yet, which is why the configuration is not offered the key."""
 
     def __init__(
         self,
@@ -407,11 +408,6 @@ class SplitWindow:
         reason = scope_error(
             cfg, state_gradient=state_gradient, row_limit=row_limit, address_gate=address_gate
         )
-        if reason is None and cfg.model.address_gate and compiled is not None:
-            reason = (
-                "model.address_gate (A12): the compiled sweeps do not add the gate to the "
-                "scorer's product yet; only the eager sweep (compiled=None) carries it"
-            )
         if reason is not None:
             raise ValueError(f"hardware.window=split is not available for this run: {reason}")
         #: P2.10c: the recurrence's reverse sweep carries the cell's read of the state.

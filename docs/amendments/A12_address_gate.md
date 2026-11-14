@@ -81,13 +81,22 @@ P2.10c) the key is still refused for a training run, and half of the work is don
   (the gate's among them) under the full cut, with the state gradient and with A8's fast
   cells, for A5's two address features and A9's four (`tests/test_a12_address_gate.py`).
   That is the reference for what follows.
-- *Open.* The compiled sweeps (the sweep twin's merged scorer product in the fused and the
-  folded block) do not add the gate. The term fits that product as `A · d` more input
-  columns, `u_k · address_a[i]`, against `G` as more rows of the merged weight, so the
-  selection kernels and their inputs stay as they are. Then the tapes against the split
-  sweep's and the fused window against the autograd window, on the card. Until both, the
-  configuration is refused the key on `hardware.window=split|fused`, and a split window
-  over a compiled sweep is refused it whatever the caller asks.
+- *Written, not yet run on a card (13 Nov).* The compiled sweeps. The fused and the folded
+  block take their scorer's logits from one merged product (the scorer's linear with `V` as
+  `d` more outputs). The gate enters it as `A · d` more input columns, `u_k · address_a[i]`
+  (`hsn.train.compile.gated_features`), against `G` as more rows of the merged weight
+  (`SweepTwin`), so the gate's term is summed in the same matmul and the selection kernels
+  and their inputs are as they were. On the CPU in float64 that product equals the model's
+  scorer with the gate and `V` (`test_merged_scorer_product_holds_the_gate`), and without the
+  key the features and the weight are the ones without it. The cost is 128 more columns of a
+  200-column product per position (256 with the two-byte address); to be measured.
+- *Open: the card.* The tapes of the fused and folded sweeps against the split sweep's with
+  a gate that is not zero (`tests/kernels/test_p2_10c_window.py`: `routed_gate`,
+  `fast_read_gate`, `fast_read_gate_ngram2`) and the fused window against the autograd window
+  and against its own PyTorch sweep (`tests/kernels/test_p2_10c_fused_window.py`:
+  `candidate_routed_gate`, `approved_shape_gate`), then the step time. Until they have
+  passed, the configuration is refused the key on `hardware.window=split|fused` exactly as
+  before; the tests admit it for themselves.
 
 ## The smallest test, and its kill rule
 
