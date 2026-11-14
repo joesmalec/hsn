@@ -688,6 +688,30 @@ the experiment queue. This work changes neither those kernels nor their wrappers
 it added to `cell.py` and `units.py` are off by default and the CPU suite passes. They remain
 to be run where the artifacts exist.
 
+**The existing windows on the card, against the base commit.** The CPU comparison (23 cases
+bit for bit) does not cover the card's compiled paths and kernels, two of which this step
+extended (`hsn_win_select`, `hsn_win_cell_update`). So `09db900` was exported with its own
+kernels built and compared with the head (`scratch/card_bitwise.py`: the recipe as it is,
+batch 8, 48 positions, the third call's logits, final state, decisions and every parameter
+gradient; fp32 and bf16).
+
+| Window | Base against head |
+| --- | --- |
+| Fused: the recipe's shape, 12 and 20 slots of 64 cells, executed credit (8 cases) | bit for bit, with either tree's compile cache old or fresh |
+| Split and compiled autograd (4 cases), the head on a copy of the base run's compile cache | the forward bit for bit; the gradients bit for bit except two fp32 tensors of the autograd window (7e-8), which also differ between two runs of the base |
+| Training, the fused window, 40 steps under `train.deterministic=true` (P2.10b's comparison; `scratch/card_train_bitwise.py`), base twice and the head | step records and final weights bit for bit |
+
+The shared cache is needed because two compilations of one commit do not round alike, which
+is a property of the base. The base against itself (a second export, a fresh cache) differs by
+9e-7 in the fp32 forward of the compiled window and in 31 gradient tensors; two fresh
+compilations with the same forward differ in 22 gradient tensors by 2e-7; two runs on one
+cache differ in two fp32 gradient tensors by 3e-8 to 7e-8 and in nothing under bf16. The first
+comparison here, each tree on its own cache, showed exactly such differences for the split
+and autograd windows and was not evidence either way. On the copy of the base's cache the
+head compiled nothing (2,883 cache files before and after): it traces the base's graphs.
+Whoever compares compiled windows across commits on the card should do it on one cache or
+under `train.deterministic=true`.
+
 **What the kernels cost, and the first version's lesson.** Per position at the approved
 shape (a CUDA graph of each part alone, `scratch/bench_sweep.py`):
 
@@ -769,7 +793,10 @@ is the state-columns identity: the first layer's transposed product costs 37.8 Â
   `test_p2_10c_fused_window.py` (on the card).
 - Card measurements (outside the repository): `/home/joe/hsn-experiments/cutc-speed/card/`
   (step times, phases, product and sweep-part timings, the card suites' logs) with
-  `scratch/bench_products.py`, `bench_mm.py`, `bench_sweep.py`, `diag_fused_fast.py`.
+  `scratch/bench_products.py`, `bench_mm.py`, `bench_sweep.py`, `diag_fused_fast.py`; the
+  base-against-head comparisons on the card with `scratch/card_bitwise.py`,
+  `card_bitwise_pairs.py`, `card_train_bitwise.py`, `card_train_compare.py` (outputs under
+  `scratch/out/`, the exported base under `scratch/base_card/`).
 - `python/hsn/train/split.py`: `SplitWindow(state_gradient=)`, the fast read and the reserved
   slots in the replay.
 - `python/hsn/model/cell.py`, `units.py`, `router.py`, `python/hsn/config.py`: the default-off
