@@ -814,7 +814,7 @@ is the state-columns identity: the first layer's transposed product costs 37.8 �
 4. A12's `model.address_gate` (not on main) is one more scorer term: the forward sweep's
    scorer product only.
 5. The card tests of the four-op cell driver, where its artifacts exist.
-6. Accuracy runs: prepared, "Accuracy runs" below.
+6. Accuracy runs: done, "Accuracy runs" below.
 
 ### Step 3: amendment A6's per-row limit, as a reference only (13 Nov, evening)
 
@@ -873,7 +873,7 @@ repository: `/home/joe/hsn-experiments/cutc-speed/scratch/ratio_kernels_wip/` (a
 this step's first commit, its card tests, a note). Should the limit return, that is one more
 launch per position and a card session of tests.
 
-### Accuracy runs (prepared 13 Nov, to run when the card returns)
+### Accuracy runs (13 Nov, 20:37 to 22:46 MST)
 
 Equal gradients on one window do not show that a run trains the same: the trained models
 amplify rounding, so two windows part within a run however equal they are. What can be shown
@@ -889,9 +889,8 @@ that differs; TinyStories, delayed recall, arithmetic; seeds 0 and 1; the first 
 recipe's 9,000-step schedule (`train.steps` stays 9000: the peak rate throughout, and the
 autograd arm is the first third of the campaign's run of the same arm); dev evaluation every
 500 steps. Twelve runs, one at a time on the local card (their step times are then
-measurements of real runs). Queue order: seed 0 of the three tasks, then seed 1. Last, for
-information only, one seed per window on the pair task (kv + delayed), on which two runs of
-one seed and configuration differ by more than ten points.
+measurements of real runs), seed 0 of the three tasks first. (The spec also holds one seed
+per window on the pair task, kv + delayed; those two were not run.)
 
 **Where.** A database and run folder of their own:
 `/home/joe/hsn-experiments/cutc-speed/accuracy/` (the spec, `experiments.sqlite`, `runs/`,
@@ -912,6 +911,80 @@ A difference between the windows that is no larger than the gaps between seeds i
 finding "not distinguishable at two seeds"; a difference several times the gaps, with one
 sign on every task, would be a finding against the window.
 
+**Results.** All twelve ran to the end at commit `840090a` with a clean tree; no step was
+skipped and none came near the 0.5 s limit. Dev scores at step 3,000 (every evaluation:
+`accuracy/comparison.txt`):
+
+| Task, score | Autograd s0 | Autograd s1 | Fused s0 | Fused s1 | Mean, fused − autograd | Seed gap, autograd | Seed gap, fused |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TinyStories, bits per byte (lower is better) | 1.1314 | 1.1338 | 1.1331 | 1.1377 | +0.0028 | 0.0024 | 0.0046 |
+| Delayed recall, accuracy | 95.63 % | 64.72 % | 98.40 % | 98.59 % | +18.3 pp | 30.9 pp | 0.2 pp |
+| Arithmetic, accuracy | 69.88 % | 67.72 % | 75.64 % | 63.30 % | +0.7 pp | 2.2 pp | 12.3 pp |
+
+- *The bar as set* (each fused seed within the two autograd seeds): 4 of 12 on TinyStories,
+  2 of 12 on delayed recall, 2 of 12 on arithmetic over the six evaluations; at step 3,000
+  one of two, none, none. The same-seed twins part within the first 26 to 118 steps (training
+  losses more than 1 % apart), so every evaluation is of runs that have parted, where about
+  one in three is expected for equivalent windows. By the bar the fused arm does not pass.
+- *TinyStories*, the task on which runs repeat well (the campaign's autograd run of this arm
+  and seed on another card ends 0.002 bits from this one): the four runs end within 0.006
+  bits of each other. From step 1,500 to 2,500 the fused seed-1 run is 0.008 to 0.011 bits
+  behind the other three, which lie within 0.004 of each other; at step 3,000 it is 0.004
+  behind. One run of four; two seeds cannot say whether that is the window.
+- *Delayed recall*: both fused runs bind (98.4 and 98.6 %); one autograd run binds (95.6 %,
+  after a peak of 97.1 %) and one stays on a plateau (64.7 %). This task is known to end
+  either way from one configuration; the route guard acted in three of the four runs.
+- *Arithmetic*: the means are equal (+0.7 pp) and the same-seed differences have opposite
+  signs (+5.8 and −4.4 pp), but the fused runs lie 12 pp apart and the autograd runs 2 pp
+  (the campaign's autograd run of seed 0 on another card: 72.1 %, 2.2 pp from this one).
+- *Step times of the real runs*, alone on the card (host load 1.0 to 9.4, above 4 in 19 of
+  130 minutes): fused 131.2 to 133.4 ms, autograd 201.3 to 204.0 ms, 1.53 to 1.54 times on
+  each task. A whole 3,000-step run with its evaluations took 7.1 minutes fused and 12.3 to
+  12.5 autograd on delayed recall and arithmetic (9.0 to 10.7 and 14.2 to 16.3 on
+  TinyStories, whose evaluations are longer); the autograd window compiles for about 2.5
+  minutes at the start of every run (5.8 the first time).
+
+**Why the two windows part so early: bf16, not the window.** The records showed something
+that rounding between two correct windows should not: at step 1, from one initialisation and
+one batch, the windows' losses agree to 1e-5 but their gradient norms differ by 0.4 to 43 %
+(TinyStories seed 1: 1.097 fused, 1.941 autograd). So the step-1 gradient was computed
+directly (`accuracy/step1_grads.py`: the run's own initialisation and its first six
+batches, the raw gradient through the trainer's hook, each window in fp32 and in bf16):
+
+| The first six batches at the initial weights | TinyStories, seed 1 | Delayed recall, seed 0 |
+| --- | --- | --- |
+| Fused against autograd, fp32: relative distance | 6e-6 to 1.3e-3 | 2e-5 to 6e-5 |
+| Fused against autograd, fp32: cosine | 0.999999 to 1.000000 | 1.000000 |
+| Fused against autograd, bf16: relative distance | 0.06 to 0.77 | 0.22 to 0.66 |
+| Autograd, bf16 against its own fp32: relative distance; cosine | 0.05 to 0.65; 0.845 to 0.999 | 0.43 to 0.96; 0.349 to 0.908 |
+| Fused, bf16 against its own fp32: relative distance; cosine | 0.05 to 0.56; 0.827 to 0.999 | 0.43 to 0.95; 0.488 to 0.911 |
+
+In fp32 the fused window's gradient is the autograd window's, on the runs' own data, on
+every batch, those with an unusually large gradient included. Under
+bf16 autocast each window's gradient is far from its own fp32 gradient, the autograd window's
+as far as the fused window's, and the two bf16 gradients are as far from each other as each
+is from fp32. The state gradient amplifies bf16's rounding already at the initial weights
+(phase 1 found the same of fp32 against float64 on trained checkpoints). So a bf16 run on
+either window follows a gradient that is a rough copy of the fp32 one, the two windows make
+different rough copies, and the twins part within a hundred steps. That is a property of the
+recipe (bf16 with the state gradient), and it is there on the autograd window alone.
+
+**What this does and does not show.**
+
+- The fused window computes the state gradient correctly: fp32, real batches, 1e-5.
+- Whether bf16 runs on the two windows train alike is not settled by twelve runs. Nothing
+  here says the fused window trains worse: it is equal on TinyStories within 0.5 %, level in
+  the mean on arithmetic, ahead on delayed recall. But its two arithmetic runs lie five to
+  six times further apart than the autograd runs, and on the three batches of TinyStories
+  with a large gradient its bf16 norm was below the fp32 norm (0.70 to 0.87 of it) where the
+  autograd window's was above (1.21 to 1.38); on the one such batch of delayed recall both
+  were below. Two seeds and four batches do not make either a finding; they are the places
+  to look.
+- What would settle it: more seeds on TinyStories, where runs repeat to 0.002 bits (four
+  more per window is about 90 minutes of the card); and an fp32 pair, in which the windows
+  start with the same gradient, to see whether bf16's error in the state gradient matters to
+  the outcome at all. The second question is the campaign's as much as this window's.
+
 ## Files
 
 - `python/hsn/train/state_gradient.py`: the cell's backward into the state, the sweep, the
@@ -925,6 +998,10 @@ sign on every task, would be a finding against the window.
   `hsn_win_select`, the fast read in `hsn_win_cell_update`, and `hsn_win_back_head` / `_mid` /
   `_tail`; `tests/kernels/test_p2_10c_window.py`, `test_p2_10c_sweep.py`,
   `test_p2_10c_fused_window.py` (on the card).
+- The accuracy runs (outside the repository): `/home/joe/hsn-experiments/cutc-speed/accuracy/`
+  (`p2_10c_accuracy.yaml`, `run.sh`, `compare.py` and its output `comparison.txt`, `twins.py`
+  and `twins.txt` for the same-seed twins' training records, `step1_grads.py` with its
+  gradients and comparisons under `step1/`, the database, `runs/`, `logs/host_load.log`).
 - Card measurements (outside the repository): `/home/joe/hsn-experiments/cutc-speed/card/`
   (step times, phases, product and sweep-part timings, the card suites' logs) with
   `scratch/bench_products.py`, `bench_mm.py`, `bench_sweep.py`, `diag_fused_fast.py`; the
