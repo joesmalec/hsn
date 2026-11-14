@@ -590,16 +590,33 @@ sensitive to it.
 | Shape | Autograd window, state gradient | Fused window, full cut, the same number of routed slots | Fused window, state gradient |
 | --- | ---: | ---: | ---: |
 | 4 slots, 32 cells (the recipe) | | 43.7 ms (load 1.3) | |
-| 12 slots, 64 cells (routed candidate) | 159.2 ms (load 1.4) | 73.8 ms (load 1.0) | 98.6 ms (load 9: to be repeated) |
-| 20 slots of which 8 fast, 64 cells (the approved shape) | 202.5 ms (load 1.9) | 100.1 ms (20 routed slots; load 0.5) | 137.5 ms (load 9: to be repeated) |
+| 12 slots, 64 cells (routed candidate) | 159.2 ms (load 1.4) | 73.8 ms (load 1.0) | 96.1 ms (load 4 to 5); 96.9 ms (load 7.5) |
+| 20 slots of which 8 fast, 64 cells (the approved shape) | 202.5 ms (load 1.9) | 100.1 ms (20 routed slots; load 0.5) | 133.6 ms (load 0.4 at the start, 3.9 at the end); 133.5 ms (load 7) |
 
-So the state-gradient window is 1.61 times faster than the autograd window at the routed
-candidate and 1.47 times at the approved shape, with the kernels as they stand ("What is
-left"). Phases of the fused full-cut step at 20 routed slots and 64 cells
-(`bench_window.py phases`, synchronised): prologue 1.5, forward sweep 43.3, replay forward
-20.6, backward 29.6 ms. The estimates of phase 1 for that shape (40 to 50, 18 to 27, 22 to
-35) hold; half of the step is the batched replay and its backward, which this work does not
-touch.
+So the state-gradient window is 1.66 times faster than the autograd window at the routed
+candidate and 1.52 times at the approved shape. The fused timings do not move with the host's
+load in the range met here (other sessions' CPU evaluations came and went: a fully quiet
+host for a whole run was not available, and the two runs of each shape agree within 1 %).
+With the first kernels the two steps were 130.0 and 185.9 ms, after their rewrite 98.6 and
+137.5 ms, and with the middle kernel's wide reads the figures of the table.
+
+Phases (`bench_window.py phases`, synchronised, medians):
+
+| Phase | Fused, full cut, 20 routed slots | Fused, state gradient, the approved shape |
+| --- | ---: | ---: |
+| Prologue | 1.5 ms | 1.5 ms |
+| Forward sweep | 43.3 ms | 42.7 ms |
+| Replay forward | 20.6 ms | 25.3 ms |
+| Loss | | 0.4 ms |
+| Backward | 29.6 ms | 56.7 ms |
+
+The estimates of phase 1 for the full cut at that shape (40 to 50, 18 to 27, 22 to 35) hold.
+With the state gradient the backward holds the reverse sweep (22.2 ms), its loading and
+copying out (3.8 ms) and the replay's own backward (about 31 ms, by difference); the replay
+forward is 4.7 ms longer than the full cut's (it also returns the record the sweep reads; the
+two were not separated by a measurement). A third of the step is the
+forward sweep and four tenths the batched replay and its backward, which this work does not
+touch; the reverse sweep with its loading is a fifth.
 
 **The forward sweep for the approved shape.**
 
@@ -660,6 +677,7 @@ products; five graph nodes for the routed shape, seven with fast slots.
 | Whole windows: the kernels' sweep against the PyTorch steps and against the phase-1 reference; the captured graph against the eager kernels | within 2e-4 (fp32); the graph bit for bit |
 | The fused window through the kernels' sweep against the same window through the PyTorch sweep (one tape, one replay), three shapes | fp32: 5e-8 to 9e-8, cosine 1.00000000; bf16: 1.2e-3 to 1.7e-3, cosine above 0.999998 |
 | The fused window against the compiled autograd window, fp32, an initial model | identical routing decisions; gradients 7e-8 (routed candidate) and 2e-7 (approved shape) apart |
+| The middle kernel's reads of four values (bf16, the recipe's widths): slot counts that do not divide into its thread groups, slots cut by the budget (routed, and into the fast slots), hidden widths 256 and 384 | its operands bit for bit the PyTorch step's; the norm's sums within 3e-7 |
 | Every card test of the repository (`-m cuda`, `HSN_REQUIRE_CUDA=1`) with the changed kernels | 279 pass, 2 skip; 109 could not run (below) |
 
 The 109 are the tests of the four-op cell driver (`tests/kernels/test_p2_10_cuda.py`, 106; two
@@ -673,15 +691,17 @@ to be run where the artifacts exist.
 **What the kernels cost, and the first version's lesson.** Per position at the approved
 shape (a CUDA graph of each part alone, `scratch/bench_sweep.py`):
 
-| Part | First version | Now |
-| --- | ---: | ---: |
-| Head | 102 µs | 9.5 µs |
-| Second layer, transposed | 23.6 µs | 15.2 µs |
-| Middle | 33.9 µs | 33.7 µs |
-| First layer's state rows, transposed | 34.5 µs | 34.3 µs |
-| Tail | 104 µs | 12.8 µs |
-| A window's sweep | 77 ms | 27.7 ms |
-| Loading a window into the buffers; copying the result out | 3.2 ms; 0.5 ms | the same |
+| Part | First version | Rewritten | With wide reads in the middle |
+| --- | ---: | ---: | ---: |
+| Head | 102 µs | 9.5 µs | 9.5 µs |
+| Second layer, transposed | 23.6 µs | 15.2 µs | 15.3 µs |
+| Middle | 33.9 µs | 33.7 µs | 11.3 µs |
+| First layer's state rows, transposed | 34.5 µs | 34.3 µs | 34.3 µs |
+| Tail | 104 µs | 12.8 µs | 12.7 µs |
+| A window's sweep | 77 ms | 27.7 ms | 22.2 ms |
+| Loading a window into the buffers; copying the result out | 3.2 ms; 0.5 ms | the same | the same |
+
+At the routed candidate (12 slots) the sweep is 17.1 ms per window and the loading 2.0 ms.
 
 The first head and tail each multiplied a `d × d` matrix in the kernel, reading a transposed
 tile with a stride that put a warp's lanes on one shared-memory bank, and reduced each slot's
@@ -690,6 +710,15 @@ products' weights and reducing by warp shuffles removed them. The second product
 by a different call: `torch.mm` and `torch.addmm` reach different cuBLAS paths for one shape
 (at 384 rows of width 512, 20.0 against 11.7 µs; at 640 rows 20.1 against 24.5), so the sweep
 picks by a fixed rule.
+
+The middle kernel read one bf16 value per load: of its 34 µs, 21 were the reads (the product's
+output, the hidden values, the bias), 6 the arithmetic and 7 the stores; the GELU derivative
+cost nothing measurable. It now reads and stores four values at a time when the buffers are
+bf16 and a quarter of the hidden width is a whole number of warps that divides the block's
+512 threads (hidden widths 128, 256 and the recipe's 512); a thread owns four consecutive
+hidden indices and
+the block's threads split into groups that share the slots. The values it writes are the same
+bits; the norm's sum is taken in another order. Other shapes and fp32 keep the one-value path.
 
 **Step 1's estimate, corrected by measurement.** Per position (bf16, a CUDA graph of the
 product alone):
@@ -710,20 +739,19 @@ is the state-columns identity: the first layer's transposed product costs 37.8 �
 
 **What is left** (in the order of what the measurements say it is worth):
 
-1. The middle kernel: 21 of its 34 µs are its reads (the product's output, the hidden values,
-   the bias, one bf16 value per load), 6 the arithmetic, 7 the stores; the GELU derivative
-   costs nothing measurable. Reads and stores of four values at a time should bring it to
-   about 12 µs (5 ms per step).
-2. Loading a window: the hidden values through the replay's permutation instead of a copy,
+1. Loading a window: the hidden values through the replay's permutation instead of a copy,
    and the slots' old states gathered straight into the buffer (about 1.5 of 3.3 ms).
-3. Timings repeated on a quiet host.
-4. `train.state_grad_ratio` / `state_grad_clip` (A6's per-row limit on what a position passes
+2. The first layer's transposed product is now the sweep's largest part (34 µs of 87 per
+   position); seven eighths of its operand are the zeros of the units a slot did not run. No
+   cheaper form of it has been measured yet.
+3. `train.state_grad_ratio` / `state_grad_clip` (A6's per-row limit on what a position passes
    back; a result of 13 Nov suggests it for the base): a per-row rescale of `A` and `R`
    between one position's tail and the next position's head, with the batch's typical live
    row as the autograd window computes it; first in the float64 reference, then as a fourth
    glue step. The buffers and the step order leave that place.
-5. A12's `model.address_gate` (not on main) is one more scorer term: the forward sweep's
+4. A12's `model.address_gate` (not on main) is one more scorer term: the forward sweep's
    scorer product only.
+5. The card tests of the four-op cell driver, where its artifacts exist.
 6. Accuracy runs.
 
 ## Files

@@ -1177,6 +1177,8 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
  *   i: 0 B, 1 T, 2 K, 3 d, 4 M, 5 H, 6 F, 7 t, 8 the products and operands are bf16,
  *      9 hidden is bf16, 10 the activation's code.
  * Shared: (3 K + K blockDim / 32) words. K <= 32 (a thread keeps one partial sum per slot).
+ * With bf16 buffers, H a multiple of 128 dividing 4 blockDim and d a multiple of 4, a thread
+ * reads and stores four values at a time (the same values; sigma's sum in another order).
  */
 extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
     extern __shared__ float shared[];
@@ -1200,12 +1202,73 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
         unit_before[k] = t + 1 < T ? static_cast<int>(units[K + k]) : -1;
     }
     __syncthreads();
-    float acc[32];
-    for (int k = 0; k < K; ++k) acc[k] = 0.0f;
     const int wide = M * H + d;
     const int64_t act_row = static_cast<int64_t>(row) * Kr * H;   // this row's routed slots
     const int64_t op_row = static_cast<int64_t>(row) * Kr * wide;
     const int64_t hid_row = rt * K * H;
+    // Four bf16 values per read and per store (measured: of this kernel's 34 us per position at
+    // 20 slots, 21 were its reads, one value at a time). A thread owns four consecutive hidden
+    // indices; the block's threads split into groups of H / 4, group g walking the slots
+    // g, g + G, ...; a slot's sum is folded by its group's warps. Needs bf16 buffers on
+    // sixteen-byte bases whose rows start on eight bytes (H and d multiples of 4), the biases
+    // on sixteen bytes, and whole warps per group.
+    const int chunks = H >> 2;
+    uintptr_t bases = reinterpret_cast<uintptr_t>(a.p[2]) | reinterpret_cast<uintptr_t>(a.p[5]);
+    if (Kr > 0) bases |= reinterpret_cast<uintptr_t>(a.p[0]) | reinterpret_cast<uintptr_t>(a.p[6]);
+    if (F > 0) bases |= reinterpret_cast<uintptr_t>(a.p[1]) | reinterpret_cast<uintptr_t>(a.p[7]);
+    if (half && hid_half && (H & 127) == 0 && (d & 3) == 0 && nt % chunks == 0
+        && (bases & 15) == 0) {
+        const int G = nt / chunks, g = tid / chunks, h0 = (tid - g * chunks) << 2;
+        const int group_warps = chunks >> 5;
+        const uint16_t* act_r = static_cast<const uint16_t*>(a.p[0]);
+        const uint16_t* act_f = static_cast<const uint16_t*>(a.p[1]);
+        const uint16_t* hid = static_cast<const uint16_t*>(a.p[2]) + hid_row;
+        uint16_t* op = static_cast<uint16_t*>(a.p[6]) + op_row;
+        uint16_t* op_fast = static_cast<uint16_t*>(a.p[7]);
+        for (int k = g; k < K; k += G) {
+            const int u = unit_now[k];
+            const uint16_t* from = k >= F
+                ? act_r + act_row + static_cast<int64_t>(k - F) * H + h0
+                : act_f + (static_cast<int64_t>(k) * B + row) * H + h0;
+            const uint64_t act4 = *reinterpret_cast<const uint64_t*>(from);
+            const uint64_t hid4 =
+                *reinterpret_cast<const uint64_t*>(hid + static_cast<int64_t>(k) * H + h0);
+            const float4 bias4 = *reinterpret_cast<const float4*>(b1 + u * H + h0);
+            float sum = 0.0f;
+            uint64_t out = 0;
+            if (ok[k]) {
+                const float bs[4] = {bias4.x, bias4.y, bias4.z, bias4.w};
+                for (int i = 0; i < 4; ++i) {
+                    const float da = bf16_to_float(static_cast<uint16_t>(act4 >> (16 * i)));
+                    const float hv = bf16_to_float(static_cast<uint16_t>(hid4 >> (16 * i)));
+                    const float dh = da * activation_grad(hv, code);
+                    sum += dh * (hv - bs[i]);
+                    out |= static_cast<uint64_t>(float_to_bf16(dh)) << (16 * i);
+                }
+            }
+            if (k >= F) {
+                uint16_t* base = op + static_cast<int64_t>(k - F) * wide;
+                const int before = unit_before[k];
+                if (before >= 0 && before != u)
+                    *reinterpret_cast<uint64_t*>(base + before * H + h0) = 0;
+                *reinterpret_cast<uint64_t*>(base + u * H + h0) = out;
+            } else {
+                *reinterpret_cast<uint64_t*>(
+                    op_fast + (static_cast<int64_t>(k) * B + row) * (H + d) + h0) = out;
+            }
+            for (int w = 16; w > 0; w >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, w);
+            if ((tid & 31) == 0) part[k * warps + (tid >> 5) % group_warps] = sum;
+        }
+        __syncthreads();
+        if (tid < K) {
+            float total = 0.0f;
+            for (int w = 0; w < group_warps; ++w) total += part[tid * warps + w];
+            sigma[tid] += total;
+        }
+        return;
+    }
+    float acc[32];
+    for (int k = 0; k < K; ++k) acc[k] = 0.0f;
     // a thread owns the hidden indices h = tid, tid + nt, ... and walks the slots for each: the
     // slots' reads go out a batch at a time, before any is used
     for (int h = tid; h < H; h += nt) {

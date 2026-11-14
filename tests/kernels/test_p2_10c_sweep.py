@@ -90,6 +90,31 @@ WIDE = {
     ),
 }  # fmt: skip
 
+#: bf16 at the recipe's widths, for the middle kernel's reads of four values: slot counts that
+#: do not divide into its thread groups, slots the budget cuts (64 cells of eight units: a slot
+#: costs 1 / 512 of the dense step), and hidden widths with eight groups (256) and with no
+#: whole number of groups (384: one value per read). Value: (overrides, valid slots of K).
+WIDE_READS = {
+    "uneven_groups": (
+        ("model.k_select=7", "model.fast_cells=3", "model.fast_units=fixed",
+         "model.fast_readout=true"),
+        7,
+    ),
+    "cut_routed": (("model.k_select=6", "model.budget=0.007"), 3),
+    "cut_routed_after_fast": (
+        ("model.k_select=7", "model.fast_cells=3", "model.fast_units=fixed",
+         "model.fast_readout=true", "model.budget=0.01"),
+        5,
+    ),
+    "cut_fast": (
+        ("model.k_select=7", "model.fast_cells=3", "model.fast_units=fixed",
+         "model.fast_readout=true", "model.budget=0.005"),
+        2,
+    ),
+    "hidden_256": (("model.k_select=7", "model.hidden=256"), 7),
+    "hidden_384": (("model.k_select=6", "model.hidden=384"), 6),
+}  # fmt: skip
+
 
 def _small_cfg(*extra: str) -> RunConfig:
     from test_a6_feedback_detach import A5, _cfg
@@ -261,6 +286,24 @@ def test_kernels_step_by_step_recipe_widths(
     assert args[-2]["hidden"].dtype == (torch.bfloat16 if autocast else torch.float32)
     worst = _check_kernels_step_by_step(model, args, cfg)
     print(name, "bf16" if autocast else "fp32", {k: f"{v:.1e}" for k, v in worst.items()})
+
+
+@pytest.mark.parametrize("name", list(WIDE_READS))
+def test_kernels_step_by_step_wide_reads(device: torch.device, name: str) -> None:
+    """bf16 products and operands at the recipe's widths, where the middle kernel reads and
+    stores four values at a time: uneven thread groups, slots cut by the budget (routed slots,
+    and into the fast slots), and other hidden widths. Each kernel against its PyTorch step
+    from the same buffers at every position."""
+    overrides, valid_slots = WIDE_READS[name]
+    cfg = _wide_cfg("model.n_cells=64", *overrides)
+    model, args, _ = _arguments(cfg, device, autocast=True, scale=0.05)
+    valid = args[5]
+    assert args[-2]["hidden"].dtype == torch.bfloat16
+    assert valid.float().mean(dim=(0, 1)).tolist() == [
+        float(k < valid_slots) for k in range(int(valid.shape[2]))
+    ]
+    worst = _check_kernels_step_by_step(model, args, cfg)
+    print(name, {k: f"{v:.1e}" for k, v in worst.items() if k.startswith("mid")})
 
 
 # --------------------------------------------------------------------------------------------------
