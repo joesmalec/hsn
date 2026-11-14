@@ -1,0 +1,68 @@
+# synthetic_hold: two-byte keys with a hold-out of key PAIRS (13 Nov 2026).
+#
+# Why: the dev and test keys of synthetic_v1 and synthetic_keys use bytes that never occur in
+# training. That is the hardest case and not the common one: in real records the bytes of a name
+# occur in training and the name is a new combination of them. Models with fast cells (amendment
+# A8) lose on never-seen key bytes (key-value 96 % on training keys against 91 % on dev keys at
+# 9k steps, 99.5 % against 93.7 % at 27k) and it was not known whether they also lose on new
+# combinations of seen bytes.
+#
+# The tasks:
+#   kv         synthetic_v1's key-value task, in range, the same documents (same seed and
+#              parameters), so that a run is a pair-task run as before.
+#   delayed2h  the delayed task with keys of two bytes (as synthetic_keys' delayed2) and a pair
+#              hold-out: a key (k_1, k_2) with (k_1 + k_2) mod 4 == 0 never occurs in any split.
+#              Its training keys are bytes 64-111, so every key byte is seen in both positions;
+#              a quarter of the pairs is never seen.
+# Evaluation of new combinations is done on fresh documents made from delayed2h's spec with
+# hold_role: only and the TRAIN split's key range (/home/joe/hsn-handoff/hold_eval.py): every key
+# is a held pair of seen bytes. The dev and test splits here are, as elsewhere, keys of bytes
+# never seen in training.
+# Select with
+#   data.dataset=synthetic_hold data.manifest=data/synthetic_hold/manifest.json data.tasks=[kv, delayed2h]
+# Golden manifest: configs/data/synthetic_hold.manifest.json.
+
+name: synthetic_hold
+unroll: 256
+
+tasks:
+  - name: kv
+    variant: in_range
+    family: kv
+    context_id: 1
+    seed: 1001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      markers: { ins: 16, ovr: 17, del: 18 }
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 8
+      op_rate: 0.15
+      p_del: 0.25
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 }
+      max_queries: 8
+
+  - name: delayed2h
+    variant: in_range
+    family: delayed
+    context_id: 2
+    seed: 44001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
+      key_len: 2
+      hold_mod: 4
+      hold_role: exclude
