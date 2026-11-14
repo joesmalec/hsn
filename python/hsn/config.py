@@ -296,6 +296,15 @@ class ModelConfig(_StrictModel):
     # codes; nothing about a key is learned. 1 (default): A5's two features only.
     address_ngram: int = Field(default=1, ge=1, le=3)
     # --- end A9 ---
+    # --- Amendment A12 (docs/amendments/A12_address_gate.md; opt-in, needs key_address) ---
+    # address_gate: the weight a unit puts on each address feature becomes a function of the
+    # position's content. The scorer adds (G u_t)[j, a] * address_a[i] to the logit of cell i and
+    # unit j, with one new matrix G (d -> n_units * address features, zero at the start, so the
+    # model starts as the model without the key). A unit can then follow the current byte's
+    # address at a queried key and not at a value, which a linear scorer cannot express. The
+    # addresses are A5's fixed codes; nothing about a key is learned.
+    address_gate: bool = False
+    # --- end A12 ---
     # --- Amendment A11 (docs/amendments/A11_position_bound.md; opt-in) ---
     # The position the scorer's ``pos`` feature reads. "document" (default): the position in the
     # document, pos / unroll, which grows past 1 in a document longer than the training window.
@@ -383,6 +392,11 @@ class ModelConfig(_StrictModel):
                     f"model.disabled_cells {fast_disabled} lie in the fast group "
                     f"[0, {self.fast_cells})"
                 )
+        if self.address_gate and not (self.key_address and self.scorer == "linear"):
+            raise ValueError(
+                "model.address_gate (A12) needs model.key_address=true and model.scorer=linear, "
+                f"got key_address={self.key_address}, scorer={self.scorer!r}"
+            )
         if self.cell_units != "routed" and self.routing != "topk":
             raise ValueError(
                 f"model.cell_units={self.cell_units!r} needs model.routing=topk, got "
@@ -1553,6 +1567,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.answer_weight",
     "model.cell_units",
     "model.scorer_position",
+    "model.address_gate",
 )
 
 
@@ -1596,6 +1611,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
             "has A5's two address columns only; use hardware.window=autograd"
+        )
+    if model.address_gate:
+        return (
+            "model.address_gate (A12): the split window's scorer has no content-dependent "
+            "address weights; use hardware.window=autograd"
         )
     if model.scorer_position != "document":
         return (
