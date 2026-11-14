@@ -1084,6 +1084,31 @@ The routing shares overstate the functional difference where cells are interchan
 TinyStories at the trained weights the fp32 windows differ at 6 % of the positions and their
 gradients agree to 1.5e-6.
 
+**How close the selection is at the cut** (`accuracy/margin.py`, CPU, from the kept fp32
+tapes: the scores are recomputed as the replay computes them from the taped state and the
+redrawn batch; at every position without a stale cell the 12 highest recomputed scores are
+the tape's 12 routed cells). Per position, over 24,576 positions a block: the gap between the
+last selected and the first unselected of the 56 routed cells' scores, against the spread of
+those scores (their standard deviation) and against bf16's spacing at the cut's score (one
+ulp):
+
+| Block | Gap / spread, median | Gap in ulps, median [quartiles] | Positions with a gap under 1 ulp; under ½ | Unselected cells within 1 ulp of the cut, mean (90th percentile) | Measured: positions until bf16 first selects otherwise, median (flip probability per position) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TinyStories, initial | 0.05 | 2.6 [1.0, 5.2] | 24 %; 13 % | 0.3 (1) | 11 (8 %) |
+| Delayed recall, initial | 0.05 | 2.5 [1.0, 5.5] | 25 %; 14 % | 0.3 (1) | 10 (8 %) |
+| Arithmetic, initial | 0.05 | 2.8 [1.1, 6.3] | 23 %; 13 % | 0.3 (1) | 10 (8 %) |
+| TinyStories, trained | 0.73 | 28 [1.7, 108] | 20 %; 13 % | 0.4 (1) | 2 (18 %) |
+| Delayed recall, trained | 0.04 | 1.0 [0.4, 2.2] | 50 %; 31 % | 0.8 (2) | 4 (15 %) |
+| Arithmetic, trained | 0.06 | 0.9 [0.3, 2.9] | 53 %; 37 % | 1.4 (4) | 6 (13 %) |
+
+The cut falls where the scores are dense: the gap is a twentieth of their spread (except on
+TinyStories at the trained weights, where it is wide at most positions and still under one
+ulp at a fifth of them). There is seldom more than one unselected cell within bf16's rounding
+of the cut, and no exact tie in fp32; but one such cell at an eighth to a half of the
+positions is enough for the selection to go the other way at 8 to 18 % of the positions, and
+so within the first ten positions of every row. The last column is from the routings of all
+24 batches a block, both windows alike.
+
 **Two things the diagnostic's own script taught.** `model.load_state_dict` between blocks made
 every block cost 90 to 100 s of CPU on the card (by all appearances the compiled window was
 built again); copying the tensors in place took a six-block pass from ten minutes to one. And
@@ -1108,8 +1133,9 @@ passes; a `fit` stopped by its callback has none.
   and `twins.txt` for the same-seed twins' training records, `step1_grads.py` with its
   gradients and comparisons under `step1/`, the database, `runs/`, `logs/host_load.log`).
 - The bf16 diagnostic (outside the repository): `accuracy/bf16_diag.py` (the passes and the
-  analysis), `bf16_diag.sh` (the card driver), and under `accuracy/bf16/` the raw gradients,
-  routings and tapes of every pass, the card log, the fp32 timings and `analysis.txt`.
+  analysis), `bf16_diag.sh` (the card driver), `margin.py` (the margin at the selection cut),
+  and under `accuracy/bf16/` the raw gradients, routings and tapes of every pass, the card
+  log, the fp32 timings, `analysis.txt` and `margin.txt`.
 - Card measurements (outside the repository): `/home/joe/hsn-experiments/cutc-speed/card/`
   (step times, phases, product and sweep-part timings, the card suites' logs) with
   `scratch/bench_products.py`, `bench_mm.py`, `bench_sweep.py`, `diag_fused_fast.py`; the
