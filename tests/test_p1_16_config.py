@@ -99,6 +99,11 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.write_init",
         "train.lambda_w",
         "hardware.graph_alias_index",
+        "model.reader",  # A14
+        "model.reader_width",
+        "model.reader_layers",
+        "model.reader_heads",
+        "model.reader_span",
     )
 
 

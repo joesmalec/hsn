@@ -745,6 +745,11 @@ def _expand_one(
             f"arm {entry.name}: model.fast_cells (A8) requires variant pdg; variant {variant} "
             "may replace the router or the readout"
         )
+    if cfg.model.reader != "none" and variant != "pdg":
+        raise SpecError(
+            f"arm {entry.name}: model.reader (A14) requires variant pdg; variant {variant} "
+            "may replace the readout"
+        )
     if cfg.model.ablate_shared_u and variant not in ("pdg", "none"):
         raise SpecError(
             f"arm {entry.name}: model.ablate_shared_u requires variant pdg; variant {variant} "
