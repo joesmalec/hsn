@@ -24,6 +24,7 @@ from torch import Tensor, nn
 if TYPE_CHECKING:
     from hsn.model.cell import PDGCell
     from hsn.model.state import CellGraphState
+    from hsn.train.state_sweep import ReverseSweep, SweepShape
 
 ROOT = Path(__file__).resolve().parents[3]
 BUILD = ROOT / "build"
@@ -38,6 +39,10 @@ _SELECT_THREADS = 256
 #: Threads of a row's block in the end-of-round kernel (a multiple of 32; one per slot element
 #: when they fit, and the row's ``N * d`` states in ``N * d / threads`` steps).
 _UPDATE_THREADS = 512
+
+
+#: Threads of a row's block in the reverse sweep's three kernels (P2.10c).
+_BACK_THREADS = 512
 
 
 def _select_shared(n_cells: int, n_units: int, k: int) -> int:
@@ -360,11 +365,15 @@ def select_op(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """The hard decision of one position, forward only: ``(cells, units, valid, theta,
     refreshed)`` (``kernels/cuda/hsn_window.cu``, ``hsn_win_select``). ``logits [B, N, M]`` fp32,
     ``age [B, N]`` int64 and ``cost [M]`` fp32 are contiguous tensors on one prepared CUDA
-    device."""
+    device. ``reserved`` / ``reserved_units`` (P2.10c) are
+    :meth:`hsn.model.router.Router.select`'s: amendment A8's fast cells hold the first
+    ``reserved`` slots, at unit ``slot mod M`` when their units are fixed."""
     B, N, M = (int(n) for n in logits.shape)
     device = logits.device
     cells = torch.empty((B, k), dtype=torch.int64, device=device)
@@ -378,7 +387,7 @@ def select_op(
         _SELECT_THREADS,
         _select_shared(N, M, k),
         [logits, age, cost, cells, units, valid, theta, refreshed],
-        [B, N, M, k, age_max, int(probes), 0, 1, 1],
+        [B, N, M, k, age_max, int(probes), 0, 1, 1, 0, 0, reserved, int(reserved_units)],
         [lambda_cost, cell_overhead, shared_cost, limit],
     )
     return cells, units, valid, theta, refreshed
@@ -396,6 +405,8 @@ def _select_fake(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     B = logits.shape[0]
     return (
@@ -428,6 +439,8 @@ def select_tape_op(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> None:
     """:func:`select_op` written into a tape: the decision of position ``t`` from ``logits
     [B, N, M]`` and the ages ``age[:, t]`` (``[B, n + 1, N]``) into record ``t`` of ``cells`` /
@@ -442,7 +455,8 @@ def select_tape_op(
         _SELECT_THREADS,
         _select_shared(N, M, k),
         [logits, age, cost, cells, units, valid, theta, refreshed],
-        [B, N, M, k, age_max, int(probes), t, n, int(age.shape[1])],
+        [B, N, M, k, age_max, int(probes), t, n, int(age.shape[1]), 0, 0]
+        + [reserved, int(reserved_units)],
         [lambda_cost, cell_overhead, shared_cost, limit],
     )
 
@@ -464,6 +478,8 @@ def _select_tape_fake(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> None:
     return None
 
@@ -490,6 +506,8 @@ def select_fold_op(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> None:
     """:func:`select_tape_op` on the scorer's matrix product as it is (P2.10b, the folded
     sweep): ``scored [B * N, W]`` in fp32 or bf16 holds the logits in its first ``n_units``
@@ -506,7 +524,8 @@ def select_fold_op(
         _SELECT_THREADS,
         _select_shared(N, n_units, k),
         [scored, age, cost, cells, units, valid, theta, refreshed],
-        [B, N, n_units, k, age_max, int(probes), t, n, int(age.shape[1]), width, int(half)],
+        [B, N, n_units, k, age_max, int(probes), t, n, int(age.shape[1]), width, int(half)]
+        + [reserved, int(reserved_units)],
         [lambda_cost, cell_overhead, shared_cost, limit],
     )
 
@@ -529,6 +548,8 @@ def _select_fold_fake(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> None:
     return None
 
@@ -556,11 +577,14 @@ def select(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """:meth:`hsn.model.router.Router.select` for the forward sweep (mode ``topk``, the hard
     decision, no exploration, the refresh probes when ``probes``) as one kernel: ``(cells,
     units, valid, theta, refreshed)`` with the router's values, tie rules included (equal
-    scores and equal ages in index order). ``limit`` is ``budget * (1 + BUDGET_SLACK)``."""
+    scores and equal ages in index order). ``limit`` is ``budget * (1 + BUDGET_SLACK)``;
+    ``reserved`` / ``reserved_units`` are the router's (amendment A8's fast cells)."""
     decision: tuple[Tensor, Tensor, Tensor, Tensor, Tensor] = select_op(
         logits.to(torch.float32).contiguous(),
         age.contiguous(),
@@ -572,6 +596,8 @@ def select(
         cell_overhead,
         shared_cost,
         limit,
+        reserved,
+        reserved_units,
     )
     return decision
 
@@ -760,6 +786,7 @@ def update_fold_op(
     t: int,
     cand_norm: bool,
     cand_eps: float,
+    n_fast: int = 0,
 ) -> None:
     """:func:`update_tape_op` on the round's matrix products as they are (P2.10b, the folded
     sweep): ``y [B, K, d]`` (``W_out``'s output) and ``gate [B * K, d]`` (the gate's
@@ -770,12 +797,16 @@ def update_fold_op(
     becomes ``[z; q; context]`` of position ``t + 1`` from ``z [B, n, d_z]``, ``context
     [B, n, d_c]`` and ``q`` after the round and the next reset, each value rounded to ``x``'s
     dtype (the cast of the assembled row). Tensors on one prepared CUDA device, contiguous
-    except ``gate``."""
+    except ``gate``. ``n_fast = F > 0`` (P2.10c, amendment A8's ``model.fast_readout``): the
+    row is ``[z; q; context; f]`` (``d`` wider), ``f`` the mean of cells ``0 .. F − 1`` of the
+    state position ``t + 1`` reads (:meth:`hsn.model.hsn.HSN._fast_read`)."""
     B, n_state, N, d = (int(n) for n in tape_h.shape)
     n, K = int(cells.shape[1]), int(cells.shape[2])
     d_z, d_c = int(z.shape[2]), int(context.shape[2])
-    if tuple(x.shape) != (n, B, d_z + d + d_c):
-        raise ValueError(f"x must be [n, B, d_z + d + d_c], got {tuple(x.shape)}")
+    if tuple(x.shape) != (n, B, d_z + d + d_c + (d if n_fast else 0)):
+        raise ValueError(f"x must be [n, B, d_z + d + d_c (+ d)], got {tuple(x.shape)}")
+    if not 0 <= n_fast <= N:
+        raise ValueError(f"n_fast must lie in [0, {N}], got {n_fast}")
     ints = [B, N, d, K, int(cand_norm), t, n_state, n, t + 1, int(t + 1 < n), 0, 1]
     ints += [
         int(y.dtype == torch.bfloat16),
@@ -787,6 +818,7 @@ def update_fold_op(
         int(z.dtype == torch.bfloat16),
         d_c,
         int(context.dtype == torch.bfloat16),
+        n_fast,
     ]
     _extension().launch_views(
         "hsn_win_cell_update",
@@ -841,6 +873,7 @@ def _update_fold_fake(
     t: int,
     cand_norm: bool,
     cand_eps: float,
+    n_fast: int = 0,
 ) -> None:
     return None
 
@@ -904,6 +937,8 @@ def select_tape(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> None:
     """:func:`select` for position ``t`` of a block, written into record ``t`` of the block's
     decision tape (``cells`` / ``units`` / ``valid`` / ``refreshed`` ``[B, n, K]``, ``theta
@@ -925,6 +960,8 @@ def select_tape(
         cell_overhead,
         shared_cost,
         limit,
+        reserved,
+        reserved_units,
     )
 
 
@@ -1032,6 +1069,8 @@ def select_fold(
     cell_overhead: float,
     shared_cost: float,
     limit: float,
+    reserved: int = 0,
+    reserved_units: bool = False,
 ) -> None:
     """:func:`select_tape` from the scorer's matrix product ``scored [B * N, W]`` as it is
     (:func:`select_fold_op`)."""
@@ -1052,6 +1091,8 @@ def select_fold(
         cell_overhead,
         shared_cost,
         limit,
+        reserved,
+        reserved_units,
     )
 
 
@@ -1073,9 +1114,11 @@ def update_fold(
     context: Tensor,
     *,
     t: int,
+    n_fast: int = 0,
 ) -> None:
     """:func:`update_tape` from the round's matrix products as they are, with the next
-    position's input of the first product written into ``x`` (:func:`update_fold_op`)."""
+    position's input of the first product written into ``x`` (:func:`update_fold_op`;
+    ``n_fast``: the fast cells whose mean ends the row)."""
     cand_norm = cell.cand_norm_kind != "none"
     update_fold_op(
         y,
@@ -1096,4 +1139,138 @@ def update_fold(
         t,
         cand_norm,
         float(cast(nn.RMSNorm, cell.cand_norm).eps or 0.0) if cand_norm else 0.0,
+        n_fast,
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# P2.10c: the reverse sweep of the state-gradient window (hsn.train.state_sweep)
+# --------------------------------------------------------------------------------------------------
+
+
+def _back_head_shared(shape: SweepShape) -> int:
+    K, d = shape.K, shape.d
+    return 4 * (2 * d + 5 * K + 2 * K * d + 3 * ((K * d + 31) // 32))
+
+
+def _back_mid_shared(shape: SweepShape) -> int:
+    return 4 * (3 * shape.K + shape.K * (_BACK_THREADS // 32))
+
+
+def _back_tail_shared(shape: SweepShape) -> int:
+    K, d, N = shape.K, shape.d, shape.N
+    return 4 * (3 * K + N + 2 * K * d + 2 * N * shape.d_out)
+
+
+def back_unsupported(shape: SweepShape) -> str | None:
+    """Why the reverse sweep's kernels cannot take this shape (``None``: they can)."""
+    if shape.K > 32:
+        return f"k_select={shape.K}: a thread of the middle kernel keeps a sum per slot (32)"
+    largest = max(_back_head_shared(shape), _back_mid_shared(shape), _back_tail_shared(shape))
+    if largest > _MAX_SHARED_BYTES:
+        return (
+            f"k_select={shape.K}, model.d={shape.d}, model.n_cells={shape.N}: a row's values do "
+            "not fit a block's shared memory"
+        )
+    return None
+
+
+def _half(t: Tensor) -> int:
+    return int(t.dtype == torch.bfloat16)
+
+
+def back_head(sweep: ReverseSweep, t: int) -> None:
+    """The head of position ``t`` of a :class:`~hsn.train.state_sweep.ReverseSweep` on its
+    buffers (``hsn_win_back_head``; :meth:`ReverseSweep.head_reference` is its contract)."""
+    s = sweep.shape
+    _extension().launch(
+        "hsn_win_back_head",
+        s.B,
+        _BACK_THREADS,
+        _back_head_shared(s),
+        [
+            sweep.A,
+            sweep.R,
+            sweep.c,
+            sweep.b,
+            sweep.h_old,
+            sweep.y,
+            sweep.cells,
+            sweep.units,
+            sweep.valid,
+            sweep.d_q_post,
+            sweep.d_h_sel,
+            sweep.d_h_fast,
+            sweep.cand_gain,
+            sweep.gate_pre,
+            sweep.gate_bias,
+            sweep.dc,
+            sweep.db,
+            sweep.op1,
+            sweep.op1_fast,
+            sweep.op2,
+            sweep.op2_fast,
+            sweep.sigma,
+        ],
+        [s.B, s.T, s.K, s.d, s.N, s.M, s.H, s.n_fast, t, s.n_read, int(sweep.cand_norm)]
+        + [_half(sweep.op1)],
+        [sweep.cand_eps],
+    )
+
+
+def back_mid(sweep: ReverseSweep, t: int) -> None:
+    """The middle of position ``t`` (``hsn_win_back_mid``;
+    :meth:`ReverseSweep.middle_reference`)."""
+    from hsn.train.state_sweep import ACTIVATION_CODES
+
+    s = sweep.shape
+    _extension().launch(
+        "hsn_win_back_mid",
+        s.B,
+        _BACK_THREADS,
+        _back_mid_shared(s),
+        [
+            sweep.act_r,
+            sweep.act_f,
+            sweep.hidden,
+            sweep.units,
+            sweep.valid,
+            sweep.b1,
+            sweep.op2,
+            sweep.op2_fast,
+            sweep.sigma,
+        ],
+        [s.B, s.T, s.K, s.d, s.M, s.H, s.n_fast, t, _half(sweep.act_r), _half(sweep.hidden)]
+        + [ACTIVATION_CODES[sweep.activation]],
+        [],
+    )
+
+
+def back_tail(sweep: ReverseSweep, t: int) -> None:
+    """The tail of position ``t`` (``hsn_win_back_tail``; :meth:`ReverseSweep.tail_reference`)."""
+    s = sweep.shape
+    _extension().launch(
+        "hsn_win_back_tail",
+        s.B,
+        _BACK_THREADS,
+        _back_tail_shared(s),
+        [
+            sweep.A,
+            sweep.R,
+            sweep.dv_r,
+            sweep.dv_f,
+            sweep.sigma,
+            sweep.rms,
+            sweep.h_old,
+            sweep.mv,
+            sweep.cells,
+            sweep.valid,
+            sweep.out_tgt,
+            sweep.out_w,
+            sweep.d_q_pre,
+            sweep.reset,
+        ],
+        [s.B, s.T, s.K, s.d, s.N, s.n_fast, t, s.d_out, int(sweep.cell_norm), s.in_dim]
+        + [_half(sweep.dv_r)],
+        [],
     )

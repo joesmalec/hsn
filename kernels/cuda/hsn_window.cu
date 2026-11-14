@@ -543,6 +543,12 @@ extern "C" __global__ void hsn_win_cell_back(HsnWinArgs a) {
  * matrix product left them.
  *   i: 9 W, the logits' row width when they are the first M columns of a wider product
  *        [B N, W] (0: W = M); 10 that product is bf16 (read as f32: exact).
+ * P2.10c, amendment A8's fast cells (zero in the calls above: the decision as before):
+ *   i: 11 F, the reserved cells: cells 0 .. F-1 take the first F slots in index order whatever
+ *        their scores, the scored cells fill the other slots, theta's lowest selected score is
+ *        taken among the scored slots' cells and the probes replace scored slots only;
+ *      12 the reserved slots' units are fixed: slot k < F runs unit k mod M (0: the cell's
+ *        first maximiser, like any slot).
  * Shared: (4 N + M + 4 K + 1 + 3 ceil(N / 32)) words. The steps are the router's, in its order
  * and with its tie rules:
  *   score_i = max_j (logit_ij - lambda * cost_j), unit_i the first maximiser;
@@ -563,6 +569,8 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
     const float lambda = a.f[0], overhead = a.f[1], shared_cost = a.f[2], limit = a.f[3];
     const int width = a.i[9] > 0 ? a.i[9] : M;  // the row width of the logits' matrix
     const bool logits_half = a.i[10] != 0;
+    const int reserved = a.i[11];           // A8: cells 0 .. reserved-1 hold the first slots
+    const bool fixed_units = a.i[12] != 0;  // and slot k < reserved runs unit k mod M
     const void* scored = a.p[0];
     const int64_t scored_row = static_cast<int64_t>(row) * N * width;  // the row's first cell
     const int64_t* age =
@@ -640,8 +648,13 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
     int rank = N;  // this cell's rank in the stable descending order
     if (tid < N) {
         mine = score[tid];
-        rank = 0;
-        for (int j = 0; j < N; ++j) rank += (score[j] > mine) || (score[j] == mine && j < tid);
+        if (tid < reserved) {
+            rank = tid;  // the reserved cells sort first, in index order
+        } else {
+            rank = reserved;
+            for (int j = reserved; j < N; ++j)
+                rank += (score[j] > mine) || (score[j] == mine && j < tid);
+        }
         order[rank] = tid;
     }
     __syncthreads();
@@ -650,7 +663,8 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
         float cumulative = 0.0f;
         int n_valid = 0;
         for (int k = 0; k < K; ++k) {
-            const int c = order[k], u = unit[c];
+            const int c = order[k];
+            const int u = (fixed_units && k < reserved) ? k % M : unit[c];
             cumulative += overhead + cost_s[u];
             const bool ok = shared_cost + cumulative <= limit;
             out_cell[k] = ok ? c : 0;
@@ -666,7 +680,7 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
     // unselected cells: each warp reduces its cells, thread 0 joins the warps
     const int n_valid = *n_valid_s;
     const bool inside = rank < n_valid;
-    float lowest_in = (tid < N && inside) ? mine : INFINITY;
+    float lowest_in = (tid < N && inside && tid >= reserved) ? mine : INFINITY;
     float highest_out = (tid < N && !inside) ? mine : -INFINITY;
     const bool is_stale = tid < N && !inside && key >= 0.0f;
     int n_stale = is_stale ? 1 : 0;
@@ -692,7 +706,8 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
             n_stale += warp_stale[w];
         }
         *theta = 0.5f * (lowest_in + highest_out);
-        const int n_force = n_stale < n_valid ? n_stale : n_valid;
+        const int scored_slots = n_valid > reserved ? n_valid - reserved : 0;
+        const int n_force = n_stale < scored_slots ? n_stale : scored_slots;
         for (int j = 0; j < n_force; ++j) {  // the j-th stalest cell goes to slot n_valid - 1 - j
             int pick = 0;
             float stalest = stale[0];
@@ -717,7 +732,8 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
                 for (int k = 0; k < K; ++k) {
                     const int c = slot[k];
                     out_cell[k] = c;
-                    out_unit[k] = (out_flag[k] & 1) ? unit[c] : 0;
+                    const int u = (fixed_units && k < reserved) ? k % M : unit[c];
+                    out_unit[k] = (out_flag[k] & 1) ? u : 0;
                     out_flag[k] &= 1;
                 }
             }
@@ -761,6 +777,10 @@ extern "C" __global__ void hsn_win_select(HsnWinArgs a) {
  *      19 context [B, n_slot, d_c]: with t + 1 < n_slot the row x[t + 1, row] becomes
  *      [z; q; context] of position t + 1, q being the summary that position reads (q' after
  *      the reset), each value rounded to the buffer's dtype (the cast of the assembled row).
+ * P2.10c, amendment A8's fast read (zero in the calls above):
+ *   i: 21 F, the fast cells: x is [n_slot, B, d_z + d + d_c + d] and the row also gets
+ *        f = mean over cells 0 .. F-1 of the state position t + 1 reads (after the reset),
+ *        summed in cell order, after the context.
  * Shared: (2 K + 1 + N + K ceil(d / 32) + 2 K d) words.
  *   c = tanh(rms(y) * cand_w)   (or tanh(y));   b = 1 / (1 + exp(-gate))
  *   h'[cell] = (1 - b) h[cell] + b c  on the valid slots;   q' = q + sum_k (h' - h)[k] / N
@@ -866,7 +886,9 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
     __syncthreads();
     const bool next_input = a.i[15] != 0 && t + 1 < n_slot, x_half = a.i[16] != 0;
     const int d_z = a.i[17], d_c = a.i[19];
-    const int64_t next_row = (static_cast<int64_t>(t + 1) * a.i[0] + row) * (d_z + d + d_c);
+    const int n_fast = a.i[21];  // A8: the row ends with the fast cells' mean
+    const int x_width = d_z + d + d_c + (n_fast > 0 ? d : 0);
+    const int64_t next_row = (static_cast<int64_t>(t + 1) * a.i[0] + row) * x_width;
     for (int x = tid; x < d; x += nt) {
         float sum = 0.0f;
         for (int k = 0; k < K; ++k) sum += delta[k * d + x];
@@ -884,6 +906,17 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
         for (int e = tid; e < d_c; e += nt)
             store_value(a.p[17], next_row + d_z + d + e, x_half,
                 load_value(a.p[19], from * d_c + e, c_half));
+        if (n_fast > 0) {  // the fast cells' mean of the state the next position reads
+            for (int x = tid; x < d; x += nt) {
+                float sum = 0.0f;
+                for (int n = 0; n < n_fast; ++n) {
+                    const int k = slot_of[n];
+                    sum += k >= 0 ? h_new[k * d + x] : h[n * d + x];
+                }
+                store_value(a.p[17], next_row + d_z + d + d_c + x, x_half,
+                    clear ? 0.0f : sum / static_cast<float>(n_fast));
+            }
+        }
     }
     for (int n = tid; n < N; n += nt) age_next[n] = (clear || slot_of[n] >= 0) ? 0 : age[n] + 1;
     if (has_pos && tid == 0)
@@ -918,6 +951,479 @@ extern "C" __global__ void hsn_win_cell_update(HsnWinArgs a) {
     if (tid % 32 == 0) atomicMax(top, mine);
     __syncthreads();
     if (tid == 0) *h_max = __int_as_float(*top);
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * P2.10c: the reverse sweep of the state-gradient window (hsn.train.state_sweep.ReverseSweep).
+ * A position is three launches with the cell's two transposed unit layers (cuBLAS) between
+ * them; one block per batch row. The buffers are the sweep's static buffers:
+ *   A [B,N,d], R [B,d]            the state's cotangent, carried from position to position (f32)
+ *   record  [B,T,K,..]            c, b, h_old, y, gate_pre, m (f32), rms [B,T,K], hidden [B,T,K,H]
+ *                                 (f32 | bf16), cells, units (i64; 0 on padded slots), valid (u8)
+ *   operands                      op1 [B Kr, M d], op2 [B Kr, M H + d] of the routed slots
+ *                                 (Kr = K - F), zero outside one unit block per row (and op2's
+ *                                 last d columns, the gate's); op1_fast [F,B,d], op2_fast
+ *                                 [F,B,H+d] of the slots with a fixed unit (f32 | bf16)
+ * Every reduction has a fixed order, and a cell's cotangent is written by one thread: the result
+ * does not depend on how the threads are scheduled.
+ * ---------------------------------------------------------------------------------------------- */
+namespace {
+/* The derivative of model.activation at x (hsn.train.state_gradient.activation_grad):
+ * 0 gelu (erf), 1 relu, 2 silu, 3 tanh. */
+__device__ __forceinline__ float activation_grad(float x, int code) {
+    if (code == 0)
+        return 0.5f * (1.0f + erff(x * 0.7071067811865475244f))
+            + x * expf(-0.5f * x * x) * 0.3989422804014326779f;
+    if (code == 1) return x > 0.0f ? 1.0f : 0.0f;
+    if (code == 2) {
+        const float s = sigmoidf(x);
+        return s * (1.0f + x * (1.0f - s));
+    }
+    const float th = tanhf(x);
+    return 1.0f - th * th;
+}
+}  // namespace
+
+/* What keeps these three kernels short (measured on their first versions, which took 100, 34
+ * and 104 us per position at 20 slots): no kernel multiplies a matrix (W_out is folded into the
+ * transposed second layer's operand weights and V with the cell norm's gain into the transposed
+ * first layer's, so the two cuBLAS products deliver what the kernels need); a slot's sums are
+ * folded by warp shuffles, not by one thread walking shared memory with a stride that puts a
+ * warp's lanes on one bank; and a thread issues all the global reads of its elements before it
+ * uses any (a core runs in order: a read that is consumed at once holds back the next).
+ */
+#define HSN_BACK_BATCH 8
+
+/* Head of position t: the carry of the split window's recurrence, the candidate's backward and
+ * the gate's backward.
+ *   R += d_q_post[t];  A[i] += d_h_fast[t, i] (i < n_read);  carried_k = A[cell_k] + d_h_sel[t, k]
+ *   g = carried + R / N;  dc = b g;  db = (c - h_old) g;  A[cell_k] = (1 - b) carried - b R / N
+ *   dz = dc (1 - c^2);  dy = rho gain dz - rho^3 y mean(y gain dz)  (rho = rsqrt(mean(y^2) + eps);
+ *   without the candidate norm dy = dz);  dg = db b (1 - b)
+ * and writes dc, db (record t), dy into the slot's unit block of op1 (clearing the block position
+ * t + 1 used) or into op1_fast, dg into the gate's columns of op2 / op2_fast, and the gate's part
+ * of the cell norm's inner product, sum_x dg (gate_pre - gate_bias), into sigma.
+ *   p: 0 A, 1 R; 2 c, 3 b, 4 h_old, 5 y; 6 cells, 7 units, 8 valid; 9 d_q_post [B,T,d],
+ *      10 d_h_sel [B,T,K,d], 11 d_h_fast [B,T,max(n_read,1),d]; 12 cand_gain [d];
+ *      13 gate_pre, 14 gate_bias [d]; 15 dc, 16 db [B,T,K,d]; 17 op1, 18 op1_fast, 19 op2,
+ *      20 op2_fast; 21 sigma [B,K].
+ *   i: 0 B, 1 T, 2 K, 3 d, 4 N, 5 M, 6 H, 7 F, 8 t, 9 n_read, 10 cand_norm, 11 operands are bf16.
+ *   f: 0 cand_eps.
+ * Shared: (2 d + 5 K + 2 K d + 3 ceil(K d / 32)) words.
+ */
+extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
+    extern __shared__ float shared[];
+    const int B = a.i[0], T = a.i[1], K = a.i[2], d = a.i[3], N = a.i[4], M = a.i[5], H = a.i[6];
+    const int F = a.i[7], t = a.i[8], n_read = a.i[9];
+    const bool cand_norm = a.i[10] != 0, half = a.i[11] != 0;
+    const float cand_eps = a.f[0];
+    const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    const int Kr = K - F;
+    const int64_t rt = static_cast<int64_t>(row) * T + t;
+    float* A = fout(a, 0) + static_cast<int64_t>(row) * N * d;
+    float* R = fout(a, 1) + static_cast<int64_t>(row) * d;
+    const float* c = fptr(a, 2) + rt * K * d;
+    const float* b = fptr(a, 3) + rt * K * d;
+    const float* h_old = fptr(a, 4) + rt * K * d;
+    const float* y = fptr(a, 5) + rt * K * d;
+    const int64_t* cells = static_cast<const int64_t*>(a.p[6]) + rt * K;
+    const int64_t* units = static_cast<const int64_t*>(a.p[7]) + rt * K;
+    const uint8_t* valid = static_cast<const uint8_t*>(a.p[8]) + rt * K;
+    const float* post = fptr(a, 9) + rt * d;
+    const float* sel = fptr(a, 10) + rt * K * d;
+    const float* fast_cot = fptr(a, 11) + rt * (n_read > 0 ? n_read : 1) * d;
+    const float* cand_gain = fptr(a, 12);
+    const float* gate_pre = fptr(a, 13) + rt * K * d;
+    const float* gate_bias = fptr(a, 14);
+    float* dc = fout(a, 15) + rt * K * d;
+    float* db = fout(a, 16) + rt * K * d;
+    float* sigma = fout(a, 21) + static_cast<int64_t>(row) * K;
+    const int groups = (K * d + 31) / 32;                    // warps' worth of slot elements
+    float* Rs = shared;                                      // [d] R after d_q_post
+    float* gain = Rs + d;                                    // [d] the candidate norm's gain
+    int* cell_of = reinterpret_cast<int*>(gain + d);         // [K] the slot's cell, -1 if padded
+    int* unit_now = cell_of + K;                             // [K] the slot's unit
+    int* unit_before = unit_now + K;                         // [K] its unit at t + 1, -1 if none
+    float* rho = reinterpret_cast<float*>(unit_before + K);  // [K]
+    float* dot = rho + K;                                    // [K] mean(y gain dz)
+    float* dz = dot + K;                                     // [K, d]
+    float* ys = dz + K * d;                                  // [K, d]
+    float* part = ys + K * d;                                // [3, groups] a warp's sums
+    const int d_shift = log2_or_minus1(d);
+    for (int x = tid; x < d; x += nt) {
+        const float r = R[x] + post[x];
+        Rs[x] = r;
+        R[x] = r;
+        gain[x] = cand_norm ? cand_gain[x] : 1.0f;
+    }
+    for (int k = tid; k < K; k += nt) {
+        cell_of[k] = valid[k] ? static_cast<int>(cells[k]) : -1;
+        unit_now[k] = static_cast<int>(units[k]);
+        unit_before[k] = t + 1 < T ? static_cast<int>(units[K + k]) : -1;
+    }
+    __syncthreads();
+    const float inv_n = 1.0f / static_cast<float>(N);
+    const int wide = M * H + d;
+    // warps fold their 32 elements when a slot is a whole number of warps; else a thread per slot
+    const bool lanes = (d & 31) == 0 && (nt & 31) == 0;
+    for (int e = tid; e < groups * 32; e += nt) {
+        float sq = 0.0f, dt = 0.0f, sg = 0.0f;
+        if (e < K * d) {
+            const int k = quot(e, d, d_shift), x = rem(e, d, d_shift);
+            const int n = cell_of[k], at = n >= 0 ? n : 0;
+            // every read first
+            const float a0 = A[at * d + x];
+            const float f0 = n_read > 0 ? fast_cot[(at < n_read ? at : 0) * d + x] : 0.0f;
+            const float s0 = sel[e], gate = b[e], cv = c[e], h0 = h_old[e], y0 = y[e];
+            const float gp = gate_pre[e], gb = gate_bias[x];
+            float dcv = 0.0f, dbv = 0.0f, dzv = 0.0f, dgv = 0.0f, yv = 0.0f;
+            if (n >= 0) {
+                const float carried = a0 + (at < n_read ? f0 : 0.0f) + s0;
+                const float share = Rs[x] * inv_n;
+                const float g = carried + share;
+                dcv = gate * g;
+                dbv = (cv - h0) * g;
+                A[n * d + x] = (1.0f - gate) * carried - gate * share;
+                dzv = dcv * (1.0f - cv * cv);
+                dgv = dbv * gate * (1.0f - gate);
+                yv = y0;
+                sq = yv * yv;
+                dt = yv * (gain[x] * dzv);
+                sg = dgv * (gp - gb);
+            }
+            dc[e] = dcv;
+            db[e] = dbv;
+            dz[e] = dzv;
+            ys[e] = yv;
+            if (k >= F)  // the gate's columns of the first layer's operand
+                store_value(a.p[19], (static_cast<int64_t>(row) * Kr + (k - F)) * wide + M * H + x,
+                    half, dgv);
+            else
+                store_value(a.p[20], (static_cast<int64_t>(k) * B + row) * (H + d) + H + x, half, dgv);
+        }
+        if (lanes) {
+            for (int w = 16; w > 0; w >>= 1) {
+                sq += __shfl_xor_sync(0xffffffff, sq, w);
+                dt += __shfl_xor_sync(0xffffffff, dt, w);
+                sg += __shfl_xor_sync(0xffffffff, sg, w);
+            }
+            if ((tid & 31) == 0) {
+                part[e >> 5] = sq;
+                part[groups + (e >> 5)] = dt;
+                part[2 * groups + (e >> 5)] = sg;
+            }
+        }
+    }
+    // a fast cell no slot wrote keeps its state: its read's cotangent joins the carried one
+    for (int e = tid; e < n_read * d; e += nt) {
+        const int n = quot(e, d, d_shift);
+        bool written = false;
+        for (int k = 0; k < K; ++k) written = written || cell_of[k] == n;
+        if (!written) A[e] += fast_cot[e];
+    }
+    __syncthreads();
+    if (tid < K) {  // per slot: the candidate norm's two means, and the gate's part of sigma
+        float sq = 0.0f, dt = 0.0f, sg = 0.0f;
+        if (lanes) {
+            const int first = (tid * d) >> 5, count = d >> 5;
+            for (int w = 0; w < count; ++w) {
+                sq += part[first + w];
+                dt += part[groups + first + w];
+                sg += part[2 * groups + first + w];
+            }
+        } else {
+            for (int x = 0; x < d; ++x) {
+                const float yv = ys[tid * d + x], dzv = dz[tid * d + x];
+                sq += yv * yv;
+                dt += yv * (gain[x] * dzv);
+                if (cell_of[tid] >= 0) {
+                    const float gate = b[tid * d + x];
+                    const float dgv = db[tid * d + x] * gate * (1.0f - gate);
+                    sg += dgv * (gate_pre[tid * d + x] - gate_bias[x]);
+                }
+            }
+        }
+        rho[tid] = rsqrtf(sq / static_cast<float>(d) + cand_eps);
+        dot[tid] = dt / static_cast<float>(d);
+        sigma[tid] = sg;
+    }
+    __syncthreads();
+    for (int e = tid; e < K * d; e += nt) {  // dy, into the slot's unit block
+        const int k = quot(e, d, d_shift), x = rem(e, d, d_shift);
+        float value = dz[e];
+        if (cand_norm) {
+            const float r = rho[k];
+            value = r * (gain[x] * value) - r * r * r * ys[e] * dot[k];
+        }
+        if (cell_of[k] < 0) value = 0.0f;
+        if (k >= F) {
+            const int64_t base = (static_cast<int64_t>(row) * Kr + (k - F)) * (M * d);
+            const int u = unit_now[k], before = unit_before[k];
+            if (before >= 0 && before != u) store_value(a.p[17], base + before * d + x, half, 0.0f);
+            store_value(a.p[17], base + u * d + x, half, value);
+        } else {
+            store_value(a.p[18], (static_cast<int64_t>(k) * B + row) * d + x, half, value);
+        }
+    }
+}
+
+/* Middle of position t: the activation's derivative on the second layer's transposed product and
+ * the unit's part of the cell norm's inner product.
+ *   dhid = act (.) activation'(hid);  sigma_k += sum_h dhid (hid - b1[unit_k])
+ * and writes dhid into the slot's unit block of op2 (clearing the block position t + 1 used) or
+ * into op2_fast.
+ *   p: 0 act_r [B Kr, H], 1 act_f [F,B,H] (f32 | bf16); 2 hidden [B,T,K,H] (f32 | bf16);
+ *      3 units, 4 valid; 5 b1 [M,H] f32; 6 op2, 7 op2_fast; 8 sigma [B,K] f32.
+ *   i: 0 B, 1 T, 2 K, 3 d, 4 M, 5 H, 6 F, 7 t, 8 the products and operands are bf16,
+ *      9 hidden is bf16, 10 the activation's code.
+ * Shared: (3 K + K blockDim / 32) words. K <= 32 (a thread keeps one partial sum per slot).
+ * With bf16 buffers, H a multiple of 128 dividing 4 blockDim and d a multiple of 4, a thread
+ * reads and stores four values at a time (the same values; sigma's sum in another order).
+ */
+extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
+    extern __shared__ float shared[];
+    const int B = a.i[0], T = a.i[1], K = a.i[2], d = a.i[3], M = a.i[4], H = a.i[5];
+    const int F = a.i[6], t = a.i[7], code = a.i[10];
+    const bool half = a.i[8] != 0, hid_half = a.i[9] != 0;
+    const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    const int Kr = K - F, warps = nt / 32;
+    const int64_t rt = static_cast<int64_t>(row) * T + t;
+    const int64_t* units = static_cast<const int64_t*>(a.p[3]) + rt * K;
+    const uint8_t* valid = static_cast<const uint8_t*>(a.p[4]) + rt * K;
+    const float* b1 = fptr(a, 5);
+    float* sigma = fout(a, 8) + static_cast<int64_t>(row) * K;
+    int* ok = reinterpret_cast<int*>(shared);             // [K]
+    int* unit_now = ok + K;                               // [K]
+    int* unit_before = unit_now + K;                      // [K]
+    float* part = reinterpret_cast<float*>(unit_before + K);  // [K, warps]
+    for (int k = tid; k < K; k += nt) {
+        ok[k] = valid[k];
+        unit_now[k] = static_cast<int>(units[k]);
+        unit_before[k] = t + 1 < T ? static_cast<int>(units[K + k]) : -1;
+    }
+    __syncthreads();
+    const int wide = M * H + d;
+    const int64_t act_row = static_cast<int64_t>(row) * Kr * H;   // this row's routed slots
+    const int64_t op_row = static_cast<int64_t>(row) * Kr * wide;
+    const int64_t hid_row = rt * K * H;
+    // Four bf16 values per read and per store (measured: of this kernel's 34 us per position at
+    // 20 slots, 21 were its reads, one value at a time). A thread owns four consecutive hidden
+    // indices; the block's threads split into groups of H / 4, group g walking the slots
+    // g, g + G, ...; a slot's sum is folded by its group's warps. Needs bf16 buffers on
+    // sixteen-byte bases whose rows start on eight bytes (H and d multiples of 4), the biases
+    // on sixteen bytes, and whole warps per group.
+    const int chunks = H >> 2;
+    uintptr_t bases = reinterpret_cast<uintptr_t>(a.p[2]) | reinterpret_cast<uintptr_t>(a.p[5]);
+    if (Kr > 0) bases |= reinterpret_cast<uintptr_t>(a.p[0]) | reinterpret_cast<uintptr_t>(a.p[6]);
+    if (F > 0) bases |= reinterpret_cast<uintptr_t>(a.p[1]) | reinterpret_cast<uintptr_t>(a.p[7]);
+    if (half && hid_half && (H & 127) == 0 && (d & 3) == 0 && nt % chunks == 0
+        && (bases & 15) == 0) {
+        const int G = nt / chunks, g = tid / chunks, h0 = (tid - g * chunks) << 2;
+        const int group_warps = chunks >> 5;
+        const uint16_t* act_r = static_cast<const uint16_t*>(a.p[0]);
+        const uint16_t* act_f = static_cast<const uint16_t*>(a.p[1]);
+        const uint16_t* hid = static_cast<const uint16_t*>(a.p[2]) + hid_row;
+        uint16_t* op = static_cast<uint16_t*>(a.p[6]) + op_row;
+        uint16_t* op_fast = static_cast<uint16_t*>(a.p[7]);
+        for (int k = g; k < K; k += G) {
+            const int u = unit_now[k];
+            const uint16_t* from = k >= F
+                ? act_r + act_row + static_cast<int64_t>(k - F) * H + h0
+                : act_f + (static_cast<int64_t>(k) * B + row) * H + h0;
+            const uint64_t act4 = *reinterpret_cast<const uint64_t*>(from);
+            const uint64_t hid4 =
+                *reinterpret_cast<const uint64_t*>(hid + static_cast<int64_t>(k) * H + h0);
+            const float4 bias4 = *reinterpret_cast<const float4*>(b1 + u * H + h0);
+            float sum = 0.0f;
+            uint64_t out = 0;
+            if (ok[k]) {
+                const float bs[4] = {bias4.x, bias4.y, bias4.z, bias4.w};
+                for (int i = 0; i < 4; ++i) {
+                    const float da = bf16_to_float(static_cast<uint16_t>(act4 >> (16 * i)));
+                    const float hv = bf16_to_float(static_cast<uint16_t>(hid4 >> (16 * i)));
+                    const float dh = da * activation_grad(hv, code);
+                    sum += dh * (hv - bs[i]);
+                    out |= static_cast<uint64_t>(float_to_bf16(dh)) << (16 * i);
+                }
+            }
+            if (k >= F) {
+                uint16_t* base = op + static_cast<int64_t>(k - F) * wide;
+                const int before = unit_before[k];
+                if (before >= 0 && before != u)
+                    *reinterpret_cast<uint64_t*>(base + before * H + h0) = 0;
+                *reinterpret_cast<uint64_t*>(base + u * H + h0) = out;
+            } else {
+                *reinterpret_cast<uint64_t*>(
+                    op_fast + (static_cast<int64_t>(k) * B + row) * (H + d) + h0) = out;
+            }
+            for (int w = 16; w > 0; w >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, w);
+            if ((tid & 31) == 0) part[k * warps + (tid >> 5) % group_warps] = sum;
+        }
+        __syncthreads();
+        if (tid < K) {
+            float total = 0.0f;
+            for (int w = 0; w < group_warps; ++w) total += part[tid * warps + w];
+            sigma[tid] += total;
+        }
+        return;
+    }
+    float acc[32];
+    for (int k = 0; k < K; ++k) acc[k] = 0.0f;
+    // a thread owns the hidden indices h = tid, tid + nt, ... and walks the slots for each: the
+    // slots' reads go out a batch at a time, before any is used
+    for (int h = tid; h < H; h += nt) {
+        for (int k0 = 0; k0 < K; k0 += HSN_BACK_BATCH) {
+            const int count = K - k0 < HSN_BACK_BATCH ? K - k0 : HSN_BACK_BATCH;
+            float da[HSN_BACK_BATCH], hv[HSN_BACK_BATCH], bias[HSN_BACK_BATCH];
+            for (int i = 0; i < count; ++i) {
+                const int k = k0 + i;
+                da[i] = k >= F
+                    ? load_value(a.p[0], act_row + static_cast<int64_t>(k - F) * H + h, half)
+                    : load_value(a.p[1], (static_cast<int64_t>(k) * B + row) * H + h, half);
+                hv[i] = load_value(a.p[2], hid_row + static_cast<int64_t>(k) * H + h, hid_half);
+                bias[i] = b1[unit_now[k] * H + h];
+            }
+            for (int i = 0; i < count; ++i) {
+                const int k = k0 + i;
+                const int u = unit_now[k];
+                float dh = 0.0f;
+                if (ok[k]) {
+                    dh = da[i] * activation_grad(hv[i], code);
+                    acc[k] += dh * (hv[i] - bias[i]);
+                }
+                if (k >= F) {
+                    const int64_t base = op_row + static_cast<int64_t>(k - F) * wide;
+                    const int before = unit_before[k];
+                    if (before >= 0 && before != u)
+                        store_value(a.p[6], base + before * H + h, half, 0.0f);
+                    store_value(a.p[6], base + u * H + h, half, dh);
+                } else {
+                    store_value(a.p[7], (static_cast<int64_t>(k) * B + row) * (H + d) + h, half, dh);
+                }
+            }
+        }
+    }
+    for (int k = 0; k < K; ++k) {  // each slot's sum: the lanes of a warp, then the warps in order
+        float s = acc[k];
+        for (int w = 16; w > 0; w >>= 1) s += __shfl_xor_sync(0xffffffff, s, w);
+        if ((tid & 31) == 0) part[k * warps + (tid >> 5)] = s;
+    }
+    __syncthreads();
+    if (tid < K) {
+        float s = 0.0f;
+        for (int w = 0; w < warps; ++w) s += part[tid * warps + w];
+        sigma[tid] += s;
+    }
+}
+
+/* Tail of position t: the cell norm's backward on the first layer's transposed product and the
+ * cotangent of the state position t reads. The product arrives with the norm's gain and V folded
+ * in: prod = [gain_h (.) dv_h ; (gain_m (.) dv_m) V] (without the cell norm [dv_h ; dv_m V]).
+ *   dh  = rms prod_h - (rms^2 / n) sigma h_old;   dvm = rms prod_m - (rms^2 / n) sigma (m V)
+ *   (without the cell norm dh = prod_h, dvm = prod_m)
+ *   A[cell_k] += dh_k;  A[n] += sum_j out_w[n, j] dvm[slot of out_tgt[n, j]]   (j in order)
+ *   R += d_q_pre[t];  A, R = 0 on a row that resets at t.
+ *   p: 0 A, 1 R; 2 prod_r [B Kr, 2d], 3 prod_f [F,B,2d] (f32 | bf16); 4 sigma [B,K];
+ *      5 rms [B,T,K]; 6 h_old, 7 mv [B,T,K,d] (m V); 8 cells, 9 valid;
+ *      10 out_tgt [N,D_out] i32 (-1 on padding), 11 out_w [N,D_out] f32; 12 d_q_pre [B,T,d];
+ *      13 reset [B,T] u8.
+ *   i: 0 B, 1 T, 2 K, 3 d, 4 N, 5 F, 6 t, 7 D_out, 8 cell_norm, 9 n (the cell input's width),
+ *      10 the product is bf16.
+ * Shared: (3 K + N + 2 K d + 2 N D_out) words.
+ */
+extern "C" __global__ void hsn_win_back_tail(HsnWinArgs a) {
+    extern __shared__ float shared[];
+    const int B = a.i[0], T = a.i[1], K = a.i[2], d = a.i[3], N = a.i[4], F = a.i[5];
+    const int t = a.i[6], D_out = a.i[7], in_dim = a.i[9];
+    const bool cell_norm = a.i[8] != 0, half = a.i[10] != 0;
+    const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    const int Kr = K - F, two = 2 * d;
+    const int64_t rt = static_cast<int64_t>(row) * T + t;
+    float* A = fout(a, 0) + static_cast<int64_t>(row) * N * d;
+    float* R = fout(a, 1) + static_cast<int64_t>(row) * d;
+    const float* sigma = fptr(a, 4) + static_cast<int64_t>(row) * K;
+    const float* rms = fptr(a, 5) + rt * K;
+    const float* h_old = fptr(a, 6) + rt * K * d;
+    const float* mv = fptr(a, 7) + rt * K * d;
+    const int64_t* cells = static_cast<const int64_t*>(a.p[8]) + rt * K;
+    const uint8_t* valid = static_cast<const uint8_t*>(a.p[9]) + rt * K;
+    const int32_t* out_tgt = static_cast<const int32_t*>(a.p[10]);
+    const float* out_w = fptr(a, 11);
+    const float* pre = fptr(a, 12) + rt * d;
+    const bool cut = static_cast<const uint8_t*>(a.p[13])[rt] != 0;
+    int* cell_of = reinterpret_cast<int*>(shared);          // [K]
+    int* slot_of = cell_of + K;                             // [N] the slot that holds the cell
+    float* scale = reinterpret_cast<float*>(slot_of + N);   // [K] rms
+    float* back = scale + K;                                // [K] (rms^2 / n) sigma
+    float* ds = back + K;                                   // [K, 2d]: dh, then dvm
+    int* tgt = reinterpret_cast<int*>(ds + K * two);        // [N, D_out]
+    float* wgt = reinterpret_cast<float*>(tgt + N * D_out); // [N, D_out]
+    const int d_shift = log2_or_minus1(d);
+    const float per = 1.0f / static_cast<float>(in_dim);
+    for (int k = tid; k < K; k += nt) {
+        const float r = cell_norm ? rms[k] : 1.0f;
+        cell_of[k] = valid[k] ? static_cast<int>(cells[k]) : -1;
+        scale[k] = r;
+        back[k] = cell_norm ? r * r * per * sigma[k] : 0.0f;
+    }
+    for (int e = tid; e < N * D_out; e += nt) {
+        tgt[e] = out_tgt[e];
+        wgt[e] = out_w[e];
+    }
+    __syncthreads();
+    for (int n = tid; n < N; n += nt) {
+        int k = -1;
+        for (int j = 0; j < K; ++j) k = cell_of[j] == n ? j : k;
+        slot_of[n] = k;
+    }
+    for (int e0 = tid; e0 < K * two; e0 += HSN_BACK_BATCH * nt) {
+        float prod[HSN_BACK_BATCH], read[HSN_BACK_BATCH];
+        for (int i = 0; i < HSN_BACK_BATCH; ++i) {  // the batch's reads
+            const int e = e0 + i * nt;
+            if (e >= K * two) break;
+            const int k = e / two, j = e - k * two;
+            prod[i] = k >= F
+                ? load_value(a.p[2], (static_cast<int64_t>(row) * Kr + (k - F)) * two + j, half)
+                : load_value(a.p[3], (static_cast<int64_t>(k) * B + row) * two + j, half);
+            read[i] = j < d ? h_old[k * d + j] : mv[k * d + j - d];
+        }
+        for (int i = 0; i < HSN_BACK_BATCH; ++i) {
+            const int e = e0 + i * nt;
+            if (e >= K * two) break;
+            const int k = e / two;
+            ds[e] = cell_of[k] >= 0 ? scale[k] * prod[i] - back[k] * read[i] : 0.0f;
+        }
+    }
+    __syncthreads();
+    for (int e0 = tid; e0 < N * d; e0 += HSN_BACK_BATCH * nt) {
+        float value[HSN_BACK_BATCH];
+        for (int i = 0; i < HSN_BACK_BATCH; ++i) {  // the batch's reads
+            const int e = e0 + i * nt;
+            if (e >= N * d) break;
+            value[i] = A[e];
+        }
+        for (int i = 0; i < HSN_BACK_BATCH; ++i) {
+            const int e = e0 + i * nt;
+            if (e >= N * d) break;
+            const int n = quot(e, d, d_shift), x = rem(e, d, d_shift);
+            const int k = slot_of[n];
+            bool touched = k >= 0;
+            float v = value[i];
+            if (k >= 0) v += ds[k * two + x];
+            for (int j = 0; j < D_out; ++j) {
+                const int target = tgt[n * D_out + j];
+                if (target < 0) continue;
+                const int s = slot_of[target];
+                if (s >= 0) {
+                    v += wgt[n * D_out + j] * ds[s * two + d + x];
+                    touched = true;
+                }
+            }
+            if (cut) A[e] = 0.0f;
+            else if (touched) A[e] = v;
+        }
+    }
+    for (int x = tid; x < d; x += nt) R[x] = cut ? 0.0f : R[x] + pre[x];
 }
 
 /* The trainer's per-step passes (P2.10b) share this fatbin and its launcher. */

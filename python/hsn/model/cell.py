@@ -117,6 +117,16 @@ class WindowConsts(NamedTuple):
     #: serves both (:meth:`UnitBank.forward_static_chosen`'s rider). ``None``: two matmuls.
     w1_gate: Tensor | None = None
     b1_gate: Tensor | None = None
+    #: P2.10c (amendment A8 with ``model.fast_units = fixed``): the weights of the first ``F``
+    #: slots' fixed units, stacked per slot (:meth:`UnitBank.slot_layout`; ``fast_w1`` with the
+    #: gate's columns where ``w1_gate`` has them). With them the static rounds multiply a fast
+    #: slot's pairs with its own unit's weights instead of every unit's. ``None``: every slot
+    #: takes the all-units pass, as before. Only the split window's sweep sets them
+    #: (:meth:`PDGCell.window_consts` with ``fast_slots``).
+    fast_w1: Tensor | None = None
+    fast_b1: Tensor | None = None
+    fast_w2: Tensor | None = None
+    fast_b2: Tensor | None = None
 
 
 def _mix(alpha: Tensor, unit_out: Tensor) -> Tensor:
@@ -227,14 +237,20 @@ class PDGCell(nn.Module):
             finally:
                 self._in_window = previous
 
-    def window_consts(self) -> WindowConsts:
+    def window_consts(self, fast_slots: int = 0) -> WindowConsts:
         """The :class:`WindowConsts` of this window (P2.8): the same tensors the rounds of the
-        window read from the caches. Only inside :meth:`window`."""
+        window read from the caches. Only inside :meth:`window`. ``fast_slots = F > 0`` (P2.10c:
+        the split window's sweep of a model with ``model.fast_units = fixed``) adds the layouts
+        of the first ``F`` slots' fixed units; ``0`` (default): the constants as before."""
         if not self._in_window:
             raise RuntimeError("PDGCell.window_consts is only available inside PDGCell.window()")
-        return WindowConsts(
+        consts = WindowConsts(
             edge_weights=self.graph._padded_weights(), w1_flat=self.units._w1_flat()
         )
+        if not fast_slots:
+            return consts
+        fast_w1, fast_b1, fast_w2, fast_b2 = self.units.slot_layout(fast_slots)
+        return consts._replace(fast_w1=fast_w1, fast_b1=fast_b1, fast_w2=fast_w2, fast_b2=fast_b2)
 
     # ----------------------------------------------------------------------------------------------
     # The dense round
@@ -380,7 +396,20 @@ class PDGCell(nn.Module):
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
             with profiler_segment(profiler, "selected_cells", B):
-                if static:  # P2.8: every unit on the pairs, then a gather (no histogram)
+                if static and consts is not None and consts.fast_w1 is not None:
+                    # P2.10c: the fast slots against their own unit's weights, the others as below
+                    assert consts.fast_b1 is not None
+                    assert consts.fast_w2 is not None and consts.fast_b2 is not None
+                    unit_out = self.units.forward_static_slots(
+                        v,
+                        units,
+                        consts.fast_w1,
+                        consts.fast_b1,
+                        consts.fast_w2,
+                        consts.fast_b2,
+                        w1_flat=w1_flat,
+                    )
+                elif static:  # P2.8: every unit on the pairs, then a gather (no histogram)
                     unit_out = native.grouped_unit_mlp(
                         v.reshape(B * K, in_dim),
                         units.reshape(B * K),
@@ -470,7 +499,26 @@ class PDGCell(nn.Module):
             v = self.norm(native.gather_concat(u_read, eps, h_read, m, cells))
             flat = v.reshape(B * K, self.in_dim)
             w2_flat = consts.w2_flat if consts.w2_flat is not None else self.units._w2_flat()
-            if consts.w1_gate is not None and consts.b1_gate is not None:
+            merged = consts.w1_gate is not None and consts.b1_gate is not None
+            if consts.fast_w1 is not None:
+                # P2.10c: the fast slots against their own unit's weights (WindowConsts)
+                assert consts.fast_b1 is not None
+                assert consts.fast_w2 is not None and consts.fast_b2 is not None
+                unit_out, rider = self.units.forward_static_chosen_slots(
+                    v,
+                    units,
+                    consts.fast_w1,
+                    consts.fast_b1,
+                    consts.fast_w2,
+                    consts.fast_b2,
+                    w1_flat=consts.w1_flat
+                    if consts.w1_gate is None or not merged
+                    else consts.w1_gate,
+                    w2_flat=w2_flat,
+                    b1_flat=consts.b1_gate if merged else None,
+                )
+                gate = (self.gate(v) if rider is None else rider).to(state.dtype)
+            elif consts.w1_gate is not None and consts.b1_gate is not None:
                 unit_out, rider = self.units.forward_static_chosen(
                     flat,
                     units.reshape(B * K),
@@ -524,19 +572,44 @@ class PDGCell(nn.Module):
             )
             u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
             v = self.norm(native.gather_concat(u_read, eps, h_read, m, cells))
-            unit_out, rider = self.units.forward_static_chosen(
-                v.reshape(B * K, self.in_dim),
-                units.reshape(B * K),
-                w1_flat=consts.w1_gate,
-                w2_flat=consts.w2_flat,
-                b1_flat=consts.b1_gate,
-            )
-            assert rider is not None
+            if consts.fast_w1 is not None:
+                # P2.10c: the fast slots against their own unit's weights; the gate is then a
+                # dense [B * K, d] tensor of the same values, not a view of one wider product
+                assert consts.fast_b1 is not None
+                assert consts.fast_w2 is not None and consts.fast_b2 is not None
+                unit_out, rider = self.units.forward_static_chosen_slots(
+                    v,
+                    units,
+                    consts.fast_w1,
+                    consts.fast_b1,
+                    consts.fast_w2,
+                    consts.fast_b2,
+                    w1_flat=consts.w1_gate,
+                    w2_flat=consts.w2_flat,
+                    b1_flat=consts.b1_gate,
+                )
+                assert rider is not None
+                rider = rider.reshape(B * K, d)
+            else:
+                unit_out, rider = self.units.forward_static_chosen(
+                    v.reshape(B * K, self.in_dim),
+                    units.reshape(B * K),
+                    w1_flat=consts.w1_gate,
+                    w2_flat=consts.w2_flat,
+                    b1_flat=consts.b1_gate,
+                )
+                assert rider is not None
             y: Tensor = self.W_out(unit_out.reshape(B, K, d))
         return rider, y
 
     def replay_sparse(
-        self, u: Tensor, eps: Tensor, h_read: Tensor, sel: Selection
+        self,
+        u: Tensor,
+        eps: Tensor,
+        h_read: Tensor,
+        sel: Selection,
+        *,
+        record: dict[str, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
         """The candidate and the gate of :meth:`step_sparse` without the state update (P2.10, the
         split window's replay): ``(c, b)``, each ``[R, K, d]`` in ``h_read``'s dtype, for ``R``
@@ -547,7 +620,18 @@ class PDGCell(nn.Module):
         :meth:`step_sparse` in the same order: messages, inputs, norm, gate, the unit bank's
         grouped pass (one unit per pair, :meth:`UnitBank.forward_grouped`), ``W_out``, the
         candidate norm, ``tanh``. Only inside :meth:`window` (the edge weights and ``W1`` layout
-        are the window's)."""
+        are the window's).
+
+        ``record`` (P2.10c, :mod:`hsn.train.state_gradient`: the window without the ``state``
+        cut): a dict that receives what the reverse sweep reads of this pass, detached and in
+        ``h_read``'s dtype unless said: ``y [R, K, d]`` (``W_out``'s output, the candidate
+        norm's input), ``alpha [R, K]`` (the slot weights' values), ``hidden [R, K, H]`` (the
+        executed unit's first-layer pre-activation, in the unit bank's dtype), ``gate_pre
+        [R, K, d]`` (the gate before its sigmoid), ``m [R, K, d]`` (the messages) and ``rms
+        [R, K]`` (the cell norm's ``1 / sqrt(mean(v_raw²) + eps)``; absent with
+        ``model.cell_norm = none``). The state is still read as a constant here: ``(c, b)`` and
+        their graph are the local half of the gradient, and the sweep adds the half that
+        passes through the state. ``None`` (default): the pass above, bit for bit."""
         if not self._in_window:
             raise RuntimeError("PDGCell.replay_sparse is only available inside PDGCell.window()")
         if self.disabled_cells:
@@ -572,16 +656,31 @@ class PDGCell(nn.Module):
             u_read = None if self.ablate_shared_u else u  # model.ablate_shared_u: v without u
             v_raw = native_ops.gather_concat(u_read, eps, h_const, m, cells)  # [R, K, 4d]
             v = self.norm(v_raw)
-            b = torch.sigmoid(self.gate(v).to(dtype))
+            gate_pre = self.gate(v).to(dtype)
+            b = torch.sigmoid(gate_pre)
             unit_out = self.units.forward_grouped(
-                v.reshape(R * K, self.in_dim), units.reshape(R * K)
+                v.reshape(R * K, self.in_dim), units.reshape(R * K), record=record
             ).reshape(R, K, d)
             if self.cand_norm_kind == "none":
                 mixed = sel.alpha.unsqueeze(-1) * unit_out
-                c = torch.tanh(self.W_out(mixed).to(dtype))
+                y = self.W_out(mixed).to(dtype)
+                c = torch.tanh(y)
             else:
-                pre = self.cand_norm(self.W_out(unit_out).to(dtype))
+                y = self.W_out(unit_out).to(dtype)
+                pre = self.cand_norm(y)
                 c = torch.tanh(sel.alpha.unsqueeze(-1).to(dtype) * pre)
+            if record is not None:
+                record["y"] = y.detach()
+                record["alpha"] = sel.alpha.detach().to(dtype)
+                record["hidden"] = record["hidden"].reshape(R, K, self.units.hidden)
+                record["gate_pre"] = gate_pre.detach()
+                record["m"] = v_raw.detach()[..., self.in_dim - d :]
+                if isinstance(self.norm, nn.RMSNorm):
+                    eps_norm = self.norm.eps  # torch's default when unset: the dtype's epsilon
+                    if eps_norm is None:
+                        eps_norm = torch.finfo(dtype).eps
+                    mean_square = v_raw.detach().square().mean(dim=-1)
+                    record["rms"] = torch.rsqrt(mean_square + eps_norm)
         return c, b
 
     # ----------------------------------------------------------------------------------------------

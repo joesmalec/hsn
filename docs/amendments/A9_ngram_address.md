@@ -73,8 +73,10 @@ not part of this amendment.
 **Parameters:** `2·(n−1)·M` scorer weights (16 for `n = 2`). **Cost per position:**
 `2·(n−1)·N·d` MACs for the dot products (4,096 for `n = 2`), scorer work.
 
-**Windows.** Eager and compiled autograd windows. The split and fused windows refuse the key:
-their scorer layout has A5's two address columns.
+**Windows.** Eager and compiled autograd windows, and since P2.10c (13 Nov 2026) the split
+and fused windows: the scorer's scalars pass through their sweep and replay at whatever
+width, so the earlier refusal ("their scorer layout has A5's two address columns") was a
+scope statement for an untested combination (`docs/p2_10c_state_gradient_window.md`).
 
 ## The tasks (`configs/data/synthetic_keys.yaml`)
 

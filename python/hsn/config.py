@@ -1571,14 +1571,36 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
 )
 
 
-def split_window_scope_error(cfg: RunConfig) -> str | None:
+def split_window_scope_error(
+    cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
+) -> str | None:
     """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
-    ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is only
-    defined where the heavy backward work is local to its position (the full A6 feedback cut)
-    and for the routed hard-gate round it replays. A soft warm-up (``train.soft_until_step``)
-    is inside the scope: its steps run every cell with autograd, which is the autograd window's
-    work, so they take that window and the split window takes over at the first hard-gate step
-    (:meth:`hsn.train.split.SplitWindow.splits_now`)."""
+    ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is defined
+    for the routed hard-gate round it replays, with the ``summary``, ``eps`` and ``router``
+    feedback reads cut. With ``state`` cut as well (the full A6 cut) the heavy backward work is
+    local to its position and the state recurrence is P2.10's elementwise carry. Without it
+    (P2.10c, "the state gradient": ``docs/p2_10c_state_gradient_window.md``) the recurrence's
+    reverse sweep also carries the cell's read of the state position by position
+    (:mod:`hsn.train.state_gradient`, :mod:`hsn.train.state_sweep`); that sweep also takes
+    amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and ``fast_readout``),
+    which the full cut's recurrence does not.
+
+    A soft warm-up (``train.soft_until_step``) is inside the scope: its steps run every cell
+    with autograd, which is the autograd window's work, so they take that window and the split
+    window takes over at the first hard-gate step
+    (:meth:`hsn.train.split.SplitWindow.splits_now`).
+
+    ``state_gradient`` narrows the question to one of the two cuts (``True``: the state
+    gradient; ``False``: the full cut); ``None`` (default, what ``hardware.window`` is checked
+    against at load) accepts either.
+
+    Amendment A6's per-row limit (``train.state_grad_clip``, ``train.state_grad_ratio``) is
+    outside the scope: a run with it trains on the autograd window. ``row_limit=True`` admits
+    it with the state gradient, for the reference sweep that applies it
+    (:func:`hsn.train.state_gradient.state_gradient_backward` with ``limits``: plain PyTorch,
+    tested against the autograd window in float64). No kernel applies it, so on the card that
+    sweep would cost more than the autograd window, and the configuration is never offered
+    it."""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn":
         return f"model_name={cfg.model_name!r} is not the HSN"
@@ -1589,28 +1611,37 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
     if train.ste_scope != "selected":
         return f"train.ste_scope={train.ste_scope!r}: the masked round runs every cell"
     missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
-    if missing:
+    if missing not in ([], ["state"]):
         return (
-            f"train.feedback_detach lacks {missing}: without the full feedback cut the heavy "
-            "backward work is not local to its position"
+            f"train.feedback_detach lacks {missing}: without the summary, eps and router cuts "
+            "the heavy backward work is not local to its position (the state read alone may "
+            "carry gradient: its sweep runs position by position)"
+        )
+    sweeps_state = missing == ["state"]
+    if state_gradient is True and not sweeps_state:
+        return (
+            "train.feedback_detach holds every path: with the state read cut there is no "
+            "state gradient to sweep, and the split window of P2.10 is the window to use"
+        )
+    if state_gradient is False and sweeps_state:
+        return (
+            "train.feedback_detach lacks ['state']: the cell's read of the state carries "
+            "gradient, which the full cut's recurrence does not sweep"
         )
     if train.epsilon_start > 0.0 or train.epsilon_end > 0.0:
         return "train.epsilon_*: exploration draws are not replayed"
     if train.lambda_u > 0.0:
         return "train.lambda_u > 0: the counterfactual probes are untested with the split window"
-    if train.state_grad_clip is not None or train.state_grad_ratio is not None:
+    limited = train.state_grad_clip is not None or train.state_grad_ratio is not None
+    if limited and not (row_limit and sweeps_state):
         return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
     if model.disabled_cells:
         return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
-    if model.fast_cells:
+    if model.fast_cells and not sweeps_state:
         return (
-            f"model.fast_cells={model.fast_cells} (A8): the reserved slots and the fast read "
-            "are not built into the split window; use hardware.window=autograd"
-        )
-    if model.address_ngram > 1:
-        return (
-            f"model.address_ngram={model.address_ngram} (A9): the split window's scorer layout "
-            "has A5's two address columns only; use hardware.window=autograd"
+            f"model.fast_cells={model.fast_cells} (A8): the fast read of the decoder is part of "
+            "the state-gradient sweep only (train.feedback_detach=[summary, eps, router]); "
+            "with the full cut use hardware.window=autograd"
         )
     if model.address_gate:
         return (

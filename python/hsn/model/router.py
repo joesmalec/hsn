@@ -1880,6 +1880,8 @@ class Router(nn.Module):
         temperature: float = 1.0,
         dense_rows: Tensor | None = None,
         executed_scores: bool = True,
+        reserved: int = 0,
+        reserved_units: bool = False,
     ) -> Selection:
         """The :class:`Selection` of a decision that was already taken (P2.10, the split window's
         replay): ``cells`` / ``units`` / ``valid`` (``[B, K]``) and the threshold ``θ [B]`` are the
@@ -1888,11 +1890,21 @@ class Router(nn.Module):
         the cost) follow the recorded slots exactly, and ``logits`` only supply the gradient path
         of ``gate`` (:meth:`_finish`). No probes are flagged (``explored`` / ``refreshed`` are
         the recording's). ``dense_rows`` (bool ``[B]``) are the rows that ran the dense step
-        instead (:meth:`select`'s ``dense_rows``)."""
+        instead (:meth:`select`'s ``dense_rows``). ``reserved`` / ``reserved_units`` (amendment
+        A8) are :meth:`select`'s: the recorded decision's first ``reserved`` slots are the fast
+        cells, whose mask is the constant 1 and, with ``reserved_units``, whose unit weight is
+        a constant one-hot; ``0`` / ``False`` (default): the gradient path as before."""
         B, N, _ = self._check_logits(logits)
         dense = self._check_dense_rows(dense_rows, mode, B, logits.device)
         if mode not in SCORED_MODES:
             raise ValueError(f"finish_recorded needs a scored mode {SCORED_MODES}, got {mode!r}")
+        if reserved and (mode != "topk" or gate == "reinforce"):
+            raise ValueError(
+                f"reserved={reserved} needs mode='topk' without gate='reinforce', got "
+                f"mode={mode!r}, gate={gate!r}"
+            )
+        if reserved_units and not reserved:
+            raise ValueError("reserved_units needs reserved > 0")
         tau = self._check_gate_args(mode, gate, temperature, 0.0)
         K = int(cells.shape[1])
         device = logits.device
@@ -1912,6 +1924,8 @@ class Router(nn.Module):
             refreshed=none,
             dense=dense,
             executed_scores=executed_scores,
+            reserved=reserved,
+            reserved_units=reserved_units,
         )
 
     @staticmethod

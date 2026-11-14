@@ -42,7 +42,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-__all__ = ["TYPICAL_QUANTILE", "clip_row_grad", "row_norm", "typical_row"]
+__all__ = ["TYPICAL_QUANTILE", "clip_row_grad", "limit_row_grad", "row_norm", "typical_row"]
 
 
 def row_norm(grad: Tensor) -> Tensor:
@@ -75,6 +75,32 @@ def typical_row(norm: Tensor) -> Tensor:
     return typical
 
 
+def limit_row_grad(
+    grad: Tensor, limit: float | None, ratio: float | None, norm: Tensor | None = None
+) -> Tensor:
+    """``grad [B, ...]`` limited per row (module docstring): what :func:`clip_row_grad` does to
+    the gradient that arrives at it. Also what a hand-written backward applies where the
+    autograd window has a :func:`clip_row_grad` (:mod:`hsn.train.state_gradient`); ``norm``
+    (``[B, 1]``) is then the rows' norm where a step before already took it
+    (:func:`row_norm` by default)."""
+    flat = grad.flatten(1)
+    if norm is None:
+        norm = row_norm(grad)
+    finite = torch.isfinite(norm)
+    bound = torch.full_like(norm, float("inf"))
+    if limit is not None:
+        bound = bound.clamp_max(limit)
+    if ratio is not None:
+        bound = torch.minimum(bound, ratio * typical_row(norm))
+    over = finite & (norm > bound)
+    # an over row has norm > bound >= 0, so the division is safe; the others are not scaled
+    scale = torch.where(over, bound / norm.clamp_min(torch.finfo(flat.dtype).tiny), 1.0)
+    # under the limit: the gradient itself (no multiplication by 1.0 that could round)
+    out = torch.where(over, flat * scale, flat)
+    out = torch.where(finite, out, torch.zeros_like(out))
+    return out.view_as(grad)
+
+
 class _RowGradClip(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, x: Tensor, limit: float | None, ratio: float | None) -> Tensor:
@@ -84,21 +110,7 @@ class _RowGradClip(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad: Tensor) -> tuple[Tensor, None, None]:
-        flat = grad.flatten(1)
-        norm = row_norm(grad)
-        finite = torch.isfinite(norm)
-        bound = torch.full_like(norm, float("inf"))
-        if ctx.limit is not None:
-            bound = bound.clamp_max(ctx.limit)
-        if ctx.ratio is not None:
-            bound = torch.minimum(bound, ctx.ratio * typical_row(norm))
-        over = finite & (norm > bound)
-        # an over row has norm > bound >= 0, so the division is safe; the others are not scaled
-        scale = torch.where(over, bound / norm.clamp_min(torch.finfo(flat.dtype).tiny), 1.0)
-        # under the limit: the gradient itself (no multiplication by 1.0 that could round)
-        out = torch.where(over, flat * scale, flat)
-        out = torch.where(finite, out, torch.zeros_like(out))
-        return out.view_as(grad), None, None
+        return limit_row_grad(grad, ctx.limit, ctx.ratio), None, None
 
 
 def clip_row_grad(x: Tensor, limit: float | None = None, *, ratio: float | None = None) -> Tensor:
