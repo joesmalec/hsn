@@ -215,7 +215,10 @@ Under bf16 a rounding at the third digit reroutes every row within its first pos
 end in solutions that are equal on the bytes they trained on and far apart on bytes they never
 saw. Exp 585 fits the training bytes from the start (step 6,000: 97.1 against 67.5 %); exp 580
 after step 15,000; exp 584 keeps a gap of two to four points to the end (18,000 steps: 97.9
-against 95.8 / 97.1; never-seen bytes 98.7).
+against 95.8 / 97.1; never-seen bytes 98.7). A second seed of the plain arm (exp 586) ends at
+99.6 against 97.4 / 97.7 with never-seen bytes at 98.5 and no late fall. Of the four runs of
+this shape two keep unseen keys within two to three points of the training keys, one loses
+them late and one never has them.
 
 **Every run split by keys so far** (key-value answers, fresh documents, training keys against
 dev keys; pair task of synthetic_v1 unless "hold"):
@@ -225,7 +228,7 @@ dev keys; pair task of synthetic_v1 unless "hold"):
 | routed only, no gate | 97.7 / 97.2 (9k); 92.2 / 92.6 and 94.7 / 94.8 (27k) |
 | routed only, gate | 98.0 / 81.5 (9k, arm 2); 99.0 / 97.0 and 98.8 / 95.6 (27k); 99.2 / 99.1 (hold, 18k) |
 | fast cells, no gate | 96.1 / 90.9 (9k); 95.5 / 96.1 (hold, 18k) |
-| fast cells, gate | 99.4 / 98.7 and 98.5 / 96.3 (9k); 99.5 / 93.7 (27k); hold: 98.3 / 84.2, 97.9 / 95.8, 98.3 / 38.9 |
+| fast cells, gate | 99.4 / 98.7 and 98.5 / 96.3 (9k); 99.5 / 93.7 (27k); hold, 18k: 98.3 / 84.2 (exp 580), 97.9 / 95.8 (584), 98.6 / 32.8 (585), 99.6 / 97.4 (586, seed 1) |
 
 - Without the gate and without fast cells no run has a gap. The gate opens one in some runs
   with and without fast cells; the largest are with both.
