@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 import random
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -198,6 +198,7 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     *,
     averaged: bool = False,
+    allow_missing: Collection[str] = (),
 ) -> dict[str, Any]:
     """Load a checkpoint into ``model`` (and the optimiser and scheduler when given); return it.
 
@@ -210,6 +211,10 @@ def load_checkpoint(
     average in ``extra["weight_ema"]``; with ``averaged`` the average replaces the loaded
     weights, which is the model the run's evaluations scored. A checkpoint without an average
     loads as usual.
+
+    ``allow_missing`` (a warm start only, :func:`hsn.runner.warm_start`): state-dict keys of
+    ``model`` the checkpoint may lack; they keep the model's own values. Every other key must
+    match as with ``strict=True``, and a key the model does not have is always refused.
     """
     if averaged and (optimizer is not None or scheduler is not None):
         raise ValueError("load_checkpoint(averaged=True) is for evaluation only: no optimizer")
@@ -222,7 +227,16 @@ def load_checkpoint(
     fmt = loaded.get("format")
     if fmt != CHECKPOINT_FORMAT:
         raise ValueError(f"{file}: checkpoint format {fmt!r} != {CHECKPOINT_FORMAT}")
-    model.load_state_dict(loaded["model"], strict=True)
+    if allow_missing:
+        result = model.load_state_dict(loaded["model"], strict=False)
+        missing = sorted(set(result.missing_keys) - set(allow_missing))
+        if missing or result.unexpected_keys:
+            raise ValueError(
+                f"{file}: the checkpoint does not match the model: missing {missing}, "
+                f"unexpected {sorted(result.unexpected_keys)}"
+            )
+    else:
+        model.load_state_dict(loaded["model"], strict=True)
     if optimizer is not None:
         if loaded["optimizer"] is None:
             raise ValueError(f"{file}: checkpoint has no optimizer state to load")
@@ -234,7 +248,7 @@ def load_checkpoint(
     if averaged:
         from hsn.train.weight_ema import install_averaged
 
-        install_averaged(model, loaded.get("extra") or {}, str(file))
+        install_averaged(model, loaded.get("extra") or {}, str(file), allow_missing=allow_missing)
     return dict(loaded)
 
 

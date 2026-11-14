@@ -425,6 +425,8 @@ def window_state_stats(
                     if k in ("rank_pr", "abs_h")
                 }
             )
+    if "write_fraction" in info:  # A10: the share of the routed slots that may write
+        out["write/permitted"] = float(info["write_fraction"].float().mean())
     if model.cfg.routing != "dense":
         writes = written.float().sum(0)  # [N]
         share = writes / writes.sum().clamp_min(1)

@@ -395,6 +395,8 @@ class PDGCell(nn.Module):
                 v_raw = native.gather_concat(u_read, eps, h_read, m, cells)  # [B, K, 4d]
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
                 b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
+                if sel.write_mask is not None:  # A10: the write decision multiplies the gate
+                    b = b * sel.write_mask.gather(1, cells).unsqueeze(-1).to(state.dtype)
             with profiler_segment(profiler, "selected_cells", B):
                 if static and consts is not None and consts.fast_w1 is not None:
                     # P2.10c: the fast slots against their own unit's weights, the others as below

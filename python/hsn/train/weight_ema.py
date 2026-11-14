@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from typing import Any
 
 import torch
@@ -172,17 +172,27 @@ def _checked(state: Any, path: str) -> Mapping[str, Tensor]:
 
 
 @torch.no_grad()
-def install_averaged(model: nn.Module, extra: Mapping[str, Any], path: str = "checkpoint") -> bool:
+def install_averaged(
+    model: nn.Module,
+    extra: Mapping[str, Any],
+    path: str = "checkpoint",
+    *,
+    allow_missing: Collection[str] = (),
+) -> bool:
     """Replace ``model``'s weights by the average a checkpoint's ``extra`` carries; False (and the
-    model untouched) when it carries none. Evaluation only: the training weights are gone."""
+    model untouched) when it carries none. Evaluation only: the training weights are gone.
+    ``allow_missing`` (a warm start): parameters of ``model`` the average may lack; they keep
+    their values."""
     state = extra.get("weight_ema")
     if state is None:
         return False
     shadow = _checked(state, path)
     named = dict(_averaged_parameters(model))
-    if set(shadow) != set(named):
+    if set(shadow) - set(named) or set(named) - set(shadow) - set(allow_missing):
         raise ValueError(f"{path}: weight_ema holds other parameters than the model")
     for name, p in named.items():
+        if name not in shadow:
+            continue
         value = shadow[name]
         if tuple(value.shape) != tuple(p.shape):
             raise ValueError(

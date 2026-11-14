@@ -266,6 +266,9 @@ SELECTION_RECORD_KEYS: tuple[str, ...] = (
     "refreshed",
     "dense_fallback",
 )
+#: A10 (``model.write_gate``): the extra record of a routed window, the batch-mean share of the
+#: valid routed slots that may write, per position (:attr:`HSN.selection_record_keys`).
+WRITE_RECORD_KEY = "write_fraction"
 
 
 def _gate_of_written(b: Tensor, written: Tensor) -> Tensor:
@@ -434,6 +437,11 @@ class HSN(nn.Module):
         # the scorer is built here, in the P1.5 position, so seeded initialisation is unchanged
         self.router = Router.from_config(cfg, unroll=unroll, seed=seed)
         self.router.set_unit_credit(unit_credit)  # train.unit_credit (opt-in)
+        #: The per-position routed records a window stacks: :data:`SELECTION_RECORD_KEYS`, and
+        #: with ``model.write_gate`` (A10) the write fraction after them.
+        self.selection_record_keys: tuple[str, ...] = SELECTION_RECORD_KEYS + (
+            (WRITE_RECORD_KEY,) if cfg.write_gate else ()
+        )
         self.halting = HaltingHead(cfg)
         self.decoder = Decoder(cfg, seed=seed)
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
@@ -758,9 +766,11 @@ class HSN(nn.Module):
         state: CellGraphState,
         dense_rows: Tensor | None,
         controls: _Controls | None = None,
+        write_logits: Tensor | None = None,
     ) -> Selection:
         """The selection of this model's ``model.routing`` for one round, with the P2.2 gate and
-        controls of this step (:meth:`_controls` unless given)."""
+        controls of this step (:meth:`_controls` unless given). ``write_logits`` (A10): the
+        scorer's write logits of this position, with ``model.write_gate``."""
         cfg = self.cfg
         gate, tau, epsilon, probes = self._controls() if controls is None else controls
         fast: dict[str, Any] = {}  # A8: only named when set, so wrappers of select keep working
@@ -768,6 +778,8 @@ class HSN(nn.Module):
             fast["reserved"] = cfg.fast_cells
         if cfg.fast_units == "fixed":
             fast["reserved_units"] = True
+        if write_logits is not None:  # A10: named only when set, as the A8 keywords are
+            fast["write_logits"] = write_logits
         return self.router.select(
             unit_logits,
             budget=cfg.budget,
@@ -799,7 +811,12 @@ class HSN(nn.Module):
         unit_logits = self.router(feats).to(state.dtype)  # [B, N, M]
         if mode == "dense":
             return unit_logits, torch.softmax(unit_logits, dim=-1), None
-        return unit_logits, None, self._select(unit_logits, state, dense_rows, controls)
+        write_logits = self.scorer.write_logits(feats) if self.cfg.write_gate else None  # A10
+        return (
+            unit_logits,
+            None,
+            self._select(unit_logits, state, dense_rows, controls, write_logits),
+        )
 
     def _update(
         self,
@@ -993,6 +1010,8 @@ class HSN(nn.Module):
         alpha = selection.unit_weights.to(state.dtype)
         h_cand, info = self._cell_dense(u_s, eps_s, state, alpha, consts)
         mask = selection.cell_mask.to(state.dtype)[:, :, None]
+        if selection.write_mask is not None:  # A10: h + m·w·b·(c − h), the gate times w
+            mask = mask * selection.write_mask.to(state.dtype)[:, :, None]
         # P1.10c: m·h_cand + (1 − m)·h_prev in one op; exactly h_cand / h_prev at m = 1 / 0
         h_new = torch.lerp(state.h, h_cand, mask)
         if self.cell.disabled_cells:  # a soft m would move a disabled cell by an ulp
@@ -1182,7 +1201,7 @@ class HSN(nn.Module):
                 "window runs the same mode (the dense fallback is a flag on the selection)"
             )
         routed = (
-            {key: _stack_record([r[key] for r in records]) for key in SELECTION_RECORD_KEYS}
+            {key: _stack_record([r[key] for r in records]) for key in self.selection_record_keys}
             if records
             else None
         )
@@ -1394,7 +1413,7 @@ class HSN(nn.Module):
         detached indices and slot masks, the logits (autograd intact; P2.4's balance input), the
         per-row cost (detached), the batch-mean expected cost, the REINFORCE log-probability, and
         the exploration, refresh and dense-fallback rates of the position."""
-        return {
+        record = {
             "cell_idx": sel.cell_idx,
             "unit_idx": sel.unit_idx,
             "valid": sel.valid,
@@ -1406,6 +1425,9 @@ class HSN(nn.Module):
             "refreshed": sel.refreshed.float().sum(dim=1).mean(),
             "dense_fallback": sel.dense_fallback.float().mean(),
         }
+        if sel.write_fraction is not None:  # A10: the batch-mean share of slots that may write
+            record[WRITE_RECORD_KEY] = sel.write_fraction.mean()
+        return record
 
     def _window_epilogue(
         self,
@@ -1466,6 +1488,8 @@ class HSN(nn.Module):
             info["explored"] = routed["explored"]
             info["refreshed"] = routed["refreshed"]
             info["dense_fallback"] = routed["dense_fallback"]
+            if WRITE_RECORD_KEY in routed:  # A10: [T], differentiable (the write cost's input)
+                info[WRITE_RECORD_KEY] = routed[WRITE_RECORD_KEY]
         if gates is not None and written is not None:
             assert hs is not None
             info["cell_states"] = hs
