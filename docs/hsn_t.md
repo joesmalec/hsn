@@ -129,6 +129,28 @@ multiply-accumulate table does not count the reader's attention.
   baselines and the cell variants other than `pdg` cannot have a reader: it needs A5's
   readout, which they refuse.
 
+## The reader alone (`model_name: reader`)
+
+Before a text or arithmetic result of HSN-T is read as a failure of the hybrid, the reader it
+contains has to be measured by itself (the review amendments of 14 Nov 2026, item 04a-3). The
+stock Transformer baseline of the same shape is not that reader: it has a position table and a
+context input, the reader has rotary positions and none.
+
+`hsn.baselines.reader_lm.ReaderLM` is the reader module itself with one linear layer from
+`c_t` to the next byte (`configs/baselines/reader_w64l2.yaml`: 116,480 + 16,640 = 133,120
+parameters; `model.reader_span=32` for the short-sighted form). Built with the seed of an
+HSN-T it starts with that HSN-T's reader weights and gives the same hidden outputs, bit for
+bit (float32, CPU; `tests/test_reader_lm.py`). It is stateless, reads no context symbol, and
+trains with the generic trainer on the Transformer baseline's settings, so that the two
+differ in the model only. In an experiment spec the family is `reader`.
+
+What it does not settle: the reader inside HSN-T trains on the HSN recipe (learning rate
+2.5e-3, the recipe's controllers; the reader's parameters are in no update-limit group), the
+reader alone on the baseline's (1e-3, cosine). A difference between the two results mixes
+recipe and integration; separate learning-rate groups for reader and core are not built.
+
+No run of it exists yet.
+
 ## Tests (`tests/test_hsn_t.py`)
 
 The two families are kept apart (config, class, registry); the keys leave the HSN's hashes
