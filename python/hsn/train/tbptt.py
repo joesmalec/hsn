@@ -194,7 +194,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from hsn.config import GradNormPrecision, RunConfig
+from hsn.config import HSN_MODEL_NAMES, GradNormPrecision, RunConfig
 from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, memory_stats, reset_peak, synchronize
 from hsn.eval.evaluate import Metric
@@ -406,10 +406,10 @@ class TBPTTTrainer(Trainer):
                 f"TBPTTTrainer trains the HSN module, got {type(model).__name__}; the baselines "
                 "use hsn.train.loop.Trainer"
             )
-        if cfg.model_name != "hsn":
+        if cfg.model_name not in HSN_MODEL_NAMES:
             raise ValueError(
-                f"model_name={cfg.model_name!r}: TBPTTTrainer needs model_name=hsn (the "
-                "configuration and the model must agree)"
+                f"model_name={cfg.model_name!r}: TBPTTTrainer needs model_name=hsn or hsn_t "
+                "(the configuration and the model must agree)"
             )
         super().__init__(model, cfg, ctx, profiler, run_dir=run_dir)
         self.hsn: HSN = model

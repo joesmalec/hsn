@@ -138,7 +138,7 @@ the bytes further back than that one read as BOS. A document that starts at a wi
 exact. :meth:`step` takes ``prev_tokens`` as ``[B, n]`` (``x_{t−1}`` first) for exact features;
 ``[B]`` means the older bytes are BOS.
 
-Amendment A14 (``model.reader = transformer``, ``docs/amendments/A14_reader.md``; opt-in): a
+HSN-T (``model_name: hsn_t``, ``model.reader = transformer``, ``docs/hsn_t.md``): a
 small causal Transformer (:class:`~hsn.model.reader.Reader`) reads the window's bytes once, in
 the prologue, and its output ``c_t`` takes the place of A8's fast read: ``u_t = S([z_t ; q_{t−1} ;
 ctx_t ; c_t])`` and ``D([q_t ; u_t ; r_t ; c_t])``. ``c_t`` is a function of the document's bytes
@@ -324,7 +324,7 @@ class _Prologue(NamedTuple):
     ctx_steps: tuple[Tensor, ...]
     scalar_steps: tuple[Tensor, ...]
     counters: tuple[Tensor, Tensor, Tensor, Tensor] | None
-    #: A14 (``model.reader``): the reader's output ``c [B, T, w]``, which ``context`` also ends
+    #: HSN-T (``model.reader``): the reader's output ``c [B, T, w]``, which ``context`` also ends
     #: in and the decoder reads after the loop; ``None`` without the key.
     reader: Tensor | None = None
 
@@ -357,6 +357,10 @@ class HSN(nn.Module):
     docstring; empty: full backpropagation through time) and ``state_grad_clip`` its
     ``train.state_grad_clip`` (``None``: off)."""
 
+    #: Whether this class may own a window reader (``model.reader``). ``False`` here: the HSN
+    #: has no sequence attention. :class:`hsn.model.hsn_t.HSNT` is the family that does.
+    _takes_reader: bool = False
+
     def __init__(
         self,
         cfg: ModelConfig,
@@ -372,6 +376,11 @@ class HSN(nn.Module):
         ste_scope: str = "selected",
     ) -> None:
         super().__init__()
+        if cfg.reader != "none" and not self._takes_reader:
+            raise ValueError(
+                f"model.reader={cfg.reader!r} belongs to the HSN-T family "
+                "(hsn.model.hsn_t.HSNT, model_name: hsn_t): the HSN has no sequence attention"
+            )
         if ste_scope not in ("selected", "all"):
             raise ValueError(f"ste_scope must be 'selected' or 'all', got {ste_scope!r}")
         #: ``train.ste_scope`` (opt-in): "all" trains the routed window on the masked round.
@@ -446,7 +455,7 @@ class HSN(nn.Module):
                 "fixed_embedding, ema_encoder"
             )
         self.predictor = Predictor(cfg)
-        # A8 / A14: the seed only draws the extra input columns of model.fast_readout / reader
+        # A8 / HSN-T: the seed only draws the extra input columns of model.fast_readout / reader
         widened = cfg.fast_readout or cfg.reader != "none"
         self.shared = SharedTransform(cfg, seed=seed) if widened else SharedTransform(cfg)
         self.cell = PDGCell(cfg, seed=seed)
@@ -461,7 +470,7 @@ class HSN(nn.Module):
         )
         self.halting = HaltingHead(cfg)
         self.decoder = Decoder(cfg, seed=seed)
-        #: A14 (``model.reader``): the window reader, or ``None``. Built last and from its own
+        #: HSN-T (``model.reader``): the window reader, or ``None``. Built last and from its own
         #: generator: no other parameter's initialisation depends on it.
         self.reader: Reader | None = Reader(cfg, seed=seed) if cfg.reader != "none" else None
         #: ``model.address_gate_input = reader_prev``: the width of ``c_{t−1}`` at the end of a
@@ -692,10 +701,10 @@ class HSN(nn.Module):
         )
 
     def _refuse_step_with_reader(self) -> None:
-        """A14: one position has no window for the reader to read."""
+        """HSN-T: one position has no window for the reader to read."""
         if self.reader is not None:
             raise ValueError(
-                f"model.reader={self.cfg.reader!r} (A14) reads the bytes of a window: a single "
+                f"model.reader={self.cfg.reader!r} (HSN-T) reads the bytes of a window: a single "
                 "position has none. Run windows through forward (tokens [B, T])"
             )
 
@@ -716,7 +725,7 @@ class HSN(nn.Module):
     def _shared_input(self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor) -> Tensor:
         """The input of ``S``: ``[z_t ; q_{t−1} ; ctx_t]``, and with ``model.fast_readout`` (A8)
         the fast group's mean ``f_{t−1}`` after it. Both state reads are ``summary`` reads (A6).
-        With ``model.reader`` (A14) a window's ``ctx`` already ends in the reader's ``c_t``
+        With ``model.reader`` (HSN-T) a window's ``ctx`` already ends in the reader's ``c_t``
         (:meth:`_window_prologue`), which is not a state read and keeps its gradient."""
         if self._gate_rides:  # the last columns are the address gate's c_{t−1}, not S's
             ctx = ctx[..., : -self._gate_rides]
@@ -1328,7 +1337,7 @@ class HSN(nn.Module):
         context = self.ctx_emb(ctx)  # [B, T, context_dim]
         reader_out: Tensor | None = None
         if self.reader is not None:
-            # A14: c_t travels behind the context embedding, so S reads [z; q; ctx; c] at every
+            # HSN-T: c_t travels behind the context embedding, so S reads [z; q; ctx; c] at every
             # position with the loop, the compiled block and _position unchanged
             reader_out = self.reader(tokens, reset)  # [B, T, w]
             context = torch.cat([context, reader_out], dim=-1)
@@ -1509,9 +1518,9 @@ class HSN(nn.Module):
             state = CellGraphState._make(
                 h=state.h, q=state.q, age=state.age, pos=positions_after[:, -1].contiguous()
             )
-        if pro.reader is not None:  # A14: the decoder reads c_t after [q; u; r] (and A8's f)
+        if pro.reader is not None:  # HSN-T: the decoder reads c_t after [q; u; r] (and A8's f)
             if readouts is None:
-                raise ValueError("A14's reader needs A5's per-position readouts")
+                raise ValueError("HSN-T's reader needs A5's per-position readouts")
             readouts = torch.cat([readouts, pro.reader], dim=-1)
         logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
@@ -1646,7 +1655,7 @@ class HSN(nn.Module):
     def param_report(self) -> dict[str, int]:
         """Measured parameter counts: the Appendix C.1 rows in table order and their ``total``
         (the closed form of :func:`hsn.train.memory_plan.expected_param_count`), then ``edges``
-        (the P1.4 edge logits, outside Appendix C), with ``model.reader`` (A14) ``reader``
+        (the P1.4 edge logits, outside Appendix C), with ``model.reader`` (HSN-T) ``reader``
         (:func:`hsn.train.memory_plan.reader_param_count`), and ``total_trainable`` (every
         parameter of this module; the run manifest's ``param_count``)."""
         modules: dict[str, nn.Module] = {
@@ -1670,14 +1679,14 @@ class HSN(nn.Module):
         report["total"] = sum(report.values())
         report["edges"] = self.cell.graph.edge_logit.numel()
         accounted = report["total"] + report["edges"]
-        if self.reader is not None:  # A14: outside Appendix C, like the edge logits
+        if self.reader is not None:  # HSN-T: outside Appendix C, like the edge logits
             report["reader"] = sum(p.numel() for p in self.reader.parameters())
             accounted += report["reader"]
         report["total_trainable"] = sum(p.numel() for p in self.parameters())
         if report["total_trainable"] != accounted:
             raise RuntimeError(
                 f"param_report: {report['total_trainable']} trainable parameters, but the Appendix "
-                f"C rows ({report['total']}), the edge logits ({report['edges']}) and A14's "
+                f"C rows ({report['total']}), the edge logits ({report['edges']}) and HSN-T's "
                 f"reader ({report.get('reader', 0)}) give {accounted}; a submodule carries "
                 "unaccounted parameters"
             )

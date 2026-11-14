@@ -1,8 +1,9 @@
-"""Amendment A14 (``docs/amendments/A14_reader.md``): ``model.reader``, the window reader.
+"""HSN-T (``docs/hsn_t.md``): the model family ``hsn_t``, the HSN's memory core behind a reader.
 
-With ``model.reader = transformer`` a small causal Transformer reads the bytes of the window and
-its output ``c_t`` takes the place of A8's fast read in ``S`` and in the decoder. These tests
-check that the keys are opt-in and leave the default model and its hashes alone, what ``c_t`` may
+With ``model_name: hsn_t`` and ``model.reader = transformer`` a small causal Transformer reads
+the bytes of the window and its output ``c_t`` enters ``S`` and the decoder where the HSN's fast
+cells are read. These tests check that the two families are kept apart (the HSN refuses a
+reader, HSN-T requires one), that the keys leave the HSN and its hashes alone, what ``c_t`` may
 depend on (the document's bytes up to ``t`` inside the window, the last ``reader_span`` of them
 with a span), that the rest of the model is the model without the key (initialisation, and the
 forward pass once the new input columns are zero), the closed forms, the refusals, the compiled
@@ -18,14 +19,17 @@ import pytest
 import test_p2_8_compile as p28
 import torch
 from hsn.config import RunConfig, config_hash, load_config, split_window_scope_error
-from hsn.device import seed_everything
+from hsn.device import resolve, seed_everything
 from hsn.experiments.variants import install_variant
 from hsn.model.hsn import HSN
+from hsn.model.hsn_t import HSNT
 from hsn.model.reader import Reader
+from hsn.runner import build_model
 from hsn.train.memory_plan import expected_param_count, reader_param_count
+from hsn.train.tbptt import TBPTTTrainer
 from p1_11_support import restore_determinism  # noqa: F401
-from p1_15_support import datasets, hsn_config, hsn_trainer
-from test_a6_feedback_detach import A5, _cfg, _model, _start, _window
+from p1_15_support import datasets, hsn_config
+from test_a6_feedback_detach import A5, _cfg, _start, _window
 from test_a8_fast_cells import COMPILED
 from test_p2_8_compile import _release_compiled_state, small_blocks  # noqa: F401
 from torch import Tensor
@@ -36,7 +40,8 @@ REPO = Path(__file__).resolve().parents[1]
 RECIPE_A6 = REPO / "configs" / "experiments" / "hsn_recipe_a6.yaml"
 
 W = 8  # the reader's width on the six-cell model of the A6 tests (d = 8)
-READER = ("model.reader=transformer", f"model.reader_width={W}", "model.reader_heads=2")
+FAMILY = "model_name=hsn_t"
+READER = (FAMILY, "model.reader=transformer", f"model.reader_width={W}", "model.reader_heads=2")
 SPAN = 4
 SHORT = (*READER, f"model.reader_span={SPAN}")
 #: the address gate reading the reader's output of the position before (W equals d here)
@@ -47,6 +52,16 @@ CUT_C = "train.feedback_detach=[summary,eps,router]"
 
 def _reader_cfg(*extra: str) -> RunConfig:
     return _cfg(*A5, *READER, *extra)
+
+
+def _model(cfg: RunConfig, dtype: torch.dtype = torch.float64) -> HSNT:
+    """The A6 tests' model (away from the symmetric start), as an HSN-T."""
+    seed_everything(0)
+    model = HSNT.from_config(cfg).to(dtype)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(0.3 * torch.randn_like(p))
+    return model.train()
 
 
 def _gap(a: Tensor, b: Tensor) -> float:
@@ -78,8 +93,8 @@ def test_keys_are_opt_in_and_the_default_keeps_its_hash() -> None:
         ],
     )
     assert config_hash(named) == config_hash(base)
-    on = load_config(RECIPE_A6, ["model.reader=transformer"])
-    short = load_config(RECIPE_A6, ["model.reader=transformer", "model.reader_span=32"])
+    on = load_config(RECIPE_A6, [FAMILY, "model.reader=transformer"])
+    short = load_config(RECIPE_A6, [FAMILY, "model.reader=transformer", "model.reader_span=32"])
     assert len({config_hash(base), config_hash(on), config_hash(short)}) == 3
     assert HSN.from_config(base).reader is None
     assert "reader" not in HSN.from_config(base).param_report()
@@ -93,6 +108,8 @@ def test_keys_are_opt_in_and_the_default_keeps_its_hash() -> None:
         (["model.reader=transformer", "model.reader_width=30"], "multiple of"),
         (["model.reader=transformer", "model.reader_width=12"], "even width per head"),
         (["model.reader=transformer", "model.reader_span=0"], "reader_span"),
+        (["model.reader=transformer"], "belongs to the HSN-T family"),  # model_name is hsn
+        ([FAMILY], "set model.reader"),
         (["model.address_gate=true", "model.address_gate_input=reader_prev"], "reads the reader"),
         (
             [
@@ -110,13 +127,28 @@ def test_configuration_refusals(overrides: list[str], message: str) -> None:
         load_config(RECIPE_A6, overrides)
 
 
-def test_split_and_fused_windows_refuse_the_reader() -> None:
-    recipe = ["train.gate_mode=ste", "model.reader=transformer"]
+def test_split_and_fused_windows_are_the_hsns() -> None:
+    recipe = ["train.gate_mode=ste", FAMILY, "model.reader=transformer"]
     reason = split_window_scope_error(load_config(RECIPE_A6, recipe))
-    assert reason is not None and "model.reader" in reason
+    assert reason is not None and "hsn_t" in reason
     for window in ("split", "fused"):
-        with pytest.raises(ValueError, match="reader"):
+        with pytest.raises(ValueError, match="hsn_t"):
             load_config(RECIPE_A6, [*recipe, f"hardware.window={window}"])
+
+
+def test_the_two_families_are_kept_apart_by_construction() -> None:
+    """An ``HSN`` never owns a reader and an ``HSNT`` always does; the registry builds each
+    from its model name and both train with the HSN's window trainer."""
+    plain, read = _cfg(*A5), _reader_cfg()
+    kwargs = {"seed": 0, "unroll": 12}
+    with pytest.raises(ValueError, match="HSN-T family"):
+        HSN(read.model, **kwargs)
+    with pytest.raises(ValueError, match="behind a reader"):
+        HSNT(plain.model, **kwargs)
+    model, other = build_model(read), build_model(plain)
+    assert type(model) is HSNT and isinstance(model, HSN) and model.reader is not None
+    assert type(other) is HSN and other.reader is None
+    assert read.model_name == "hsn_t" and plain.model_name == "hsn"
 
 
 def test_baselines_and_variants_refuse_the_key() -> None:
@@ -127,7 +159,7 @@ def test_baselines_and_variants_refuse_the_key() -> None:
     with pytest.raises(ValueError, match="selected_readout"):
         load_config(gru, ["model.reader=transformer", "model.selected_readout=true"])
     # and A5 refuses every cell variant but pdg, so the reader never meets one
-    model = HSN.from_config(_reader_cfg())
+    model = HSNT.from_config(_reader_cfg())
     with pytest.raises(ValueError, match="A5 is unsupported"):
         install_variant(model, "gru_cell", {})
 
@@ -215,8 +247,8 @@ def test_reader_reads_distances_not_window_positions() -> None:
 
 @pytest.mark.parametrize("extra", [READER, SHORT])
 def test_param_report_matches_the_closed_form(extra: tuple[str, ...]) -> None:
-    for cfg in (_cfg(*A5, *extra), load_config(RECIPE_A6, ["model.reader=transformer"])):
-        model = HSN.from_config(cfg)
+    for cfg in (_cfg(*A5, *extra), load_config(RECIPE_A6, [FAMILY, "model.reader=transformer"])):
+        model = HSNT.from_config(cfg)
         report, expected = model.param_report(), expected_param_count(cfg.model)
         for row, count in expected.items():
             assert report[row] == count, row
@@ -237,7 +269,7 @@ def test_reader_keeps_the_other_parameters_initialisation() -> None:
     plain = HSN.from_config(_cfg(*A5))
     after_plain = torch.rand(4)
     torch.manual_seed(0)
-    read = HSN.from_config(_reader_cfg())
+    read = HSNT.from_config(_reader_cfg())
     after_read = torch.rand(4)
     assert torch.equal(after_plain, after_read)
     theirs = dict(read.named_parameters())
@@ -259,7 +291,7 @@ def test_model_with_zeroed_reader_columns_is_the_model_without_it(cut: tuple[str
     seed_everything(0)
     plain = HSN.from_config(_cfg(*A5, *cut)).double().train()
     seed_everything(0)
-    read = HSN.from_config(_reader_cfg(*cut)).double().train()
+    read = HSNT.from_config(_reader_cfg(*cut)).double().train()
     with torch.no_grad():
         for layer in (read.shared.fc1, read.decoder.fc1):
             layer.weight[:, -W:] = 0.0
@@ -410,9 +442,9 @@ def test_zero_gate_on_the_reader_is_the_model_with_the_summary_gate(training: bo
     """``G`` starts at zero, so the gate's input does not matter until it has trained."""
     summary = (*READER, "model.address_gate=true", "model.address_gate_input=summary")
     seed_everything(0)
-    model = HSN.from_config(_cfg(*A5, "train.gate_mode=ste", *PREV)).double()
+    model = HSNT.from_config(_cfg(*A5, "train.gate_mode=ste", *PREV)).double()
     seed_everything(0)
-    other = HSN.from_config(_cfg(*A5, "train.gate_mode=ste", *summary)).double()
+    other = HSNT.from_config(_cfg(*A5, "train.gate_mode=ste", *summary)).double()
     gate = model.scorer.address_gate
     assert gate is not None and not bool(gate.weight.any())
     for (name, p), (_, q) in zip(model.named_parameters(), other.named_parameters(), strict=True):
@@ -472,7 +504,13 @@ def test_compiled_window_equals_eager(name: str, extra: tuple[str, ...]) -> None
         *overrides,
         *extra,
     )
-    model = p28._model(cfg, training=training, scale=0.3)
+    seed_everything(0)
+    model = HSNT.from_config(cfg)
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    with torch.no_grad():  # as p28._model(cfg, training=training, scale=0.3)
+        for p in model.parameters():
+            p.add_(torch.randn(p.shape, generator=generator) * 0.3)
+    model.train(training)
     ctx = p28._ctx()
     window = p28._window(model, ctx)
     tokens, cx, state, reset = p28._case_inputs(model, True)
@@ -501,7 +539,8 @@ def test_recipe_with_the_reader_trains(extra: tuple[str, ...], tmp_path: Path) -
         "train.lr=3e-3",
         *extra,
     )
-    trainer = hsn_trainer(cfg, tmp_path / "run")
+    seed_everything(0)
+    trainer = TBPTTTrainer(build_model(cfg), cfg, resolve(cfg.hardware), run_dir=tmp_path / "run")
     history = trainer.fit(*datasets(), steps)
     losses = [s.loss for s in history.steps]
     assert len(losses) == steps and all(math.isfinite(x) for x in losses)

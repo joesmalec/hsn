@@ -13,7 +13,7 @@ Plan §2.1 / §2.2 and Appendix C.1:
 * ``D``: ``logits_t = D([q_t; u_t])``, ``2d -> H -> V`` (:class:`Decoder`); A5's optional
   selected-cell readout appends ``r_t`` and expands the input to ``3d``. A8's optional fast read
   (``model.fast_readout``) appends ``f`` to the inputs of ``S`` and ``D`` (one more ``d`` each).
-  A14's reader (``model.reader``) appends its output ``c_t`` to both (``model.reader_width``
+  HSN-T's reader (``model.reader``) appends its output ``c_t`` to both (``model.reader_width``
   each): ``S([z; q; ctx; c])`` (``c`` before A8's ``f``) and ``D([q; u; r; c])`` (after it).
 
 The activation is ``model.activation`` (``gelu`` in A.1, taken as the exact erf form; the P2.9
@@ -147,7 +147,7 @@ class SharedTransform(MLP2):
         super().__init__(
             2 * cfg.d + cfg.context_dim, cfg.hidden, cfg.d, cfg.activation, init=cfg.state_init
         )
-        if cfg.reader != "none":  # A14: c_t, the reader's output, after [z; q; ctx]
+        if cfg.reader != "none":  # HSN-T: c_t, the reader's output, after [z; q; ctx]
             _widen_first_layer(self, cfg.reader_width, cfg.state_init, seed + 0xA14C0DE)
         if cfg.fast_readout:  # A8: f_{t-1}, the fast cells' mean, after [z; q; ctx] (and c_t)
             _widen_first_layer(self, cfg.d, cfg.state_init, seed + 0xA8FA57)
@@ -196,7 +196,7 @@ class Decoder(MLP2):
             self.in_dim = 3 * cfg.d
         if cfg.fast_readout:  # A8: f_t after [q; u; r] (the configuration requires A5's readout)
             _widen_first_layer(self, cfg.d, cfg.init, seed + 0xA8DEC0DE)
-        if cfg.reader != "none":  # A14: c_t after [q; u; r] (and A8's f)
+        if cfg.reader != "none":  # HSN-T: c_t after [q; u; r] (and A8's f)
             _widen_first_layer(self, cfg.reader_width, cfg.init, seed + 0xA14DEC0)
 
 

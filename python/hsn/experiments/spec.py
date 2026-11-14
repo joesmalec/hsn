@@ -106,8 +106,10 @@ __all__ = [
     "slug",
 ]
 
-FAMILIES = ("hsn", "gru", "transformer", "selective_ssm")
-Family = Literal["hsn", "gru", "transformer", "selective_ssm"]
+FAMILIES = ("hsn", "hsn_t", "gru", "transformer", "selective_ssm")
+Family = Literal["hsn", "hsn_t", "gru", "transformer", "selective_ssm"]
+#: The families trained by the HSN's window trainer: the HSN and HSN-T (``docs/hsn_t.md``).
+HSN_FAMILIES = ("hsn", "hsn_t")
 # P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
 # computes; P1.16: neither do the kept mid-run checkpoints (keep_every, keep_last)
 EXECUTION_ONLY = frozenset(
@@ -622,15 +624,15 @@ def _variant(arm: ArmSpec, family: str) -> tuple[str, dict[str, Any]]:
 
     raw = arm.variant
     if raw is None:
-        name, params = ("pdg" if family == "hsn" else "none"), dict[str, Any]()
+        name, params = ("pdg" if family in HSN_FAMILIES else "none"), dict[str, Any]()
     elif isinstance(raw, str):
         name, params = raw, {}
     else:
         name = raw.name
         params = {} if raw.offset_std is None else {"offset_std": raw.offset_std}
-    if family != "hsn" and name != "none":
+    if family not in HSN_FAMILIES and name != "none":
         raise SpecError(f"arm {arm.name}: variant {name!r} needs model family hsn, not {family}")
-    if family == "hsn" and name == "none":
+    if family in HSN_FAMILIES and name == "none":
         raise SpecError(f"arm {arm.name}: an hsn arm takes variant pdg (the model as configured)")
     try:
         return name, variant_params(name, params)
@@ -726,7 +728,7 @@ def _expand_one(
             f"arm {entry.name}: family {family} but the configuration's model_name is "
             f"{cfg.model_name}"
         )
-    if family != "hsn" and cfg.hardware.compile_mode != "none":
+    if family not in HSN_FAMILIES and cfg.hardware.compile_mode != "none":
         # P2.8: the generic trainer ignores the compile mode and trains a baseline eager, so a
         # record would claim a compile that never ran
         raise SpecError(
@@ -765,11 +767,11 @@ def _expand_one(
     if diagnostics is not None and hasattr(protocol, "diagnostics"):
         protocol = protocol.model_copy(update={"diagnostics": diagnostics})
     timing = entry.timing if entry.timing is not None else spec.timing
-    if isinstance(protocol, SpikeDiagnosticParams) and (family != "hsn" or not timing):
+    if isinstance(protocol, SpikeDiagnosticParams) and (family not in HSN_FAMILIES or not timing):
         raise SpecError(
             "spike_diagnostic requires family hsn and timing: true (exclusive execution)"
         )
-    if protocol.name == "reads_state" and family == "hsn" and cfg.model.routing == "random":
+    if protocol.name == "reads_state" and family in HSN_FAMILIES and cfg.model.routing == "random":
         raise SpecError(
             f"arm {entry.name}: routing=random with reads_state: its evaluation draws batch-shaped "
             "random numbers, so the batched edit probe would not match the per-document one"

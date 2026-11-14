@@ -1,19 +1,29 @@
-# Amendment A14: a window reader in place of the fast cells (experimental)
+# HSN-T: the HSN's memory core behind a Transformer reader (experimental)
 
-Status: **implemented as an opt-in experiment on 14 Nov 2026; not adopted; no result yet.**
-- Approved by the user on 14 Nov 2026 ("yes build rung 1 as an opt in amendement"), after
-  "lets explore this hybrid idea even more, I feel like it is different then a straight llm
-  being a hybrid and if we can manage the same percentages with the speed it is a significant
-  developement." The design the user read is `HYBRID-DESIGN-2026-11-14.md`; this is its rung 1.
-- `model.reader`: `none` (default) | `transformer`, with `model.reader_width` (64),
+Status: **a model family of its own (`model_name: hsn_t`), implemented on 14 Nov 2026; not
+adopted; first runs in progress.**
+- **Why a family and not an HSN amendment.** The reader is sequence attention, and the HSN is
+  defined without it (A5: "No sequence attention, additional persistent state, or
+  computation-path weight writes"). The user's decision on 14 Nov 2026, relayed by the
+  campaign session: "HSN-T family of its own"; the name is the user's ("what about HSN-T for
+  transformer?"). So the HSN is unchanged and cannot have a reader: `model_name: hsn`
+  refuses `model.reader`, the class `hsn.model.hsn.HSN` refuses it, and `model_name: hsn_t`
+  (class `hsn.model.hsn_t.HSNT`) requires it. The white paper of this line is
+  `whitepaper-hsn-t` (drafted separately); this document is the code's record.
+- **History.** Built first as an opt-in key of the HSN ("amendment A14", commits 50db3ae to
+  76c2aec on `claude/a14-reader`) after the user's "yes build rung 1 as an opt in
+  amendement" and "lets explore this hybrid idea even more, I feel like it is different then
+  a straight llm being a hybrid and if we can manage the same percentages with the speed it
+  is a significant developement." The first runs (spec `a14_reader.yaml`, 14 Nov) were made
+  from those commits with `model_name: hsn`; they compute what `hsn_t` computes, and their
+  run folders load from a checkout of 54957f3 or 76c2aec, not from this one.
+- `model.reader`: `none` | `transformer`, with `model.reader_width` (64),
   `model.reader_layers` (2), `model.reader_heads` (4) and `model.reader_span` (null). Needs
   `model.selected_readout`. All five keys are left out of the configuration hash at their
-  defaults: existing configurations, hashes and arm ids are unchanged, and with the key at
-  `none` no reader is built and the model is the model it was.
-- **It crosses a line on purpose.** A5's readout is described as "No sequence attention,
-  additional persistent state, or computation-path weight writes". The reader is sequence
-  attention. It adds no persistent state and no weight writes. Nothing of A5 changes while the
-  key is off.
+  defaults, so no HSN configuration, hash or arm id changed.
+- The memory's opt-in keys (fast cells, address n-grams, the address gate and its inputs, the
+  write decision, the feedback cuts) mean the same in both families; the cell arithmetic is
+  shared code.
 - It changes no metric, threshold or task.
 
 ## Cause
@@ -109,13 +119,20 @@ multiply-accumulate table does not count the reader's attention.
 - `python/hsn/model/hsn.py`: the reader runs once per window in `_window_prologue`; `c_t`
   travels behind the context embedding, so the loop, the compiled block and `_position` are
   untouched; the decoder's read is added in `_window_epilogue`.
-- Refused with the key on: `HSN.step` (one position has no window to read: the chat session
-  and the edit probes use it) and `hardware.window = split | fused`. The baselines and the cell
-  variants other than `pdg` cannot have it: it needs A5's readout, which they refuse.
+- `python/hsn/model/hsn_t.py`: the class `HSNT`, an `HSN` that owns a reader; the runner
+  builds it for `model_name: hsn_t` and the HSN's window trainer trains it. In an experiment
+  spec the family is `hsn_t`.
+- The built-in verdict presets of the experiment rules (`reads_state`, the write and gate
+  presets) are scoped to the family `hsn` and pinned; they are not applied to `hsn_t` arms.
+- Not available to HSN-T: `HSN.step` (one position has no window to read: the chat session
+  and the edit probes use it) and `hardware.window = split | fused` (the HSN's windows). The
+  baselines and the cell variants other than `pdg` cannot have a reader: it needs A5's
+  readout, which they refuse.
 
-## Tests (`tests/test_a14_reader.py`)
+## Tests (`tests/test_hsn_t.py`)
 
-The keys are opt-in and the default keeps its hash; the refusals; no later byte, no earlier
+The two families are kept apart (config, class, registry); the keys leave the HSN's hashes
+alone; the refusals; no later byte, no earlier
 document, the span, distances and not window positions; the closed forms; the other
 parameters' initialisation and the global random stream are untouched; with the new columns
 zero the window equals the window of the model without the key (float64, 1e-12); logits read
@@ -145,7 +162,7 @@ split by training keys and unseen keys (`hold_eval.py`) is the check in both for
 Readings are two of three seeds; the reference for recall is the same memory core without a
 reader on three seeds (`hold_k12nw_ag_ng2_cutC_cells64_18k_gsum`).
 
-**No speed is claimed by this amendment.** The routed cells still run at every byte; the
+**No speed is claimed.** The routed cells still run at every byte; the
 window is the slow one. Speed is rungs 2 and 3 of the design and needs its own approval.
 
 ## Results

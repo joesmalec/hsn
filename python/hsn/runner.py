@@ -69,6 +69,7 @@ from hsn.eval.results import (
     evidence_package,
 )
 from hsn.model.hsn import HSN
+from hsn.model.hsn_t import HSNT
 from hsn.model.router import SCORED_MODES
 from hsn.profiler import (
     NullMeter,
@@ -118,6 +119,7 @@ MODEL_REGISTRY: dict[str, ModelFactory] = {
     "transformer": TransformerBaseline,
     "selective_ssm": MambaBaseline,  # the paper's selective-memory control (plan P2.13)
     "hsn": HSN.from_config,  # P1.9: the dense predictive cell (P1.5) trained by TBPTTTrainer (P1.7)
+    "hsn_t": HSNT.from_config,  # HSN-T: the HSN's memory core behind a reader (docs/hsn_t.md)
 }
 
 

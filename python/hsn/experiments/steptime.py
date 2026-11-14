@@ -184,7 +184,11 @@ def enqueue_refusal(arm: Any, estimate: tuple[float, int] | None) -> str | None:
             'needs step_time_approval: "<who approved, when>" in its protocol'
         )
     hardware = arm.config.hardware
-    if arm.family == "hsn" and hardware.device == "cuda" and hardware.compile_mode == "none":
+    if (
+        arm.family in ("hsn", "hsn_t")
+        and hardware.device == "cuda"
+        and hardware.compile_mode == "none"
+    ):
         return (
             f"{arm.label}: {EAGER_HSN}; it needs step_time_approval: "
             '"<who approved, when>" and a max_step_s above its step time in its protocol'

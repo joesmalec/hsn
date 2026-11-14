@@ -114,13 +114,13 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
     """
     d, h, v = m.d, m.hidden, m.vocab_size
     v_in = m.cell_input_width  # 4d: [u; eps; h_i; m_i]; 3d with model.ablate_shared_u
-    c = m.reader_width if m.reader != "none" else 0  # A14: S and D read the reader's output
+    c = m.reader_width if m.reader != "none" else 0  # HSN-T: S and D read the reader's output
     rows = {
         "byte_emb": v * d,
         "ctx_emb": m.n_context * m.context_dim,
         "encoder": _mlp(d, h, d),
         "predictor": _mlp(d, h, d),
-        # A8: + f; A14: + c
+        # A8: + f; HSN-T: + c
         "shared": _mlp(2 * d + m.context_dim + (d if m.fast_readout else 0) + c, h, d),
         "units": m.n_units * _mlp(v_in, h, d),
         "w_out": d * d,
@@ -137,7 +137,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
 
 
 def reader_param_count(m: ModelConfig) -> int:
-    """Amendment A14: the parameters of the window reader (:class:`hsn.model.reader.Reader`),
+    """HSN-T: the parameters of the window reader (:class:`hsn.model.reader.Reader`),
     outside Appendix C like the edge logits; 0 without ``model.reader``. The byte embedding
     ``V w``, per block ``12 w² + 13 w`` (two LayerNorms ``4 w``, the attention's ``w → 3w`` and
     ``w → w`` maps, the MLP ``w → 4w → w``) and the final LayerNorm ``2 w``: 116,480 for the
