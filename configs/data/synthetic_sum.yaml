@@ -1,0 +1,73 @@
+# synthetic_sum: recall, then compute (14 Nov 2026).
+#
+# Why: in HSN-T (docs/hsn_t.md) the reader's layers do not receive a recalled fact during the
+# current pass ("late fusion"), so anything computed on a recalled fact has to be computed by the
+# memory core or the decoder. No task so far asks for that: the recall tasks copy a stored value
+# out, the arithmetic task adds digits that stand in the item. This task states digits as facts
+# and then asks for sums whose operands are named by key. It is the test the user moved forward
+# on 14 Nov 2026 (the white paper's proposed task 2): if a model recalls and adds but cannot add
+# what it recalled, the second form (the memory between two halves of the reader) is due.
+#
+# A document:  BOS filler (k d)^n filler SEP (QRY x PLUS y EQ s SEP)+ EOS
+#   k d     a fact: key k has the digit d (one-byte keys, split by key range as in kv / delayed)
+#   x, y    an operand: a stated key (its digit is recalled) or a digit written in the item
+#   s       the sum, one or two digits, least significant first; the answer positions are the
+#           sum digits and the terminating SEP, as in the arithmetic task
+# Items are of three kinds, drawn by recall_weights (two, one, none of the operands recalled):
+#   two   QRY k_a PLUS k_b EQ ..   compute on two recalled digits
+#   one   QRY k_a PLUS 7 EQ ..     compute on one recalled digit and one written digit
+#   none  QRY 3 PLUS 7 EQ ..       no memory needed: the control inside the same documents
+# Score the three kinds separately (the operand symbols say which kind an item is).
+#
+# min_gap: 64 puts every recalled operand at least 64 positions before the position that
+# predicts the sum, beyond the complete receptive field of the HSN-T reader that is run (two
+# blocks, span 32: 63 bytes). A whole-window reader sees every operand of an in-range document;
+# for it the out-of-range variant is the test.
+#
+# Select with
+#   data.dataset=synthetic_sum data.manifest=data/synthetic_sum/manifest.json data.tasks=[recall_sum]
+# Golden manifest: configs/data/synthetic_sum.manifest.json.
+
+name: synthetic_sum
+unroll: 256
+
+tasks:
+  - name: recall_sum
+    variant: in_range
+    family: recall_sum
+    context_id: 7
+    seed: 71001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [96, 256]
+    dep_len_range: [80, 240]
+    params:
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      digits: [48, 58]
+      markers: { plus: 19, eq: 20 }
+      filler: [192, 256]
+      max_facts: 6
+      max_items: 4
+      recall_weights: [2, 1, 1]
+      min_gap: 64
+
+  - name: recall_sum
+    variant: out_of_range
+    family: recall_sum
+    context_id: 7
+    seed: 71002
+    n_train: 0
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params:
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      digits: [48, 58]
+      markers: { plus: 19, eq: 20 }
+      filler: [192, 256]
+      max_facts: 6
+      max_items: 4
+      recall_weights: [2, 1, 1]
+      min_gap: 64

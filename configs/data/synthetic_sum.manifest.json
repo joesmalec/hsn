@@ -1,0 +1,169 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/out_of_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "recall_sum/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "recall_sum/out_of_range/dev"
+    }
+  ],
+  "name": "synthetic_sum",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 7,
+      "family": "recall_sum",
+      "file": "recall_sum.in_range.train.npz",
+      "hash": "09527c6251297869ca200b4a0d36ea4b5efcb5c89a9fa1f379e21b357388d04f",
+      "n_docs": 20000,
+      "n_loss": 120245,
+      "n_tokens": 4208300,
+      "split": "train",
+      "task": "recall_sum",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 7,
+      "family": "recall_sum",
+      "file": "recall_sum.in_range.dev.npz",
+      "hash": "08031efb35f7fc737d3b1e77b56b9b5b9981c3d884cdb02efd292d48dcfda61d",
+      "n_docs": 1000,
+      "n_loss": 6018,
+      "n_tokens": 211176,
+      "split": "dev",
+      "task": "recall_sum",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 7,
+      "family": "recall_sum",
+      "file": "recall_sum.in_range.test.npz",
+      "hash": "0979a6e74e92694d45b93466efb3e963571afb89f8b38ac6c45af5427a7564f2",
+      "n_docs": 1000,
+      "n_loss": 6015,
+      "n_tokens": 210503,
+      "split": "test",
+      "task": "recall_sum",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 7,
+      "family": "recall_sum",
+      "file": "recall_sum.out_of_range.train.npz",
+      "hash": "7aa134c7b565f223c7d0ce9908886c943f13fb4fd47e11b4362cf2adc255a75d",
+      "n_docs": 0,
+      "n_loss": 0,
+      "n_tokens": 0,
+      "split": "train",
+      "task": "recall_sum",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 7,
+      "family": "recall_sum",
+      "file": "recall_sum.out_of_range.dev.npz",
+      "hash": "9f7208e7dd65fa9671778a25afe5f1860a2dad4dda28280554d4475b40ad69cd",
+      "n_docs": 1000,
+      "n_loss": 6080,
+      "n_tokens": 775106,
+      "split": "dev",
+      "task": "recall_sum",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 7,
+      "family": "recall_sum",
+      "file": "recall_sum.out_of_range.test.npz",
+      "hash": "dedd0ec0dae8d089a3e93f164728309cb6fdfa4b361c1e83257ff47bd5772b32",
+      "n_docs": 1000,
+      "n_loss": 6183,
+      "n_tokens": 779520,
+      "split": "test",
+      "task": "recall_sum",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "f7990b4ed20c14906e67e15fa51f07d333eeb24c12ccccf3ddee504555d80661",
+  "split_hashes": {
+    "dev": "45f17603c50e2c531d091fad7c2ac5a0bf488752cfe87433266587a26cd8091f",
+    "test": "33303baedbdec6de9091dcb41429641d006f6054f471e5a5669436b42015cd37",
+    "train": "741fceb025ce4c341a3128d17f58a8a3eb1fbbcfb276d796eed813e9ccbb0910"
+  },
+  "unroll": 256
+}
