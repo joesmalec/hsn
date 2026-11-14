@@ -453,6 +453,14 @@ class TBPTTTrainer(Trainer):
             if cfg.train.route_guard.enabled
             else None
         )
+        # Opt-in diagnostic (train.address_gate_hold_step): A12's gate weights and the number
+        # of optimiser steps they are trained for; None: off
+        self._gate_hold: tuple[int, Tensor] | None = None
+        if cfg.train.address_gate_hold_step is not None:
+            gate = model.router.scorer.address_gate
+            if gate is None:  # the configuration refuses it; a model built by hand may not
+                raise ValueError("train.address_gate_hold_step needs model.address_gate")
+            self._gate_hold = (cfg.train.address_gate_hold_step, gate.weight)
         self.counterfactual = cfg.train.lambda_u > 0.0  # P2.3: probes, utility term, EMA features
         # P1.10d: the trailing-padding cut (exact in math under dense routing only, to rounding in
         # floats since P1.10a; module docstring)
@@ -1163,6 +1171,9 @@ class TBPTTTrainer(Trainer):
                 if isinstance(self.optimizer, LazyAdamW):  # P2.6: None = every unit (dense)
                     step_kwargs["active_units"] = active
                 applied = not skipped
+                held_gate: Tensor | None = None
+                if self._gate_hold is not None and next_step > self._gate_hold[0]:
+                    held_gate = self._gate_hold[1].detach().clone()
                 if self.scaler is not None:
                     # A scaler suppresses optimizer.step itself on overflow. Only an EMA target
                     # or adaptive controller needs this check; defaults add no synchronisation.
@@ -1184,6 +1195,9 @@ class TBPTTTrainer(Trainer):
                 self._growth_after_step(applied)
                 if self.route_guard is not None and applied:
                     self.route_guard.apply()  # A6: the router's step at the guard's scale
+                if held_gate is not None:  # train.address_gate_hold_step: the step is undone
+                    with torch.no_grad():
+                        self._gate_hold[1].copy_(held_gate)  # type: ignore[index]
                 if applied:
                     for hook in self.update_post_hooks:
                         hook(self)

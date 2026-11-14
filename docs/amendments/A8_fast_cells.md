@@ -220,6 +220,46 @@ configuration refuses zero routed slots), state gradient on, 9,000 steps:
   the amendment's third point, which is still not met (on text the routed cells are written
   at most positions although they add nothing).
 
+## The combined shape at 64 cells (13 Nov 2026, afternoon and evening)
+
+The shape: 64 cells, `k_select=20` with `fast_cells=8`, `fast_units=fixed`,
+`fast_readout=true` (8 fast + 12 routed slots), state gradient, executed credit, no soft
+warm-up. Autograd window: 229 to 238 ms per step on a
+rented 3060, 201 to 204 ms on the local card. 9,000 steps, one seed unless two are given.
+
+| Task | Combined shape | 12 routed slots, 64 cells | With A11 wrap, A12 gate, `state_grad_ratio=3` |
+| --- | --- | --- | --- |
+| Arithmetic | `arith_f8ru20nw_cutC_cells64` 99.0 % | 73.7 % | 99.9 % |
+| TinyStories, bits per byte | `ts_f8ru20nw_cutC_cells64` 0.970 | 1.121 | 0.959 (GRU 0.952 / 0.954) |
+| Delayed | `f8ru20nw_cutC_cells64` 97.3 % | 99.6 / 98.0 / 98.5 % | |
+| Pair (key-value + delayed) | `g1_f8ru20nw_cutC_cells64` 93.4 % | 98.0 / 98.6 / 98.3 % | 27k: 94.4 % |
+| Pair, with A12's gate only | `g1_f8ru20nw_ag_cutC_cells64` 99.1 / 97.2 % | | |
+
+- With 64 cells the routed-only model loses on text and arithmetic (1.121 bits, 73.7 %) what
+  it gains on the pair task. The fast cells restore both: this shape is the first that is
+  near the GRU on text and at 99 % on arithmetic while delayed recall stays at 97.3 % and,
+  with A12's gate, the pair task at 97 to 99 %.
+- **Unit control** (`model.cell_units=fixed`, 16 routed slots, cell i runs unit i mod M, no
+  fast cells): TinyStories `ts_k16_fixu_cutC` 1.031 (routed units 1.046; 8 fast cells
+  0.951 / 0.961); arithmetic `arith_k16_fixu_cutC` 90.1 % (routed 84.2 / 84.3; fast cells
+  86.5 / 99.8 / 100.0); delayed `k16_fixu_cutC` 88.1 % (routed 98.9). So "all units in use"
+  explains a small part of the gain on text; most of it is being written at every byte. Routed
+  cells need their choice of unit to bind keys.
+- **A cost: fitting to the training keys.** Fresh documents, key-value answers on training
+  keys against dev / test keys (`key_split_eval.py`): the combined shape at 9k 96.1 against
+  90.9 / 91.4; with A12's gate 99.4 against 98.7 / 98.4; the routed-only model 97.7 against
+  97.2 / 97.4. At 27k with the gate and the gradient limit: 99.5 against 93.7 / 93.3 (delayed
+  100.0 against 95.3 / 96.8), with a training loss still falling. A reading, not measured: the
+  fast cells hold content and can learn the training keys by heart, which the fixed addresses
+  of the routed cells cannot.
+- **Story text from scratch** (facts inside text, the text supervised) on the full candidate:
+  1.8 % (chance), as in every earlier from-scratch arm; with the answers weighted 8
+  (`train.answer_weight`, a diagnostic) 99.1 % at step 5,000 and 82.5 % at the end.
+- Open: a hold-out of key pairs (`configs/data/synthetic_hold.yaml`: do new combinations of
+  seen key bytes behave like seen pairs or like never-seen bytes), more seeds, and the fast
+  window (the fused window takes this shape at 131 to 133 ms per step; it does not take the
+  gate yet).
+
 ## Tests
 
 `tests/test_a8_fast_cells.py`: the keys are opt-in and hashed only when set; the selection rule
