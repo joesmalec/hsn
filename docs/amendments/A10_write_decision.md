@@ -1,14 +1,24 @@
 # Amendment A10: the router's write decision, with a cost (experimental)
 
-Status: **implemented as an opt-in experiment on 13 Nov 2026; not adopted; no result yet.**
-- Asked for by the user on 13 Nov 2026 ("build now as opt-in"), after the overnight runs of the
-  white paper v1.2 review. It is decision (e) of `ARCH-READING-2026-11-13.md`.
+Status: **an opt-in experiment; not adopted. Built and dropped on 13 Nov 2026, on main again
+since 14 Nov 2026 for one question: can the memory be left untouched where it is not needed?**
+- 13 Nov 2026: asked for by the user ("build now as opt-in"), tested the same day on the pair
+  task and dropped by its own kill rule (the user: "Lets drop A10"). Its code was not merged
+  and its keys were retired. That record is the section "13 Nov" below.
+- 14 Nov 2026: taken up again as step 1 of "memory touched only when needed" (the user: "I
+  think 1 makes sense as it is our weakest spot as well", then "lets complete step 1 I agree
+  that's the right path"). The question is no longer whether it helps the pair task; it is
+  how many routed writes text, arithmetic and recall need. The keys are schema keys again and
+  the same code as on 13 Nov. Results in the section "14 Nov".
 - `model.write_gate` (default false), `model.write_init` (default 2.0) and `train.lambda_w`
   (default 0). All three are left out of the configuration hash at their defaults: existing
   configurations, hashes and arm ids are unchanged, and a model without the key is the model as
   before, bit for bit.
 - It amends plan §2.3 (the cell update) by one factor on the gate and §2.2 step 4 (the scorer)
   by a second output. It changes no metric, threshold or task.
+- **It saves no compute, in training or in evaluation.** Every selected cell runs its unit
+  whether its write is open or closed; a closed write gets its reopening gradient through the
+  candidate that was computed. A share of closed writes is a measurement, not a time saved.
 
 ## Cause
 
@@ -81,32 +91,97 @@ features, `N·F·M` MACs, scorer work.
 **Windows.** Eager and compiled autograd windows. The split and fused windows refuse the key.
 Not defined for `train.gate_mode=reinforce`, the MLP scorer or `train.lambda_u > 0`.
 
-## The smallest test, and its kill rule
+## 13 Nov: the pair task, and the kill rule
 
-All with the state gradient, 9,000 steps:
-1. **Pair task, 12 slots** (`g1_k12_cutC`: 89.7 / 78.4 %, key-value 86.4 / 78.4 %): the same
-   arm with `model.write_gate=true` and `train.lambda_w` in {0, 0.02, 0.1}.
-2. **Pair task, 8 slots** (`g1_a8_cutC`: 95.4 / 93.5 %): `write_gate`, `lambda_w=0.02`. It must
-   not cost anything where the base is already good.
-3. **Delayed recall, 12 slots** (`k12_cutC`: 98.5 / 99.1 / 95.5 %): the same check.
-4. **Story text from scratch, 8 fast + 12 routed** (`tf128_f8ru20_cutC`: 1.9 %, chance): the
-   same arm with `write_gate` and `lambda_w` in {0.02, 0.1}. This is the arm the cause above
-   predicts most directly: with the text supervised, writing text into the routed cells is
-   rewarded at every position and nothing a fact needs survives until its query; a cost on
-   routed writes should move the text to the fast cells.
-5. **Story text, warm start** (`tf128w_f8ru20_cutC`: 99 % at step 500, 89.2 % at 9,000) with
-   `write_gate` and `lambda_w=0.02`: does the cost stop the erosion? `train.init_from` accepts
-   a source checkpoint without the write output (it starts open).
+State gradient, 9,000 steps, one seed per arm. Pair task, 12 slots, 32 cells (control
+`g1_k12_cutC`: 89.7 / 78.4 % in range, 79.6 / 72.9 % out of range):
 
-**It works** if arm 1 with a cost reaches the 8-slot key-value score (92 % or more) with fewer
-writes per position than `g1_k12_cutC`, and arms 2 and 3 stay within their seeds' spread. Arm 4
-is a result of its own: any score clearly above chance from scratch is one no arm has reached.
-**Kill rule:** if arm 1 is not above `g1_k12_cutC` at any cost, the write decision is not what
-limits the key-value task at 12 slots, and the amendment is dropped. If only the arm with
-`lambda_w = 0` gains, the cost is dropped and the decision kept.
+| Arm | Cost | In range | Key-value part | Out of range | Slots that may write |
+| --- | --- | --- | --- | --- | --- |
+| `g1_k12_wg_cutC` | 0 | 81.3 | 75.9 | 68.2 | 48 % |
+| `g1_k12_wg02_cutC` | 0.02 | 76.9 | 71.0 | 54.6 | 46 % |
+| `g1_k12_wg10_cutC` | 0.1 | 89.7 | 86.6 | 35.8 | 24 % |
+| `g1_k12_wg50_cutC` | 0.5 | 65.1 | 59.1 | 51.1 | 12 % |
 
-Read from the run records: `write/permitted` (the share of routed slots with `w = 1` on the dev
-window) and `gate/write_rate` (which now counts a slot with `w = 0` as closed).
+Pair task, 12 slots, 64 cells, position wrapped (A11), cost 0.1:
+`g1_k12nw_wg10_cutC_cells64_poswrap` 78.5 % (key-value 70.8 %), against 98.0 / 98.6 / 98.3 %
+(key-value 97.3 to 98.1 %) for the same setting without the write decision.
+
+- The kill rule was: dropped if the 12-slot pair arm is not above its control at any cost.
+  No arm was, the arm at 64 cells lost 20 points, and recall past the window was worse in
+  every arm. The write rate did fall by half or more.
+- What limited the pair task instead: the number of cells (64 cells give 98 % at 8 and at 12
+  slots) and, past the training window, the scorer's position feature (A11).
+- The arms with A8's fast cells never ran: the compiled window did not get past its first
+  hard-gate step on the cards (next section).
+
+## The start-up stall, and `hardware.graph_alias_index`
+
+With `model.write_gate` and fast cells the compiled window sat at one busy core with the card
+idle. The cause is not this amendment: PyTorch 2.15's CUDA-graph tree checks every output of a
+newly recorded graph against every live recorded tensor
+(`CUDAGraphNode._is_alias_of_live_recorded_tensor`), a walk whose cost grows with the number of
+live outputs; with the write decision's extra per-position records it did not finish in the
+time anyone waited. The same walk is part of every compiled autograd run's start.
+
+`hardware.graph_alias_index` (opt-in, default false, left out of the hash at its default;
+`hsn.train.compile.install_graph_alias_index`) replaces that walk by an index built once per
+recording. It changes when a recording finishes, not what is computed. Measured on the
+RTX 3060 (14 Nov): the candidate's recording between step 1 and step 2 takes 98.5 s without it
+and 57 s with it; the candidate with the write decision never passes step 1 without it (cut at
+180 s) and runs 30 steps in 137 s with it. Do not dump Python stacks into a process during that
+recording (fault handler, SIGABRT): it ended a run with a segmentation fault.
+
+## 14 Nov: how many routed writes do text, arithmetic and recall need?
+
+The candidate (64 cells, 8 fast + 12 routed slots, state gradient, address gate reading the
+summary, A9, A11) with the write decision, `hardware.graph_alias_index=true`, autograd window.
+"Allowed" is `write/permitted`, the share of routed slots with an open write on the dev
+window at the end. Twins are the same arms without the write decision.
+
+| Data, steps | Cost | Routed writes allowed | Score | Twins |
+| --- | --- | --- | --- | --- |
+| Arithmetic, 9,000 (2 seeds) | 0.1 | 0 % / 0 % | 96.3 / 95.6 % | 86.4 / 86.4 % (6 to 11 % of routed slots written by the gate) |
+| TinyStories, 9,000 (1 seed) | 0.1 | 2.4 % | 1.007 bits | 0.990 / 0.974 bits (62 % written) |
+| `synthetic_hold`, 18,000 | 0.02 | 35 % | 95.3 % (peak 96.6 at 13,500) | 97.9 to 98.4 % (five seeds) |
+| `synthetic_hold`, 18,000 (2 seeds) | 0.1 | 7.7 % / 9.6 % | 81.9 % (peak 92.6 at 15,000) / 90.4 % | the same |
+
+By keys, fresh documents (`hold_eval.py`), final checkpoints:
+
+| Run | kv: training keys | kv: dev / test keys | delayed: seen pairs / new pairs / never-seen bytes |
+| --- | --- | --- | --- |
+| cost 0.02 | 95.5 | 95.8 / 94.2 | 95.8 / 95.8 / 95.9 |
+| cost 0.1, seed 0 | 95.5 | 82.5 / 84.6 | 91.2 / 91.8 / 80.9 |
+| twins (five seeds) | 98.4 to 99.3 | 97.3 to 98.7 | 97.9 to 99.7 |
+
+Step times on the rented RTX 5060 Ti with runs sharing a card: 0.192 to 0.201 s with the
+write decision, 0.191 to 0.193 s for the twins measured the same way (the decision adds one
+linear map of the scorer's features). Not a controlled timing.
+
+Reading:
+- **On arithmetic and text the routed memory can stay untouched.** The model closes every
+  routed write on arithmetic and all but 2.4 % on text. Arithmetic is no worse (ten points
+  above its twins, which are themselves below the old gate input's 90 to 100 %); text loses
+  0.017 to 0.033 bits against two twins that differ by 0.016. One seed for text.
+- **On recall a flat cost has a price that grows with the cost**: 3 points at 0.02, 8 to 16 at
+  0.1 with a late fall. At 0.1 the loss is mostly on keys of bytes never seen in training (a
+  gap of 11 to 13 points to the training keys); at 0.02 it is even.
+- **So one cost for every position is the wrong form for mixed data.** The cost closes writes
+  a fact needs as readily as the ones text does not need. The five-task mix with the cost (in
+  progress when this was written) is the direct test.
+- Nothing here measures speed. The twins' own gate already writes only 5 to 8 % of the
+  routed slots on the recall data; what the write decision adds is a decision that could be
+  taken before the unit runs, which no window uses yet.
+
+## If it is taken further
+
+- A cost that depends on what the position is (for example none where the address matches a
+  stored key), or a floor under the writes the address selects.
+- A training method in which a closed write is not computed needs another estimator than the
+  straight-through one: the reopening gradient is `b ⊙ (c − h)` of the candidate.
+- Write share does not give time saved: slot sparsity, touched positions and batch activity
+  are different quantities (with independent 5 % activity per row, a batch of 32 has an active
+  row at about 81 % of positions).
 
 ## Tests
 
