@@ -25,7 +25,7 @@ What the candidate's two groups of cells do, as measured on 13 and 14 Nov:
 | 8 fast cells + 1 routed slot: TinyStories 0.948 / 0.956 bits, arithmetic 100 %; delayed recall 80 % | The fast cells read text and do arithmetic; they do not bind keys |
 | 12 routed slots + address gate, no fast cells, 18,000 steps on `synthetic_hold`: 99.2 % on training keys, 99.1 / 98.9 % on unseen keys | The routed cells with fixed addresses are the memory, and the best recall measured |
 | Write decision with a cost (A10 revived, 9,000 steps): routed writes allowed at 0 % of slots on arithmetic (96.3 / 95.6 %), 2.4 % on TinyStories (1.007 bits against 0.990) | On text and arithmetic the memory can stay untouched |
-| Transformer baseline: 16 ms per step, TinyStories 0.827 at 27,000 steps; candidate 132 ms, 0.84 | Reading inside the window is what a Transformer does faster |
+| Transformer baseline (1.93 M parameters): 16 ms per step, TinyStories 0.827 bits at 27,000 steps; the candidate's shape 132 ms without the address gate and 143 ms with it, 0.84 bits | Reading inside the window is what a Transformer does faster. No Transformer of the reader's size has been trained here (reference runs: `a14_refs.yaml`) |
 | Transformer on the pair task: 18 %; with the byte codes as an input 100 % on training keys, 55 % on unseen keys | It cannot replace the memory |
 | All speed changes inside the HSN together: 1.15 to 1.22 times | The time is in the work per byte, not in waste |
 
@@ -99,8 +99,8 @@ multiply-accumulate table does not count the reader's attention.
   travels behind the context embedding, so the loop, the compiled block and `_position` are
   untouched; the decoder's read is added in `_window_epilogue`.
 - Refused with the key on: `HSN.step` (one position has no window to read: the chat session
-  and the edit probes use it), `hardware.window = split | fused`, the cell variants other than
-  `pdg`.
+  and the edit probes use it) and `hardware.window = split | fused`. The baselines and the cell
+  variants other than `pdg` cannot have it: it needs A5's readout, which they refuse.
 
 ## Tests (`tests/test_a14_reader.py`)
 
@@ -124,9 +124,15 @@ summary gate), slow window, three seeds where a claim is made:
 | Arithmetic, 9,000 steps | 95 % or more | (then: two fast cells beside the reader) |
 | Five tasks, 27,000 steps | at least the candidate's 89.9 % | |
 
-The short-sighted reader (`model.reader_span=32`) is run beside the full-window one on the
-hold-out data: a reader that cannot see far has to leave every distant fact to the memory, and
-the Transformer baseline learned training keys by heart.
+The short-sighted reader (`model.reader_span=32`) is the main form and the full-window one is
+run beside it. The recipe aligns documents to windows (`data.align_docs`), so on the synthetic
+tasks a full-window reader sees a fact and its query together and could answer without the
+memory, as the Transformer baseline did for the keys it trained on (100 % against 55 % on
+unseen keys). A reader that cannot see far has to leave every distant fact to the memory. The
+split by training keys and unseen keys (`hold_eval.py`) is the check in both forms.
+
+Readings are two of three seeds; the reference for recall is the same memory core without a
+reader on three seeds (`hold_k12nw_ag_ng2_cutC_cells64_18k_gsum`).
 
 **No speed is claimed by this amendment.** The routed cells still run at every byte; the
 window is the slow one. Speed is rungs 2 and 3 of the design and needs its own approval.

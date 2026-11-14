@@ -159,10 +159,6 @@ def install_variant(
         raise ValueError(
             f"variant {variant!r} with model.fast_cells (A8) is unsupported: use variant pdg"
         )
-    if model.cfg.reader != "none":
-        raise ValueError(
-            f"variant {variant!r} with model.reader (A14) is unsupported: use variant pdg"
-        )
     if model.cfg.ablate_shared_u:
         raise ValueError(
             f"variant {variant!r} with model.ablate_shared_u=true is refused: the variants' "

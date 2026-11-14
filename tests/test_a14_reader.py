@@ -114,8 +114,9 @@ def test_baselines_and_variants_refuse_the_key() -> None:
         load_config(gru, ["model.reader=transformer"])
     with pytest.raises(ValueError, match="selected_readout"):
         load_config(gru, ["model.reader=transformer", "model.selected_readout=true"])
+    # and A5 refuses every cell variant but pdg, so the reader never meets one
     model = HSN.from_config(_reader_cfg())
-    with pytest.raises(ValueError, match="reader"):
+    with pytest.raises(ValueError, match="A5 is unsupported"):
         install_variant(model, "gru_cell", {})
 
 

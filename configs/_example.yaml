@@ -61,6 +61,11 @@ model: # Appendix A.1
   scorer_position: document # amendment A11: document | clamp | wrap, the position the scorer's pos feature reads (equal while pos < unroll)
   write_gate: false # amendment A10: a selected routed cell is written only where the write logit of its unit is positive (topk, linear scorer)
   write_init: 2.0 # amendment A10: the write output's initial bias (positive: every selected cell is written at the start)
+  reader: none # amendment A14: none | transformer, a small causal Transformer over the window's bytes whose output c_t takes the fast read's place in S and the decoder (needs selected_readout)
+  reader_width: 64 # amendment A14: the width of the reader and of c_t (a multiple of reader_heads, even per head)
+  reader_layers: 2 # amendment A14: the reader's blocks
+  reader_heads: 4 # amendment A14: attention heads per block
+  reader_span: null # amendment A14: n = a position reads itself and the n - 1 bytes before it only (short-sighted); null = the document up to the position, inside the window
   address_ngram: 1 # amendment A9: longest byte n-gram with an address feature pair (needs key_address); 1 = A5 only
   state_schema_version: 1 # bumped on any state layout change
 
