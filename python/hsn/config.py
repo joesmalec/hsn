@@ -312,7 +312,11 @@ class ModelConfig(_StrictModel):
     # left out of its input. G keeps its shape (d -> n_units * address features) and its zero
     # start; only its input changes. Under train.feedback_detach with "router" the input is a
     # constant in the backward, like the scorer's u.
-    address_gate_input: Literal["u", "summary", "u_no_fast"] = "u"
+    # "reader_prev" (HSN-T: needs model.reader and reader_width = d): the reader's output for the
+    # position before, c_{t-1} (zero at a document's first position and at a window's first
+    # column). It holds the bytes up to t - 1 and not the current byte, which without fast cells
+    # the carried summary does not.
+    address_gate_input: Literal["u", "summary", "u_no_fast", "reader_prev"] = "u"
     # --- end A13 ---
     # --- Amendment A11 (docs/amendments/A11_position_bound.md; opt-in) ---
     # The position the scorer's ``pos`` feature reads. "document" (default): the position in the
@@ -334,6 +338,24 @@ class ModelConfig(_StrictModel):
     # cell is written at the start, as without the key.
     write_init: float = Field(default=2.0, allow_inf_nan=False)
     # --- end A10 ---
+    # --- Amendment A14 (docs/amendments/A14_reader.md; opt-in, default off) ---
+    # reader = "transformer": a small causal Transformer reads the bytes of the current window,
+    # all positions at once, and its output c_t (width reader_width) takes the place of the fast
+    # cells' read: S reads [z; q; ctx; c_t] and the decoder reads [q; u; r; c_t]. c_t depends on
+    # the bytes up to t of the same document inside the window and on nothing else (no earlier
+    # window, no cell state). The cells and their carried state, the fixed addresses, the
+    # router, the units, the gate, the graph and q are unchanged. This is sequence attention,
+    # which A5's text excludes: the key changes that line on purpose. Needs selected_readout.
+    # "none" (default): no reader. The fast cells may be kept beside it (fast_cells > 0).
+    reader: Literal["none", "transformer"] = "none"
+    reader_width: int = Field(default=64, ge=8)
+    reader_layers: int = Field(default=2, ge=1)
+    reader_heads: int = Field(default=4, ge=1)
+    # reader_span = n: a position reads itself and the n - 1 bytes before it only (the
+    # short-sighted reader, which must leave everything further back to the memory).
+    # null (default): every byte of the document up to the position, inside the window.
+    reader_span: int | None = Field(default=None, ge=1)
+    # --- end A14 ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -449,6 +471,37 @@ class ModelConfig(_StrictModel):
                 "model.fast_readout requires model.fast_cells > 0 and model.selected_readout=true"
             )
         # --- end A8 ---
+        # --- Amendment A14: the window reader ---
+        if self.reader == "none":
+            if self.address_gate_input == "reader_prev":
+                raise ValueError(
+                    "model.address_gate_input=reader_prev reads the reader's output; set "
+                    "model.reader=transformer"
+                )
+            if self.reader_span is not None:
+                raise ValueError(
+                    f"model.reader_span={self.reader_span} (A14) is the span of model.reader; "
+                    "set model.reader=transformer or leave it null"
+                )
+        else:
+            if not self.selected_readout:
+                raise ValueError(
+                    "model.reader (A14) requires model.selected_readout=true: the decoder reads "
+                    "[q; u; r; c]"
+                )
+            if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
+                raise ValueError(
+                    f"model.address_gate_input=reader_prev: the gate's map reads width d = "
+                    f"{self.d}; model.reader_width={self.reader_width} must equal it"
+                )
+            per_head, rest = divmod(self.reader_width, self.reader_heads)
+            if rest or per_head % 2:
+                raise ValueError(
+                    f"model.reader_width={self.reader_width} must be a multiple of "
+                    f"model.reader_heads={self.reader_heads} with an even width per head (the "
+                    "positions rotate pairs of the attention's query and key)"
+                )
+        # --- end A14 ---
         return self
 
 
@@ -1648,6 +1701,11 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.write_init",
     "train.lambda_w",
     "hardware.graph_alias_index",
+    "model.reader",
+    "model.reader_width",
+    "model.reader_layers",
+    "model.reader_heads",
+    "model.reader_span",
 )
 
 
@@ -1740,6 +1798,11 @@ def split_window_scope_error(
         return (
             "model.write_gate (A10): the write decision is not built into the split window; "
             "use hardware.window=autograd"
+        )
+    if model.reader != "none":
+        return (
+            f"model.reader={model.reader!r} (A14): the reader is not built into the split "
+            "window; use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (
