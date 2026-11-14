@@ -1572,11 +1572,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
 
 
 def split_window_scope_error(
-    cfg: RunConfig,
-    *,
-    state_gradient: bool | None = None,
-    row_limit: bool = False,
-    address_gate: bool = False,
+    cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
 ) -> str | None:
     """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
     ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is defined
@@ -1592,7 +1588,9 @@ def split_window_scope_error(
     What the scorer reads of a position apart from the state comes from the window's prologue
     and passes through the sweep and the replay as it is: amendment A9's address n-grams
     (``model.address_ngram``) and amendment A11's bounded position
-    (``model.scorer_position``) are inside the scope under both cuts.
+    (``model.scorer_position``) are inside the scope under both cuts. So is amendment A12's
+    address gate (``model.address_gate``), one more term of the scorer's logits, which the
+    replay adds and the compiled sweeps hold in their merged scorer product.
 
     A soft warm-up (``train.soft_until_step``) is inside the scope: its steps run every cell
     with autograd, which is the autograd window's work, so they take that window and the split
@@ -1609,13 +1607,7 @@ def split_window_scope_error(
     (:func:`hsn.train.state_gradient.state_gradient_backward` with ``limits``: plain PyTorch,
     tested against the autograd window in float64). No kernel applies it, so on the card that
     sweep would cost more than the autograd window, and the configuration is never offered
-    it.
-
-    Amendment A12's ``model.address_gate`` is outside the scope for now: ``address_gate=True``
-    admits it for the tests. The replay adds the gate's term to the scorer's logits and the
-    eager sweep runs the model's scorer (float64 tests against the autograd window); the
-    compiled sweeps hold the gate in their merged scorer product, which is tested as a layout
-    on the CPU and has not run on a card. Until it has, the configuration is not offered it."""
+    it."""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn":
         return f"model_name={cfg.model_name!r} is not the HSN"
@@ -1657,12 +1649,6 @@ def split_window_scope_error(
             f"model.fast_cells={model.fast_cells} (A8): the fast read of the decoder is part of "
             "the state-gradient sweep only (train.feedback_detach=[summary, eps, router]); "
             "with the full cut use hardware.window=autograd"
-        )
-    if model.address_gate and not address_gate:
-        return (
-            "model.address_gate (A12): the split window's compiled sweeps have not been "
-            "checked on a card with the content-dependent address weights; use "
-            "hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

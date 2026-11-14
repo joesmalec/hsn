@@ -71,32 +71,35 @@ address features and `q`. No attention over the sequence, no new state.
 **Parameters:** `d · M · A` (1,024 for the recipe with A5; 2,048 with the two-byte address).
 **Cost per position:** one `d → M·A` map and `N · M · A` multiply-adds, scorer work.
 
-**Windows.** Eager and compiled autograd windows. On the split and fused windows (P2.10,
-P2.10c) the key is still refused for a training run, and half of the work is done:
-- *Done (13 Nov, CPU, float64).* The split window's replay adds the gate's term to the
-  scorer's logits (`hsn.train.split._scorer_logits`), with `u` the constant the router cut
-  makes it, so `G` gets its gradient from the replay's graph like the scorer's other weights;
-  the eager sweep runs the model's own scorer. With `SplitWindow(..., address_gate=True)` the
-  window gives the autograd window's decisions, logits, final state and parameter gradients
-  (the gate's among them) under the full cut, with the state gradient and with A8's fast
-  cells, for A5's two address features and A9's four (`tests/test_a12_address_gate.py`).
-  That is the reference for what follows.
-- *Written, not yet run on a card (13 Nov).* The compiled sweeps. The fused and the folded
-  block take their scorer's logits from one merged product (the scorer's linear with `V` as
-  `d` more outputs). The gate enters it as `A · d` more input columns, `u_k · address_a[i]`
-  (`hsn.train.compile.gated_features`), against `G` as more rows of the merged weight
-  (`SweepTwin`), so the gate's term is summed in the same matmul and the selection kernels
-  and their inputs are as they were. On the CPU in float64 that product equals the model's
-  scorer with the gate and `V` (`test_merged_scorer_product_holds_the_gate`), and without the
-  key the features and the weight are the ones without it. The cost is 128 more columns of a
-  200-column product per position (256 with the two-byte address); to be measured.
-- *Open: the card.* The tapes of the fused and folded sweeps against the split sweep's with
-  a gate that is not zero (`tests/kernels/test_p2_10c_window.py`: `routed_gate`,
-  `fast_read_gate`, `fast_read_gate_ngram2`) and the fused window against the autograd window
-  and against its own PyTorch sweep (`tests/kernels/test_p2_10c_fused_window.py`:
-  `candidate_routed_gate`, `approved_shape_gate`), then the step time. Until they have
-  passed, the configuration is refused the key on `hardware.window=split|fused` exactly as
-  before; the tests admit it for themselves.
+**Windows.** Eager and compiled autograd windows, and the split and fused windows (P2.10,
+P2.10c) under the full cut and with the state gradient (`hardware.window=split|fused` takes the
+key since 14 Nov).
+- *The replay* adds the gate's term to the scorer's logits (`hsn.train.split._scorer_logits`),
+  with `u` the constant the router cut makes it, so `G` gets its gradient from the replay's
+  graph like the scorer's other weights. The term is summed feature by feature; as one einsum
+  over the window's rows it was a batched product of tiny matrices and cost 9.3 ms of a
+  140.3 ms step on the RTX 3060 (131.0 ms without the key). The step time with the plain sum
+  is still to be taken on the card.
+- *The eager sweep* runs the model's own scorer. *The compiled sweeps* (the fused and the
+  folded block) take their scorer's logits from one merged product (the scorer's linear with
+  `V` as `d` more outputs); the gate enters it as `A · d` more input columns,
+  `u_k · address_a[i]` (`hsn.train.compile.gated_features`), against `G` as more rows of the
+  merged weight (`SweepTwin`), so the selection kernels and their inputs are as they were, and
+  without the key the features and the weight are the ones without it.
+- *CPU, float64* (`tests/test_a12_address_gate.py`): the split window gives the autograd
+  window's decisions, logits, final state and parameter gradients, the gate's among them,
+  under the full cut, with the state gradient and with A8's fast cells, for A5's two address
+  features and A9's four; with the gate's weights zeroed its decisions are others. The merged
+  product equals the model's scorer with the gate, and `V`.
+- *Card, RTX 3060, 14 Nov, a gate that is not zero* (`tests/kernels/test_p2_10c_window.py`,
+  `test_p2_10c_fused_window.py`): the fused and folded sweeps record the split sweep's tape
+  (three shapes, A9's four features among them: every decision equal wherever the scores have
+  a margin, 100 % of the positions); the fused window through its kernels against its own
+  PyTorch sweep, 5e-8 and 9e-8 in fp32, 9e-4 and 1.5e-3 under bf16; the fused window against
+  the compiled autograd window in fp32, identical cells and gradients 6e-8 (12 routed slots)
+  and 2.5e-7 (the approved shape) apart. Those runs used the einsum form of the replay's
+  term; the plain sum is the same values in another order (the CPU tests above) and its card
+  run is the timing's.
 
 ## The smallest test, and its kill rule
 

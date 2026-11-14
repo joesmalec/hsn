@@ -48,11 +48,10 @@ feature is one of the scorer's scalars, which the window's prologue computes
 (`Scorer.window_scalars`) and the sweep and the replay read as they are; the sweeps keep the
 position only as the state's counter. Checked on a window that crosses `pos = unroll`: the
 split window gives the autograd window's decisions, logits, final state and parameter
-gradients in float64 on the CPU (`tests/test_a11_position_bound.py`). The compiled sweeps'
-tapes against the split sweep's across the bound are card tests
-(`tests/kernels/test_p2_10c_window.py`, the cases `fast_read_wrap` and `routed_clamp`),
-written on 13 Nov and not yet run: until they have passed on the card, treat a fused run with
-this key as unverified.
+gradients in float64 on the CPU (`tests/test_a11_position_bound.py`). On the card (RTX 3060,
+14 Nov) the fused and folded sweeps record the split sweep's tape across the bound in fp32
+(`tests/kernels/test_p2_10c_window.py`, the cases `fast_read_wrap` and `routed_clamp`: every
+decision equal wherever the scores have a margin, 100 % and 96 % of the positions).
 
 ## Results (13 Nov 2026; evaluation only, CPU)
 

@@ -3,11 +3,12 @@ the position's content. ``model.address_gate``: the scorer adds ``(G u_t)[j, a] 
 the logit of cell ``i`` and unit ``j``. ``G`` is zero at the start, so the model starts as the model
 without the key; with the key off nothing changes.
 
-The split window (P2.10, P2.10c): its replay adds the gate's term to the scorer's logits and its
-eager sweep runs the model's own scorer, so with ``address_gate=True`` it is the reference for the
-compiled sweeps. Those hold the gate in their merged scorer product (tested here as a layout,
-on the CPU); they have not run on a card with it, so the configuration is still refused the key
-on ``hardware.window=split|fused``."""
+The split and fused windows (P2.10, P2.10c) take the key: the replay adds the gate's term to the
+scorer's logits, the eager sweep runs the model's own scorer, and the compiled sweeps hold the
+gate in their merged scorer product. Here, on the CPU in float64: the split window against the
+autograd window, and that merged product as a layout. On the card
+(``tests/kernels/test_p2_10c_window.py``, ``test_p2_10c_fused_window.py``): the compiled sweeps'
+tapes and the fused window against the autograd window."""
 
 from __future__ import annotations
 
@@ -48,15 +49,15 @@ def test_address_gate_scope() -> None:
         load_config(REF_A1, list(GATE))  # no key address
     with pytest.raises(ValueError, match="address_gate"):
         load_config(RECIPE_A6, [*GATE, "model.scorer=mlp"])
+    # the split and fused windows take the key, under the full cut (the recipe's) and with
+    # the state gradient
     recipe = ["model.k_select=8", "train.gate_mode=ste"]
-    assert split_window_scope_error(load_config(RECIPE_A6, recipe)) is None
-    gated = load_config(RECIPE_A6, [*recipe, *GATE])
-    reason = split_window_scope_error(gated)
-    assert reason is not None and "address_gate" in reason
-    # the eager sweep and the replay carry the gate: admitted on request, as the reference
-    assert split_window_scope_error(gated, address_gate=True) is None
-    with pytest.raises(ValueError, match="address_gate"):  # at load, as before
-        load_config(RECIPE_A6, [*recipe, *GATE, "hardware.window=fused"])
+    cut = "train.feedback_detach=[summary,eps,router]"
+    for extra in ((), (cut,)):
+        assert split_window_scope_error(load_config(RECIPE_A6, [*recipe, *extra, *GATE])) is None
+        for window in ("split", "fused"):
+            cfg = load_config(RECIPE_A6, [*recipe, *extra, *GATE, f"hardware.window={window}"])
+            assert cfg.model.address_gate and cfg.hardware.window == window
 
 
 #: the split window's two cuts (P2.10's full cut, P2.10c's state gradient), the latter also
@@ -91,7 +92,7 @@ def test_split_window_with_the_gate_equals_autograd(cut: str, ngram: int) -> Non
     assert gate is not None and float(gate.weight.detach().abs().max()) > 0.1
     assert gate.weight.shape == (cfg.model.n_units * 2 * ngram, cfg.model.d)
     logits, final, info, ref = _windows(model, cfg, model, (inputs, mask))
-    split = SplitWindow(model, cfg, None, address_gate=True)
+    split = SplitWindow(model, cfg, None)
     s_logits, s_final, s_info, got = _windows(model, cfg, split, (inputs, mask))
     assert split.calls == 1
     for key in ("cell_idx", "unit_idx", "valid"):
@@ -117,14 +118,6 @@ def test_split_window_with_the_gate_equals_autograd(cut: str, ngram: int) -> Non
     assert not torch.equal(z_info["cell_idx"], s_info["cell_idx"]) or not torch.equal(
         z_info["unit_idx"], s_info["unit_idx"]
     )
-
-
-def test_the_split_window_takes_the_gate_on_request_only() -> None:
-    cfg = _cfg(*A5, ALL, "model.cand_norm=rms", *GATE)
-    model = _model(cfg)
-    with pytest.raises(ValueError, match="address_gate"):
-        SplitWindow(model, cfg, None)
-    assert SplitWindow(model, cfg, None, address_gate=True).compiled is None
 
 
 @pytest.mark.parametrize("ngram", [1, 2])

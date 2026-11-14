@@ -110,21 +110,14 @@ DENSE_BYTES = 4 << 30
 
 
 def scope_error(
-    cfg: RunConfig,
-    *,
-    state_gradient: bool | None = None,
-    row_limit: bool = False,
-    address_gate: bool = False,
+    cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
 ) -> str | None:
     """Why ``cfg`` cannot train with the split window, or ``None`` when it can (module
     docstring, "Scope"): :func:`hsn.config.split_window_scope_error`, which the configuration
     itself applies when ``hardware.window`` asks for the split window. ``state_gradient``
     narrows it to the window with the state gradient (P2.10c) or to the full cut's;
-    ``row_limit`` admits amendment A6's per-row limit for the reference sweep, and
-    ``address_gate`` amendment A12's gate for the eager sweep and the replay."""
-    return split_window_scope_error(
-        cfg, state_gradient=state_gradient, row_limit=row_limit, address_gate=address_gate
-    )
+    ``row_limit`` admits amendment A6's per-row limit for the reference sweep."""
+    return split_window_scope_error(cfg, state_gradient=state_gradient, row_limit=row_limit)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -334,11 +327,17 @@ def _scorer_logits(
     if scorer.address_gate is not None:
         # A12: the address weights' part that depends on the position's content,
         # sum_a (G u)[j, a] * address_a[i] (Scorer.forward); the address features are the
-        # features' last columns, so the scalars' last
+        # features' last columns, so the scalars' last. Summed feature by feature (two of
+        # them, four with A9): as one einsum over the window's rows it is a batched product
+        # of tiny matrices, which cost 9 ms of a 140 ms step on the RTX 3060.
         n_address = scorer.in_features - scorer._address_start
         gate = scorer.address_gate(u).view(u.shape[0], -1, n_address)  # [R, M, A]
-        address = scalars[..., scalars.shape[-1] - n_address :]  # [R, N, A]
-        out = out + torch.einsum("rna,rma->rnm", address, gate.to(address.dtype)).to(dtype)
+        gate = gate.to(scalars.dtype)
+        first = scalars.shape[-1] - n_address
+        term = scalars[:, :, first, None] * gate[:, None, :, 0]  # [R, N, M]
+        for a in range(1, n_address):
+            term = term + scalars[:, :, first + a, None] * gate[:, None, :, a]
+        out = out + term.to(dtype)
     return out
 
 
@@ -389,11 +388,12 @@ class SplitWindow:
     which of the two windows the caller expects. ``row_limit=True`` admits a configuration
     with amendment A6's per-row limit (``train.state_grad_clip`` / ``state_grad_ratio``): its
     reverse sweep is the PyTorch reference's (no kernel applies the limit), which is for
-    tests, not for training on the card. ``address_gate=True`` admits amendment A12's
-    ``model.address_gate``: the replay adds the gate's term to the scorer's logits, the eager
-    sweep runs the model's own scorer, and the compiled sweeps hold the gate in their merged
-    scorer product (:func:`hsn.train.compile.gated_features`). The compiled sweeps' part has
-    not run on a card yet, which is why the configuration is not offered the key."""
+    tests, not for training on the card.
+
+    Amendment A12's ``model.address_gate`` is inside the scope: the replay adds the gate's
+    term to the scorer's logits (:func:`_scorer_logits`), the eager sweep runs the model's own
+    scorer, and the compiled sweeps hold the gate in their merged scorer product
+    (:func:`hsn.train.compile.gated_features`)."""
 
     def __init__(
         self,
@@ -403,11 +403,8 @@ class SplitWindow:
         *,
         state_gradient: bool | None = None,
         row_limit: bool = False,
-        address_gate: bool = False,
     ) -> None:
-        reason = scope_error(
-            cfg, state_gradient=state_gradient, row_limit=row_limit, address_gate=address_gate
-        )
+        reason = scope_error(cfg, state_gradient=state_gradient, row_limit=row_limit)
         if reason is not None:
             raise ValueError(f"hardware.window=split is not available for this run: {reason}")
         #: P2.10c: the recurrence's reverse sweep carries the cell's read of the state.
