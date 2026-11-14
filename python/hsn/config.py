@@ -1585,6 +1585,11 @@ def split_window_scope_error(
     amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and ``fast_readout``),
     which the full cut's recurrence does not.
 
+    What the scorer reads of a position apart from the state comes from the window's prologue
+    and passes through the sweep and the replay as it is: amendment A9's address n-grams
+    (``model.address_ngram``) and amendment A11's bounded position
+    (``model.scorer_position``) are inside the scope under both cuts.
+
     A soft warm-up (``train.soft_until_step``) is inside the scope: its steps run every cell
     with autograd, which is the autograd window's work, so they take that window and the split
     window takes over at the first hard-gate step
@@ -1647,11 +1652,6 @@ def split_window_scope_error(
         return (
             "model.address_gate (A12): the split window's scorer has no content-dependent "
             "address weights; use hardware.window=autograd"
-        )
-    if model.scorer_position != "document":
-        return (
-            f"model.scorer_position={model.scorer_position!r} (A11) has not been checked "
-            "against the split window's tape; use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

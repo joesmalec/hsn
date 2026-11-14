@@ -362,6 +362,10 @@ SHAPES = {
     "fast_read_probes": (*READ, "model.age_max=2"),
     "fast_read_ngram2": (*READ, "model.address_ngram=2"),
     "routed_ngram2": ("model.n_cells=64", "model.k_select=12", "model.address_ngram=2"),
+    # amendment A11's bounded position: the second and third of the carried windows hold rows
+    # past pos = unroll (16 here), where the feature differs from the document's position
+    "fast_read_wrap": (*READ, "model.scorer_position=wrap"),
+    "routed_clamp": ("model.n_cells=64", "model.k_select=12", "model.scorer_position=clamp"),
 }
 
 #: A decision counts as settled when its scores are this far apart. Two sweeps compute one

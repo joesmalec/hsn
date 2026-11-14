@@ -42,9 +42,17 @@ wrap:                pos_feature = (pos mod unroll) / unroll
 **What stays.** Everything but one scalar feature of the scorer: cells, graph, units, ε, the
 convex tanh gate, the router, the address features and `q`. No parameter is added.
 
-**Windows.** Eager and compiled autograd windows. The split and fused windows refuse the key
-until it has been checked against their tape (the feature is computed before the window in
-both, so this is expected to be a check and not a change).
+**Windows.** Eager and compiled autograd windows, and the split and fused windows (P2.10,
+P2.10c) under the full cut and with the state gradient. Nothing in those windows changed: the
+feature is one of the scorer's scalars, which the window's prologue computes
+(`Scorer.window_scalars`) and the sweep and the replay read as they are; the sweeps keep the
+position only as the state's counter. Checked on a window that crosses `pos = unroll`: the
+split window gives the autograd window's decisions, logits, final state and parameter
+gradients in float64 on the CPU (`tests/test_a11_position_bound.py`). The compiled sweeps'
+tapes against the split sweep's across the bound are card tests
+(`tests/kernels/test_p2_10c_window.py`, the cases `fast_read_wrap` and `routed_clamp`),
+written on 13 Nov and not yet run: until they have passed on the card, treat a fused run with
+this key as unverified.
 
 ## Results (13 Nov 2026; evaluation only, CPU)
 

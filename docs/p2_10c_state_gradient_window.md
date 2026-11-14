@@ -46,6 +46,12 @@ What does change:
      split and fused windows now take address n-grams. No kernel changed for it (the scorer's
      scalars pass through the sweep at any width); the refusal had been a scope statement for
      an untested combination, and the combination is now tested (CPU and card).
+   - amendment A11's `model.scorer_position` (`clamp`, `wrap`), under both cuts (on the branch
+     that carries A11, `claude/cutc-a11-a12`). No window code changed: the feature is one of
+     the scorer's scalars from the window's prologue. Equal to the autograd window across
+     `pos = unroll` in float64 on the CPU; the compiled sweeps' tapes are card tests that
+     have not run yet.
+
    Amendment A6's `train.state_grad_clip` / `train.state_grad_ratio` are refused as before,
    under both cuts ("Step 3": a reference exists, no kernel).
 2. **`hsn.model.gradclip`**: the limit's arithmetic moved from the autograd function's
