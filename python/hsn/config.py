@@ -1572,7 +1572,11 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
 
 
 def split_window_scope_error(
-    cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
+    cfg: RunConfig,
+    *,
+    state_gradient: bool | None = None,
+    row_limit: bool = False,
+    address_gate: bool = False,
 ) -> str | None:
     """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
     ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is defined
@@ -1605,7 +1609,12 @@ def split_window_scope_error(
     (:func:`hsn.train.state_gradient.state_gradient_backward` with ``limits``: plain PyTorch,
     tested against the autograd window in float64). No kernel applies it, so on the card that
     sweep would cost more than the autograd window, and the configuration is never offered
-    it."""
+    it.
+
+    Amendment A12's ``model.address_gate`` is outside the scope for now: ``address_gate=True``
+    admits it for the eager sweep and the replay, which carry the gate (the replay adds its
+    term to the scorer's logits; float64 tests against the autograd window). The compiled
+    sweeps do not add it to their scorer product yet, so the configuration is not offered it."""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn":
         return f"model_name={cfg.model_name!r} is not the HSN"
@@ -1648,10 +1657,10 @@ def split_window_scope_error(
             "the state-gradient sweep only (train.feedback_detach=[summary, eps, router]); "
             "with the full cut use hardware.window=autograd"
         )
-    if model.address_gate:
+    if model.address_gate and not address_gate:
         return (
-            "model.address_gate (A12): the split window's scorer has no content-dependent "
-            "address weights; use hardware.window=autograd"
+            "model.address_gate (A12): the split window's compiled sweeps do not add the "
+            "content-dependent address weights yet; use hardware.window=autograd"
         )
     if model.cell_units != "routed":
         return (

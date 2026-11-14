@@ -71,7 +71,23 @@ address features and `q`. No attention over the sequence, no new state.
 **Parameters:** `d · M · A` (1,024 for the recipe with A5; 2,048 with the two-byte address).
 **Cost per position:** one `d → M·A` map and `N · M · A` multiply-adds, scorer work.
 
-**Windows.** Eager and compiled autograd windows. The split and fused windows refuse the key.
+**Windows.** Eager and compiled autograd windows. On the split and fused windows (P2.10,
+P2.10c) the key is still refused for a training run, and half of the work is done:
+- *Done (13 Nov, CPU, float64).* The split window's replay adds the gate's term to the
+  scorer's logits (`hsn.train.split._scorer_logits`), with `u` the constant the router cut
+  makes it, so `G` gets its gradient from the replay's graph like the scorer's other weights;
+  the eager sweep runs the model's own scorer. With `SplitWindow(..., address_gate=True)` the
+  window gives the autograd window's decisions, logits, final state and parameter gradients
+  (the gate's among them) under the full cut, with the state gradient and with A8's fast
+  cells, for A5's two address features and A9's four (`tests/test_a12_address_gate.py`).
+  That is the reference for what follows.
+- *Open.* The compiled sweeps (the sweep twin's merged scorer product in the fused and the
+  folded block) do not add the gate. The term fits that product as `A · d` more input
+  columns, `u_k · address_a[i]`, against `G` as more rows of the merged weight, so the
+  selection kernels and their inputs stay as they are. Then the tapes against the split
+  sweep's and the fused window against the autograd window, on the card. Until both, the
+  configuration is refused the key on `hardware.window=split|fused`, and a split window
+  over a compiled sweep is refused it whatever the caller asks.
 
 ## The smallest test, and its kill rule
 

@@ -110,14 +110,21 @@ DENSE_BYTES = 4 << 30
 
 
 def scope_error(
-    cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
+    cfg: RunConfig,
+    *,
+    state_gradient: bool | None = None,
+    row_limit: bool = False,
+    address_gate: bool = False,
 ) -> str | None:
     """Why ``cfg`` cannot train with the split window, or ``None`` when it can (module
     docstring, "Scope"): :func:`hsn.config.split_window_scope_error`, which the configuration
     itself applies when ``hardware.window`` asks for the split window. ``state_gradient``
     narrows it to the window with the state gradient (P2.10c) or to the full cut's;
-    ``row_limit`` admits amendment A6's per-row limit for the reference sweep."""
-    return split_window_scope_error(cfg, state_gradient=state_gradient, row_limit=row_limit)
+    ``row_limit`` admits amendment A6's per-row limit for the reference sweep, and
+    ``address_gate`` amendment A12's gate for the eager sweep and the replay."""
+    return split_window_scope_error(
+        cfg, state_gradient=state_gradient, row_limit=row_limit, address_gate=address_gate
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -323,7 +330,16 @@ def _scorer_logits(
     dtype = h.dtype  # the state's dtype: the partial products are summed in it, not in bf16
     cells = F.linear(h, weight[:, 2 * d : 3 * d]).to(dtype)  # [R, N, M]
     cells = cells + F.linear(tail, weight[:, 3 * d :], net.bias).to(dtype)
-    return cells + row.to(dtype)[:, None, :]
+    out = cells + row.to(dtype)[:, None, :]
+    if scorer.address_gate is not None:
+        # A12: the address weights' part that depends on the position's content,
+        # sum_a (G u)[j, a] * address_a[i] (Scorer.forward); the address features are the
+        # features' last columns, so the scalars' last
+        n_address = scorer.in_features - scorer._address_start
+        gate = scorer.address_gate(u).view(u.shape[0], -1, n_address)  # [R, M, A]
+        address = scalars[..., scalars.shape[-1] - n_address :]  # [R, N, A]
+        out = out + torch.einsum("rna,rma->rnm", address, gate.to(address.dtype)).to(dtype)
+    return out
 
 
 def _readout_of_slots(
@@ -373,7 +389,10 @@ class SplitWindow:
     which of the two windows the caller expects. ``row_limit=True`` admits a configuration
     with amendment A6's per-row limit (``train.state_grad_clip`` / ``state_grad_ratio``): its
     reverse sweep is the PyTorch reference's (no kernel applies the limit), which is for
-    tests, not for training on the card."""
+    tests, not for training on the card. ``address_gate=True`` admits amendment A12's
+    ``model.address_gate``: the replay adds the gate's term to the scorer's logits and the
+    eager sweep runs the model's own scorer; the compiled sweeps do not carry it yet, so a
+    compiled window is refused with it."""
 
     def __init__(
         self,
@@ -383,8 +402,16 @@ class SplitWindow:
         *,
         state_gradient: bool | None = None,
         row_limit: bool = False,
+        address_gate: bool = False,
     ) -> None:
-        reason = scope_error(cfg, state_gradient=state_gradient, row_limit=row_limit)
+        reason = scope_error(
+            cfg, state_gradient=state_gradient, row_limit=row_limit, address_gate=address_gate
+        )
+        if reason is None and cfg.model.address_gate and compiled is not None:
+            reason = (
+                "model.address_gate (A12): the compiled sweeps do not add the gate to the "
+                "scorer's product yet; only the eager sweep (compiled=None) carries it"
+            )
         if reason is not None:
             raise ValueError(f"hardware.window=split is not available for this run: {reason}")
         #: P2.10c: the recurrence's reverse sweep carries the cell's read of the state.

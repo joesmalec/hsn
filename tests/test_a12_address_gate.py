@@ -1,7 +1,12 @@
 """Amendment A12 (``docs/amendments/A12_address_gate.md``; opt-in): address weights that depend on
 the position's content. ``model.address_gate``: the scorer adds ``(G u_t)[j, a] * address_a[i]`` to
 the logit of cell ``i`` and unit ``j``. ``G`` is zero at the start, so the model starts as the model
-without the key; with the key off nothing changes."""
+without the key; with the key off nothing changes.
+
+The split window (P2.10, P2.10c): its replay adds the gate's term to the scorer's logits and its
+eager sweep runs the model's own scorer, so with ``address_gate=True`` it is the reference for the
+compiled sweeps, which do not carry the gate yet (the configuration is still refused the key on
+``hardware.window=split|fused``)."""
 
 from __future__ import annotations
 
@@ -14,10 +19,12 @@ import torch
 from hsn.config import config_hash, load_config, split_window_scope_error
 from hsn.model.hsn import HSN
 from hsn.train.memory_plan import expected_param_count
+from hsn.train.split import SplitWindow
 from p1_11_support import restore_determinism  # noqa: F401
 from p1_15_support import datasets, hsn_config, hsn_trainer
 from test_a6_feedback_detach import A5, ALL, _cfg, _model, _start, _window
 from test_p2_8_compile import _release_compiled_state, small_blocks  # noqa: F401
+from test_p2_10c_state_gradient import BASE, PINNED, _assert_same_grads, _case, _objective
 from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
@@ -42,8 +49,89 @@ def test_address_gate_scope() -> None:
         load_config(RECIPE_A6, [*GATE, "model.scorer=mlp"])
     recipe = ["model.k_select=8", "train.gate_mode=ste"]
     assert split_window_scope_error(load_config(RECIPE_A6, recipe)) is None
-    reason = split_window_scope_error(load_config(RECIPE_A6, [*recipe, *GATE]))
+    gated = load_config(RECIPE_A6, [*recipe, *GATE])
+    reason = split_window_scope_error(gated)
     assert reason is not None and "address_gate" in reason
+    # the eager sweep and the replay carry the gate: admitted on request, as the reference
+    assert split_window_scope_error(gated, address_gate=True) is None
+    with pytest.raises(ValueError, match="address_gate"):  # at load, as before
+        load_config(RECIPE_A6, [*recipe, *GATE, "hardware.window=fused"])
+
+
+#: the split window's two cuts (P2.10's full cut, P2.10c's state gradient), the latter also
+#: with A8's fast cells at fixed units and their read
+WINDOW_CUTS = {
+    "full_cut": (*A5, ALL, "model.cand_norm=rms"),
+    "state_gradient": BASE,
+    "state_gradient_fast_cells": (*BASE, *PINNED),
+}
+
+
+def _windows(model: HSN, cfg: object, call: object, mask_from: tuple) -> tuple:
+    (tokens, ctx, state, reset), mask = mask_from
+    names = [n for n, _ in model.named_parameters()]
+    params = [p for _, p in model.named_parameters()]
+    logits, final, info = call(tokens, ctx, state, reset)  # type: ignore[operator]
+    grads = torch.autograd.grad(_objective(logits, info, mask), params, allow_unused=True)
+    return logits.detach(), final, info, dict(zip(names, grads, strict=True))
+
+
+@pytest.mark.parametrize("ngram", [1, 2])
+@pytest.mark.parametrize("cut", list(WINDOW_CUTS))
+def test_split_window_with_the_gate_equals_autograd(cut: str, ngram: int) -> None:
+    """The split window with a gate that is not zero (the perturbed model), float64: the
+    autograd window's decisions, logits, final state and parameter gradients, the gate's own
+    among them, under the full cut and with the state gradient, for A5's two address features
+    and A9's four. And the window reads the gate: with the gate's weights set to zero its
+    logits are others."""
+    cfg = _cfg(*WINDOW_CUTS[cut], *GATE, f"model.address_ngram={ngram}")
+    model, inputs, mask = _case(cfg)
+    gate = model.scorer.address_gate
+    assert gate is not None and float(gate.weight.detach().abs().max()) > 0.1
+    assert gate.weight.shape == (cfg.model.n_units * 2 * ngram, cfg.model.d)
+    logits, final, info, ref = _windows(model, cfg, model, (inputs, mask))
+    split = SplitWindow(model, cfg, None, address_gate=True)
+    s_logits, s_final, s_info, got = _windows(model, cfg, split, (inputs, mask))
+    assert split.calls == 1
+    for key in ("cell_idx", "unit_idx", "valid"):
+        assert torch.equal(s_info[key], info[key]), key
+    torch.testing.assert_close(s_logits, logits, rtol=1e-10, atol=1e-12)
+    for field in ("h", "q"):
+        torch.testing.assert_close(
+            getattr(s_final, field), getattr(final, field), rtol=1e-10, atol=1e-12
+        )
+    for key in ("unit_logits", "route_log_prob", "expected_cost"):
+        torch.testing.assert_close(s_info[key], info[key], rtol=1e-9, atol=1e-12)
+    _assert_same_grads(ref, got)
+    name = next(n for n in ref if n.endswith("address_gate.weight"))
+    assert float(ref[name].abs().max()) > 1e-6  # the gate is trained through this window
+    # the same window without the gate's term
+    with torch.no_grad():
+        kept = gate.weight.clone()
+        gate.weight.zero_()
+    z_logits, _, z_info, _ = _windows(model, cfg, split, (inputs, mask))
+    with torch.no_grad():
+        gate.weight.copy_(kept)
+    assert float((z_info["unit_logits"] - s_info["unit_logits"]).abs().max()) > 1e-3
+    assert not torch.equal(z_info["cell_idx"], s_info["cell_idx"]) or not torch.equal(
+        z_info["unit_idx"], s_info["unit_idx"]
+    )
+
+
+def test_a_compiled_sweep_is_refused_the_gate() -> None:
+    """The compiled sweeps do not add the gate to their scorer product yet: the split window
+    over a compiled window is refused with the key, whatever the caller asks."""
+    cfg = p28._cfg(
+        "model.routing=topk", "model.key_address=true", "model.selected_readout=true",
+        "train.gate_mode=ste", ALL, *GATE,
+    )  # fmt: skip
+    model = p28._model(cfg, training=True, scale=0.3)
+    compiled = p28._window(model, p28._ctx())
+    with pytest.raises(ValueError, match="compiled sweeps"):
+        SplitWindow(model, cfg, compiled, address_gate=True)
+    with pytest.raises(ValueError, match="address_gate"):
+        SplitWindow(model, cfg, None)
+    assert SplitWindow(model, cfg, None, address_gate=True).compiled is None
 
 
 @pytest.mark.parametrize("ngram", [1, 2])
