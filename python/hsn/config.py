@@ -305,6 +305,15 @@ class ModelConfig(_StrictModel):
     # addresses are A5's fixed codes; nothing about a key is learned.
     address_gate: bool = False
     # --- end A12 ---
+    # --- Amendment A13 (docs/amendments/A13_gate_input.md; opt-in, needs address_gate) ---
+    # address_gate_input: what A12's gate reads. "u" (default): the position's content u_t,
+    # A12 as it is. "summary": the carried summary q_{t-1} as S reads it, which does not hold
+    # the current byte. "u_no_fast" (needs fast_readout): S's output with the fast cells' read
+    # left out of its input. G keeps its shape (d -> n_units * address features) and its zero
+    # start; only its input changes. Under train.feedback_detach with "router" the input is a
+    # constant in the backward, like the scorer's u.
+    address_gate_input: Literal["u", "summary", "u_no_fast"] = "u"
+    # --- end A13 ---
     # --- Amendment A11 (docs/amendments/A11_position_bound.md; opt-in) ---
     # The position the scorer's ``pos`` feature reads. "document" (default): the position in the
     # document, pos / unroll, which grows past 1 in a document longer than the training window.
@@ -396,6 +405,16 @@ class ModelConfig(_StrictModel):
             raise ValueError(
                 "model.address_gate (A12) needs model.key_address=true and model.scorer=linear, "
                 f"got key_address={self.key_address}, scorer={self.scorer!r}"
+            )
+        if self.address_gate_input != "u" and not self.address_gate:
+            raise ValueError(
+                f"model.address_gate_input={self.address_gate_input!r} (A13) says what "
+                "model.address_gate reads; set model.address_gate=true or leave it at 'u'"
+            )
+        if self.address_gate_input == "u_no_fast" and not self.fast_readout:
+            raise ValueError(
+                "model.address_gate_input=u_no_fast (A13) leaves the fast cells' read out of "
+                "the gate's input; without model.fast_readout there is none (use 'u')"
             )
         if self.cell_units != "routed" and self.routing != "topk":
             raise ValueError(
@@ -1582,6 +1601,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.scorer_position",
     "model.address_gate",
     "train.address_gate_hold_step",
+    "model.address_gate_input",
 )
 
 
@@ -1630,6 +1650,11 @@ def split_window_scope_error(cfg: RunConfig) -> str | None:
         return (
             "model.address_gate (A12): the split window's scorer has no content-dependent "
             "address weights; use hardware.window=autograd"
+        )
+    if model.address_gate_input != "u":
+        return (
+            f"model.address_gate_input={model.address_gate_input!r} (A13): the split window "
+            "has no gate input apart from u; use hardware.window=autograd"
         )
     if model.scorer_position != "document":
         return (

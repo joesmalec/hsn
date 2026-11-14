@@ -57,6 +57,7 @@ model: # Appendix A.1
   fast_units: routed # amendment A8: routed = a fast cell runs its best unit; fixed = fast cell i always runs unit i mod n_units
   cell_units: routed # opt-in control for A8: fixed = every cell i runs unit i mod n_units (the router still chooses the cells; topk only)
   address_gate: false # amendment A12: a unit's weight on each address feature also depends on the position's content u (needs key_address, linear scorer)
+  address_gate_input: u # A13 (opt-in, needs address_gate): what the gate reads: u | summary (the carried summary, not the current byte) | u_no_fast (u without the fast cells' read)
   scorer_position: document # amendment A11: document | clamp | wrap, the position the scorer's pos feature reads (equal while pos < unroll)
   address_ngram: 1 # amendment A9: longest byte n-gram with an address feature pair (needs key_address); 1 = A5 only
   state_schema_version: 1 # bumped on any state layout change
