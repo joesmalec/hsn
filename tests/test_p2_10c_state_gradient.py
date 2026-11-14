@@ -273,6 +273,11 @@ def _objective(logits: Tensor, info: dict[str, Tensor], mask: Tensor) -> Tensor:
     return task + 0.7 * pred + 0.3 * cost + 0.2 * balance
 
 
+def _limited(cfg: RunConfig) -> bool:
+    """Whether ``cfg`` sets amendment A6's per-row limit (the reference sweep's ``row_limit``)."""
+    return cfg.train.state_grad_clip is not None or cfg.train.state_grad_ratio is not None
+
+
 def _case(
     cfg: RunConfig, model: HSN | None = None
 ) -> tuple[HSN, tuple[Tensor, Tensor, CellGraphState, Tensor], Tensor]:
@@ -309,7 +314,7 @@ def _both(
     logits, ref_state, ref_info = model(tokens, ctx, state, reset)
     ref = torch.autograd.grad(_objective(logits, ref_info, mask), params, allow_unused=True)
 
-    window = SplitWindow(model, cfg, None, state_gradient=True)
+    window = SplitWindow(model, cfg, None, state_gradient=True, row_limit=_limited(cfg))
     s_logits, s_state, s_info = window(tokens, ctx, state, reset)
     got = torch.autograd.grad(_objective(s_logits, s_info, mask), params, allow_unused=True)
     assert window.calls == 1
@@ -563,7 +568,7 @@ def _cotangents_by_position(
 
     limits: list[object] = []
     monkeypatch.setattr(state_gradient, "state_gradient_backward", traced)
-    window = SplitWindow(model, cfg, None, state_gradient=True)
+    window = SplitWindow(model, cfg, None, state_gradient=True, row_limit=_limited(cfg))
     s_logits, _, s_info = window(tokens, ctx, state, reset)
     _objective(s_logits, s_info, mask).backward()
     monkeypatch.undo()
@@ -694,22 +699,25 @@ def test_sweeps_limited_state_cotangent_is_autograds(
 
 
 def test_the_row_limit_is_the_models() -> None:
-    """The window hands the sweep the model's limits: the absolute limit of ``dL/dq``, that of
-    ``dL/dh`` (``limit / sqrt(n_cells)``) and the ratio; none without the keys, and none under
-    the full cut (whose window the scope refuses with them)."""
+    """With ``row_limit=True`` the window hands the sweep the model's limits: the absolute
+    limit of ``dL/dq``, that of ``dL/dh`` (``limit / sqrt(n_cells)``) and the ratio; none
+    without the keys. Without ``row_limit``, and under the full cut, the scope refuses a
+    configuration with them."""
     cfg = _cfg(*BASE, "train.state_grad_clip=0.5", "train.state_grad_ratio=3.0")
-    limits = SplitWindow(HSN.from_config(cfg), cfg, None).row_limits
+    limits = SplitWindow(HSN.from_config(cfg), cfg, None, row_limit=True).row_limits
     assert limits is not None
     assert limits.q == 0.5 and limits.ratio == 3.0
     assert limits.h == pytest.approx(0.5 / cfg.model.n_cells**0.5, rel=1e-15)
     ratio = _cfg(*BASE, "train.state_grad_ratio=3.0")
-    only = SplitWindow(HSN.from_config(ratio), ratio, None).row_limits
+    only = SplitWindow(HSN.from_config(ratio), ratio, None, row_limit=True).row_limits
     assert only is not None and (only.h, only.q, only.ratio) == (None, None, 3.0)
     plain = _cfg(*BASE)
-    assert SplitWindow(HSN.from_config(plain), plain, None).row_limits is None
-    with pytest.raises(ValueError, match="state_grad_clip"):
+    assert SplitWindow(HSN.from_config(plain), plain, None, row_limit=True).row_limits is None
+    with pytest.raises(ValueError, match="state_grad_clip"):  # not offered without row_limit
+        SplitWindow(HSN.from_config(ratio), ratio, None)
+    with pytest.raises(ValueError, match="state_grad_clip"):  # nor under the full cut
         full = _cfg(*A5, ALL, "train.state_grad_ratio=3.0")
-        SplitWindow(HSN.from_config(full), full, None)
+        SplitWindow(HSN.from_config(full), full, None, row_limit=True)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -770,11 +778,17 @@ def test_the_scope_with_the_state_gradient() -> None:
     assert scope_error(_cfg(*BASE, *PINNED), state_gradient=True) is None
     assert scope_error(_cfg(*BASE, "model.address_ngram=2"), state_gradient=True) is None
     assert scope_error(_cfg(*BASE, "train.p_dense=0.25"), state_gradient=True) is None
-    # A6's per-row limit: the state-gradient sweep applies it, the full cut's recurrence not
+    # A6's per-row limit stays outside the scope (no kernel applies it); row_limit admits it
+    # for the reference sweep, with the state gradient only
     for limit in ("train.state_grad_clip=1.0", "train.state_grad_ratio=3.0"):
-        assert scope_error(_cfg(*BASE, limit), state_gradient=True) is None
-        reason = scope_error(_cfg(*A5, ALL, limit))
-        assert reason is not None and "state_grad_clip" in reason
+        for cut in ((*BASE, limit), (*A5, ALL, limit)):
+            reason = scope_error(_cfg(*cut))
+            assert reason is not None and "state_grad_clip" in reason
+        assert scope_error(_cfg(*BASE, limit), state_gradient=True) is not None
+        assert scope_error(_cfg(*BASE, limit), state_gradient=True, row_limit=True) is None
+        assert scope_error(_cfg(*A5, ALL, limit), row_limit=True) is not None
+        with pytest.raises(ValueError, match="state_grad_clip"):  # at load, as before
+            _cfg(*BASE, limit, "hardware.window=split")
     for overrides, message in (
         ((*A5, ALL), "holds every path"),
         ((*A5, "train.feedback_detach=[summary,eps]"), "lacks"),

@@ -43,9 +43,12 @@ window kernels built, a kernel (``hsn_win_back_head`` / ``_mid`` / ``_tail``,
 :mod:`hsn.kernels.window`). On CUDA the loop over the positions can be captured once per shape
 in a CUDA graph (:meth:`ReverseSweep.capture`) and replayed for every window.
 
-The limit (:class:`hsn.train.state_gradient.RowLimits`) is a property of the run, fixed when
-the sweep is built. Its step has the PyTorch implementation only: a sweep with a limit does
-not take the kernels yet, and :class:`SweepRunner` leaves such a window to the PyTorch sweep.
+The limit (:class:`hsn.train.state_gradient.RowLimits`) is fixed when the sweep is built. Its
+step has the PyTorch implementation only, as the reference of a kernel that was not built (13
+Nov 2026: the limit is not expected to join the base): a sweep with a limit does not take the
+kernels, :class:`SweepRunner` leaves such a window to the PyTorch sweep, and the split
+window's scope does not offer a training run the limit
+(:func:`hsn.config.split_window_scope_error`).
 """
 
 from __future__ import annotations
@@ -205,7 +208,7 @@ class ReverseSweep:
 
         if self.device.type != "cuda" or self.state_dtype != torch.float32:
             return False
-        if self.limits is not None:  # the limit's step is not a kernel yet
+        if self.limits is not None:  # the limit's step is not a kernel
             return False
         if self.product_dtype not in (torch.float32, torch.bfloat16):
             return False
@@ -615,7 +618,7 @@ class SweepRunner:
         device = c.device
         if device.type != "cuda" or c.dtype != torch.float32:
             return None
-        if limits is not None:  # the limit's step is not a kernel yet: the PyTorch sweep
+        if limits is not None:  # the limit's step is not a kernel: the PyTorch sweep
             return None
         if not window_kernels.available() or not window_kernels.prepared(device):
             return None

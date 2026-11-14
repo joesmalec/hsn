@@ -1517,7 +1517,9 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
 )
 
 
-def split_window_scope_error(cfg: RunConfig, *, state_gradient: bool | None = None) -> str | None:
+def split_window_scope_error(
+    cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
+) -> str | None:
     """Why ``cfg`` cannot train with the split window (``hardware.window`` = ``split`` or
     ``fused``, P2.10, :mod:`hsn.train.split`), or ``None`` when it can: the window is defined
     for the routed hard-gate round it replays, with the ``summary``, ``eps`` and ``router``
@@ -1526,10 +1528,8 @@ def split_window_scope_error(cfg: RunConfig, *, state_gradient: bool | None = No
     (P2.10c, "the state gradient": ``docs/p2_10c_state_gradient_window.md``) the recurrence's
     reverse sweep also carries the cell's read of the state position by position
     (:mod:`hsn.train.state_gradient`, :mod:`hsn.train.state_sweep`); that sweep also takes
-    amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and ``fast_readout``)
-    and amendment A6's per-row limit on what a position passes back
-    (``train.state_grad_clip``, ``train.state_grad_ratio``), which the full cut's recurrence
-    does not.
+    amendment A8's fast cells (``model.fast_cells`` with ``fast_units`` and ``fast_readout``),
+    which the full cut's recurrence does not.
 
     A soft warm-up (``train.soft_until_step``) is inside the scope: its steps run every cell
     with autograd, which is the autograd window's work, so they take that window and the split
@@ -1538,7 +1538,15 @@ def split_window_scope_error(cfg: RunConfig, *, state_gradient: bool | None = No
 
     ``state_gradient`` narrows the question to one of the two cuts (``True``: the state
     gradient; ``False``: the full cut); ``None`` (default, what ``hardware.window`` is checked
-    against at load) accepts either."""
+    against at load) accepts either.
+
+    Amendment A6's per-row limit (``train.state_grad_clip``, ``train.state_grad_ratio``) is
+    outside the scope: a run with it trains on the autograd window. ``row_limit=True`` admits
+    it with the state gradient, for the reference sweep that applies it
+    (:func:`hsn.train.state_gradient.state_gradient_backward` with ``limits``: plain PyTorch,
+    tested against the autograd window in float64). No kernel applies it, so on the card that
+    sweep would cost more than the autograd window, and the configuration is never offered
+    it."""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn":
         return f"model_name={cfg.model_name!r} is not the HSN"
@@ -1571,12 +1579,8 @@ def split_window_scope_error(cfg: RunConfig, *, state_gradient: bool | None = No
     if train.lambda_u > 0.0:
         return "train.lambda_u > 0: the counterfactual probes are untested with the split window"
     limited = train.state_grad_clip is not None or train.state_grad_ratio is not None
-    if limited and not sweeps_state:
-        return (
-            "train.state_grad_clip / state_grad_ratio change the state recurrence's backward: "
-            "only the state-gradient sweep applies them "
-            "(train.feedback_detach=[summary, eps, router])"
-        )
+    if limited and not (row_limit and sweeps_state):
+        return "train.state_grad_clip / state_grad_ratio change the state recurrence's backward"
     if model.disabled_cells:
         return f"model.disabled_cells={list(model.disabled_cells)} is a test hook of the full path"
     if model.fast_cells and not sweeps_state:

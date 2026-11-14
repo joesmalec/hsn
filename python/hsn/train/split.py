@@ -109,12 +109,15 @@ __all__ = [
 DENSE_BYTES = 4 << 30
 
 
-def scope_error(cfg: RunConfig, *, state_gradient: bool | None = None) -> str | None:
+def scope_error(
+    cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
+) -> str | None:
     """Why ``cfg`` cannot train with the split window, or ``None`` when it can (module
     docstring, "Scope"): :func:`hsn.config.split_window_scope_error`, which the configuration
     itself applies when ``hardware.window`` asks for the split window. ``state_gradient``
-    narrows it to the window with the state gradient (P2.10c) or to the full cut's."""
-    return split_window_scope_error(cfg, state_gradient=state_gradient)
+    narrows it to the window with the state gradient (P2.10c) or to the full cut's;
+    ``row_limit`` admits amendment A6's per-row limit for the reference sweep."""
+    return split_window_scope_error(cfg, state_gradient=state_gradient, row_limit=row_limit)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -367,7 +370,10 @@ class SplitWindow:
     :mod:`hsn.train.state_gradient`, and on the card its reverse sweep as kernels
     (:class:`hsn.train.state_sweep.SweepRunner`). A window with dense-fallback rows then goes
     to the fallback. ``state_gradient`` (``None``: what the configuration says) only asserts
-    which of the two windows the caller expects."""
+    which of the two windows the caller expects. ``row_limit=True`` admits a configuration
+    with amendment A6's per-row limit (``train.state_grad_clip`` / ``state_grad_ratio``): its
+    reverse sweep is the PyTorch reference's (no kernel applies the limit), which is for
+    tests, not for training on the card."""
 
     def __init__(
         self,
@@ -376,8 +382,9 @@ class SplitWindow:
         compiled: CompiledWindow | None,
         *,
         state_gradient: bool | None = None,
+        row_limit: bool = False,
     ) -> None:
-        reason = scope_error(cfg, state_gradient=state_gradient)
+        reason = scope_error(cfg, state_gradient=state_gradient, row_limit=row_limit)
         if reason is not None:
             raise ValueError(f"hardware.window=split is not available for this run: {reason}")
         #: P2.10c: the recurrence's reverse sweep carries the cell's read of the state.
@@ -394,7 +401,7 @@ class SplitWindow:
         self.calls = 0
         #: A6's per-row limit on what a position passes back into the state, as the model
         #: applies it (``train.state_grad_clip`` / ``state_grad_ratio``; ``None``: neither).
-        #: Only the state gradient has such a gradient to limit.
+        #: Only with ``row_limit=True``: the scope refuses such a configuration otherwise.
         limited = model.state_grad_clip is not None or model.state_grad_ratio is not None
         self.row_limits: RowLimits | None = (
             RowLimits(h=model._clip_h, q=model.state_grad_clip, ratio=model.state_grad_ratio)

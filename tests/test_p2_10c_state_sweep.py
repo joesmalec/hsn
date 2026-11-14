@@ -18,7 +18,16 @@ from hsn.train.state_gradient import RowLimits, cell_constants
 from hsn.train.state_sweep import ReverseSweep, out_adjacency, sweep_shape
 from p1_11_support import restore_determinism  # noqa: F401
 from test_a6_feedback_detach import _cfg, _model
-from test_p2_10c_state_gradient import BASE, FAST, PINNED, READ, ROWS, _case, _objective
+from test_p2_10c_state_gradient import (
+    BASE,
+    FAST,
+    PINNED,
+    READ,
+    ROWS,
+    _case,
+    _limited,
+    _objective,
+)
 from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
@@ -38,7 +47,7 @@ def sweep_arguments(cfg: RunConfig, monkeypatch: pytest.MonkeyPatch) -> tuple[tu
         return sweep(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(state_gradient, "state_gradient_backward", keeping)
-    window = SplitWindow(model, cfg, None, state_gradient=True)
+    window = SplitWindow(model, cfg, None, state_gradient=True, row_limit=_limited(cfg))
     logits, _, info = window(tokens, ctx, state, reset)
     _objective(logits, info, mask).backward()
     monkeypatch.undo()
@@ -59,7 +68,8 @@ def buffered(
 
 def row_limits(cfg: RunConfig) -> RowLimits | None:
     """The limits the window of ``cfg`` hands its sweep (the model's)."""
-    return SplitWindow(HSN.from_config(cfg), cfg, None, state_gradient=True).row_limits
+    window = SplitWindow(HSN.from_config(cfg), cfg, None, state_gradient=True, row_limit=True)
+    return window.row_limits
 
 
 def load(sweep: ReverseSweep, args: tuple, initial: tuple[Tensor, Tensor] | None = None) -> None:

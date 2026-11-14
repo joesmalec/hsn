@@ -46,17 +46,18 @@ What does change:
      split and fused windows now take address n-grams. No kernel changed for it (the scorer's
      scalars pass through the sweep at any width); the refusal had been a scope statement for
      an untested combination, and the combination is now tested (CPU and card).
-   - amendment A6's `train.state_grad_clip` / `train.state_grad_ratio`, with the state gradient
-     only ("Step 3"); under the full cut they are refused as before.
+   Amendment A6's `train.state_grad_clip` / `train.state_grad_ratio` are refused as before,
+   under both cuts ("Step 3": a reference exists, no kernel).
 2. **`hsn.model.gradclip`**: the limit's arithmetic moved from the autograd function's
-   backward into `limit_row_grad`, which that backward calls and the reverse sweep shares. The
-   same operations in the same order.
+   backward into `limit_row_grad`, which that backward calls and the reference sweep shares.
+   The same operations in the same order.
 3. **Kernel arguments** (private to `kernels/cuda/hsn_window.cu` and its wrappers; the
    kernels must be rebuilt): `hsn_win_select` takes the reserved slots, `hsn_win_cell_update`
    the number of fast slots; with the defaults both do what they did.
-4. **`SplitWindow(model, cfg, compiled, state_gradient=None)`** and
-   `split_window_scope_error(cfg, state_gradient=None)`: the new argument only asserts which
-   cut the caller expects.
+4. **`SplitWindow(model, cfg, compiled, state_gradient=None, row_limit=False)`** and
+   `split_window_scope_error(cfg, state_gradient=None, row_limit=False)`: `state_gradient`
+   only asserts which cut the caller expects; `row_limit=True` admits A6's per-row limit for
+   the reference sweep (tests). Neither default changes what a configuration is offered.
 
 **The short version of the design.** The forward sweep and the batched replay stay as they
 are. Only the state recurrence node changes: its reverse sweep gains, per position, the
@@ -808,19 +809,27 @@ is the state-columns identity: the first layer's transposed product costs 37.8 �
 2. The first layer's transposed product is now the sweep's largest part (34 µs of 87 per
    position); seven eighths of its operand are the zeros of the units a slot did not run. No
    cheaper form of it has been measured yet.
-3. `train.state_grad_ratio` / `state_grad_clip`: "Step 3" below.
+3. `train.state_grad_ratio` / `state_grad_clip`: "Step 3" below (a reference; the kernel was
+   decided against).
 4. A12's `model.address_gate` (not on main) is one more scorer term: the forward sweep's
    scorer product only.
 5. The card tests of the four-op cell driver, where its artifacts exist.
 6. Accuracy runs.
 
-### Step 3: amendment A6's per-row limit (13 Nov, evening)
+### Step 3: amendment A6's per-row limit, as a reference only (13 Nov, evening)
+
+**Status.** A float64 reference with tests, kept; no kernel, and no training run is offered
+the limit on the split or fused window. The step was started because the campaign's candidate
+base carried `train.state_grad_ratio=3.0`. While the CPU part was being finished a second
+27k-step seed with the ratio collapsed late (98.2 % at step 22,500, 61.2 % at the end; the
+first had held 97.7 %), so the limit is no longer expected to join the base and the kernel was
+decided against (joe-a5, about 20:15 MST). A run with the limit trains on the autograd window,
+as before this work.
 
 `train.state_grad_ratio` and `train.state_grad_clip` limit, row by row, the gradient a position
 passes back into the state (`hsn.model.gradclip`): a row of `dL/dh` and a row of `dL/dq` may be
 at most `ratio` times the batch's typical live row at that position (the 90th percentile of
-the rows that carry a gradient), and at most an absolute number. The campaign's candidate
-base carries a ratio of 3, so the window has to apply it.
+the rows that carry a gradient), and at most an absolute number.
 
 **Where it sits.** The model limits `h` and `q` at the entry of every position, after the
 position's reset and before any of its reads. In the reverse sweep that is the end of a
@@ -833,10 +842,10 @@ from the model's order and are tested:
 - what the decoder and the losses read of the state *after* position `t − 1` joins after the
   limit of position `t` (the head of `t − 1`), so it is not limited by it.
 
-**CPU (done).** `state_gradient_backward(limits=RowLimits(h, q, ratio))` and the recurrence
-node; `SplitWindow.row_limits` (the model's: `clip / sqrt(n_cells)` for a row of `h`, `clip`
-for a row of `q`, the ratio for both); the buffered sweep's step `limit_reference`, for which
-the tail leaves the reset to it and hands it the rows' norms; the scope.
+**What exists.** `state_gradient_backward(limits=RowLimits(h, q, ratio))` and the recurrence
+node; `SplitWindow(..., row_limit=True).row_limits` (the model's: `clip / sqrt(n_cells)` for a
+row of `h`, `clip` for a row of `q`, the ratio for both); the buffered sweep's step
+`limit_reference`, for which the tail leaves the reset to it and hands it the rows' norms.
 
 | Comparison (float64, sixteen rows; a ratio of 1.02, an absolute limit of 0.02, and both) | Result |
 | --- | --- |
@@ -852,11 +861,17 @@ rows. At ten to twelve rows this test window's scorer gradient is ill-conditione
 and the model agree on it to 1e-9 only, with or without a limit, every other parameter to
 1e-14): a property of the test's rows, noted because it cost a detour.
 
-**Card (pending).** Until the limit's step is a kernel, `SweepRunner` leaves a window with a
-limit to the PyTorch sweep, so such a run is correct on the card and slow. The kernel side is
-written and compiled, not yet run: the tail kernel takes the rows' norms (summed in double),
-and a fourth kernel, `hsn_win_back_limit`, ranks the batch's norms in every block, scales its
-row and applies the reset: one more launch per position.
+**What does not exist.** The limit's step as a kernel. `ReverseSweep` with a limit does not
+take the kernels and `SweepRunner` leaves such a window to the PyTorch sweep, which on the
+card would probably cost more than the autograd window (a Python loop of some sixty small
+operations per position; not measured); that is why the scope keeps refusing the two keys for
+a training run. A draft
+of the kernel side (the tail taking the rows' norms in double, and a fourth kernel that ranks
+the batch's norms in every block, scales its row and applies the reset) was written and
+compiled before the decision arrived. It was never run on a card and is not in the
+repository: `/home/joe/hsn-experiments/cutc-speed/scratch/ratio_kernels_wip/` (a patch against
+this step's first commit, its card tests, a note). Should the limit return, that is one more
+launch per position and a card session of tests.
 
 ## Files
 

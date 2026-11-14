@@ -77,6 +77,9 @@ passes back to the zeroed state), and are zeroed after it, as the reset's backwa
 the decoder and the losses read of the state *after* position ``t − 1`` (``D``, ``G``, ``S``)
 joins after the limit of position ``t``, as in the model.
 
+This is the reference only: no kernel applies the limit, and the split window's scope offers
+it to no training run (``row_limit=True`` admits it, for tests).
+
 Scope (:func:`hsn.config.split_window_scope_error` with ``state_gradient=True``): the split
 window's, with ``summary``, ``eps`` and ``router`` cut and ``state`` not; amendment A8's fast
 cells and A9's address n-grams are inside it. A window with dense-fallback rows
