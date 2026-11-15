@@ -135,7 +135,7 @@ CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
 #: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
 WindowMode = Literal["autograd", "split", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
-ModelName = Literal["hsn", "hsn_t", "gru", "transformer", "selective_ssm", "moe"]
+ModelName = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "moe"]
 #: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
 #: a Transformer reader in front of the HSN's memory core (``model.reader``, ``docs/hsn_t.md``).
 #: Everything "HSN-only" in this schema applies to both; ``model.reader`` separates them.
@@ -506,11 +506,6 @@ class ModelConfig(_StrictModel):
                     "set model.reader=transformer or leave it null"
                 )
         else:
-            if not self.selected_readout:
-                raise ValueError(
-                    "model.reader (HSN-T) requires model.selected_readout=true: the decoder reads "
-                    "[q; u; r; c]"
-                )
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
                 raise ValueError(
                     f"model.address_gate_input=reader_prev: the gate's map reads width d = "
@@ -1311,10 +1306,11 @@ class RunConfig(_StrictModel):
                 "features are model.key_address"
             )
         # --- HSN-T: the reader is what separates the two families built on the HSN's cells ---
-        if self.model.reader != "none" and self.model_name != "hsn_t":
+        if self.model.reader != "none" and self.model_name not in ("hsn_t", "reader"):
             raise ValueError(
                 f"model.reader={self.model.reader!r} belongs to the HSN-T family (model_name: "
-                f"hsn_t), got model_name={self.model_name!r}: the HSN has no sequence attention"
+                f"hsn_t; the reader alone is model_name: reader), got model_name="
+                f"{self.model_name!r}: the HSN has no sequence attention"
             )
         if self.model_name == "hsn_t" and self.model.reader == "none":
             raise ValueError(
@@ -1331,6 +1327,16 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"model_name=hsn_t with model.address_ngram={self.model.address_ngram} needs "
                 "model.address_history=ngram: HSN-T carries the address bytes across windows"
+            )
+        if self.model_name == "hsn_t" and not self.model.selected_readout:
+            raise ValueError(
+                "model.reader (HSN-T) requires model.selected_readout=true: the decoder reads "
+                "[q; u; r; c]"
+            )
+        if self.model_name == "reader" and self.model.reader == "none":
+            raise ValueError(
+                "model_name=reader is the HSN-T reader alone with a next-byte head: set "
+                "model.reader=transformer and the reader_* keys of the reader it stands for"
             )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:

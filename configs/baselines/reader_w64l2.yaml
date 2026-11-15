@@ -1,0 +1,43 @@
+# The HSN-T reader alone with a next-byte head (model_name: reader): the exact-reader diagnostic
+# of the review amendments of 14 Nov 2026 (item 04a-3). It is the reader module of HSN-T itself
+# (hsn.model.reader.Reader: rotary positions, no context input, the model.reader_* keys below)
+# and one linear layer to the next byte: 116,480 + 16,640 = 133,120 parameters at V = 256.
+# Built with the seed of an HSN-T, its reader starts with that HSN-T's reader weights.
+# The training settings are the Transformer baseline's (configs/baselines/transformer_2m.yaml),
+# so that the two differ in the model only. Set model.reader_span=32 for the short-sighted reader.
+# Everything not listed keeps its Appendix A default (configs/_example.yaml).
+
+run_id: reader_w64l2
+seed: 0
+notes: "The HSN-T reader alone (2 blocks, width 64, 4 heads) with a next-byte head."
+profile: cpu # override with `profile=<name>`
+model_name: reader
+
+model:
+  reader: transformer
+  reader_width: 64
+  reader_layers: 2
+  reader_heads: 4
+  reader_span: null
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv, delayed, brackets, arithmetic, algorithmic]
+  variants: [in_range]
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train:
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 256 # the window the reader reads
+  batch: 4
+  micro_batch: 4
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  search_trials: 1

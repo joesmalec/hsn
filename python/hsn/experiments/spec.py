@@ -106,8 +106,8 @@ __all__ = [
     "slug",
 ]
 
-FAMILIES = ("hsn", "hsn_t", "gru", "transformer", "selective_ssm")
-Family = Literal["hsn", "hsn_t", "gru", "transformer", "selective_ssm"]
+FAMILIES = ("hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm")
+Family = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm"]
 #: The families trained by the HSN's window trainer: the HSN and HSN-T (``docs/hsn_t.md``).
 HSN_FAMILIES = ("hsn", "hsn_t")
 # P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
