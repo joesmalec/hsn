@@ -55,6 +55,19 @@ Run affected files during iteration (for example, `tests/test_adaptive_lr.py` an
 sequential on a shared card: `uv run --no-sync pytest -q -n 0 -m cuda`. Both commands must respect
 the shared compute window. The default pytest invocation remains sequential.
 
+The test session limits PyTorch to one CPU thread: these small tensor operations otherwise
+spend more time coordinating threads than computing. Hosted CI uses two workers, limits BLAS
+and compiler threads, and prints the 20 slowest tests. A full `pytest` run already includes
+`tests/invariants`; running it again repeats the gradient, checkpoint and 10,000-step checks.
+The long state-bound and incremental-summary drift checks live in P1.8. Reference-shape and
+per-precision window tests use short sequences to avoid repeating those stress runs. The
+full-model gradcheck uses numerical directional derivatives; component gradchecks remain
+elementwise. Compiler integration tests retain each distinct compiled path; position policies
+and reader spans reuse their compiled block because those options run in the eager prologue.
+Their output/gradient comparisons also assert that changing these inputs does not recompile.
+CPU compiler checks use two-position blocks over the same eight-position windows, covering
+resets and recurrence with smaller graphs; CUDA launch-count checks keep their measured block size.
+
 On 9 November 2026 the same 956 CPU tests passed in 460.65 s sequentially, 115.52 s with four
 workers, and 71.43 s with eight (136 device skips in each run). These are local measured runtimes,
 with existing compiler caches, rather than a guarantee for other machines.

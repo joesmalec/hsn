@@ -205,10 +205,13 @@ def _release_compiled_state() -> Iterator[None]:
 
 
 @pytest.fixture
-def small_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Blocks of at most 4 positions on the CPU: an 8-position window runs two blocks (the block
-    boundary is covered) and each compile stays short."""
-    monkeypatch.setattr(compile_mod, "MAX_BLOCK", 4)
+def small_blocks(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Two-position CPU graphs keep compilation short while the eight-position inputs still
+    exercise recurrence, resets within blocks and carried state across four blocks. CUDA keeps
+    four positions per block because its launch-count checks were measured with that size.
+    """
+    block = 4 if request.node.get_closest_marker("cuda") else 2
+    monkeypatch.setattr(compile_mod, "MAX_BLOCK", block)
 
 
 #: The smallest top-K score margin (the K-th minus the (K+1)-th cell score) of a routed
@@ -248,7 +251,7 @@ def test_p2_8_compiled_equals_eager(name: str) -> None:
     state, every ``info`` value, parameter gradients of a fixed functional), with integer and
     boolean outputs exact, in every compiled mode (dense training and evaluation, top-K with
     straight-through gates, the soft warm-up's masked round, top-K evaluation), from a random
-    state over two blocks: dense with a reset at ``t = 0`` and one mid-window; routed from
+    state over four blocks: dense with a reset at ``t = 0`` and one mid-window; routed from
     distinct cell states with every top-K margin above :data:`MIN_MARGIN` (checked)."""
     overrides, training = MODES[name]
     routed = "model.routing=topk" in overrides
@@ -256,7 +259,7 @@ def test_p2_8_compiled_equals_eager(name: str) -> None:
     ctx = _ctx()
     window = _window(model, ctx)
     tokens, cx, state, reset = _case_inputs(model, routed)
-    assert block_size(T) == T // 2  # two blocks
+    assert block_size(T) == 2 and T // block_size(T) == 4
     ref = _run(lambda: model(tokens, cx, state, reset))
     got = _run(lambda: window(tokens, cx, state, reset))
     if routed:

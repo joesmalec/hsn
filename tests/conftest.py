@@ -22,6 +22,21 @@ from hsn.device import set_deterministic
 _ENV = "CUBLAS_WORKSPACE_CONFIG"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _single_threaded_torch() -> Iterator[None]:
+    """Tiny tensor operations are slower with a pool of CPU threads, especially under xdist.
+
+    Keep this test-only and restore the caller's setting when pytest finishes. CI also caps
+    BLAS pools in the environment so CLI subprocesses inherit the same limit.
+    """
+    before = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(before)
+
+
 @pytest.fixture(scope="session")
 def _determinism_baseline() -> tuple[bool, bool, bool, str | None]:
     """The process's switches before any test ran."""

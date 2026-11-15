@@ -96,23 +96,16 @@ def _ratios(scales: dict[str, float]) -> dict[str, float]:
     return {k: scales[k] / scales["emb"] for k in STAGES}
 
 
-def test_p1_5a_write_path_scale_at_init(make_model: ModelFactory, ids: IdsFactory) -> None:
-    """Every stage of the write path is within 0.1x and 10x of the embedding RMS at init."""
+def test_p1_5a_write_path_scale_and_gradient_at_init(
+    make_model: ModelFactory, ids: IdsFactory
+) -> None:
+    """One forward/backward probe checks both signal scale and the 32-position gradient."""
     _cfg, model = make_model("ref")
     tokens, ctx = ids(model, B, T, 0)
-    scales, _ = _probe(model, tokens, ctx)
+    scales, grad_norm = _probe(model, tokens, ctx)
     ratios = _ratios(scales)
     bad = {k: r for k, r in ratios.items() if not (LOW <= r <= HIGH)}
     assert not bad, f"stages outside [{LOW}x, {HIGH}x] of the embedding RMS: {bad}; all: {scales}"
-
-
-def test_p1_5a_gradient_reaches_32_positions_back(
-    make_model: ModelFactory, ids: IdsFactory
-) -> None:
-    """An answer logit's gradient w.r.t. the input 32 positions back exceeds 1e-4 at init."""
-    _cfg, model = make_model("ref")
-    tokens, ctx = ids(model, B, T, 1)
-    _, grad_norm = _probe(model, tokens, ctx)
     assert grad_norm > GRAD_MIN, grad_norm
 
 

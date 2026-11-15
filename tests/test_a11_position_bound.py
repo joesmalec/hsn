@@ -221,27 +221,36 @@ COMPILED = {
 }
 
 
-@pytest.mark.parametrize("mode", ["clamp", "wrap"])
 @pytest.mark.parametrize("name", list(COMPILED))
 @pytest.mark.usefixtures("small_blocks")
-def test_compiled_window_equals_eager_across_the_bound(name: str, mode: str) -> None:
+def test_compiled_window_equals_eager_across_the_bound(name: str) -> None:
+    """Position features are eager prologue inputs: both policies reuse the same compiled block."""
+    from torch._dynamo.utils import counters
+
     overrides, training = COMPILED[name]
     cfg = p28._cfg(
         "model.routing=topk",
         "model.key_address=true",
         "model.selected_readout=true",
         *overrides,
-        f"{KEY}={mode}",
+        f"{KEY}=clamp",
     )
     model = p28._model(cfg, training=training, scale=0.3)
     ctx = p28._ctx()
     window = p28._window(model, ctx)
     tokens, cx, state, reset = p28._case_inputs(model, True)
     state = _later(state, cfg.train.unroll - 2)  # the window crosses pos = unroll
-    ref = p28._run(lambda: model(tokens, cx, state, reset))
-    got = p28._run(lambda: window(tokens, cx, state, reset))
     tol = p28.TOL[(ctx.device.type, "fp32")]
-    diff = p28._max_diff(got, ref)
-    assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], diff
-    if training:
-        assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"]
+    graphs = None
+    for mode in ("clamp", "wrap"):
+        model.scorer.position = mode
+        ref = p28._run(lambda: model(tokens, cx, state, reset))
+        got = p28._run(lambda: window(tokens, cx, state, reset))
+        diff = p28._max_diff(got, ref)
+        assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], (mode, diff)
+        if training:
+            assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"]
+        compiled = counters["stats"]["unique_graphs"]
+        if graphs is not None:
+            assert compiled == graphs, "eager position policy recompiled the block"
+        graphs = compiled

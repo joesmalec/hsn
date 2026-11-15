@@ -756,8 +756,10 @@ def test_p1_10_trainer_passes_reset_columns(align_docs: bool, tmp_path: Path) ->
 
 #: P1.8's recipe for a saturated state: every parameter scaled so that the gates saturate.
 SATURATION_SCALE = 50.0
-STEPS_10K = 10_000
-BOUND_WINDOW = 250
+# P1.8 owns the long-run bound. Here cover carrying state across forward windows in each
+# precision, including CPU autocast, without repeating 10,000 positions three more times.
+BOUND_WINDOWS = 4
+BOUND_WINDOW = 32
 
 
 @pytest.mark.parametrize(
@@ -768,10 +770,10 @@ BOUND_WINDOW = 250
         pytest.param(torch.float32, True, id="fp32-bf16-autocast"),
     ],
 )
-def test_p1_10_lerp_state_bounded_10k_steps(dtype: torch.dtype, autocast: bool) -> None:
+def test_p1_10_lerp_state_bounded_across_windows(dtype: torch.dtype, autocast: bool) -> None:
     """The ``torch.lerp`` update keeps every coordinate of ``h`` (and of its mean ``q``) in
-    ``[−1, 1]`` through 10,000 positions of ``forward`` windows (40 × 250, random inputs, document
-    resets at 1 %), with every parameter scaled by P1.8's saturation factor so that the gates and
+    ``[−1, 1]`` across four ``forward`` windows (random inputs and document resets), with every
+    parameter scaled by P1.8's saturation factor so that the gates and
     candidates saturate: the bound is reached (worst |h| > 0.99), never passed, and ``q`` stays the
     exact mean of the cells. fp64, fp32 and fp32 under CPU bf16 autocast (the update itself runs in
     the state dtype)."""
@@ -792,10 +794,11 @@ def test_p1_10_lerp_state_bounded_10k_steps(dtype: torch.dtype, autocast: bool) 
         else torch.autocast(device_type="cpu", enabled=False)
     )
     with torch.no_grad(), context:
-        for _ in range(STEPS_10K // BOUND_WINDOW):
+        for _ in range(BOUND_WINDOWS):
             tokens = torch.randint(0, m.vocab_size, (Bb, BOUND_WINDOW), generator=generator)
             ctx = torch.randint(0, m.n_context, (Bb, BOUND_WINDOW), generator=generator)
             reset = torch.rand(Bb, BOUND_WINDOW, generator=generator) < 0.01
+            reset[0, BOUND_WINDOW // 2] = True
             _, state, info = model(tokens, ctx, state, reset, capture=True)
             states = info["cell_states"]
             worst_h = max(worst_h, float(states.abs().max()))
