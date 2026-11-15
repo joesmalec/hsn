@@ -116,17 +116,20 @@ to 143 are in no training window at all.
 
 **Training is the same with and without the key.** A window's bytes are marked before it runs,
 so no lookup of a training window is ever blank. On the CPU a run with the key takes the
-steps of the run without it, bit for bit (losses, gradient norms, every weight). What differs
-is what is scored: the evaluations during the run and after it, where an unseen byte reads
-zero. On the card two runs of one configuration differ anyway, so there an arm with the key
-alone differs from the plain arm by run-to-run variation as well.
+steps of the run without it, bit for bit (losses, gradient norms, every weight): eight steps
+of the small test models, and six steps of the hold-out arm's own configuration on the hold
+data (its schedule, update limits, weight average and route guard, with an evaluation after
+every second step). What differs is what is scored: the evaluations during the run and after
+it, where an unseen byte reads zero. On the card two runs of one configuration differ
+anyway, so there an arm with the key alone differs from the plain arm by run-to-run
+variation as well.
 
 One trained model therefore answers both questions. Scored as saved it has the key on;
 `model.mark_bytes_seen(torch.arange(model.cfg.vocab_size))` after loading turns every byte to
 "seen" and scores the same weights with the key off.
 
-**On `synthetic_hold`** (measured on the CPU, 15 Nov 2026, the treatment arm's
-configuration): the first three training windows of batch 32 and the 40,000 training
+**On `synthetic_hold`** (measured on the CPU, 15 Nov 2026, the 32-byte reader's
+configuration with both keys on): the first three training windows of batch 32 and the 40,000 training
 documents together hold 169 different bytes (0 to 5, 16 to 18, 64 to 111 and 144 to 255), and
 the three windows had marked all of them. Bytes 112 to 143 and 32 to 63 stay unseen. The
 only bytes of the dev split that no training document holds are 112 to 127, its keys.
@@ -209,20 +212,30 @@ model without it; a resumed run draws the same positions and keeps the seen byte
 
 Spec `key_content.yaml` (not in this repository: `hsn-experiments/remote/specs/`), on
 `synthetic_hold` with the 32-byte reader on main's form, 18,000 steps, seeds 0, 2 and 3
-(three of the four seeds that failed with this shape on 76c2aec; seed 1 passed):
+(three of the four seeds that failed with this shape on 76c2aec; seed 1 passed), six runs:
 
 | Arm | Keys |
 | --- | --- |
 | baseline | none (the runs of 14 and 15 Nov were made on 76c2aec with `model_name: hsn`; the comparison needs a baseline on this commit) |
-| dropout | `train.content_dropout=0.1` and `model.zero_unseen_bytes=true` |
-| zero rows alone | `model.zero_unseen_bytes=true` |
+| dropout | `train.content_dropout=0.1` |
 
-Pass: far recall on the unseen keys within 3 points of the training keys at 12,000, 15,000
-and 18,000 steps on every seed, with the training keys and delayed2h not worse than the
-baseline's.
+No arm sets `model.zero_unseen_bytes`: it does not change training (above), so its effect is
+read at evaluation. Every run is scored twice, as saved and with zero rows for bytes 112 to
+143, which gives four cells: baseline, zero rows alone, dropout alone, dropout with zero
+rows. The zero rows of the investigation's tool (`uk_standing.py`: the positions that hold
+bytes 112 to 143 read a zero row in both tables) are the key at evaluation on the documents
+the rule is scored on. Checked on the CPU on 15 Nov 2026: none of the 3,600 scored documents
+holds a never-trained byte outside 112 to 143, and on a batch of each of the dev-key, the
+test-key and the never-seen-byte documents the logits of this branch's HSN-T with the key
+equal, bit for bit, the tool's and those of the model with the rows set to zero.
+
+Pass, read for each score of the dropout arm: far recall on the unseen keys within 3 points
+of the training keys at 12,000, 15,000 and 18,000 steps on every seed, with the training
+keys and delayed2h not worse than the baseline's.
 
 The investigation's replacement test says the zero rows alone repair the runs in which the
-random row is read as noise (three of nine) and not the others; that arm is the control.
+random row is read as noise (three of nine) and not the others; the baseline scored with
+zero rows is that control.
 
 ## Results
 

@@ -514,6 +514,30 @@ def test_both_options_blank_the_union() -> None:
         _assert_blanked(model, reads, tokens, unseen)
 
 
+def test_window_under_bf16_autocast_with_both_options() -> None:
+    """The card's precision (float32 masters under bf16 autocast): the rows are blanked where
+    the tables are read, before any cast, and the window and its gradients are finite."""
+    cfg = _cfg(*FAMILIES["hsn_t"], "train.gate_mode=ste", DROP, ZERO)
+    model = _build(cfg, torch.float32)
+    model.set_train_step(2)
+    tokens, ctx, reset = _window(cfg)
+    B, T = tokens.shape
+    blank = _half_seen(model, tokens) | model.content_drop_mask(B, T)
+    state = _start(model, B)
+    with _reads(model) as reads, torch.autocast("cpu", dtype=torch.bfloat16):
+        logits, new_state, _ = model(tokens, ctx, state, reset)
+        _assert_blanked(model, reads, tokens, blank)
+    assert bool(torch.isfinite(logits).all()) and new_state.h.dtype == torch.float32
+    logits.float().square().mean().backward()
+    assert model.reader is not None
+    for table in (model.byte_emb.weight, model.reader.emb.weight):
+        assert table.grad is not None and bool(torch.isfinite(table.grad).all())
+        # a row is trained only where a position read it: an unseen byte's row gets nothing
+        read = torch.zeros(model.cfg.vocab_size, dtype=torch.bool)
+        read[tokens[~blank]] = True
+        assert not bool(table.grad[~read].any()) and bool(table.grad[read].any())
+
+
 def test_seen_bytes_are_saved_with_the_model_only_with_the_key_on() -> None:
     cfg = _cfg(*FAMILIES["hsn_t"], ZERO)
     on, off = _build(cfg), _build(_cfg(*FAMILIES["hsn_t"]))
