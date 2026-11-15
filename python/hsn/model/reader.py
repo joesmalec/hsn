@@ -189,13 +189,24 @@ class Reader(nn.Module):
             near = near & (distance < self.span)
         return (same & near)[:, None]
 
-    def forward(self, tokens: Tensor, reset: Tensor) -> Tensor:
+    def forward(self, tokens: Tensor, reset: Tensor, *, blank: Tensor | None = None) -> Tensor:
+        """``blank`` (bool ``[B, T]``; the byte-content options of ``docs/key_content.md``):
+        the positions at which the reader reads a zero row in place of the byte's row of its
+        embedding table. The attention mask and the rotary positions are those of the bytes as
+        they are. ``None`` (default): every row is read, the lookup unchanged."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
                 f"{tuple(tokens.shape)} and {reset.dtype} {tuple(reset.shape)}"
             )
         x = self.emb(tokens)
+        if blank is not None:
+            if blank.shape != tokens.shape or blank.dtype is not torch.bool:
+                raise ValueError(
+                    f"blank must be a bool tensor of the tokens' shape {tuple(tokens.shape)}, "
+                    f"got {blank.dtype} {tuple(blank.shape)}"
+                )
+            x = x.masked_fill(blank[..., None], 0.0)
         cos, sin = self._rotation(int(tokens.shape[1]), x)
         mask = self.attention_mask(reset)
         for block in self.blocks:

@@ -178,6 +178,17 @@ is the only other way in; bf16 autocast; fast cells beside the reader; the compi
 equals the eager one; thirty trainer steps fall. The rotary table has its own file,
 `tests/test_reader_rotary_table.py`.
 
+## Unseen keys: the byte-content options (`docs/key_content.md`)
+
+Two opt-in keys of 15 Nov 2026 for HSN-T and the HSN, built after the finding that runs lose
+unseen keys through the never-trained rows of the reader's embedding table and of the byte
+embedding, not through the address codes: `train.content_dropout` (in training a random
+share of positions reads a zero row in both tables) and `model.zero_unseen_bytes` (a byte no
+training window has held reads a zero row in both tables, in every mode; it changes what the
+model reads at an untrained byte, which may be decided as an amendment). Both are off by
+default, and with them off nothing in this document changes. Not available with
+`model.memory: false` or for the reader alone. No run of them exists yet.
+
 ## What it has to show (rung 1 of the design)
 
 On the candidate with the fast cells replaced (`model.k_select=12`, no `fast_*` keys, the

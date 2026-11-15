@@ -79,7 +79,7 @@ def test_key_is_opt_in_and_the_default_keeps_its_hash() -> None:
     base = load_config(RECIPE_A6)
     assert base.model.memory is True and "memory" not in json.loads(canonical_json(base))["model"]
     assert config_hash(load_config(RECIPE_A6, ["model.memory=true"])) == config_hash(base)
-    assert HASH_OMIT_AT_DEFAULT[-1] == "model.memory"
+    assert "model.memory" in HASH_OMIT_AT_DEFAULT
     hybrid = ["model_name=hsn_t", "model.reader=transformer", "model.k_select=12"]
     on = load_config(RECIPE_A6, hybrid)
     assert config_hash(load_config(RECIPE_A6, [*hybrid, "model.memory=true"])) == config_hash(on)

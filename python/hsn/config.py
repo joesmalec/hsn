@@ -392,6 +392,20 @@ class ModelConfig(_StrictModel):
     # true (default): the model with its memory, unchanged.
     memory: bool = True
     # --- end HSN-T ---
+    # --- Never-trained bytes (docs/key_content.md; opt-in, 15 Nov 2026; HSN and HSN-T) ---
+    # zero_unseen_bytes: a byte that no training window has held as an input has never received
+    # a gradient in its rows of the two byte-content tables (the byte embedding that feeds E
+    # and, in HSN-T, the reader's embedding): the rows are still their random start values,
+    # shrunk by the weight decay. With true, E and the reader read a zero row at such a byte,
+    # in training, at evaluation and at inference. The model keeps the bytes it has seen (a
+    # bool buffer of length vocab_size, in the state dict only with the key on) and the window
+    # trainer marks every training window's input bytes before the window runs. The fixed
+    # byte codes and the address features (A5, A9) are not read from these tables and are
+    # unchanged, as are the cells, the router and every equation. It changes what the model
+    # reads at a byte it was never trained on, which the user may decide as an amendment.
+    # false (default): both tables are read as they are, bit for bit.
+    zero_unseen_bytes: bool = False
+    # --- end never-trained bytes ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
     @property
@@ -552,6 +566,13 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     "model.memory=false: model.decoder_shortcut_dropout drops q and u so that "
                     "the decoder reads the selected cells, and there are none; leave it at 0"
+                )
+            if self.zero_unseen_bytes:
+                raise ValueError(
+                    "model.memory=false: model.zero_unseen_bytes is built into the window "
+                    "trainer of the model with its memory, which marks the bytes it trains on; "
+                    "the generic trainer of this model marks none, so every byte would read "
+                    "as zero. Leave it at false"
                 )
         # --- end HSN-T ---
         return self
@@ -871,6 +892,17 @@ class TrainConfig(_StrictModel):
     # unseen keys against 85.8 % with its own. null (default): off, bit for bit. Hashed when
     # set.
     address_gate_hold_step: int | None = Field(default=None, ge=0)
+    # Opt-in (15 Nov 2026, docs/key_content.md), training only, HSN and HSN-T: byte-content
+    # dropout. In every training window each position is drawn with this probability, and at a
+    # drawn position the encoder E and, in HSN-T, the reader read a zero row in place of the
+    # byte's row of their content tables: the same positions for both, so the byte's content
+    # is gone there. The fixed byte codes and the address features (A5, A9) still see the
+    # byte, the prediction loss keeps its target, and no cell, router or gate equation
+    # changes. The positions come from a generator of their own, seeded with the run seed and
+    # the optimiser step, so a resumed or replayed step draws them again and the global random
+    # stream is never read. Evaluation and inference are unchanged. 0.0 (default): off, bit
+    # for bit. Hashed when set.
+    content_dropout: float = Field(default=0.0, ge=0.0, lt=1.0, allow_inf_nan=False)
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -1410,6 +1442,37 @@ class RunConfig(_StrictModel):
                     "settings could not act: " + "; ".join(refused)
                 )
         # --- end HSN-T ---
+        # --- the byte-content options (docs/key_content.md) are built into the HSN's window ---
+        content = [
+            f"{key}={value}"
+            for key, value, on in (
+                ("train.content_dropout", self.train.content_dropout, self.train.content_dropout),
+                ("model.zero_unseen_bytes", "true", self.model.zero_unseen_bytes),
+            )
+            if on
+        ]
+        if content:
+            if self.model_name not in HSN_MODEL_NAMES or not self.model.memory:
+                raise ValueError(
+                    f"{', '.join(content)}: the byte-content options act where the HSN's window "
+                    "reads a byte's content (the inputs of its encoder E and of HSN-T's reader) "
+                    "and are built into its window trainer, which draws the positions and marks "
+                    f"the bytes; model_name={self.model_name!r}"
+                    + ("" if self.model.memory else " with model.memory=false")
+                    + " is trained by the generic trainer: leave them at their defaults"
+                )
+            if self.hardware.window == "fused":
+                raise ValueError(
+                    f"{', '.join(content)} with hardware.window=fused is untested (the fused "
+                    "sweep runs on the card only); use hardware.window=split or autograd"
+                )
+        if self.train.content_dropout > 0.0 and self.train.lambda_u > 0.0:
+            raise ValueError(
+                f"train.content_dropout={self.train.content_dropout} with train.lambda_u > 0 is "
+                "untested: the counterfactual probes replay parts of a window, whose positions "
+                "would be drawn anew"
+            )
+        # --- end byte-content options ---
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:
             ignored = []
@@ -1831,6 +1894,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_history",
     "hardware.baseline_compile",
     "model.memory",
+    "train.content_dropout",
+    "model.zero_unseen_bytes",
 )
 
 

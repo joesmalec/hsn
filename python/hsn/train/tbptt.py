@@ -436,6 +436,18 @@ class TBPTTTrainer(Trainer):
                 f"{cfg.train.state_grad_clip} / {cfg.train.state_grad_ratio}; build the model "
                 "with HSN.from_config(cfg)"
             )
+        if model.content_dropout != cfg.train.content_dropout:  # docs/key_content.md
+            raise ValueError(
+                f"the model's content_dropout {model.content_dropout} is not the "
+                f"configuration's train.content_dropout {cfg.train.content_dropout}; build the "
+                "model with HSN.from_config(cfg)"
+            )
+        if (model.byte_seen is not None) != cfg.model.zero_unseen_bytes:
+            raise ValueError(
+                f"model.zero_unseen_bytes={cfg.model.zero_unseen_bytes} but the model "
+                f"{'keeps' if model.byte_seen is not None else 'does not keep'} the bytes it "
+                "has seen; build the model with HSN.from_config(cfg)"
+            )
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0
@@ -1042,6 +1054,9 @@ class TBPTTTrainer(Trainer):
                 fwd = batch if cut == window["doc"].shape[1] else _columns(batch, cut)
                 state = self._window_start(state)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
+                # model.zero_unseen_bytes: the bytes this window trains on count as seen from
+                # here on (nothing happens with the key off)
+                self.hsn.mark_bytes_seen(fwd["tokens"])
                 if self._warm_up_recorded and self._split is not None and self._split.splits_now():
                     self._warm_up_recorded = False  # the first hard-gate step: once
                     if self._compiled is not None:

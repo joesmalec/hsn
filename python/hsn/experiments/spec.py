@@ -626,6 +626,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates
         del dump["model"]["memory"]
+    if dump["model"]["zero_unseen_bytes"] is False:
+        # model.zero_unseen_bytes (docs/key_content.md) at its default stays out, for the same
+        # reason; train.content_dropout is a train.* key and so never in the memory key
+        del dump["model"]["zero_unseen_bytes"]
     return digest(
         {
             "model_name": cfg.model_name,

@@ -107,6 +107,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.address_history",
         "hardware.baseline_compile",  # the baselines' compiled windows (opt-in)
         "model.memory",  # HSN-T without its memory
+        "train.content_dropout",  # the byte-content options (opt-in, docs/key_content.md)
+        "model.zero_unseen_bytes",
     )
 
 
