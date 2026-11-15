@@ -307,7 +307,9 @@ class ModelConfig(_StrictModel):
     # a key of two bytes that ended the window before gets another address than its key has
     # anywhere else. "ngram": the last address_ngram bytes are carried and the features are the
     # same as inside a window. BOS stands only where the document has no such byte. Runs with
-    # "ngram" are repaired runs and are reported apart from the runs before them.
+    # "ngram" are repaired runs and are reported apart from the runs before them. Adopted on
+    # 14 Nov 2026: HSN-T requires "ngram"; for the HSN the default stays "byte" so that every
+    # earlier run reproduces, and new HSN runs with address_ngram > 1 set "ngram".
     address_history: Literal["byte", "ngram"] = "byte"
     # --- end A9 ---
     # --- Amendment A12 (docs/amendments/A12_address_gate.md; opt-in, needs key_address) ---
@@ -1318,6 +1320,17 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 "model_name=hsn_t is the HSN's memory core behind a reader: set "
                 "model.reader=transformer (without one the model is the HSN, model_name: hsn)"
+            )
+        if (
+            self.model_name == "hsn_t"
+            and self.model.address_ngram > 1
+            and self.model.address_history != "ngram"
+        ):
+            # adopted 14 Nov 2026 (docs/amendments/A9_ngram_address.md): one carried byte loses
+            # recall of a fact whose value opens a window; the n bytes carried do not
+            raise ValueError(
+                f"model_name=hsn_t with model.address_ngram={self.model.address_ngram} needs "
+                "model.address_history=ngram: HSN-T carries the address bytes across windows"
             )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:

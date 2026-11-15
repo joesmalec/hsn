@@ -76,10 +76,30 @@ a_prev<m>[i] = √d · ⟨code_m(x_{t−m}   .. x_{t−1}), A_i⟩
     (the hold-out, pair, arithmetic and five-task runs), where no window continues a document.
   - **What it touches:** TinyStories, the story-text facts sets and every out-of-range
     evaluation, at one column per continuing window.
-  - Runs with `ngram` are repaired runs and are reported apart from the runs before them. The
-    default stays `byte` so that every earlier run reproduces; whether `ngram` becomes the
-    setting is decided by tests on data that crosses windows (the user, 14 Nov 2026: "if
-    tests prove useful for two byte carry then lets adopt it").
+  - Runs with `ngram` are repaired runs and are reported apart from the runs before them.
+  - **The test, and the adoption (14 Nov 2026).** The user: "if tests prove useful for two
+    byte carry then lets adopt it". Saved checkpoints of the candidate (8 fast + 12 routed
+    slots, the address gate reading the summary, two-byte addresses; trained on
+    `synthetic_hold` with documents aligned to windows, so they never met a cut in training),
+    300 fresh `delayed2h` documents per row, each run once as one window and twice as two
+    windows cut so that the value of the latest-stated queried fact is the first byte of the
+    second window (its key the last two bytes of the first). Accuracy on the fact at the cut:
+
+    | Seed, keys | One window | One byte carried | Two bytes carried |
+    | --- | --- | --- | --- |
+    | 3, training keys | 99.3 % | 96.3 % | 99.3 % |
+    | 3, unseen keys | 99.0 % | 97.7 % | 99.0 % |
+    | 4, training keys | 100.0 % | 89.3 % | 100.0 % |
+    | 4, unseen keys | 99.0 % | 92.3 % | 99.0 % |
+    | 0, training keys | 100.0 % | 84.7 % | 100.0 % |
+    | 0, unseen keys | 98.3 % | 89.3 % | 98.3 % |
+
+    The other facts of the same documents move by less than a point. With the cut at the
+    document's first fact all three read 100 % (seed 3, training keys). The script is
+    `boundary_eval.py` in the hand-off folder. **Adopted:** HSN-T (`model_name: hsn_t`) with
+    `address_ngram > 1` requires `ngram`; for the HSN the default stays `byte`, and new HSN
+    runs with two-byte addresses set `ngram`. What the test does not show: the effect on
+    training, where documents cross windows (text, the story-text facts sets).
 
 **What stays.** Cells, graph, units, ε, the convex tanh gate, the router and its linear scorer,
 A5's features and `q` are unchanged. No attention over the sequence, no new state, nothing

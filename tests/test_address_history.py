@@ -251,3 +251,16 @@ def test_trainer_carries_and_checkpoints_the_history(
     again.resume(checkpoint)
     assert again._prev_tokens is not None and tuple(again._prev_tokens.shape) == shape
     assert torch.equal(again._prev_tokens.cpu(), trainer._prev_tokens.cpu())
+
+
+def test_hsn_t_requires_the_carried_n_gram_history() -> None:
+    """Adopted on 14 Nov 2026: HSN-T carries the address bytes across windows."""
+    family = ["model_name=hsn_t", "model.reader=transformer", "model.k_select=12"]
+    with pytest.raises(ValueError, match="needs model.address_history=ngram"):
+        load_config(RECIPE_A6, [*family, "model.address_ngram=2"])
+    on = load_config(RECIPE_A6, [*family, "model.address_ngram=2", "model.address_history=ngram"])
+    assert on.model.address_history == "ngram"
+    one_byte = load_config(RECIPE_A6, family)  # one-byte addresses carry one byte
+    assert one_byte.model.address_ngram == 1 and one_byte.model.address_history == "byte"
+    # the HSN keeps the default of every earlier run
+    assert load_config(RECIPE_A6, ["model.address_ngram=2"]).model.address_history == "byte"
