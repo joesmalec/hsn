@@ -55,6 +55,15 @@ the per-document metrics change by rounding at most. **P1.15:** :attr:`Trainer.e
 (:func:`hsn.eval.evaluate.evaluate_windows`, ``position_groups``); the result gains
 ``per_position_group``, everything else is computed as before.
 
+**Compiled baselines.** ``hardware.baseline_compile`` (opt-in; ``none``, the default, is the
+trainer as it was) runs a baseline's training and evaluation windows through ``torch.compile``
+(:mod:`hsn.train.baseline_compile`, :attr:`Trainer.compiled_baseline`); the loss, the clipping,
+the guards and the optimiser stay eager. A step during which a window compiled or recorded is a
+compile step, reported as the HSN trainer reports its own (``measured["compile_seconds"]``,
+``compile_steps``, ``window_compile_seconds``, ``compiled_windows``) and kept out of
+``train_seconds`` and ``tokens_per_s``. ``hardware.compile_mode`` is the HSN's window and is
+ignored here, as before.
+
 **Search budget.** :class:`SearchBudget` counts hyperparameter-search trials against
 ``train.search_trials`` so that every method in the baseline ladder gets the same number of
 trials (paper §12); recording a trial beyond the budget raises.
@@ -163,7 +172,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import numpy as np
 import torch
@@ -197,6 +206,9 @@ from hsn.train.grad_norm import clip_grad_norm_
 from hsn.train.lazy_adam import build_lazy_adamw, cell_parameters
 from hsn.train.rollback import RollbackPolicy, SnapshotRing
 from hsn.train.weight_ema import WeightEMA
+
+if TYPE_CHECKING:
+    from hsn.train.baseline_compile import CompiledBaseline
 
 __all__ = [
     "NONFINITE_MAX_CONSECUTIVE",
@@ -616,7 +628,21 @@ class Trainer:
         set_deterministic(train.deterministic)
         seed_everything(cfg.seed)
         self.model.to(device=ctx.device, dtype=ctx.master_dtype)
-        if ctx.compile_enabled and type(self) is Trainer:
+        # hardware.baseline_compile (opt-in; none: the eager trainer, unchanged): a baseline's
+        # windows, training and evaluation, run through torch.compile (hsn.train.baseline_compile)
+        self._baseline: CompiledBaseline | None = None
+        if cfg.hardware.baseline_compile != "none":
+            from hsn.train import baseline_compile
+
+            self._baseline = baseline_compile.compile_baseline(model, cfg, ctx)
+            logger.info(
+                "hardware.baseline_compile=%s: %s",
+                cfg.hardware.baseline_compile,
+                "the windows run eager (no compile support on this device)"
+                if self._baseline is None
+                else f"compiled, {self._baseline.report()['scope']}",
+            )
+        elif ctx.compile_enabled and type(self) is Trainer:
             # P2.8: hardware.compile_mode compiles the HSN window (TBPTTTrainer); a baseline runs
             # eager and its history says so (measured["compiled_windows"] = 0)
             logger.warning(
@@ -1409,8 +1435,14 @@ class Trainer:
         reset_peak(device)
         train_seconds = 0.0
         total_tokens = 0
+        # hardware.baseline_compile: the steps during which a window compiled or recorded (as
+        # the HSN's P2.8 trainer reports them; compile time is never a steady-state number)
+        compiled = self._baseline
+        compile_seconds = 0.0
+        compile_steps = 0
         while self.step < steps:
             started = time.perf_counter()
+            compiled_before = compiled.compile_seconds if compiled is not None else 0.0
             snapshot = self._step_snapshot = self._take_snapshot(loader, state)  # P1.15
             windows = [next(loader) for _ in range(train.grad_accum)]
             counts = [int(window["loss_mask"].sum()) for window in windows]
@@ -1426,7 +1458,7 @@ class Trainer:
             for window, count in zip(windows, counts, strict=True):
                 batch = self._to_device(window)
                 state = detach_state(state)
-                logits, state, _info = self._forward(batch, state)
+                logits, state, _info = self._forward(batch, state, window=compiled)
                 loss_mask = batch["loss_mask"]
                 tokens_in_step += int((window["doc"] >= 0).sum())
                 if count > 0:
@@ -1503,8 +1535,12 @@ class Trainer:
             if self.scaler is None and n_loss and not math.isfinite(mean_loss) and not skipped:
                 raise RuntimeError(f"loss is {mean_loss} at step {self.step}")
             seconds = time.perf_counter() - started
-            train_seconds += seconds
-            total_tokens += tokens_in_step
+            if compiled is not None and compiled.compile_seconds > compiled_before:
+                compile_seconds += seconds  # a compile step: out of train_seconds and tokens/s
+                compile_steps += 1
+            else:
+                train_seconds += seconds
+                total_tokens += tokens_in_step
             history.steps.append(
                 StepRecord(
                     step=self.step,
@@ -1559,7 +1595,19 @@ class Trainer:
             "train_seconds": train_seconds,
             "tokens": float(total_tokens),
             "steps": float(self.step),
-            "compiled_windows": 0.0,  # P2.8: the generic trainer never compiles
+            # P2.8: the generic trainer never compiles the HSN's window; with
+            # hardware.baseline_compile the baseline's own windows ran compiled and are counted
+            # with their compile time, under the keys of the HSN trainer
+            "compiled_windows": float(compiled.calls) if compiled is not None else 0.0,
+            **(
+                {
+                    "compile_seconds": compile_seconds,
+                    "compile_steps": float(compile_steps),
+                    "window_compile_seconds": compiled.compile_seconds,
+                }
+                if compiled is not None
+                else {}
+            ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
             **self._spike_measured(),  # P1.15
             **self._rollback_measured(),  # P1.16
@@ -1626,8 +1674,17 @@ class Trainer:
 
     def _eval_model(self) -> Any:
         """What :meth:`evaluate` runs over the windows: the model itself (P2.8: the HSN trainer
-        hands its compiled window when it has one)."""
-        return self.model
+        hands its compiled window when it has one), or with ``hardware.baseline_compile`` the
+        baseline's compiled windows (an evaluation-mode, no-grad variant of its own, compiled at
+        the first evaluation)."""
+        return self.model if self._baseline is None else self._baseline
+
+    @property
+    def compiled_baseline(self) -> CompiledBaseline | None:
+        """``hardware.baseline_compile``: the baseline's compiled windows (``None`` with the key
+        at ``none``, for an HSN, or on MPS without compile support); its ``calls``,
+        ``compile_seconds`` and ``report()`` say what ran compiled."""
+        return self._baseline
 
     # the averaged weights (A6, train.weight_ema) -----------------------------------------------
 

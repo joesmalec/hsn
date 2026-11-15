@@ -488,8 +488,9 @@ class _StepCallback:
         if evaluated:
             self.freeze_collector(trainer)
         if self.guard is not None and history.steps and int(history.steps[-1].step) == step:
-            # a compile or CUDA-graph recording during this step or its evaluation (P2.8)
-            window = getattr(trainer, "compiled_window", None)
+            # a compile or CUDA-graph recording during this step or its evaluation (P2.8, or a
+            # baseline's under hardware.baseline_compile)
+            window = _compiled(trainer)
             compiled_s = float(window.compile_seconds) if window is not None else 0.0
             compiled, self._compile_seen = compiled_s > self._compile_seen, compiled_s
             self.guard.observe(
@@ -541,7 +542,7 @@ class _StepCallback:
         pass sees only what was allocated since the last evaluation (1 ms). Nothing about the
         training changes. Off for an eager trainer (nothing to gain) and with ``gc_freeze:
         false``; :meth:`release_collector` undoes it when the fit ends."""
-        if not self.gc_freeze or getattr(trainer, "compiled_window", None) is None:
+        if not self.gc_freeze or _compiled(trainer) is None:
             return
         gc.collect()
         gc.freeze()
@@ -609,9 +610,22 @@ def _adaptive_record(trainer: Any) -> dict[str, Any]:
     return out
 
 
-def _compile_info(trainer: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
-    """P2.8's public signals, read so that a checkout without P2.8 still works."""
+def _compiled(trainer: Any) -> Any:
+    """What of ``trainer`` runs compiled, or ``None``: the HSN's compiled window (P2.8) or a
+    baseline's compiled windows (``hardware.baseline_compile``). Both count ``calls`` and
+    ``compile_seconds``."""
     window = getattr(trainer, "compiled_window", None)
+    return window if window is not None else getattr(trainer, "compiled_baseline", None)
+
+
+def _compile_info(trainer: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
+    """P2.8's public signals, read so that a checkout without P2.8 still works. ``mode`` and
+    ``compiled_window`` are the HSN's window (``hardware.compile_mode``); a baseline compiled
+    under ``hardware.baseline_compile`` adds ``baseline`` (its mode, whether CUDA graphs replay
+    it, what of it is compiled: :meth:`hsn.train.baseline_compile.CompiledBaseline.report`) and
+    fills the counts below with its own windows."""
+    window = getattr(trainer, "compiled_window", None)
+    baseline = getattr(trainer, "compiled_baseline", None)
     return {
         "mode": trainer.cfg.hardware.compile_mode,
         "compiled_window": window is not None,
@@ -620,6 +634,7 @@ def _compile_info(trainer: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
         "compile_steps": measured.get("compile_steps"),
         # every compiled variant's compile + recording time, evaluation included (P2.8, 0814235)
         "window_compile_seconds": measured.get("window_compile_seconds"),
+        **({"baseline": baseline.report()} if baseline is not None else {}),
     }
 
 
@@ -973,7 +988,7 @@ def _partial_training(
     )
     if rollbacks is not None:
         measured["rollbacks"] = rollbacks
-    window = getattr(trainer, "compiled_window", None)
+    window = _compiled(trainer)
     compiled = {"window_compile_seconds": window.compile_seconds} if window is not None else {}
     arm.walls["eval_s"] = timer.seconds
     arm.walls["diag_s"] = diag.seconds

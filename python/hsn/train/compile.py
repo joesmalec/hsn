@@ -44,7 +44,8 @@ not bit for bit; ``hardware.compile_mode = none`` leaves every path eager and un
 ``profile:rtx3060`` compiles by default (``reduce-overhead``, the user's decision of 7 Nov 2026);
 every other profile stays ``none`` until it is measured there. A run that must stay eager on
 rtx3060 overrides ``hardware.compile_mode=none``. The generic trainer of the baselines never
-compiles (a logged notice, ``measured["compiled_windows"] = 0``).
+compiles under this key (a logged notice, ``measured["compiled_windows"] = 0``); the baselines
+have a key of their own, ``hardware.baseline_compile`` (:mod:`hsn.train.baseline_compile`).
 
 Scope (errors over silence: anything else raises ``NotImplementedError`` when the window is
 built, and runs eager with ``compile_mode: none``):
@@ -223,11 +224,12 @@ def _own_code(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _compiler(
-    mode: CompileMode, backend: Backend, device_type: str = "cuda"
+    mode: str, backend: Backend, device_type: str = "cuda"
 ) -> Callable[[Callable[..., Any]], Any]:
     """``torch.compile`` with ``fullgraph`` (a graph break, or reaching the recompile limit,
     raises) and static shapes, on a copy of the function with its own code object
-    (:func:`_own_code`). The mode goes to inductor; other backends (tests) take none. On MPS the
+    (:func:`_own_code`). The mode (a :data:`CompileMode`, or any ``torch.compile`` mode of
+    ``hardware.baseline_compile``) goes to inductor; other backends (tests) take none. On MPS the
     mode's inductor options are passed with :data:`MPS_INDUCTOR_OPTIONS` added
     (``torch.compile`` takes ``mode`` or ``options``, not both); elsewhere the call is unchanged."""
 

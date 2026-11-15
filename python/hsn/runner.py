@@ -81,6 +81,7 @@ from hsn.profiler import (
     ProfileReport,
 )
 from hsn.train.amp import autocast_ctx
+from hsn.train.baseline_compile import compile_baseline
 from hsn.train.checkpoint import load_checkpoint
 from hsn.train.compile import compile_window
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
@@ -291,9 +292,9 @@ def make_power_meter(cfg: RunConfig, choice: PowerChoice) -> PowerMeter:
 
 PROFILE_SEGMENTS: dict[str, str] = {
     "startup": "first window of the pass (warm-up; P0.6 standalone segment)",
-    "compile": "P2.8, only with hardware.compile_mode != none (HSN): the first two windows of the "
-    "pass, which compile the window and record its CUDA Graphs (P0.6 standalone segment; never in "
-    "the steady-state segments)",
+    "compile": "P2.8, only with hardware.compile_mode != none (HSN) or hardware.baseline_compile "
+    "!= none (a baseline): the first two windows of the pass, which compile the window and record "
+    "its CUDA Graphs (P0.6 standalone segment; never in the steady-state segments)",
     "shared_path": "the complete forward pass of the model (every cell of the dense HSN, or the "
     "dense baseline): training pass with the task cross-entropy, serving pass in eval mode under "
     "no_grad; the HSN prediction term is not part of this profiled loss (P2.13 profiles the HSN "
@@ -385,7 +386,9 @@ def profile_run(
     P2.8: with ``hardware.compile_mode`` other than ``none`` an HSN runs the compiled window
     (:func:`hsn.train.compile.compile_window`, as its trainer does) in both passes; the windows
     that compile or record a CUDA Graph (the first two of each pass) are timed as the ``compile``
-    segment instead of ``startup``, so compile time never enters the steady-state segments.
+    segment instead of ``startup``, so compile time never enters the steady-state segments. A
+    baseline under ``hardware.baseline_compile`` runs its compiled windows the same way
+    (:func:`hsn.train.baseline_compile.compile_baseline`).
     """
     if steps < 1:
         raise ValueError(f"steps must be >= 1, got {steps}")
@@ -418,6 +421,11 @@ def profile_run(
             replica, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
         )
         warm_windows = 2  # compile, then (CUDA Graphs) record
+    elif not isinstance(replica, HSN):  # hardware.baseline_compile: the trainer's windows
+        compiled = compile_baseline(replica, cfg, ctx)
+        if compiled is not None:  # None: the key is none (or MPS without compile support)
+            forward = compiled
+            warm_windows = 2
     first = "compile" if warm_windows > 1 else "startup"
     state: Any = api.init_state(batch_size, device)
     prev_tokens: Tensor | None = None
@@ -672,6 +680,12 @@ def run_one(
             "grad_norm_nonfinite_steps": len(grad_norms) - len(finite_norms),
             "grad_norm_max_finite": max(finite_norms) if finite_norms else None,
             "measured": measured,
+            # hardware.baseline_compile: what of the baseline ran compiled (absent: eager)
+            **(
+                {"baseline_compile": trainer.compiled_baseline.report()}
+                if trainer.compiled_baseline is not None
+                else {}
+            ),
             "data": _data_provenance(cfg, train_ds, dev_ds),
             "profile_segments": PROFILE_SEGMENTS,
             "profile_steps": profile_steps,

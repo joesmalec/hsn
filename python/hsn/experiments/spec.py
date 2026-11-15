@@ -45,7 +45,9 @@ variant, protocol execution parameters).
 **Checks at expansion** (errors over silence): a CUDA arm that does not pin
 ``hardware.compile_mode`` in its overrides (profile defaults change: ``profile:rtx3060`` compiles by
 default once P2.8 is merged), a compile mode on a baseline (P2.8 compiles the HSN window only; a
-baseline would train eager under a compiled label), a family that does not match the configuration's
+baseline would train eager under a compiled label; a baseline arm compiles with
+``hardware.baseline_compile``, which an HSN arm may not set), a family that does not match the
+configuration's
 ``model_name``, a variant on a baseline, a variant other than ``pdg`` with ``hardware.compile_mode``
 set (untested under P2.8's compiled window), ``routing=random`` with the reads-state protocol (its
 evaluation draws batch-shaped random numbers, so the batched probe would not match), protocol steps
@@ -602,6 +604,11 @@ def _plain(value: Any) -> Any:
 
 def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str:
     dump = cfg.model_dump(mode="json")
+    if dump["hardware"]["baseline_compile"] == "none":
+        # the key at its default leaves every memory key as it was before the key existed (the
+        # stored memory and step-time estimates of the eager baselines still apply); a compiled
+        # baseline has a key of its own
+        del dump["hardware"]["baseline_compile"]
     return digest(
         {
             "model_name": cfg.model_name,
@@ -730,11 +737,12 @@ def _expand_one(
         )
     if family not in HSN_FAMILIES and cfg.hardware.compile_mode != "none":
         # P2.8: the generic trainer ignores the compile mode and trains a baseline eager, so a
-        # record would claim a compile that never ran
+        # record would claim a compile that never ran (a baseline compiles under its own key,
+        # hardware.baseline_compile, which an arm sets next to the pinned compile_mode=none)
         raise SpecError(
             f"arm {entry.name}: hardware.compile_mode={cfg.hardware.compile_mode} compiles the HSN "
             f"training window only; a {family} baseline trains eager: pin "
-            "hardware.compile_mode=none"
+            "hardware.compile_mode=none (hardware.baseline_compile compiles a baseline)"
         )
     variant, vparams = _variant(entry, family)
     if (cfg.model.key_address or cfg.model.selected_readout) and variant != "pdg":

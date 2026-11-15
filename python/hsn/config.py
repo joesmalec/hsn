@@ -65,6 +65,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 __all__ = [
     "AUX_TERMS",
+    "BASELINE_COMPILE_MODEL_NAMES",
     "HARDWARE_PROFILE_DIR",
     "HASH_OMIT_AT_DEFAULT",
     "HSN_MODEL_NAMES",
@@ -128,6 +129,15 @@ Device = Literal["cuda", "mps", "cpu"]
 AutocastDtype = Literal["bf16", "fp16", "fp32"]
 MasterDtype = Literal["fp32", "fp64"]
 CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
+#: Opt-in: the ``torch.compile`` mode of a baseline's training and evaluation windows
+#: (``hardware.baseline_compile``, :mod:`hsn.train.baseline_compile`). ``none`` runs the baseline
+#: eager, as before the key; the other values are passed to ``torch.compile`` as its mode
+#: (``reduce-overhead`` and ``max-autotune`` replay the compiled graphs as CUDA graphs on CUDA).
+BaselineCompileMode = Literal[
+    "none", "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
+]
+#: The model names whose windows ``hardware.baseline_compile`` compiles.
+BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "reader")
 #: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
 #: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
 #: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut); ``fused`` is ``split``
@@ -1210,6 +1220,12 @@ class HardwareConfig(_StrictModel):
     # graphs. The index gives the same answers by dictionary lookup. Bookkeeping only: no
     # tensor value changes. false (default): PyTorch as it is.
     graph_alias_index: bool = False
+    # Opt-in (14 Nov 2026): compile the windows of a baseline (BASELINE_COMPILE_MODEL_NAMES)
+    # with torch.compile, for a like-for-like step time against the HSN's compiled window
+    # (hsn.train.baseline_compile, docs/baseline_compile.md). The value is the torch.compile
+    # mode. compile_mode above keeps its meaning (the HSN's window; the generic trainer ignores
+    # it). none (default): the baselines train eager, as before the key.
+    baseline_compile: BaselineCompileMode = "none"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1304,6 +1320,20 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 "baseline.address_input is an input of the baselines; the HSN's own address "
                 "features are model.key_address"
+            )
+        if (
+            self.hardware.baseline_compile != "none"
+            and self.model_name not in BASELINE_COMPILE_MODEL_NAMES
+        ):
+            raise ValueError(
+                f"hardware.baseline_compile={self.hardware.baseline_compile!r} compiles the "
+                f"windows of a baseline ({', '.join(BASELINE_COMPILE_MODEL_NAMES)}), not of "
+                f"model_name={self.model_name!r}: "
+                + (
+                    "the HSN's own compiled window is hardware.compile_mode"
+                    if self.model_name in HSN_MODEL_NAMES
+                    else "it is outside the compiled scope (hsn.train.baseline_compile)"
+                )
             )
         # --- HSN-T: the reader is what separates the two families built on the HSN's cells ---
         if self.model.reader != "none" and self.model_name not in ("hsn_t", "reader"):
@@ -1757,6 +1787,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.reader_heads",
     "model.reader_span",
     "model.address_history",
+    "hardware.baseline_compile",
 )
 
 
