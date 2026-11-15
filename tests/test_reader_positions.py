@@ -1,6 +1,7 @@
 """The reader's opt-in position keys (``hsn.model.reader``, ``docs/hsn_t.md``, 15 Nov 2026).
 
-``model.reader_rotary_pairs`` (only the first ``n`` pairs of a head are rotated),
+``model.reader_rotary_pairs`` (only the first ``n`` pairs of a head are rotated; a list gives
+``n`` for each block, so the last block can be left without a position),
 ``model.reader_rotary_dtype`` (the rotation in the parameters' dtype under autocast) and
 ``model.reader_position = learned`` (the Transformer baseline's position table in place of the
 rotation). They were built to test why the reader is worse on text than the baseline of its
@@ -8,9 +9,10 @@ shape; the cause they test is in the document.
 
 These tests check that the defaults leave every configuration hash, memory key, parameter,
 state dict and output as it was, and that each key does what it says: the unrotated pairs are
-compared as they are and the output still reads distances only; the rotation under bf16
-autocast runs in float32 and is closer to the exact one; the learned reader is the Transformer
-baseline's computation with the same weights, and reads the window position.
+compared as they are and the output still reads distances only; a block with no rotated pair
+compares queries and keys as they are; the rotation under bf16 autocast runs in float32 and is
+closer to the exact one; the learned reader is the Transformer baseline's computation with the
+same weights, and reads the window position.
 """
 
 from __future__ import annotations
@@ -62,9 +64,13 @@ DEFAULTS = (
 )
 #: one setting of each key away from its default
 PAIRS = ("model.reader_rotary_pairs=2",)
+#: one count for each of the two blocks: the last block is not rotated
+TOP = ("model.reader_rotary_pairs=[2,0]",)
+#: no block is rotated: the causal mask is the only order signal
+NOROT = ("model.reader_rotary_pairs=0",)
 WIDE = ("model.reader_rotary_dtype=parameters",)
 LEARNED = ("model.reader_position=learned",)
-SWITCHES = [PAIRS, WIDE, LEARNED]
+SWITCHES = [PAIRS, TOP, NOROT, WIDE, LEARNED]
 #: the memory-off recipe at a size the CPU runs in a moment (two heads of four pairs)
 TINY = ("model.d=8", "model.context_dim=8", "model.hidden=16", "model.reader_width=16")
 TINY = (*TINY, "model.reader_heads=2")
@@ -150,8 +156,14 @@ def test_the_memory_keys_of_the_arms_before_the_keys_are_unchanged() -> None:
         (READER_LM, ["model.reader_positions=128"], "size of the learned position table"),
         (READER_LM, [*LEARNED, "model.reader_rotary_pairs=2"], "has no rotation"),
         (READER_LM, [*LEARNED, *WIDE], "has no rotation"),
-        (READER_LM, ["model.reader_rotary_pairs=9"], "exceeds the 8 pairs of a head"),
-        (READER_LM, ["model.reader_rotary_pairs=0"], "greater than or equal to 1"),
+        (RECIPE_A6, ["model.reader_rotary_pairs=[2,0]"], "positions of model.reader"),
+        (READER_LM, [*LEARNED, "model.reader_rotary_pairs=[8,0]"], "has no rotation"),
+        (READER_LM, ["model.reader_rotary_pairs=9"], "between 0 and the 8 pairs of a head"),
+        (READER_LM, ["model.reader_rotary_pairs=-1"], "between 0 and the 8 pairs of a head"),
+        (READER_LM, ["model.reader_rotary_pairs=[8,9]"], "between 0 and the 8 pairs of a head"),
+        (READER_LM, ["model.reader_rotary_pairs=[8]"], "names 1 blocks"),
+        (READER_LM, ["model.reader_rotary_pairs=[8,8,0]"], "names 3 blocks"),
+        (READER_LM, ["model.reader_rotary_pairs=half"], "reader_rotary_pairs"),
         (READER_LM, [*LEARNED, "model.reader_positions=128"], "train.unroll=256"),
         (NOMEM, [*LEARNED, "train.unroll=512"], "raise model.reader_positions"),
         (READER_LM, ["model.reader_position=sinusoidal"], "rotary"),
@@ -165,6 +177,12 @@ def test_refusals(path: Path, overrides: list[str], message: str) -> None:
 
 def test_accepted_settings() -> None:
     assert load_config(READER_LM, ["model.reader_rotary_pairs=8"]).model.reader_rotary_pairs == 8
+    assert load_config(READER_LM, ["model.reader_rotary_pairs=0"]).model.reader_rotary_pairs == 0
+    top = load_config(READER_LM, ["model.reader_rotary_pairs=[8,0]"])
+    assert top.model.reader_rotary_pairs == [8, 0]
+    assert json.loads(canonical_json(top))["model"]["reader_rotary_pairs"] == [8, 0]
+    deep = ["model.reader_layers=4", "model.reader_rotary_pairs=[8,8,8,0]"]
+    assert build_model(load_config(READER_LM, deep)).reader._block_pairs == [None, None, None, 0]
     long = load_config(NOMEM, [*LEARNED, "train.unroll=512", "model.reader_positions=512"])
     assert long.model.reader_positions == 512
     short = load_config(READER_LM, [*LEARNED, "train.unroll=64", "model.reader_positions=64"])
@@ -296,6 +314,127 @@ def test_with_fewer_pairs_the_reader_still_reads_distances_only() -> None:
         with torch.no_grad():
             outs.append(reader(tokens, reset)[:, lead:])
     assert _gap(outs[0], outs[1]) <= 1e-12 and _gap(outs[0], outs[2]) <= 1e-12
+
+
+# --------------------------------------------------------------------------------------------------
+# model.reader_rotary_pairs as a list: one count for each block
+# --------------------------------------------------------------------------------------------------
+
+
+def _blocks_by_hand(reader: Reader, tokens: Tensor, reset: Tensor, pairs: list[int]) -> Tensor:
+    """The reader's forward with each block handed the cos / sin of its own count, computed
+    apart from the reader's table: the angle zero beyond the count, and no rotation at all for
+    the count zero."""
+    x = reader.emb(tokens)
+    mask = reader.attention_mask(reset)
+    for block, n in zip(reader.blocks, pairs, strict=True):
+        if n == 0:
+            x = block(x, mask, None, None)
+        else:
+            angles = reader_mod._rotary_angles(tokens.shape[1], 4, tokens.device, n)
+            x = block(x, mask, angles.cos().to(x.dtype), angles.sin().to(x.dtype))
+    out: Tensor = reader.norm(x)
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_one_count_for_each_block_names_the_same_reader_as_one_count(dtype: torch.dtype) -> None:
+    """``[n, n]`` is ``n``, and ``[4, 4]`` (every pair of a head) is the default, bit for bit:
+    the same parameters, the same table, the same outputs."""
+    tokens = _bytes(2, 30, 5)
+    reset = _none(tokens)
+    reset[1, 13] = True
+    for listed, single in (([2, 2], 2), ([4, 4], None), ([0, 0], 0)):
+        a = _reader(dtype, reader_rotary_pairs=listed)
+        b = _reader(dtype, reader_rotary_pairs=single)
+        assert a.state_dict().keys() == b.state_dict().keys()
+        assert all(torch.equal(p, q) for p, q in zip(a.parameters(), b.parameters(), strict=True))
+        assert torch.equal(a._rot_cos, b._rot_cos) and torch.equal(a._rot_sin, b._rot_sin)
+        with torch.no_grad():
+            assert torch.equal(a(tokens, reset), b(tokens, reset)), listed
+
+
+@pytest.mark.parametrize("pairs", [[4, 0], [3, 1], [0, 4], [1, 4]])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_each_block_rotates_its_own_pairs(
+    pairs: list[int], dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader, default = _reader(dtype, reader_rotary_pairs=pairs), _reader(dtype)
+    assert reader.rotary_pairs == pairs and f"rotary_pairs={pairs}" in repr(reader)
+    # the parameters and the table are the default's: the counts act in the forward pass
+    assert all(
+        torch.equal(p, q) for p, q in zip(reader.parameters(), default.parameters(), strict=True)
+    )
+    assert torch.equal(reader._rot_cos, default._rot_cos)
+    calls: list[int] = []
+    rotate = reader_mod._rotate
+
+    def spy(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        calls.append(int((sin[1:] != 0).any(dim=0).sum()))  # the pairs this call rotates
+        return rotate(x, cos, sin)
+
+    monkeypatch.setattr(reader_mod, "_rotate", spy)
+    tokens = _bytes(2, 30, 6)
+    reset = _none(tokens)
+    reset[0, 9] = True
+    with torch.no_grad():
+        out = reader(tokens, reset)
+        # a block with the count zero never calls the rotation; the others rotate q and k
+        assert calls == [n for n in pairs if n for _ in range(2)]
+        assert torch.equal(out, _blocks_by_hand(reader, tokens, reset, pairs))
+        assert _gap(out, default(tokens, reset)) > 1e-3
+
+
+def test_a_block_without_rotation_compares_queries_and_keys_as_they_are() -> None:
+    """One block with the count zero: its attention gets no position, so the output at a
+    position is the same for every order of the bytes before it. The same weights with every
+    pair rotated read the order. (Stacked, the causal mask lets a later block see order through
+    the earlier blocks' outputs, so this is a property of the block and not of a deep reader.)"""
+    cfg = {"reader": "transformer", "reader_width": 16, "reader_heads": 2, "reader_layers": 1}
+    blind = Reader(ModelConfig(**cfg, reader_rotary_pairs=[0]), seed=0).double().eval()  # type: ignore[arg-type]
+    full = Reader(ModelConfig(**cfg), seed=0).double().eval()  # type: ignore[arg-type]
+    assert blind._block_pairs == [0] and full._block_pairs == [None]
+    g = torch.Generator().manual_seed(9)
+    with torch.no_grad():
+        for p in blind.parameters():
+            p.add_(0.5 * torch.randn(p.shape, generator=g, dtype=torch.float64))
+        full.load_state_dict(blind.state_dict())
+    tokens = _bytes(1, 20, 2)
+    shuffled = tokens.clone()
+    shuffled[:, :19] = tokens[:, torch.randperm(19, generator=g)]
+    no = _none(tokens)
+    with torch.no_grad():
+        assert _gap(blind(tokens, no)[:, -1], blind(shuffled, no)[:, -1]) <= 1e-12
+        assert _gap(full(tokens, no)[:, -1], full(shuffled, no)[:, -1]) > 1e-6
+
+
+@pytest.mark.parametrize("pairs", [[4, 0], [3, 1], 0])
+def test_with_a_count_for_each_block_the_reader_still_reads_distances_only(
+    pairs: list[int] | int,
+) -> None:
+    reader = _reader(reader_rotary_pairs=pairs)
+    body = _bytes(1, 10, 4)
+    outs = []
+    for lead in (0, 3, 17):
+        tokens = torch.cat([_bytes(1, lead, 20 + lead), body], dim=1)
+        reset = _none(tokens)
+        reset[:, lead] = True  # the body is a document of its own
+        with torch.no_grad():
+            outs.append(reader(tokens, reset)[:, lead:])
+    assert _gap(outs[0], outs[1]) <= 1e-12 and _gap(outs[0], outs[2]) <= 1e-12
+
+
+def test_a_count_for_each_block_under_bf16_autocast_with_the_float32_rotation() -> None:
+    """The two keys together: the mixed table is made in the parameters' dtype, the rotation
+    runs in it and the unrotated block is untouched."""
+    keys = {"reader_rotary_pairs": [3, 0], "reader_rotary_dtype": "parameters"}
+    reader = _reader(torch.float32, **keys).train()
+    tokens = _bytes(2, 24, 9)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = reader(tokens, _none(tokens))
+    assert out.dtype == torch.float32 and bool(torch.isfinite(out).all())
+    out.float().square().mean().backward()
+    assert all(bool(torch.isfinite(p.grad).all()) for p in reader.parameters())
 
 
 # --------------------------------------------------------------------------------------------------

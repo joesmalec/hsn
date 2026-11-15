@@ -236,7 +236,7 @@ the reader alone. `S`, `D` and the model's equations are untouched.
 
 | Key | Default | Other values | What changes |
 | --- | --- | --- | --- |
-| `model.reader_rotary_pairs` | `null` (all `w / heads / 2` pairs of a head) | `n` | Only the first `n` pairs (the `n` highest frequencies, as before) are rotated. The other pairs get the angle zero: their part of a query is compared with a key as it is, at every distance. Still distances only, no parameter |
+| `model.reader_rotary_pairs` | `null` (all `w / heads / 2` pairs of a head, in every block) | `n`, or a list with one `n` for each block | Only the first `n` pairs (the `n` highest frequencies, as before) are rotated. The other pairs get the angle zero: their part of a query is compared with a key as it is, at every distance. With `0` a block is not rotated at all. Still distances only, no parameter |
 | `model.reader_rotary_dtype` | `working` | `parameters` | The rotation is computed in the parameters' dtype (float32) and the rotated queries and keys are cast back to the working dtype for the attention. Under bf16 autocast the default rotates in bf16 (cos / sin and every product rounded to 8 bits). Without autocast the two are the same computation, bit for bit |
 | `model.reader_position` | `rotary` | `learned` | No rotation; a table of `model.reader_positions` rows (256) is added to the byte embedding by window position, as the Transformer baseline's. `train.unroll` must not exceed the rows |
 
@@ -254,22 +254,48 @@ the reader alone. `S`, `D` and the model's equations are untouched.
   positions and 5 by less than a quarter); the unrotated pairs do it exactly. With half the
   pairs rotated the slowest of them still has a wavelength of 428 positions (452 at width
   224), longer than the window.
-- **Step time (estimates, not measured).** Fewer pairs: none (the same operations, zeros in
-  the table). `learned`: none or slightly less (one addition replaces the rotations). The
-  float32 rotation: four casts a block and the rotation's elementwise operations in float32, on
-  `[B, heads, T, w / heads]`; under the compiled window they fuse into the rotation's kernel.
-  Estimated under 0.1 ms of the 12.1 ms compiled step at width 224 with two blocks, under
-  0.5 ms eager. It should be timed before a result with it is called a speed result.
+- **One count for each block, and the last block unrotated.** The baseline adds its
+  positions once, before the first block, and its far reading is all in its last block; the
+  reader rotates in every block, and every block of it stays near. `[24, 24, 24, 0]` (or
+  `[28, 0]` for two blocks of width 224) rotates in the earlier blocks and leaves the last
+  block's attention to compare queries and keys as they are. That block gets no position of
+  its own; what it reads of the order is what the earlier blocks wrote into their outputs.
+  The output is still a function of distances (tested). A list in which every count is the
+  same is that count, and the count of all pairs is the default, bit for bit.
+- **No rotation in any block** (`model.reader_rotary_pairs: 0`), for the user's question of
+  15 Nov 2026, "can we also do a test with the reader looking far back with all of its
+  attention heads?". Every head of every block then compares queries and keys as they are,
+  at any distance; the causal mask is the only thing that tells the reader an order (a later
+  block can see it in the earlier blocks' outputs). It frees every head to read far and does
+  not make it do so: `scripts/reader_reach.py` shows per head whether it does. It also takes
+  away the near positions, where the reader is the better model today (above, the attention
+  cut to 32 bytes), so a loss on the near bytes is to be expected; not run.
+- **Step time, compiled, at width 224 with two blocks (12.12 ms alone on the RTX 3060; the
+  GRU 15.75). Estimates from the operations, none measured:**
+
+  | Setting | Expected change | Why |
+  | --- | --- | --- |
+  | `reader_rotary_pairs: n` | none | the same operations, zeros in the table |
+  | `reader_rotary_pairs: [28, 0]` | none to 0.1 ms less | the last block's two rotations are not computed |
+  | `reader_rotary_pairs: 0` | none to 0.2 ms less | no rotation is computed |
+  | a list of unequal non-zero counts | none | two selections on a `[T, pairs]` table for each block |
+  | `reader_position: learned` | none to 0.2 ms less | one addition replaces the rotations of both blocks |
+  | `reader_rotary_dtype: parameters` | under 0.1 ms more (under 0.5 ms eager) | four casts a block; the rotation's elementwise operations on `[B, heads, T, w / heads]` in float32, fused into the rotation's kernel when compiled |
+
+  None of them should cost the 3.6 ms lead. The setting that is kept should be timed before
+  a result with it is called a speed result.
 - **Not built: a context-symbol input to the reader.** The context symbol is constant on
   `tinystories_v1`, so it cannot explain this gap; without the memory the model reads it
   through `S` already.
 
 Tests: `tests/test_reader_positions.py`. The defaults keep every hash, memory key, parameter,
 state-dict key and output (against the forward of before the keys); the unrotated pairs come
-back bit for bit and match at every distance; the float32 rotation under bf16 autocast, read
-off the calls and closer to the exact rotation; the learned reader against the Transformer
-baseline; the refusals; the closed forms of the parameter count; HSN-T with its memory, the
-compiled memory-off graph and thirty trainer steps with each key.
+back bit for bit and match at every distance; each block rotates its own count (against the
+blocks run by hand), a block with the count zero never calls the rotation and, alone, gives
+the same output for every order of the earlier bytes; the float32 rotation under bf16
+autocast, read off the calls and closer to the exact rotation; the learned reader against the
+Transformer baseline; the refusals; the closed forms of the parameter count; HSN-T with its
+memory, the compiled memory-off graph and thirty trainer steps with each key.
 
 ## Without the memory (`model.memory: false`)
 

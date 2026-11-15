@@ -46,7 +46,11 @@ outputs, bit for bit (``tests/test_reader_positions.py``).
 
 * ``model.reader_rotary_pairs = n``: only the first ``n`` pairs of each head (the ``n`` highest
   frequencies of the same ladder) are rotated. The other pairs get the angle zero, so their part
-  of a query is compared with a key as it is, at every distance. Still distances only.
+  of a query is compared with a key as it is, at every distance. Still distances only. A list
+  gives ``n`` for each block: the Transformer baseline adds its positions once, before the first
+  block, and the reader rotates in every block; ``[all, …, 0]`` leaves the last block's attention
+  without a rotation: it compares queries and keys as they are (what it reads of the order is
+  what the blocks before it wrote into their outputs).
 * ``model.reader_rotary_dtype = parameters``: the rotation is computed in the dtype of the
   parameters (float32 master weights) and the rotated queries and keys are cast back to the
   working dtype for the attention. Under bf16 autocast the default rotates in bf16: the cos /
@@ -160,8 +164,23 @@ class Reader(nn.Module):
         self.heads = heads
         self.span: int | None = cfg.reader_span
         self.position = cfg.reader_position
-        #: ``model.reader_rotary_pairs``: the rotated pairs of a head; None: all of them
-        self.rotary_pairs: int | None = cfg.reader_rotary_pairs
+        #: ``model.reader_rotary_pairs`` as configured: one count, one for each block, or None
+        self.rotary_pairs: int | list[int] | None = cfg.reader_rotary_pairs
+        half = width // heads // 2
+        counts = (
+            list(self.rotary_pairs)
+            if isinstance(self.rotary_pairs, list)
+            else [self.rotary_pairs] * cfg.reader_layers
+        )
+        #: The rotated pairs of each block's heads; None: all of them (the default)
+        self._block_pairs: list[int | None] = [
+            None if n is None or n >= half else n for n in counts
+        ]
+        #: The pairs the rotary table itself keeps: the blocks' count when they share one (the
+        #: table is then handed to every block as it is), None when it holds every pair
+        self._table_pairs: int | None = (
+            self._block_pairs[0] if len(set(self._block_pairs)) == 1 else None
+        )
         with torch.random.fork_rng(devices=[]):
             generator = torch.Generator(device="cpu").manual_seed((seed + 0xA14EAD) % (2**63 - 1))
             torch.set_rng_state(generator.get_state())
@@ -193,7 +212,7 @@ class Reader(nn.Module):
             self._rot_cos = self._rot_sin = None
             return
         angles = _rotary_angles(
-            _ROTARY_TABLE, self.width // self.heads // 2, weight.device, self.rotary_pairs
+            _ROTARY_TABLE, self.width // self.heads // 2, weight.device, self._table_pairs
         )
         self._rot_cos = angles.cos().to(weight.dtype)
         self._rot_sin = angles.sin().to(weight.dtype)
@@ -219,8 +238,21 @@ class Reader(nn.Module):
             and cos.device == x.device
         ):
             return cos[:T], sin[:T]
-        angles = _rotary_angles(T, self.width // self.heads // 2, x.device, self.rotary_pairs)
+        angles = _rotary_angles(T, self.width // self.heads // 2, x.device, self._table_pairs)
         return angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+
+    def _block_rotation(
+        self, pairs: int | None, cos: Tensor | None, sin: Tensor | None
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """The cos / sin one block is handed: the table's when it already holds the block's
+        pairs (the default, and one count for all blocks), none for a block that rotates
+        nothing, and otherwise the table's with the angle zero in the pairs ``i ≥ pairs``."""
+        if cos is None or sin is None or pairs == 0:
+            return None, None
+        if pairs is None or pairs == self._table_pairs:
+            return cos, sin
+        keep = torch.arange(cos.shape[-1], device=cos.device) < pairs
+        return torch.where(keep, cos, 1.0), torch.where(keep, sin, 0.0)
 
     def attention_mask(self, reset: Tensor) -> Tensor:
         """Bool ``[B, 1, T, T]``, True where position ``t`` (row) may read position ``s``
@@ -257,8 +289,9 @@ class Reader(nn.Module):
         else:
             cos, sin = self._rotation(T, x)
         mask = self.attention_mask(reset)
-        for block in self.blocks:
-            x = block(x, mask, cos, sin)
+        for i, block in enumerate(self.blocks):
+            block_cos, block_sin = self._block_rotation(self._block_pairs[i], cos, sin)
+            x = block(x, mask, block_cos, block_sin)
         out: Tensor = self.norm(x)
         return out
 

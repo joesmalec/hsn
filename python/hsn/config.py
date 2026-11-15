@@ -396,8 +396,11 @@ class ModelConfig(_StrictModel):
     reader_positions: int = Field(default=256, ge=1)
     # reader_rotary_pairs = n: only the first n pairs of each head's query and key (the n
     # highest frequencies, unchanged) are rotated; the other pairs are compared as they are, at
-    # every distance. null (default): all width / heads / 2 pairs. Distances only, as before.
-    reader_rotary_pairs: int | None = Field(default=None, ge=1)
+    # every distance. A list gives n for each block, first to last (the baseline adds its
+    # positions once, before the first block; the reader rotates in every block). 0 rotates
+    # nothing: that block's attention compares queries and keys as they are. null (default):
+    # all width / heads / 2 pairs in every block. Distances only, as before.
+    reader_rotary_pairs: int | list[int] | None = None
     # reader_rotary_dtype: the arithmetic of the rotation. "working" (default): the dtype of
     # the queries and keys, which is bf16 under bf16 autocast. "parameters": the dtype of the
     # parameters (float32 master weights), the rotated queries and keys cast back for the
@@ -575,9 +578,17 @@ class ModelConfig(_StrictModel):
                     "model.reader_position=learned has no rotation: leave "
                     "model.reader_rotary_pairs and model.reader_rotary_dtype at their defaults"
                 )
-            if self.reader_rotary_pairs is not None and self.reader_rotary_pairs > per_head // 2:
+            pairs = self.reader_rotary_pairs
+            if isinstance(pairs, list) and len(pairs) != self.reader_layers:
                 raise ValueError(
-                    f"model.reader_rotary_pairs={self.reader_rotary_pairs} exceeds the "
+                    f"model.reader_rotary_pairs={pairs} names {len(pairs)} blocks and the "
+                    f"reader has model.reader_layers={self.reader_layers}: one count for each "
+                    "block, or one number for all of them"
+                )
+            counts = pairs if isinstance(pairs, list) else [] if pairs is None else [pairs]
+            if any(n < 0 or n > per_head // 2 for n in counts):
+                raise ValueError(
+                    f"model.reader_rotary_pairs={pairs} must lie between 0 and the "
                     f"{per_head // 2} pairs of a head (model.reader_width / model.reader_heads "
                     "/ 2); null rotates all of them"
                 )

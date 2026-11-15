@@ -213,8 +213,8 @@ Three readings, each with what it rests on:
    rotation are the baseline; the reader's loss stops falling after about 64 bytes of context
    and no block of it attends far. The memory-off models inherit it: their loss rises from
    positions 32 to 63 to the end of the window where the baseline's falls. Three opt-in keys of
-   the reader test the cause (`model.reader_rotary_pairs`, `model.reader_rotary_dtype`,
-   `model.reader_position`).
+   the reader test the cause (`model.reader_rotary_pairs`, also with one count for each block
+   so that the last block is not rotated, `model.reader_rotary_dtype`, `model.reader_position`).
 2. **At one parameter count the model has a smaller reader than the reader alone** (0.028
    bits from the reader alone at 192 × 4 to the memory-off model at 160 × 4; one run each).
    `E`, `S` and `D` hold 657,280 of the chosen shape's 1,942,528 parameters and the reader
