@@ -14,7 +14,8 @@ runs, so nothing of a baseline's architecture changes; the backward of a compile
 compiled with it, and the loss, the clipping, the guards and the optimiser stay eager, as under
 the HSN's compiled window):
 
-* ``transformer`` and ``reader``: the whole forward of a window as one graph.
+* ``transformer``, ``reader`` and ``hsn_t`` without its memory (``model.memory = false``,
+  :class:`hsn.model.hsn_t.HSNTNoMemory`): the whole forward of a window as one graph.
 * ``gru``: the embeddings before the recurrence and the read-out after it
   (:meth:`~hsn.baselines.gru.GRUBaseline._embed`, :meth:`~hsn.baselines.gru.GRUBaseline._readout`),
   as two graphs. The recurrence between them is ``torch.nn.GRU``, which ``torch.compile`` does not
@@ -35,7 +36,7 @@ memory, which the next window's replay overwrites: read them before the next win
 trainer and the evaluation do. ``train.grad_accum > 1`` is refused (a gradient held in ``.grad``
 across windows would be overwritten too), as for the HSN.
 
-**Scope** (errors over silence, :func:`check_baseline_scope`): the three families above; no
+**Scope** (errors over silence, :func:`check_baseline_scope`): the four families above; no
 dropout (a compiled random draw differs from the eager one); ``train.grad_accum = 1`` under CUDA
 graphs. On MPS a backend that cannot compile falls back to the eager model with a logged notice.
 ``selective_ssm`` is outside the scope: its scan writes every position's state into one
@@ -61,6 +62,7 @@ from hsn.baselines.reader_lm import ReaderLM
 from hsn.baselines.transformer import TransformerBaseline
 from hsn.config import RunConfig
 from hsn.device import DeviceContext
+from hsn.model.hsn_t import HSNTNoMemory
 from hsn.train.compile import Backend, _compiler, _mps_supported
 
 __all__ = [
@@ -81,6 +83,7 @@ _SCOPE: dict[type[nn.Module], str] = {
     "between them is the eager call (cuDNN on CUDA)",
     TransformerBaseline: "the whole forward of a window and its backward",
     ReaderLM: "the whole forward of a window and its backward",
+    HSNTNoMemory: "the whole forward of a window and its backward",
 }
 
 WindowOut = tuple[Tensor, Any, dict[str, Any]]
@@ -89,7 +92,7 @@ WindowOut = tuple[Tensor, Any, dict[str, Any]]
 def _whole_forward(
     model: nn.Module, tokens: Tensor, context: Tensor, reset: Tensor
 ) -> tuple[Tensor, None, dict[str, Any]]:
-    """A stateless baseline's forward (``transformer``, ``reader``)."""
+    """A stateless model's forward (``transformer``, ``reader``, ``hsn_t`` without memory)."""
     out: tuple[Tensor, None, dict[str, Any]] = model(tokens, context, None, reset)
     return out
 

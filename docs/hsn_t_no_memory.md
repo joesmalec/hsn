@@ -128,7 +128,9 @@ build and are not in a test.
 `hardware.compile_mode` compiles the HSN's training window only. Under the generic trainer it
 is ignored with a warning, and a spec refuses it for this family. The compile path for the
 generic trainer's models is a separate change (`hardware.baseline_compile`, branch
-`claude/baseline-compile`); nothing of it is here. What this build guarantees is that the
+`claude/baseline-compile`); on the integration branch `claude/nomem-compile` the two are
+merged and the key compiles this model's window as one graph (`docs/baseline_compile.md`).
+What this build guarantees is that the
 forward compiles as one graph: no data-dependent branch, shape or host read
 (`torch.compile(model, backend="aot_eager", fullgraph=True)`, forward and backward equal to
 eager, the second window of the same shape reusing the graph; tested). Outside the tests the
@@ -184,7 +186,8 @@ configs/experiments/hsn_t_nomem.yaml
 ```
 
 and for a GRU-sized model the same with, for example, `model.reader_width=224`. The compiled
-figure needs the generic trainer's compile path, once that is merged.
+figure adds `hardware.baseline_compile=reduce-overhead` (branch `claude/nomem-compile`;
+`docs/baseline_compile.md`, "HSN-T without its memory").
 
 ## Where it is in the code
 
