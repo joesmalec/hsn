@@ -382,6 +382,14 @@ class ModelConfig(_StrictModel):
     # short-sighted reader, which must leave everything further back to the memory).
     # null (default): every byte of the document up to the position, inside the window.
     reader_span: int | None = Field(default=None, ge=1)
+    # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
+    # memory, a stateless model that is parallel over the window: the byte and context
+    # embeddings, E, the reader, S and D, with no cells, router, units, graph, predictor or
+    # summary. S and D keep HSN-T's input widths and read zeros where q and r would stand, so a
+    # trained HSN-T's weights of those parts load unchanged. The keys above that describe the
+    # memory are then not read; the generic trainer trains it on the next-byte loss alone.
+    # true (default): the model with its memory, unchanged.
+    memory: bool = True
     # --- end HSN-T ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
@@ -527,6 +535,22 @@ class ModelConfig(_StrictModel):
                     f"model.reader_width={self.reader_width} must be a multiple of "
                     f"model.reader_heads={self.reader_heads} with an even width per head (the "
                     "positions rotate pairs of the attention's query and key)"
+                )
+        if not self.memory:
+            if self.reader == "none":
+                raise ValueError(
+                    "model.memory=false is HSN-T without its memory (model_name: hsn_t): what "
+                    "is left is the reader's path, so set model.reader=transformer"
+                )
+            if self.fast_cells or self.fast_readout:
+                raise ValueError(
+                    "model.memory=false: model.fast_cells / model.fast_readout (A8) are cells "
+                    "of the memory and a read of them; leave both at their defaults"
+                )
+            if self.decoder_shortcut_dropout:
+                raise ValueError(
+                    "model.memory=false: model.decoder_shortcut_dropout drops q and u so that "
+                    "the decoder reads the selected cells, and there are none; leave it at 0"
                 )
         # --- end HSN-T ---
         return self
@@ -1278,8 +1302,9 @@ class RunConfig(_StrictModel):
     @classmethod
     def _default_optimizer_by_routing(cls, data: Any) -> Any:
         """``train.optimizer`` left unset resolves to ``lazy_adamw`` when ``model.routing`` is a
-        selection mode; dense data is returned untouched (the field default ``adamw`` applies) and
-        an explicit value is always kept."""
+        selection mode; dense data is returned untouched (the field default ``adamw`` applies),
+        and so is HSN-T without its memory (``model.memory = false``: no unit bank); an explicit
+        value is always kept."""
         if not isinstance(data, dict):
             return data
         train = data.get("train")
@@ -1289,10 +1314,10 @@ class RunConfig(_StrictModel):
             return data
         model = data.get("model")
         if isinstance(model, dict):
-            routing = model.get("routing", "dense")
+            routing, memory = model.get("routing", "dense"), model.get("memory", True)
         else:
-            routing = getattr(model, "routing", "dense")
-        if routing == "dense":
+            routing, memory = getattr(model, "routing", "dense"), getattr(model, "memory", True)
+        if routing == "dense" or memory is False:  # HSN-T without memory has no unit bank
             return data
         return {**data, "train": {**(train or {}), "optimizer": "lazy_adamw"}}
 
@@ -1368,6 +1393,20 @@ class RunConfig(_StrictModel):
                 "model_name=reader is the HSN-T reader alone with a next-byte head: set "
                 "model.reader=transformer and the reader_* keys of the reader it stands for"
             )
+        if not self.model.memory:
+            if self.model_name != "hsn_t":
+                raise ValueError(
+                    "model.memory=false is HSN-T without its memory (docs/hsn_t_no_memory.md); "
+                    f"model_name={self.model_name!r} has no such switch: leave it at true"
+                )
+            refused = memory_off_refusals(self)
+            if refused:
+                raise ValueError(
+                    "model.memory=false: the model has no cells, router, predictor or summary "
+                    "and the generic trainer trains it on the next-byte loss alone, so these "
+                    "settings could not act: " + "; ".join(refused)
+                )
+        # --- end HSN-T ---
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:
             ignored = []
@@ -1788,7 +1827,69 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.reader_span",
     "model.address_history",
     "hardware.baseline_compile",
+    "model.memory",
 )
+
+
+#: ``model.memory = false`` (HSN-T without its memory, ``docs/hsn_t_no_memory.md``): the
+#: ``train.*`` keys that act on the memory alone, each with what it acts on. A memory-off
+#: configuration holds every one at its schema default (:func:`memory_off_refusals`).
+MEMORY_TRAIN_KEYS: dict[str, str] = {
+    "cell_lr_mult": "the cell's parameter group",
+    "cell_weight_decay": "the cell's parameter group",
+    "router_lr_mult": "the router's parameter group",
+    "feedback_detach": "A6: the state's feedback reads",
+    "state_grad_clip": "A6: the gradient into the state",
+    "state_grad_ratio": "A6: the gradient into the state",
+    "gate_mode": "the routed selection's gradient path",
+    "soft_until_step": "the routed selection's soft warm-up",
+    "unit_credit": "the routed units' credit",
+    "ste_scope": "the routed cells' straight-through scope",
+    "temperature_start": "the selection's temperature",
+    "temperature_end": "the selection's temperature",
+    "temperature_steps": "the selection's temperature",
+    "epsilon_start": "the selection's exploration",
+    "epsilon_end": "the selection's exploration",
+    "epsilon_steps": "the selection's exploration",
+    "p_dense": "the routed round's dense fallback",
+    "aux_enabled": "the routing penalties",
+    "address_gate_hold_step": "the address gate's weights",
+}
+#: The loss weights of ``train.*``: the generic trainer's objective has none of their terms.
+LOSS_WEIGHT_KEYS: tuple[str, ...] = tuple(
+    f"lambda_{term}" for term in ("p", "r", "d", "e", "c", "b", "g", "u", "ponder", "w")
+)
+#: The top-level modules of an HSN-T that are its memory (the others stay with the memory off).
+MEMORY_MODULES: tuple[str, ...] = ("predictor", "cell", "router", "halting")
+
+
+def memory_off_refusals(cfg: RunConfig) -> list[str]:
+    """``model.memory = false``: every training setting of ``cfg`` that needs the memory, as
+    ``key=value (what it acts on)``; empty when the configuration can be trained. The model is
+    stateless and the generic trainer's objective is the next-byte cross-entropy alone, so a
+    setting listed here would be dropped without a word."""
+    train = cfg.train
+    refused: list[str] = []
+    for name in LOSS_WEIGHT_KEYS:
+        if getattr(train, name) > 0.0:
+            what = "L_pred: the predictor reads the summary" if name == "lambda_p" else "no term"
+            refused.append(f"train.{name}={getattr(train, name)} ({what}; set it to 0)")
+    for name, what in MEMORY_TRAIN_KEYS.items():
+        if getattr(train, name) != TrainConfig.model_fields[name].default:
+            refused.append(f"train.{name}={getattr(train, name)} ({what})")
+    if train.route_guard.enabled:
+        refused.append("train.route_guard.enabled=true (the router's units)")
+    if train.optimizer == "lazy_adamw":
+        refused.append("train.optimizer=lazy_adamw (the unit bank's groups; use adamw)")
+    selectors = {
+        f"train.update_limit.groups.{name}": group.selectors
+        for name, group in train.update_limit.groups.items()
+    } | {f"train.gradient_growth.groups.{k}": v for k, v in train.gradient_growth.groups.items()}
+    for key, globs in selectors.items():
+        lost = [glob for glob in globs if glob.split(".")[0] in MEMORY_MODULES]
+        if lost:
+            refused.append(f"{key} selects {lost} (parameters of the memory)")
+    return refused
 
 
 def split_window_scope_error(
