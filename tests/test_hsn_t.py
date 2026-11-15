@@ -103,7 +103,7 @@ def test_keys_are_opt_in_and_the_default_keeps_its_hash() -> None:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        (["model.reader=transformer", "model.selected_readout=false"], "selected_readout"),
+        ([FAMILY, "model.reader=transformer", "model.selected_readout=false"], "selected_readout"),
         (["model.reader_span=8"], "span of model.reader"),
         (["model.reader=transformer", "model.reader_width=30"], "multiple of"),
         (["model.reader=transformer", "model.reader_width=12"], "even width per head"),
@@ -153,11 +153,9 @@ def test_the_two_families_are_kept_apart_by_construction() -> None:
 
 def test_baselines_and_variants_refuse_the_key() -> None:
     gru = REPO / "configs" / "baselines" / "gru_2m.yaml"
-    # the reader needs A5's readout, which a baseline cannot have (routed HSN only)
-    with pytest.raises(ValueError, match="selected_readout"):
+    # a reader belongs to HSN-T (or stands alone as model_name: reader), never to a baseline
+    with pytest.raises(ValueError, match="HSN-T family"):
         load_config(gru, ["model.reader=transformer"])
-    with pytest.raises(ValueError, match="selected_readout"):
-        load_config(gru, ["model.reader=transformer", "model.selected_readout=true"])
     # and A5 refuses every cell variant but pdg, so the reader never meets one
     model = HSNT.from_config(_reader_cfg())
     with pytest.raises(ValueError, match="A5 is unsupported"):
