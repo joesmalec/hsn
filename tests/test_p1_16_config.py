@@ -105,6 +105,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.reader_heads",
         "model.reader_span",
         "model.address_history",
+        "hardware.baseline_compile",  # the baselines' compiled windows (opt-in)
     )
 
 

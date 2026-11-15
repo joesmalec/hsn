@@ -26,6 +26,7 @@ dtype and only the embeddings, LayerNorm and head follow autocast (P0.8, profile
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -88,6 +89,34 @@ class GRUBaseline(nn.Module):
         self, tokens: Tensor, context: Tensor, state: Tensor, reset: Tensor
     ) -> tuple[Tensor, Tensor, dict[str, Any]]:
         """``tokens``/``context``/``reset`` are ``[B, T]``; returns logits ``[B, T, V]``, state."""
+        return self._window(tokens, context, state, reset, self._embed, self._readout)
+
+    def _embed(self, tokens: Tensor, context: Tensor, reset: Tensor) -> Tensor:
+        """The recurrence's input ``[B, T, d_model]``: the embeddings, summed."""
+        x = self.tok_emb(tokens) + self.ctx_emb(context)
+        if self.address is not None:
+            x = x + self.address(tokens, reset)
+        out: Tensor = self.drop(x)
+        return out
+
+    def _readout(self, y: Tensor) -> Tensor:
+        """The logits ``[B, T, V]`` of the recurrence's output ``y``."""
+        out: Tensor = self.head(self.drop(self.norm(y)))
+        return out
+
+    def _window(
+        self,
+        tokens: Tensor,
+        context: Tensor,
+        state: Tensor,
+        reset: Tensor,
+        embed: Callable[[Tensor, Tensor, Tensor], Tensor],
+        readout: Callable[[Tensor], Tensor],
+    ) -> tuple[Tensor, Tensor, dict[str, Any]]:
+        """:meth:`forward` with its two tensor-only stages passed in: ``forward`` passes
+        :meth:`_embed` and :meth:`_readout`; ``hardware.baseline_compile`` passes their compiled
+        twins (:mod:`hsn.train.baseline_compile`). The recurrence between them is the same call
+        of ``nn.GRU`` (cuDNN on CUDA) either way."""
         if tokens.dim() != 2:
             raise ValueError(f"tokens must be [B, T], got shape {tuple(tokens.shape)}")
         B, T = tokens.shape
@@ -97,10 +126,7 @@ class GRUBaseline(nn.Module):
         if reset.dtype is not torch.bool:
             raise TypeError(f"reset must be a bool tensor, got {reset.dtype}")
         self._check_state(state, B)
-        x = self.tok_emb(tokens) + self.ctx_emb(context)
-        if self.address is not None:
-            x = x + self.address(tokens, reset)
-        x = self.drop(x)
+        x = embed(tokens, context, reset)
         h = state
         if x.device.type == "cuda" and torch.is_autocast_enabled(x.device.type):
             # cuDNN: autocast copies the RNN weights to the autocast dtype; input and state match it
@@ -128,7 +154,7 @@ class GRUBaseline(nn.Module):
             if col < T:
                 h = h.masked_fill(reset[:, col].view(1, B, 1), 0.0)
         y = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
-        logits = self.head(self.drop(self.norm(y)))
+        logits = readout(y)
         return logits, h, {"state_abs_max": h.detach().abs().max()}  # a tensor: no host sync
 
     def param_report(self) -> dict[str, int]:
