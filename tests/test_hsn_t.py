@@ -508,10 +508,13 @@ def test_window_under_bf16_autocast_is_finite() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("extra", [READER, SHORT, PREV])
+@pytest.mark.parametrize("extra", [READER, PREV])
 @pytest.mark.parametrize("name", list(COMPILED))
 @pytest.mark.usefixtures("small_blocks")
 def test_compiled_window_equals_eager(name: str, extra: tuple[str, ...]) -> None:
+    """Reader attention runs eagerly; changing its span must reuse the compiled memory core."""
+    from torch._dynamo.utils import counters
+
     overrides, training = COMPILED[name]
     cfg = p28._cfg(
         "model.routing=topk",
@@ -530,13 +533,21 @@ def test_compiled_window_equals_eager(name: str, extra: tuple[str, ...]) -> None
     ctx = p28._ctx()
     window = p28._window(model, ctx)
     tokens, cx, state, reset = p28._case_inputs(model, True)
-    ref = p28._run(lambda: model(tokens, cx, state, reset))
-    got = p28._run(lambda: window(tokens, cx, state, reset))
     tol = p28.TOL[(ctx.device.type, "fp32")]
-    diff = p28._max_diff(got, ref)
-    assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], diff
-    if training:
-        assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"]
+    assert model.reader is not None
+    graphs = None
+    for span in (None, SPAN):
+        model.reader.span = span
+        ref = p28._run(lambda: model(tokens, cx, state, reset))
+        got = p28._run(lambda: window(tokens, cx, state, reset))
+        diff = p28._max_diff(got, ref)
+        assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], (span, diff)
+        if training:
+            assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"]
+        compiled = counters["stats"]["unique_graphs"]
+        if graphs is not None:
+            assert compiled == graphs, "eager reader span recompiled the memory core"
+        graphs = compiled
 
 
 @pytest.mark.parametrize("extra", [READER, SHORT, PREV])

@@ -50,10 +50,16 @@ jobs:
         run: uv run maturin develop --uv -m rust/hsn-py/Cargo.toml
 
       - name: pytest
-        run: uv run pytest -q
-
-      - name: pytest tests/invariants (P1.8 invariant suite, Track T)
-        run: uv run pytest tests/invariants -q
+        # The full suite already includes tests/invariants. Small tensor tests spend more
+        # time scheduling BLAS threads than doing arithmetic unless the pools are bounded.
+        env:
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          VECLIB_MAXIMUM_THREADS: "1"
+          TORCHINDUCTOR_COMPILE_THREADS: "1"
+        # Keep module fixtures together and bound concurrency on hosted runners.
+        run: uv run pytest -q -n 2 --dist=loadfile --durations=20
 
       - name: cargo test
         run: cargo test --workspace
