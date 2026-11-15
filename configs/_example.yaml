@@ -66,6 +66,10 @@ model: # Appendix A.1
   reader_layers: 2 # HSN-T: the reader's blocks
   reader_heads: 4 # HSN-T: attention heads per block
   reader_span: null # HSN-T: n = a position reads itself and the n - 1 bytes before it only (short-sighted); null = the document up to the position, inside the window
+  reader_position: rotary # HSN-T reader (opt-in, docs/hsn_t.md): rotary = positions as rotations of the attention's queries and keys (distances only, no parameter) | learned = a position table added to the byte embedding, as the Transformer baseline's, and no rotation (the reader then reads the window position)
+  reader_positions: 256 # HSN-T reader: the rows of the learned table (reader_position: learned), the longest window it reads; not read with rotary positions
+  reader_rotary_pairs: null # HSN-T reader (opt-in): n = only the first n pairs of each head (the highest frequencies) are rotated, the others are compared as they are at every distance; null = all width / heads / 2 pairs
+  reader_rotary_dtype: working # HSN-T reader (opt-in): working = the rotation runs in the dtype of the queries and keys (bf16 under bf16 autocast) | parameters = in the parameters' dtype (float32), cast back for the attention
   memory: true # HSN-T only (docs/hsn_t_no_memory.md): false = HSN-T without its memory, stateless and parallel over the window (embeddings, E, reader, S, D; zeros where q and r are read), trained by the generic trainer
   address_ngram: 1 # amendment A9: longest byte n-gram with an address feature pair (needs key_address); 1 = A5 only
   address_history: byte # A9 across windows: byte = one byte carried (every run before 14 Nov 2026; the older bytes read as BOS at a continuing window's first column) | ngram = the last address_ngram bytes carried (needs address_ngram > 1)

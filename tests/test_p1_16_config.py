@@ -107,6 +107,10 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.address_history",
         "hardware.baseline_compile",  # the baselines' compiled windows (opt-in)
         "model.memory",  # HSN-T without its memory
+        "model.reader_position",  # the reader's positions (opt-in, 15 Nov 2026)
+        "model.reader_positions",
+        "model.reader_rotary_pairs",
+        "model.reader_rotary_dtype",
     )
 
 

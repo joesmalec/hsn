@@ -1,7 +1,8 @@
 # HSN-T without its memory (`model.memory: false`)
 
-Status: **an opt-in switch of HSN-T, implemented on 14 Nov 2026; not run on a card; no result
-yet.** Asked for by the user on 14 Nov 2026: "I would like the memory option opt in and like
+Status: **an opt-in switch of HSN-T, implemented on 14 Nov 2026; first text and arithmetic
+runs on 14 and 15 Nov ("Text: the gap to the baselines" below); not adopted.** Asked for by the
+user on 14 Nov 2026: "I would like the memory option opt in and like
 to see if we can beat gru (our original goal) on a compiled kernel", then "I'm looking to beat
 gru on speed without memory, I know it can't be done with memory."
 
@@ -173,6 +174,74 @@ The speed question and the quality question use different sizes: the default mod
 third of the GRU's size, and a widened one does about three times the default's
 multiply-accumulates per position.
 
+## Text: the gap to the baselines (15 Nov 2026)
+
+TinyStories (`tinystories_v1`), 9,000 steps, batch 32, learning rate 1e-3 unless noted, bits
+per byte on the 2,000 dev stories (lower is better), uncompiled unless noted:
+
+| Model | Parameters | Seed 0 | Seed 1 |
+| --- | --- | --- | --- |
+| Transformer baseline (192 × 4) | 1,930,624 | 0.919 | 0.925 |
+| GRU baseline (learning rate 2e-3, its best) | 1,977,856 | 0.952 | 0.954 |
+| Reader alone, 192 × 4 | 1,878,400 | 0.967 | |
+| Without memory, reader 160 × 4 | 1,887,552 | 0.995 (compiled 0.983) | |
+| Without memory, reader 184 × 3 | 1,907,192 | 0.996 | |
+| Without memory, reader 224 × 2 (the shape chosen for speed) | 1,942,528 | 1.015 (compiled 1.021) | 1.027 |
+| The same at learning rate 5e-4 / 2e-3 | | 1.048 / 1.078 | |
+
+A compiled and an eager run of one configuration differ by up to 0.012 bits and two seeds by
+0.012, so differences under about 0.015 between single runs are not read.
+
+**Where the gap is** (the step-9,000 checkpoints scored on the CPU in float32; the totals
+reproduce the runs). Documents are aligned to windows, so the position in the window is the
+number of bytes the model can see:
+
+| Window positions | Share of the bytes | Transformer | Reader 192 × 4 | No memory 160 × 4 | No memory 224 × 2 |
+| --- | --- | --- | --- | --- | --- |
+| 0 to 7 | 3.6 % | 1.477 | 1.495 | 1.507 | 1.510 |
+| 8 to 31 | 10.7 % | 0.932 | 0.931 | 0.940 | 0.949 |
+| 32 to 63 | 13.8 % | 0.907 | 0.922 | 0.939 | 0.960 |
+| 64 to 127 | 26.0 % | 0.913 | 0.954 | 0.982 | 1.005 |
+| 128 to 255 | 45.9 % | 0.880 | 0.954 | 0.993 | 1.014 |
+| All | 100 % | 0.919 | 0.967 | 0.995 | 1.015 |
+
+Three readings, each with what it rests on:
+
+1. **The reader does not use the bytes far back, and the baseline does** (0.047 of the 0.096
+   bits between the chosen shape and the baseline). `docs/hsn_t.md`, "The reader's positions",
+   has the measurements: the same blocks with the baseline's position table in place of the
+   rotation are the baseline; the reader's loss stops falling after about 64 bytes of context
+   and no block of it attends far. The memory-off models inherit it: their loss rises from
+   positions 32 to 63 to the end of the window where the baseline's falls. Three opt-in keys of
+   the reader test the cause (`model.reader_rotary_pairs`, `model.reader_rotary_dtype`,
+   `model.reader_position`).
+2. **At one parameter count the model has a smaller reader than the reader alone** (0.028
+   bits from the reader alone at 192 × 4 to the memory-off model at 160 × 4; one run each).
+   `E`, `S` and `D` hold 657,280 of the chosen shape's 1,942,528 parameters and the reader
+   1,267,840; the reader alone at 192 × 4 has 1,828,992 in the reader. The trained model does
+   use them: with `u` held at zero in `D`'s input the chosen shape's loss on 300 dev stories
+   rises from 1.016 to 1.420, with `z` at zero in `S`'s input to 1.188, with `c` at zero in
+   `S`'s input to 1.234. Whether the same parameters would do more inside the reader is not
+   measured; the arms of `text_gap.yaml` run the reader alone at 224 × 2 and a shape with a
+   smaller `model.hidden` and a wider reader (an existing key: `S` and `D` keep their inputs
+   and their place, their hidden layer narrows).
+3. **Two blocks against four** (0.020 to 0.032 bits between 160 × 4 and 224 × 2, at every
+   position). This is the speed choice and is not changed here.
+
+**Not built, by the architecture rule.** Nothing that removes or bypasses `S` or `D`, changes
+`u = S([z ; q ; ctx ; c])` or `D([q ; u ; r ; c])`, or leaves the zero columns out. If the arms
+show that the cost of point 2 is `S` and `D` themselves and not their size, that is a finding
+to report and an amendment to ask for, not a switch.
+
+Shapes near the same size and arithmetic, for point 2 (counts, not measurements; the
+multiply-accumulates count the reader's attention at a window of 256):
+
+| `model.hidden` | Reader | Parameters | In the reader | Multiply-accumulates per position |
+| --- | --- | --- | --- | --- |
+| 512 (default) | 224 × 2 | 1,942,528 | 1,267,840 | 2.09 M |
+| 256 | 248 × 2 | 1,905,056 | 1,546,528 | 2.07 M |
+| 128 | 264 × 2 | 1,939,936 | 1,747,680 | 2.12 M |
+
 ## How to time it
 
 The coordinating session times it alone on the card with its own script. The configuration
@@ -214,8 +283,9 @@ trainer's own controllers run; the forward and backward compile as one graph and
 
 ## Limits
 
-- No run exists. The step time on the card is not measured, and nothing here says the model
-  beats the GRU's.
+- On text every shape run so far is behind the GRU baseline (0.952 / 0.954 bits) and the
+  Transformer baseline ("Text: the gap to the baselines"). The step times are the
+  coordinating session's and are not recorded here.
 - `hsn run` labels its results by `model_name`, so a memory-off run made with it appears as
   `hsn_t` in the result store; the configuration hash and `model.memory` tell the two apart.
   The experiment harness uses the family.
