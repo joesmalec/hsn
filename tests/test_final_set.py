@@ -1,8 +1,9 @@
 """``synthetic_final`` (14 Nov 2026): the untouched final test set of the hold-out data. A key
-alphabet that no task of the hold-out data uses and fresh documents, to be scored once per gate
-claim (``python -m hsn.eval.final_test``). These tests check that the set is the hold-out tasks
-apart from the test keys and the seeds, that its alphabet and documents are new, the manifest,
-and that a scoring goes on the ledger and is refused a second time."""
+alphabet that no task of the hold-out data uses and fresh documents, scored in one preregistered
+campaign (``python -m hsn.eval.final_test``: freeze, then run). These tests check that the set
+is the hold-out tasks apart from the test keys and the seeds, that its alphabet and documents
+are new, the manifest, and the lock: a frozen plan, one campaign, the set spent afterwards, and
+no candidate whose training stream held a final byte."""
 
 from __future__ import annotations
 
@@ -135,20 +136,21 @@ def test_golden_manifest_matches(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Scoring: once per claim, on the record
+# Scoring: one frozen plan, one campaign, on the record
 # --------------------------------------------------------------------------------------------------
 
+HOLD_OUT = ("data.dataset=synthetic_hold", "data.tasks=[kv, delayed2h]", "data.variants=[in_range]")
 
-def _run_folder(tmp_path: Path) -> Path:
+
+def _run_folder(tmp_path: Path, name: str = "run", data: tuple[str, ...] = HOLD_OUT) -> Path:
     """A run folder as the runner leaves it: the resolved configuration and one checkpoint of a
-    tiny untrained HSN whose configuration names the hold-out tasks."""
+    tiny untrained HSN whose configuration names its training data."""
     cfg = load_config(
-        REPO / "configs" / "tiny_gradcheck.yaml",
-        overrides=["model.vocab_size=256", "data.tasks=[kv, delayed2h]"],
+        REPO / "configs" / "tiny_gradcheck.yaml", overrides=["model.vocab_size=256", *data]
     )
     seed_everything(0)
     model = HSN.from_config(cfg)
-    run_dir = tmp_path / "run"
+    run_dir = tmp_path / name
     dump_resolved(cfg, run_dir / "config.resolved.yaml")
     save_checkpoint(
         run_dir / "step_00000003.pt",
@@ -163,43 +165,144 @@ def _run_folder(tmp_path: Path) -> Path:
     return run_dir
 
 
-def test_scoring_goes_on_the_ledger_and_is_refused_a_second_time(
+def _draft(tmp_path: Path, *run_dirs: Path, reach: int = 63, **changes: object) -> Path:
+    draft = {
+        "name": "a test campaign",
+        "claims": [{"id": "K", "text": "recall beyond the reach", "pass": "97 % or more"}],
+        "candidates": [
+            {"run_dir": str(run_dir), "checkpoint": "step_00000003.pt", "reach": reach}
+            for run_dir in run_dirs
+        ],
+        "analysis": "accuracy per condition, total and beyond the reach",
+        **changes,
+    }
+    path = tmp_path / "draft.json"
+    path.write_text(json.dumps(draft))
+    return path
+
+
+def _frozen(tmp_path: Path, *run_dirs: Path, reach: int = 63) -> tuple[Path, Path]:
+    plan, ledger = tmp_path / "plan.json", tmp_path / "ledger.jsonl"
+    draft = _draft(tmp_path, *run_dirs, reach=reach)
+    assert final_test.main(["freeze", str(draft), "--out", str(plan), "--ledger", str(ledger)]) == 0
+    return plan, ledger
+
+
+def test_one_frozen_plan_one_campaign_then_the_set_is_spent(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir, ledger = _run_folder(tmp_path), tmp_path / "ledger.jsonl"
-    args = [str(run_dir), "--reach", "63", "--docs", "6", "--ledger", str(ledger)]
-    assert final_test.main([*args, "--claim", "a test claim"]) == 0
+    first, second = _run_folder(tmp_path, "a"), _run_folder(tmp_path, "b")
+    plan, ledger = _frozen(tmp_path, first, second)
+    frozen = json.loads(plan.read_text())
+    assert [c["run"] for c in frozen["candidates"]] == ["a", "b"]
+    assert all(len(c["checkpoint_sha256"]) == 64 for c in frozen["candidates"])
+    assert frozen["final_alphabet"] == [32, 48] and len(frozen["plan_sha256"]) == 64
+    run = ["run", str(plan), "--ledger", str(ledger), "--docs", "5"]
+    # a plan that is not committed in the repository is refused: it must be on record first
+    assert final_test.main(run) == 2
+    assert "not committed" in capsys.readouterr().err and not ledger.exists()
+    assert final_test.main([*run, "--allow-uncommitted"]) == 0
     out = capsys.readouterr().out
-    assert "final keys" in out and "new pairs" in out and "beyond the reach" in out
+    assert "final keys" in out and "new pairs" in out and "is spent" in out
     (record,) = [json.loads(line) for line in ledger.read_text().splitlines()]
-    assert record["claim"] == "a test claim" and record["again"] is None
-    assert record["reach"] == 63 and record["checkpoint"] == "step_00000003.pt"
-    assert set(record["results"]) == {"kv", "delayed2h"}
-    assert set(record["results"]["delayed2h"]) == {"seen pairs", "new pairs", "final bytes"}
-    for conditions in record["results"].values():
-        for entry in conditions.values():
-            total, beyond = entry["total"], entry["beyond_reach"]
-            assert entry["docs"] == 6 and 0 < beyond["n"] <= total["n"]
-            low, high = total["ci95"]
-            assert 0.0 <= low <= total["accuracy"] <= high <= 1.0
-    # the same checkpoint again: refused, and nothing is added
-    assert final_test.main([*args, "--claim", "another claim"]) == 2
-    assert "once per gate claim" in capsys.readouterr().err
+    assert record["plan"] == "a test campaign" and record["plan_committed"] is False
+    assert record["plan_sha256"] == frozen["plan_sha256"]
+    assert set(record["results"]) == {"a/step_00000003.pt", "b/step_00000003.pt"}
+    for results in record["results"].values():
+        assert set(results) == {"kv", "delayed2h"}
+        assert set(results["delayed2h"]) == {"seen pairs", "new pairs", "final bytes"}
+        assert results["kv"]["final keys"]["population"].startswith("key bytes absent")
+        for conditions in results.values():
+            for entry in conditions.values():
+                total, beyond = entry["total"], entry["beyond_reach"]
+                assert entry["docs"] == 5 and 0 < beyond["n"] <= total["n"]
+                low, high = total["ci95"]
+                assert 0.0 <= low <= total["accuracy"] <= high <= 1.0
+    # the set is spent: neither the same plan nor a new one is scored or frozen again
+    assert final_test.main([*run, "--allow-uncommitted"]) == 2
+    assert "was spent" in capsys.readouterr().err
+    other = _draft(tmp_path, first)
+    again = ["freeze", str(other), "--out", str(tmp_path / "p2.json"), "--ledger", str(ledger)]
+    assert final_test.main(again) == 2
+    assert "needs a new final set" in capsys.readouterr().err
     assert len(ledger.read_text().splitlines()) == 1
-    # with a reason it is scored again, and the reason is on the record
-    assert final_test.main([*args, "--claim", "another claim", "--again", "a reason"]) == 0
-    records = [json.loads(line) for line in ledger.read_text().splitlines()]
-    assert len(records) == 2 and records[1]["again"] == "a reason"
-    assert records[1]["results"] == records[0]["results"]  # the same documents, the same score
+
+
+def test_a_plan_or_checkpoint_changed_after_freezing_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = _run_folder(tmp_path)
+    plan, ledger = _frozen(tmp_path, run_dir)
+    run = ["run", str(plan), "--ledger", str(ledger), "--docs", "4", "--allow-uncommitted"]
+    edited = json.loads(plan.read_text())
+    edited["candidates"][0]["reach"] = 0  # a look at the numbers must not move the mask
+    plan.write_text(json.dumps(edited))
+    assert final_test.main(run) == 2
+    assert "changed after it was frozen" in capsys.readouterr().err
+    plan, ledger = _frozen(tmp_path, run_dir)
+    checkpoint = run_dir / "step_00000003.pt"
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"x")
+    assert final_test.main(run) == 2
+    assert "is not the frozen file" in capsys.readouterr().err
+    assert not ledger.exists()
+
+
+def test_freezing_checks_the_plan_and_the_training_stream(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    good = _run_folder(tmp_path)
+    ledger = ["--out", str(tmp_path / "plan.json"), "--ledger", str(tmp_path / "ledger.jsonl")]
+    empty = _draft(tmp_path, good, claims=[], analysis="")
+    assert final_test.main(["freeze", str(empty), *ledger]) == 2
+    err = capsys.readouterr().err
+    assert "at least one claim" in err and "'analysis'" in err
+    # the five-task mix holds bytes 32 to 39 as bracket symbols
+    mixed = _run_folder(
+        tmp_path, "mixed", ("data.dataset=synthetic_v1", "data.tasks=[kv, brackets]")
+    )
+    assert final_test.main(["freeze", str(_draft(tmp_path, mixed)), *ledger]) == 2
+    assert "training documents hold final bytes" in capsys.readouterr().err
+    # text holds the final alphabet everywhere
+    text = _run_folder(
+        tmp_path, "text", ("data.dataset=tinystories_v1", "data.tasks=[tinystories]")
+    )
+    assert final_test.main(["freeze", str(_draft(tmp_path, text)), *ledger]) == 2
+    assert "not a synthetic task set" in capsys.readouterr().err
+    missing = _draft(tmp_path, tmp_path / "nowhere")
+    assert final_test.main(["freeze", str(missing), *ledger]) == 2
+    assert "does not exist" in capsys.readouterr().err
+    assert not (tmp_path / "plan.json").exists()
+
+
+def test_exposure_is_read_by_role() -> None:
+    final = set(range(*FINAL_KEYS))
+    tiny = REPO / "configs" / "tiny_gradcheck.yaml"
+    hold_out = load_config(tiny, ["model.vocab_size=256", *HOLD_OUT])
+    assert final_test.exposure(hold_out, final) == []
+    five = load_config(
+        tiny,
+        [
+            "model.vocab_size=256",
+            "data.dataset=synthetic_v1",
+            "data.tasks=[kv, delayed, brackets, arithmetic, algorithmic]",
+        ],
+    )
+    problems = final_test.exposure(five, final)
+    assert problems and all("brackets" in problem for problem in problems)
+    # the dev and test keys of a task are not training inputs
+    dev_as_final = set(range(112, 128))
+    assert final_test.exposure(hold_out, dev_as_final) == []
+    assert final_test.exposure(hold_out, set(range(64, 70)))  # training keys are
 
 
 def test_a_model_without_a_reader_has_every_answer_beyond_reach(tmp_path: Path) -> None:
-    run_dir, ledger = _run_folder(tmp_path), tmp_path / "ledger.jsonl"
+    plan, ledger = _frozen(tmp_path, _run_folder(tmp_path), reach=0)
     code = final_test.main(
-        [str(run_dir), "--reach", "0", "--docs", "4", "--ledger", str(ledger), "--claim", "c"]
+        ["run", str(plan), "--ledger", str(ledger), "--docs", "4", "--allow-uncommitted"]
     )
     assert code == 0
     record = json.loads(ledger.read_text().splitlines()[0])
-    for conditions in record["results"].values():
-        for entry in conditions.values():
-            assert entry["total"] == entry["beyond_reach"]
+    for results in record["results"].values():
+        for conditions in results.values():
+            for entry in conditions.values():
+                assert entry["total"] == entry["beyond_reach"]
