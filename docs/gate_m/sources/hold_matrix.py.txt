@@ -1,0 +1,157 @@
+"""The recall matrix of a saved checkpoint (evaluation only; step 3 of the review's sequence).
+
+For a run trained on synthetic_hold: task x key group x distance bucket, with answer counts,
+document counts and a 95 % interval from a bootstrap over documents (answers of one document
+are not independent). Fresh documents, the same ones hold_eval.py scores.
+
+  key groups   kv: training keys / dev keys / test keys (one-byte keys)
+               delayed2h: seen pairs / new pairs of seen bytes / never-seen bytes (two-byte keys)
+  buckets      by the distance d from the query position back to its fact's value byte
+               (the generator's meta deps: the latest binding of the queried key):
+     near        d <= span - 1          one block of the reader can see the value
+     mid         span <= d <= reach - 1 inside the reader's complete receptive field
+     far         d >= reach             beyond it
+     far-strict  far, and the answer byte does not occur anywhere in the reader's field at the
+                 query (no local duplicate of the value, no earlier answer showing it)
+  "Beyond the reach" says where the designated source stands. It is not by itself evidence that
+  the answer came from the memory; far-strict removes the copies a reader could have used.
+
+Documents are in range and run as one window from a cleared state, so there is no cross-window
+bucket here.
+
+   python hold_matrix.py OUT.json RUN_DIR [--steps 15000,18000] [--docs 600] [--span 32] [--reach 63]
+   (run from a checkout that can load the run; CPU)
+"""
+import json, sys, time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+ROOT = Path.cwd()
+sys.path.insert(0, str(ROOT / "python"))
+from hsn.config import load_config  # noqa: E402
+from hsn.data.synthetic import TaskSpec, generate, load_dataset_spec  # noqa: E402
+from hsn.device import seed_everything  # noqa: E402
+from hsn.runner import build_model  # noqa: E402
+from hsn.train.checkpoint import load_checkpoint  # noqa: E402
+
+FRESH = 104_729  # hold_eval.py's offset: the same fresh documents
+
+
+def opt(name, default):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        value = sys.argv[i + 1]
+        del sys.argv[i : i + 2]
+        return value
+    return default
+
+
+n_docs = int(opt("--docs", "600"))
+span = int(opt("--span", "32"))
+reach = int(opt("--reach", "63"))
+steps = opt("--steps", "")
+out_path, run = Path(sys.argv[1]), Path(sys.argv[2])
+torch.set_num_threads(8)
+BUCKETS = ("near", "mid", "far", "far-strict", "all")
+
+dataset = load_dataset_spec(ROOT / "configs" / "data" / "synthetic_hold.yaml")
+
+
+def fresh(name, **params):
+    task = next(t for t in dataset.tasks if t.name == name)
+    dump = task.model_dump()
+    dump.update(seed=task.seed + FRESH, n_train=n_docs, n_dev=n_docs, n_test=n_docs)
+    dump["params"] = {**dump["params"], **params}
+    return TaskSpec.model_validate(dump)
+
+
+CONDITIONS = {
+    "kv": [("training keys", fresh("kv"), "train"), ("dev keys", fresh("kv"), "dev"), ("test keys", fresh("kv"), "test")],
+    "delayed2h": [
+        ("seen pairs", fresh("delayed2h"), "train"),
+        ("new pairs", fresh("delayed2h", hold_role="only"), "train"),
+        ("never-seen bytes", fresh("delayed2h"), "dev"),
+    ],
+}
+
+
+def masks(doc):
+    """Per answer: its bucket membership (near, mid, far, far-strict, all)."""
+    positions = np.flatnonzero(doc.loss_mask)
+    deps = np.asarray(doc.meta["deps"])
+    tokens = doc.tokens
+    near, mid, far = deps <= span - 1, (deps >= span) & (deps <= reach - 1), deps >= reach
+    local = np.array([doc.targets[t] in tokens[max(0, t - (reach - 1)) : t + 1] for t in positions])
+    return positions, {"near": near, "mid": mid, "far": far, "far-strict": far & ~local, "all": np.ones_like(near)}
+
+
+def score(model, spec, split):
+    docs = [generate(spec, split, i) for i in range(n_docs)]
+    order = sorted(range(n_docs), key=lambda i: len(docs[i].tokens))
+    counts = {b: np.zeros((n_docs, 2), dtype=np.int64) for b in BUCKETS}  # right, answers per doc
+    with torch.no_grad():
+        for lo in range(0, n_docs, 64):
+            idx = order[lo : lo + 64]
+            T, B = max(len(docs[i].tokens) for i in idx), len(idx)
+            tokens = torch.zeros(B, T, dtype=torch.int64)
+            ctx = torch.zeros(B, T, dtype=torch.int64)
+            for b, i in enumerate(idx):
+                tokens[b, : len(docs[i].tokens)] = torch.from_numpy(docs[i].tokens.astype("int64"))
+                ctx[b] = int(docs[i].context[0])
+            reset = torch.zeros(B, T, dtype=torch.bool)
+            reset[:, 0] = True
+            try:
+                state = model.init_state(B)
+            except TypeError:
+                state = model.init_state(B, tokens.device)
+            pred = model(tokens, ctx, state, reset)[0].argmax(dim=-1).numpy()
+            for b, i in enumerate(idx):
+                positions, member = masks(docs[i])
+                hit = pred[b, positions] == docs[i].targets[positions]
+                for name, m in member.items():
+                    counts[name][i] = (hit[m].sum(), m.sum())
+    rng = np.random.default_rng(0)
+    draws = rng.integers(0, n_docs, size=(1000, n_docs))
+    out = {}
+    for name, c in counts.items():
+        right, n = int(c[:, 0].sum()), int(c[:, 1].sum())
+        if n == 0:
+            out[name] = {"accuracy": None, "n": 0, "docs": 0, "ci95": None}
+            continue
+        resampled = c[draws, 0].sum(1) / np.maximum(c[draws, 1].sum(1), 1)
+        low, high = np.percentile(resampled, [2.5, 97.5])
+        out[name] = {"accuracy": right / n, "n": n, "docs": int((c[:, 1] > 0).sum()), "ci95": [float(low), float(high)]}
+    return out
+
+
+def cell(e):
+    if e["accuracy"] is None:
+        return "-"
+    return f"{100 * e['accuracy']:.1f} ({100 * e['ci95'][0]:.1f}-{100 * e['ci95'][1]:.1f}; n {e['n']}, {e['docs']} docs)"
+
+
+results = json.loads(out_path.read_text()) if out_path.exists() else {}
+ckpts = sorted(run.glob("step_*.pt"))
+if steps:
+    wanted = {int(x) for x in steps.split(",")}
+    ckpts = [c for c in ckpts if int(c.stem.split("_")[1]) in wanted]
+else:
+    ckpts = ckpts[-1:]
+cfg = load_config(run / "config.resolved.yaml", [f"hardware={ROOT / 'configs' / 'hardware' / 'cpu.yaml'}", "profile=cpu"])
+for ckpt in ckpts:
+    seed_everything(cfg.seed)
+    model = build_model(cfg)
+    load_checkpoint(ckpt, model, averaged=True)
+    model.eval()
+    t0 = time.time()
+    entry = {task: {name: score(model, spec, split) for name, spec, split in conds} for task, conds in CONDITIONS.items() if task in cfg.data.tasks}
+    results[f"{run.parent.name}:{ckpt.name}"] = {"span": span, "reach": reach, "docs": n_docs, "matrix": entry}
+    out_path.write_text(json.dumps(results, indent=1))
+    print(f"\n{run.parent.name}  {ckpt.name}  ({n_docs} fresh documents per condition; span {span}, reach {reach}; {time.time() - t0:.0f} s)")
+    print("| task | key group | near | mid | far | far-strict | all |")
+    print("| --- | --- | --- | --- | --- | --- | --- |")
+    for task, conds in entry.items():
+        for name, e in conds.items():
+            print(f"| {task} | {name} | " + " | ".join(cell(e[b]) for b in BUCKETS) + " |", flush=True)
