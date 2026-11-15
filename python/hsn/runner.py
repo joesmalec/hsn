@@ -70,7 +70,7 @@ from hsn.eval.results import (
     evidence_package,
 )
 from hsn.model.hsn import HSN, address_history
-from hsn.model.hsn_t import HSNT
+from hsn.model.hsn_t import HSNT, HSNTNoMemory
 from hsn.model.router import SCORED_MODES
 from hsn.profiler import (
     NullMeter,
@@ -115,12 +115,21 @@ PowerChoice = Literal["none", "profile"]
 # Model registry
 # --------------------------------------------------------------------------------------------------
 
+
+def _hsn_t(cfg: RunConfig) -> nn.Module:
+    """HSN-T (``docs/hsn_t.md``): the HSN's memory core behind a reader, or with
+    ``model.memory = false`` its stateless form without the memory
+    (``docs/hsn_t_no_memory.md``), which is not an :class:`HSN` and so takes the generic
+    trainer in :func:`make_trainer`."""
+    return HSNT.from_config(cfg) if cfg.model.memory else HSNTNoMemory.from_config(cfg)
+
+
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "gru": GRUBaseline,
     "transformer": TransformerBaseline,
     "selective_ssm": MambaBaseline,  # the paper's selective-memory control (plan P2.13)
     "hsn": HSN.from_config,  # P1.9: the dense predictive cell (P1.5) trained by TBPTTTrainer (P1.7)
-    "hsn_t": HSNT.from_config,  # HSN-T: the HSN's memory core behind a reader (docs/hsn_t.md)
+    "hsn_t": _hsn_t,  # HSN-T (docs/hsn_t.md); without its memory when model.memory=false
     "reader": ReaderLM,  # the HSN-T reader alone with a next-byte head (the exact-reader check)
 }
 
@@ -155,7 +164,9 @@ def make_trainer(
 ) -> Trainer:
     """The trainer for ``model`` (P1.9): the P1.7 :class:`TBPTTTrainer` for an :class:`HSN` (its
     window loop, loss assembly and checkpoint contents are the HSN ones, and its ``fit`` reads the
-    HSN ``param_report``), the generic P0.5 :class:`Trainer` for everything else."""
+    HSN ``param_report``), the generic P0.5 :class:`Trainer` for everything else, HSN-T
+    without its memory included (:class:`~hsn.model.hsn_t.HSNTNoMemory` is stateless and not an
+    :class:`HSN`)."""
     if isinstance(model, HSN):
         return TBPTTTrainer(model, cfg, ctx, profiler, run_dir=run_dir)
     return Trainer(model, cfg, ctx, profiler, run_dir=run_dir)

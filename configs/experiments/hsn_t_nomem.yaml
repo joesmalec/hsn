@@ -1,0 +1,62 @@
+# hsn_t_nomem: HSN-T without its memory (model.memory: false, docs/hsn_t_no_memory.md).
+#
+# The parts of HSN-T that are not the memory, over all positions of a window at once: the byte
+# and context embeddings, E, the reader, S and D. No cells, router, units, graph, predictor or
+# summary are built; S and D keep HSN-T's input widths and read zeros where q and r would
+# stand, so a trained HSN-T's weights of these parts load unchanged. Stateless: every window is
+# read on its own. 627,328 parameters at the sizes below (reader 116,480; S 164,416; D 262,912;
+# E 66,112; embeddings 17,408), measured by HSNTNoMemory.param_report() and equal to
+# hsn.train.memory_plan.memory_off_param_count.
+#
+# The training settings are the Transformer baseline's (configs/baselines/transformer_2m.yaml)
+# and the generic trainer runs them, so that the two differ in the model only: AdamW, the
+# next-byte loss alone (train.lambda_p is 0: there is no predictor), no routing terms, no
+# controller of the memory. The arms that compare it with the baselines on a card add the
+# baselines' overrides: profile=rtx3060 hardware.compile_mode=none train.batch=32
+# train.micro_batch=32. In an experiment spec the family is hsn_t_nomem.
+#
+# model.selected_readout and a routed model.routing are HSN-T's own requirements and stay: the
+# first keeps the r columns of the decoder, the second is the configuration's rule for the
+# first. Nothing is routed. The other keys that describe the memory are not read.
+# Everything not listed keeps its Appendix A default (configs/_example.yaml).
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
+
+run_id: hsn_t_nomem
+seed: 0
+notes: "HSN-T without its memory: embeddings, E, the reader (2 blocks, width 64, 4 heads), S and D; stateless."
+profile: cpu # override with `profile=<name>`
+model_name: hsn_t
+
+model:
+  memory: false # HSN-T without its memory
+  reader: transformer
+  reader_width: 64
+  reader_layers: 2
+  reader_heads: 4
+  reader_span: null
+  selected_readout: true # HSN-T's decoder input [q; u; r; c]; q and r read zeros
+  routing: topk # required by selected_readout; no cell exists to route
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv, delayed, brackets, arithmetic, algorithmic]
+  variants: [in_range]
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train:
+  optimizer: adamw # the generic trainer's; lazy_adamw needs the unit bank
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 256 # the window the model reads
+  batch: 4
+  micro_batch: 4
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  lambda_p: 0.0 # no predictor: the objective is the next-byte loss alone
+  search_trials: 1
