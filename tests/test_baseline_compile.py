@@ -52,6 +52,7 @@ from torch import Tensor, nn
 
 READER = REPO / "configs" / "baselines" / "reader_w64l2.yaml"
 MAMBA = REPO / "configs" / "baselines" / "mamba_2m.yaml"
+NOMEM = REPO / "configs" / "experiments" / "hsn_t_nomem.yaml"  # HSN-T without its memory
 #: family -> (configuration, overrides of a tiny model, compiled functions of the equality test)
 TINY: dict[str, tuple[Path, list[str], int]] = {
     # the embeddings and the read-out in both layouts of the recurrence's output, and the
@@ -63,6 +64,12 @@ TINY: dict[str, tuple[Path, list[str], int]] = {
         ["model.reader_width=16", "model.reader_layers=1", "model.reader_heads=2"],
         2,
     ),
+    "hsn_t_nomem": (
+        NOMEM,
+        [f"model.{key}" for key in ("d=8", "context_dim=8", "hidden=16", "reader_width=16")]
+        + ["model.reader_heads=2"],
+        2,
+    ),
 }
 FAMILIES = sorted(TINY)
 MODES = ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs")
@@ -71,8 +78,10 @@ CPU_BACKEND = "inductor" if sys.platform.startswith("linux") else "aot_eager"
 B, T = 3, 16
 #: Compiled against eager in fp32 on the CPU: 10x the largest difference measured (14 Nov 2026,
 #: inductor, every family, both reset patterns, training and evaluation), rounded up: logits and
-#: state 3.3e-7, parameter gradients 8.8e-9.
-TOL = {"values": 4e-6, "grads": 1e-7}
+#: state 3.3e-7, parameter gradients 8.8e-9; and relative to the largest eager value, 2.6e-7 for
+#: the logits and state and 8.7e-7 for the gradients (the tiny HSN-T without memory has logits
+#: of 1e-2 and gradients of 2e-5, which an absolute bound alone would not test).
+TOL = {"values": 4e-6, "grads": 1e-7, "relative": 1e-5}
 Inputs = tuple[Tensor, Tensor, Any, Tensor]
 
 
@@ -126,15 +135,19 @@ def _run(fn: Any, model: nn.Module, inputs: Inputs) -> tuple[list[Tensor], list[
 
 
 def _diff(got: tuple[list[Tensor], list[Tensor]], ref: tuple[list[Tensor], list[Tensor]]) -> Any:
-    """The largest absolute differences: ``{"values": ..., "grads": ...}``."""
-    return {
+    """The largest absolute differences, ``{"values": ..., "grads": ...}``, and ``"relative"``,
+    the larger of the two as a fraction of the largest reference value of its kind."""
+    diff = {
         name: max(float((a - b).abs().max()) for a, b in zip(g, r, strict=True))
         for name, g, r in (("values", got[0], ref[0]), ("grads", got[1], ref[1]))
     }
+    largest = {name: max(float(r.abs().max()) for r in ref[i]) for i, name in enumerate(diff)}
+    diff["relative"] = max(diff[name] / largest[name] for name in largest)
+    return diff
 
 
 def _within(diff: dict[str, float], scale: float = 1.0) -> bool:
-    return diff["values"] <= scale * TOL["values"] and diff["grads"] <= scale * TOL["grads"]
+    return all(diff[name] <= scale * bound for name, bound in TOL.items())
 
 
 # --------------------------------------------------------------------------------------------------
@@ -181,6 +194,13 @@ def test_key_is_for_the_baselines_in_the_scope() -> None:
     with pytest.raises(ValueError, match="outside the compiled scope"):
         load_config(MAMBA, ["hardware.baseline_compile=default"])
     assert load_config(READER, ["hardware.baseline_compile=default"]).model_name == "reader"
+    # HSN-T without its memory is a stateless model on the generic trainer and takes the key;
+    # with its memory it is an HSN
+    nomem = load_config(NOMEM, ["hardware.baseline_compile=default"])
+    assert (nomem.model_name, nomem.model.memory) == ("hsn_t", False)
+    with_memory = ["model.memory=true", "train.optimizer=lazy_adamw"]
+    with pytest.raises(ValueError, match=r"hardware\.compile_mode"):
+        load_config(NOMEM, [*with_memory, "hardware.baseline_compile=default"])
     cuda = load_config(GRU_2M, ["profile=rtx3060"])  # the profile compiles the HSN by default
     assert cuda.hardware.compile_mode == "reduce-overhead"
     assert cuda.hardware.baseline_compile == "none"
@@ -201,8 +221,9 @@ def _arms(tmp: Path, arms: list[dict[str, Any]]) -> dict[str, Any]:
 def test_spec_accepts_a_compiled_baseline_arm(tmp_path: Path) -> None:
     """A baseline arm may set the key (next to the pinned ``hardware.compile_mode=none``): it is
     an arm of its own with a memory key of its own, and the key at ``none`` is the arm it was.
-    An HSN arm may not set it, and the memory keys of the committed validation sweep are those
-    of main before the key."""
+    So may an arm of family ``hsn_t_nomem`` (HSN-T without its memory). An HSN arm may not set
+    it, and the memory keys of the committed validation sweep are those of main before the key
+    (and before ``model.memory``)."""
     cuda = ["profile=rtx3060", "hardware.compile_mode=none"]
     arms = _arms(
         tmp_path,
@@ -218,11 +239,19 @@ def test_spec_accepts_a_compiled_baseline_arm(tmp_path: Path) -> None:
                 "family": "gru",
                 "overrides": [*cuda, "hardware.baseline_compile=reduce-overhead"],
             },
+            {
+                "name": "nomem",
+                "family": "hsn_t_nomem",
+                "config": "configs/experiments/hsn_t_nomem.yaml",
+                "overrides": [*cuda, "hardware.baseline_compile=reduce-overhead"],
+            },
         ],
     )
     eager, off, compiled = arms["eager"], arms["off"], arms["compiled"]
     assert compiled.config.hardware.baseline_compile == "reduce-overhead"
     assert compiled.config.hardware.compile_mode == "none"
+    assert arms["nomem"].family == "hsn_t_nomem" and arms["nomem"].variant == "none"
+    assert arms["nomem"].config.hardware.baseline_compile == "reduce-overhead"
     assert (off.arm_id, off.memory_key) == (eager.arm_id, eager.memory_key)
     assert compiled.arm_id != eager.arm_id and compiled.memory_key != eager.memory_key
     hsn = {
@@ -265,7 +294,8 @@ def test_compiled_equals_eager(family: str) -> None:
         logits, state, _ = compiled(*small)
         model.train()
     pairs = zip([logits, *_tensors(state)], [ref_logits, *_tensors(ref_state)], strict=True)
-    assert max(float((a - b).abs().max()) for a, b in pairs) <= TOL["values"]
+    bound = min(TOL["values"], TOL["relative"] * float(ref_logits.abs().max()))
+    assert max(float((a - b).abs().max()) for a, b in pairs) <= bound
 
     report = compiled.report()
     assert report["functions"] == report["graphs"] == TINY[family][2], report  # one graph each

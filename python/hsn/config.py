@@ -136,7 +136,8 @@ CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
 BaselineCompileMode = Literal[
     "none", "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"
 ]
-#: The model names whose windows ``hardware.baseline_compile`` compiles.
+#: The model names whose windows ``hardware.baseline_compile`` compiles; ``hsn_t`` is one more
+#: with ``model.memory = false`` (HSN-T without its memory: stateless, on the generic trainer).
 BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "reader")
 #: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
 #: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
@@ -1346,14 +1347,16 @@ class RunConfig(_StrictModel):
                 "baseline.address_input is an input of the baselines; the HSN's own address "
                 "features are model.key_address"
             )
+        memory_off = self.model_name == "hsn_t" and not self.model.memory
         if (
             self.hardware.baseline_compile != "none"
             and self.model_name not in BASELINE_COMPILE_MODEL_NAMES
+            and not memory_off
         ):
             raise ValueError(
                 f"hardware.baseline_compile={self.hardware.baseline_compile!r} compiles the "
-                f"windows of a baseline ({', '.join(BASELINE_COMPILE_MODEL_NAMES)}), not of "
-                f"model_name={self.model_name!r}: "
+                f"windows of a baseline ({', '.join(BASELINE_COMPILE_MODEL_NAMES)}, or hsn_t "
+                f"with model.memory=false), not of model_name={self.model_name!r}: "
                 + (
                     "the HSN's own compiled window is hardware.compile_mode"
                     if self.model_name in HSN_MODEL_NAMES
