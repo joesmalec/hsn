@@ -206,7 +206,7 @@ from hsn.losses import (
     terms_total,
     utility_loss,
 )
-from hsn.model.hsn import HSN
+from hsn.model.hsn import HSN, address_history
 from hsn.model.router import SCORED_MODES
 from hsn.model.state import CellGraphState
 from hsn.train.amp import autocast_ctx, autocast_name
@@ -1077,7 +1077,9 @@ class TBPTTTrainer(Trainer):
                     **self._address_kwargs(),
                 )
                 if self.cfg.model.key_address:
-                    self._prev_tokens = fwd["tokens"][:, -1].detach().clone()
+                    self._prev_tokens = address_history(
+                        self.cfg.model, fwd["tokens"], self._prev_tokens
+                    )
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
                 terms = self._routing_terms(terms, info, count)
@@ -1500,10 +1502,17 @@ class TBPTTTrainer(Trainer):
                 if (
                     not isinstance(previous, Tensor)
                     or previous.dtype not in (torch.int32, torch.int64)
-                    or tuple(previous.shape) != (self.cfg.train.batch,)
+                    or tuple(previous.shape)
+                    not in (
+                        (self.cfg.train.batch,),
+                        (self.cfg.train.batch, self.cfg.model.address_ngram),
+                    )
                     or not bool(((previous >= 0) & (previous < self.cfg.model.vocab_size)).all())
                 ):
-                    raise ValueError(f"{path}: prev_tokens must be integer bytes [train.batch]")
+                    raise ValueError(
+                        f"{path}: prev_tokens must be integer bytes [train.batch] or "
+                        "[train.batch, model.address_ngram]"
+                    )
                 previous = previous.to(self.ctx.device).clone()
             self._prev_tokens = previous
         if "q_resync" not in extra:

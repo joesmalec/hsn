@@ -12,7 +12,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from hsn.model.hsn import HSN
+from hsn.model.hsn import HSN, address_history
 from hsn.model.state import CellGraphState
 from hsn.train.checkpoint import capture_rng_state, restore_rng_state
 
@@ -89,7 +89,7 @@ class StabilityObserver:
         h = (state.h + self.epsilon * direction).clamp(-1, 1)
         delta = h - state.h
         perturbed = CellGraphState(h, state.q + delta.mean(1), state.age.clone(), state.pos.clone())
-        prev = w["tokens"][:, start - 1] if start else None
+        prev = address_history(model.cfg, w["tokens"][:, :start]) if start else None
         args = (w["tokens"][:, start:end], w["context"][:, start:end])
         logits, reference, _ = model(*args, state, w["reset"][:, start:end], prev_tokens=prev)
         shifted, changed, _ = model(*args, perturbed, w["reset"][:, start:end], prev_tokens=prev)

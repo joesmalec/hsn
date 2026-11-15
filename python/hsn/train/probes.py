@@ -76,7 +76,7 @@ from torch import Tensor
 
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import BOS
-from hsn.model.hsn import HSN
+from hsn.model.hsn import HSN, address_history
 from hsn.model.router import (
     CANDIDATE_ADD,
     CANDIDATE_NONE,
@@ -536,7 +536,7 @@ def measure_utility_correlation(
                 **_address_kwargs(model, prev_tokens),
             )  # carry the state into the next window
             if model.cfg.key_address:
-                prev_tokens = window.tokens[:, -1].detach().clone()
+                prev_tokens = address_history(model.cfg, window.tokens, prev_tokens)
     return _summarise(per_window, n_windows, horizon, n_probe, seed, n_bootstrap)
 
 
