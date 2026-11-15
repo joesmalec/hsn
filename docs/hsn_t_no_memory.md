@@ -225,8 +225,9 @@ Three readings, each with what it rests on:
    measured; the arms of `text_gap.yaml` run the reader alone at 224 × 2 and a shape with a
    smaller `model.hidden` and a wider reader (an existing key: `S` and `D` keep their inputs
    and their place, their hidden layer narrows).
-3. **Two blocks against four** (0.020 to 0.032 bits between 160 × 4 and 224 × 2, at every
-   position). This is the speed choice and is not changed here.
+3. **Two blocks against four** (0.020 to 0.038 bits between 160 × 4 and 224 × 2 over the
+   eager, second-seed and compiled runs; about 0.02 from position 32 on and less before it).
+   This is the speed choice and is not changed here.
 
 **Not built, by the architecture rule.** Nothing that removes or bypasses `S` or `D`, changes
 `u = S([z ; q ; ctx ; c])` or `D([q ; u ; r ; c])`, or leaves the zero columns out. If the arms
