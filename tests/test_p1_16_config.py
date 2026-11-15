@@ -111,6 +111,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.reader_positions",
         "model.reader_rotary_pairs",
         "model.reader_rotary_dtype",
+        "model.reader_rotary_base",  # the rotation's base (opt-in, 15 Nov 2026)
     )
 
 

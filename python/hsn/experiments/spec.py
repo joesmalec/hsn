@@ -621,6 +621,7 @@ _READER_POSITION_DEFAULTS: dict[str, Any] = {
     "reader_positions": 256,
     "reader_rotary_pairs": None,
     "reader_rotary_dtype": "working",
+    "reader_rotary_base": 10_000.0,
 }
 
 

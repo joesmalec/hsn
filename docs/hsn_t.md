@@ -21,9 +21,9 @@ adopted; first runs in progress.**
   `model.reader_layers` (2), `model.reader_heads` (4) and `model.reader_span` (null). Needs
   `model.selected_readout`. All five keys are left out of the configuration hash at their
   defaults, so no HSN configuration, hash or arm id changed.
-- Four more opt-in keys of 15 Nov 2026 change how the position enters the reader
+- Five more opt-in keys of 15 Nov 2026 change how the position enters the reader
   (`model.reader_position`, `model.reader_positions`, `model.reader_rotary_pairs`,
-  `model.reader_rotary_dtype`; "The reader's positions" below). At their defaults the reader
+  `model.reader_rotary_dtype`, `model.reader_rotary_base`; "The reader's positions" below). At their defaults the reader
   is the one described here, bit for bit, and they are left out of the hash the same way.
 - The memory's opt-in keys (fast cells, address n-grams, the address gate and its inputs, the
   write decision, the feedback cuts) mean the same in both families; the cell arithmetic is
@@ -238,6 +238,7 @@ the reader alone. `S`, `D` and the model's equations are untouched.
 | --- | --- | --- | --- |
 | `model.reader_rotary_pairs` | `null` (all `w / heads / 2` pairs of a head, in every block) | `n`, or a list with one `n` for each block | Only the first `n` pairs (the `n` highest frequencies, as before) are rotated. The other pairs get the angle zero: their part of a query is compared with a key as it is, at every distance. With `0` a block is not rotated at all. Still distances only, no parameter |
 | `model.reader_rotary_dtype` | `working` | `parameters` | The rotation is computed in the parameters' dtype (float32) and the rotated queries and keys are cast back to the working dtype for the attention. Under bf16 autocast the default rotates in bf16 (cos / sin and every product rounded to 8 bits). Without autocast the two are the same computation, bit for bit |
+| `model.reader_rotary_base` | `10000.0` | a finite number above 1 | The base `b` of the frequency ladder: pair `i` of a head turns by `t · b^(−i / half)` at distance `t`, in the table and in the angles the forward pass computes itself alike. Refused with `reader_position: learned`. Still distances only, no parameter |
 | `model.reader_position` | `rotary` | `learned` | No rotation; a table of `model.reader_positions` rows (256) is added to the byte embedding by window position, as the Transformer baseline's. `train.unroll` must not exceed the rows |
 
 - **`learned` is a diagnostic.** With it the reader alone is the Transformer baseline's
@@ -270,12 +271,22 @@ the reader alone. `S`, `D` and the model's equations are untouched.
   not make it do so: `scripts/reader_reach.py` shows per head whether it does. It also takes
   away the near positions, where the reader is the better model today (above, the attention
   cut to 32 bytes), so a loss on the near bytes is to be expected; not run.
+- **A larger base** (`model.reader_rotary_base`), after the user's decision of 15 Nov 2026 to
+  keep a rotation-based scheme. Every pair but the first turns more slowly (pair 0 keeps one
+  radian a position), so more pairs can match a key by content far back while the fast pairs
+  keep the near order. At width 224 with four heads (28 pairs) the pairs that turn by less than
+  one radian over 255 positions are 11 at the default 10000, 14 at 1e5 and 16 at 1e6 (under a
+  quarter radian: 6, 11 and 13). It composes with `reader_rotary_pairs` (the unrotated pairs
+  keep the angle zero) and `reader_rotary_dtype`. Like them it is refused without a reader and
+  with `reader_position: learned`; with `reader_rotary_pairs: 0` it has nothing to act on and
+  is accepted, as `reader_rotary_dtype` is. Spec `text_rotary_base.yaml`; not run.
 - **Step time, compiled, at width 224 with two blocks (12.12 ms alone on the RTX 3060; the
   GRU 15.75). Estimates from the operations, none measured:**
 
   | Setting | Expected change | Why |
   | --- | --- | --- |
   | `reader_rotary_pairs: n` | none | the same operations, zeros in the table |
+  | `reader_rotary_base: b` | none | the same operations, other numbers in the table |
   | `reader_rotary_pairs: [28, 0]` | none to 0.1 ms less | the last block's two rotations are not computed |
   | `reader_rotary_pairs: 0` | none to 0.2 ms less | no rotation is computed |
   | a list of unequal non-zero counts | none | two selections on a `[T, pairs]` table for each block |
@@ -293,7 +304,9 @@ state-dict key and output (against the forward of before the keys); the unrotate
 back bit for bit and match at every distance; each block rotates its own count (against the
 blocks run by hand), a block with the count zero never calls the rotation and, alone, gives
 the same output for every order of the earlier bytes; the float32 rotation under bf16
-autocast, read off the calls and closer to the exact rotation; the learned reader against the
+autocast, read off the calls and closer to the exact rotation; another base's angles against
+`t · b^(−i / half)` and the same base in the table, in the angles computed past it, without it
+and after casts; the learned reader against the
 Transformer baseline; the refusals; the closed forms of the parameter count; HSN-T with its
 memory, the compiled memory-off graph and thirty trainer steps with each key.
 

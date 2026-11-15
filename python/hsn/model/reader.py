@@ -40,7 +40,7 @@ The parameters are drawn from the module's own generator (``seed``) inside a for
 building a reader neither changes another parameter's initialisation nor consumes the global
 random stream.
 
-Three opt-in keys change how the position enters (``docs/hsn_t.md``, "The reader's positions";
+Four opt-in keys change how the position enters (``docs/hsn_t.md``, "The reader's positions";
 15 Nov 2026). At their defaults the reader is the one above: the same parameters, state dict and
 outputs, bit for bit (``tests/test_reader_positions.py``).
 
@@ -55,6 +55,12 @@ outputs, bit for bit (``tests/test_reader_positions.py``).
   parameters (float32 master weights) and the rotated queries and keys are cast back to the
   working dtype for the attention. Under bf16 autocast the default rotates in bf16: the cos /
   sin and every product are rounded to 8 bits.
+* ``model.reader_rotary_base = b`` (default 10000): the base of the frequency ladder, so pair
+  ``i`` of a head turns by ``t · b^(−i / half)`` at distance ``t``, in the table and in the
+  angles the forward pass computes itself alike. A larger base gives the slower pairs longer
+  wavelengths; pair 0 keeps one radian a position. Still distances only, no parameter; it acts
+  on the pairs ``model.reader_rotary_pairs`` rotates, and ``model.reader_position = learned``
+  refuses it.
 * ``model.reader_position = learned``: no rotation; a table ``pos`` of
   ``model.reader_positions`` rows is added to the byte embedding by window position, as the
   Transformer baseline's. The reader then reads the position in the window: its output is no
@@ -75,6 +81,7 @@ from hsn.config import ModelConfig
 
 __all__ = ["Reader"]
 
+#: The default of ``model.reader_rotary_base``: the base of the rotary frequency ladder.
 _ROTARY_BASE = 10_000.0
 #: Window positions in the rotary table: four windows of the default ``train.unroll`` (the
 #: reader is built from ``ModelConfig``, which has no window length). 2 · 1024 · half values.
@@ -82,15 +89,22 @@ _ROTARY_TABLE = 1024
 _INIT_STD = 0.02
 
 
-def _rotary_angles(T: int, half: int, device: torch.device, pairs: int | None = None) -> Tensor:
-    """The rotary angles ``[T, half]``: position ``t`` times ``10000^(−i / half)``. In float64
-    where the device has it (float32 on MPS), so that a rotation by ``t`` against one by ``s``
-    is the rotation by ``t − s`` to the working precision at every window position. With
-    ``pairs`` (``model.reader_rotary_pairs``) the pairs ``i ≥ pairs`` have the angle zero: their
-    cos is 1 and their sin 0, and the rotation returns them as they are, bit for bit."""
+def _rotary_angles(
+    T: int,
+    half: int,
+    device: torch.device,
+    pairs: int | None = None,
+    base: float = _ROTARY_BASE,
+) -> Tensor:
+    """The rotary angles ``[T, half]``: position ``t`` times ``base^(−i / half)``
+    (``model.reader_rotary_base``, 10000 by default). In float64 where the device has it
+    (float32 on MPS), so that a rotation by ``t`` against one by ``s`` is the rotation by
+    ``t − s`` to the working precision at every window position. With ``pairs``
+    (``model.reader_rotary_pairs``) the pairs ``i ≥ pairs`` have the angle zero: their cos is 1
+    and their sin 0, and the rotation returns them as they are, bit for bit."""
     wide = torch.float32 if device.type == "mps" else torch.float64
     exponent = torch.arange(half, device=device, dtype=wide) / half
-    angles = torch.arange(T, device=device, dtype=wide)[:, None] * (_ROTARY_BASE**-exponent)
+    angles = torch.arange(T, device=device, dtype=wide)[:, None] * (base**-exponent)
     if pairs is not None:
         angles[:, pairs:] = 0.0
     return angles
@@ -164,6 +178,9 @@ class Reader(nn.Module):
         self.heads = heads
         self.span: int | None = cfg.reader_span
         self.position = cfg.reader_position
+        #: ``model.reader_rotary_base``: the base of the frequency ladder of the table and of
+        #: the angles the forward pass computes itself
+        self.rotary_base: float = float(cfg.reader_rotary_base)
         #: ``model.reader_rotary_pairs`` as configured: one count, one for each block, or None
         self.rotary_pairs: int | list[int] | None = cfg.reader_rotary_pairs
         half = width // heads // 2
@@ -212,7 +229,11 @@ class Reader(nn.Module):
             self._rot_cos = self._rot_sin = None
             return
         angles = _rotary_angles(
-            _ROTARY_TABLE, self.width // self.heads // 2, weight.device, self._table_pairs
+            _ROTARY_TABLE,
+            self.width // self.heads // 2,
+            weight.device,
+            self._table_pairs,
+            self.rotary_base,
         )
         self._rot_cos = angles.cos().to(weight.dtype)
         self._rot_sin = angles.sin().to(weight.dtype)
@@ -238,7 +259,8 @@ class Reader(nn.Module):
             and cos.device == x.device
         ):
             return cos[:T], sin[:T]
-        angles = _rotary_angles(T, self.width // self.heads // 2, x.device, self._table_pairs)
+        half = self.width // self.heads // 2
+        angles = _rotary_angles(T, half, x.device, self._table_pairs, self.rotary_base)
         return angles.cos().to(x.dtype), angles.sin().to(x.dtype)
 
     def _block_rotation(
@@ -301,4 +323,6 @@ class Reader(nn.Module):
             text += f", position={self.position}"
         if self.rotary_pairs is not None:
             text += f", rotary_pairs={self.rotary_pairs}"
+        if self.rotary_base != _ROTARY_BASE:
+            text += f", rotary_base={self.rotary_base:g}"
         return text

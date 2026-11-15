@@ -2,7 +2,8 @@
 
 ``model.reader_rotary_pairs`` (only the first ``n`` pairs of a head are rotated; a list gives
 ``n`` for each block, so the last block can be left without a position),
-``model.reader_rotary_dtype`` (the rotation in the parameters' dtype under autocast) and
+``model.reader_rotary_dtype`` (the rotation in the parameters' dtype under autocast),
+``model.reader_rotary_base`` (the base of the rotation's frequency ladder) and
 ``model.reader_position = learned`` (the Transformer baseline's position table in place of the
 rotation). They were built to test why the reader is worse on text than the baseline of its
 shape; the cause they test is in the document.
@@ -11,12 +12,14 @@ These tests check that the defaults leave every configuration hash, memory key, 
 state dict and output as it was, and that each key does what it says: the unrotated pairs are
 compared as they are and the output still reads distances only; a block with no rotated pair
 compares queries and keys as they are; the rotation under bf16 autocast runs in float32 and is
-closer to the exact one; the learned reader is the Transformer baseline's computation with the
-same weights, and reads the window position.
+closer to the exact one; another base turns pair ``i`` by ``t · base^(−i / half)``, in the table
+and in the angles the forward pass computes itself alike; the learned reader is the Transformer
+baseline's computation with the same weights, and reads the window position.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from pathlib import Path
@@ -44,10 +47,11 @@ from hsn.train.memory_plan import memory_off_param_count, reader_param_count
 from p1_11_support import restore_determinism  # noqa: F401
 from p1_15_support import datasets, train_overrides
 from test_a6_feedback_detach import A5, _cfg, _start, _window
-from test_reader_rotary_table import _reference_forward
+from test_reader_rotary_table import _reference_cos_sin, _reference_forward
 from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
+L = reader_mod._ROTARY_TABLE
 
 REPO = Path(__file__).resolve().parents[1]
 NOMEM = REPO / "configs" / "experiments" / "hsn_t_nomem.yaml"
@@ -55,12 +59,19 @@ READER_LM = REPO / "configs" / "baselines" / "reader_w64l2.yaml"
 RECIPE_A6 = REPO / "configs" / "experiments" / "hsn_recipe_a6.yaml"
 TRANSFORMER = REPO / "configs" / "baselines" / "transformer_2m.yaml"
 
-KEYS = ("reader_position", "reader_positions", "reader_rotary_pairs", "reader_rotary_dtype")
+KEYS = (
+    "reader_position",
+    "reader_positions",
+    "reader_rotary_pairs",
+    "reader_rotary_dtype",
+    "reader_rotary_base",
+)
 DEFAULTS = (
     "model.reader_position=rotary",
     "model.reader_positions=256",
     "model.reader_rotary_pairs=null",
     "model.reader_rotary_dtype=working",
+    "model.reader_rotary_base=10000.0",
 )
 #: one setting of each key away from its default
 PAIRS = ("model.reader_rotary_pairs=2",)
@@ -69,8 +80,10 @@ TOP = ("model.reader_rotary_pairs=[2,0]",)
 #: no block is rotated: the causal mask is the only order signal
 NOROT = ("model.reader_rotary_pairs=0",)
 WIDE = ("model.reader_rotary_dtype=parameters",)
+#: a larger rotary base: longer wavelengths for the slower pairs
+BASE = ("model.reader_rotary_base=1000000.0",)
 LEARNED = ("model.reader_position=learned",)
-SWITCHES = [PAIRS, TOP, NOROT, WIDE, LEARNED]
+SWITCHES = [PAIRS, TOP, NOROT, WIDE, BASE, LEARNED]
 #: the memory-off recipe at a size the CPU runs in a moment (two heads of four pairs)
 TINY = ("model.d=8", "model.context_dim=8", "model.hidden=16", "model.reader_width=16")
 TINY = (*TINY, "model.reader_heads=2")
@@ -121,6 +134,7 @@ def test_keys_are_opt_in_and_the_defaults_keep_hashes_and_memory_keys(
     base = load_config(path, list(overrides))
     assert (base.model.reader_position, base.model.reader_positions) == ("rotary", 256)
     assert base.model.reader_rotary_pairs is None and base.model.reader_rotary_dtype == "working"
+    assert base.model.reader_rotary_base == 10_000.0
     dumped = json.loads(canonical_json(base))["model"]
     assert not any(key in dumped for key in KEYS)
     assert all(f"model.{key}" in HASH_OMIT_AT_DEFAULT for key in KEYS)
@@ -168,6 +182,16 @@ def test_the_memory_keys_of_the_arms_before_the_keys_are_unchanged() -> None:
         (NOMEM, [*LEARNED, "train.unroll=512"], "raise model.reader_positions"),
         (READER_LM, ["model.reader_position=sinusoidal"], "rotary"),
         (READER_LM, ["model.reader_rotary_dtype=float64"], "working"),
+        (RECIPE_A6, ["model.reader_rotary_base=100000.0"], "positions of model.reader"),
+        (TRANSFORMER, ["model.reader_rotary_base=100000.0"], "positions of model.reader"),
+        (READER_LM, [*LEARNED, "model.reader_rotary_base=100000.0"], "has no rotation"),
+        (READER_LM, ["model.reader_rotary_base=1.0"], "finite number above 1"),
+        (READER_LM, ["model.reader_rotary_base=0.5"], "finite number above 1"),
+        (READER_LM, ["model.reader_rotary_base=-10000"], "finite number above 1"),
+        (READER_LM, ["model.reader_rotary_base=.inf"], "finite number above 1"),
+        (READER_LM, ["model.reader_rotary_base=.nan"], "finite number above 1"),
+        (RECIPE_A6, ["model.reader_rotary_base=0"], "finite number above 1"),
+        (READER_LM, ["model.reader_rotary_base=long"], "reader_rotary_base"),
     ],
 )
 def test_refusals(path: Path, overrides: list[str], message: str) -> None:
@@ -187,6 +211,15 @@ def test_accepted_settings() -> None:
     assert long.model.reader_positions == 512
     short = load_config(READER_LM, [*LEARNED, "train.unroll=64", "model.reader_positions=64"])
     assert build_model(short).reader.pos.shape == (64, 64)
+    # the base: a float, written as YAML reads it or not (1e5 is a string to YAML 1.1)
+    for text in ("1e5", "100000", "100000.0", "1.0e+5"):
+        cfg = load_config(READER_LM, [f"model.reader_rotary_base={text}"])
+        assert cfg.model.reader_rotary_base == 1e5
+    keys = ["model.reader_rotary_base=1e6", "model.reader_rotary_pairs=[8,4]", *WIDE]
+    assert build_model(load_config(READER_LM, keys)).reader.rotary_base == 1e6
+    # with no rotated pair in any block the base acts on nothing; accepted, as the dtype key is
+    idle = load_config(READER_LM, [*NOROT, "model.reader_rotary_base=1e6", *WIDE])
+    assert idle.model.reader_rotary_base == 1e6
 
 
 # --------------------------------------------------------------------------------------------------
@@ -207,6 +240,7 @@ def test_default_reader_is_the_reader_as_it_was() -> None:
         reader_positions=256,
         reader_rotary_pairs=None,
         reader_rotary_dtype="working",
+        reader_rotary_base=10_000.0,
     )
     a, b = Reader(base, seed=3).eval(), Reader(named, seed=3).eval()
     assert a.pos is None and "pos" not in a.state_dict()
@@ -506,6 +540,182 @@ def test_gradients_flow_through_the_float32_rotation_under_autocast() -> None:
     for name, p in reader.named_parameters():
         assert p.grad is not None and bool(torch.isfinite(p.grad).all()), name
     assert float(reader.blocks[0].qkv.weight.grad.abs().sum()) > 0.0
+
+
+# --------------------------------------------------------------------------------------------------
+# model.reader_rotary_base
+# --------------------------------------------------------------------------------------------------
+
+#: the two bases of text_rotary_base.yaml, and one below the default
+BASES = (100_000.0, 1_000_000.0, 500.0)
+CPU = torch.device("cpu")
+
+
+def _ladder(T: int, half: int, base: float) -> Tensor:
+    """``t · base^(−i / half)`` ``[T, half]`` in Python floats, apart from the reader's code."""
+    rows = [[t * base ** (-i / half) for i in range(half)] for t in range(T)]
+    return torch.tensor(rows, dtype=torch.float64)
+
+
+def _forward_with_angles(reader: Reader, tokens: Tensor, reset: Tensor, base: float) -> Tensor:
+    """The reader's forward with the angles of ``base`` computed here for the whole window,
+    never read from the reader's table."""
+    angles = reader_mod._rotary_angles(tokens.shape[1], 4, tokens.device, base=base)
+    x = reader.emb(tokens)
+    cos, sin = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+    mask = reader.attention_mask(reset)
+    for block in reader.blocks:
+        x = block(x, mask, cos, sin)
+    out: Tensor = reader.norm(x)
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_default_base_is_the_old_constant_bit_for_bit(dtype: torch.dtype) -> None:
+    """Named or not, the default base is the constant of before the key: the same angles as the
+    old code (literal 10000), the same table, parameters, state dict and outputs."""
+    assert ModelConfig.model_fields["reader_rotary_base"].default == 10_000.0
+    assert reader_mod._ROTARY_BASE == 10_000.0
+    for half in (1, 4, 28):
+        angles = reader_mod._rotary_angles(L, half, CPU, None, 10_000.0)
+        assert torch.equal(angles, reader_mod._rotary_angles(L, half, CPU))
+        old_cos, old_sin = _reference_cos_sin(L, half, CPU)
+        assert torch.equal(angles.cos(), old_cos) and torch.equal(angles.sin(), old_sin)
+    default, named = _reader(dtype), _reader(dtype, reader_rotary_base=10_000.0)
+    assert default.rotary_base == named.rotary_base == 10_000.0
+    assert repr(default) == repr(named) and "rotary_base" not in repr(default)
+    assert torch.equal(named._rot_cos, default._rot_cos)
+    assert torch.equal(named._rot_sin, default._rot_sin)
+    assert list(named.state_dict()) == list(default.state_dict())
+    assert all(
+        torch.equal(p, q) for p, q in zip(named.parameters(), default.parameters(), strict=True)
+    )
+    tokens = _bytes(2, 30, 5)
+    reset = _none(tokens)
+    reset[1, 13] = True
+    with torch.no_grad():
+        want = _reference_forward(default, tokens, reset)
+        assert torch.equal(default(tokens, reset), want) and torch.equal(named(tokens, reset), want)
+
+
+@pytest.mark.parametrize("base", BASES)
+def test_another_base_turns_pair_i_by_t_times_base_to_the_minus_i_over_half(base: float) -> None:
+    for half in (4, 28):
+        angles = reader_mod._rotary_angles(300, half, CPU, base=base)
+        torch.testing.assert_close(angles, _ladder(300, half, base), rtol=1e-14, atol=0.0)
+        # pair 0 turns by one radian a position whatever the base
+        assert torch.equal(angles[:, 0], torch.arange(300, dtype=torch.float64))
+        # pair i against the default's: slower by (base / 10000)^(i / half), at every position
+        default = reader_mod._rotary_angles(300, half, CPU)
+        ratio = angles[1:, 1:] / default[1:, 1:]
+        exponent = torch.arange(1, half, dtype=torch.float64) / half
+        want = ((10_000.0 / base) ** exponent).expand_as(ratio)
+        torch.testing.assert_close(ratio, want, rtol=1e-13, atol=0.0)
+    # with fewer rotated pairs the first n follow the base and the others keep the angle zero
+    part = reader_mod._rotary_angles(300, 4, CPU, 2, base)
+    assert torch.equal(part[:, :2], reader_mod._rotary_angles(300, 4, CPU, base=base)[:, :2])
+    assert bool((part[:, 2:] == 0.0).all())
+    # the reader: a table of those angles' cos / sin, the default's parameters, other outputs
+    for dtype in (torch.float32, torch.float64):
+        reader, default = _reader(dtype, reader_rotary_base=base), _reader(dtype)
+        assert reader.rotary_base == base and f"rotary_base={base:g}" in repr(reader)
+        table = reader_mod._rotary_angles(L, 4, CPU, base=base)
+        assert torch.equal(reader._rot_cos, table.cos().to(dtype))
+        assert torch.equal(reader._rot_sin, table.sin().to(dtype))
+        exact = _ladder(L, 4, base)
+        close = 1e-6 if dtype == torch.float32 else 1e-12
+        torch.testing.assert_close(reader._rot_cos.double(), exact.cos(), rtol=0.0, atol=close)
+        assert list(reader.state_dict()) == list(default.state_dict())
+        assert all(
+            torch.equal(p, q)
+            for p, q in zip(reader.parameters(), default.parameters(), strict=True)
+        )
+        tokens = _bytes(2, 30, 6)
+        with torch.no_grad():
+            assert _gap(reader(tokens, _none(tokens)), default(tokens, _none(tokens))) > 1e-4
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_table_and_the_computed_angles_agree_for_another_base(dtype: torch.dtype) -> None:
+    """The forward pass reads the table or computes the angles itself (past the table, without
+    one as on MPS, for weights cast behind the module): every path has the same base."""
+    base = 1_000_000.0
+    reader = _reader(dtype, reader_rotary_base=base)
+    x = torch.zeros(1, dtype=dtype)
+    for T in (1, 7, 256, L):
+        cos, sin = reader._rotation(T, x)
+        assert cos.data_ptr() == reader._rot_cos.data_ptr()  # read from the table
+        angles = reader_mod._rotary_angles(T, 4, CPU, base=base)
+        assert torch.equal(cos, angles.cos().to(dtype)) and torch.equal(sin, angles.sin().to(dtype))
+    # past the table: computed in the call, the rows inside it equal to the table's
+    long_cos, long_sin = reader._rotation(L + 5, x)
+    assert long_cos.data_ptr() != reader._rot_cos.data_ptr()
+    assert torch.equal(long_cos[:L], reader._rot_cos) and torch.equal(long_sin[:L], reader._rot_sin)
+    assert _gap(long_cos[L:], torch.cos(_ladder(L + 5, 4, base)[L:]).to(dtype)) <= 1e-6
+    tokens = _bytes(2, 40, 7)
+    reset = _none(tokens)
+    reset[0, 17] = True
+    with torch.no_grad():
+        want = _forward_with_angles(reader, tokens, reset, base)
+        assert torch.equal(reader(tokens, reset), want)  # the table
+        long_tokens = _bytes(1, L + 3, 8)
+        long_reset = _none(long_tokens)
+        long_want = _forward_with_angles(reader, long_tokens, long_reset, base)
+        assert torch.equal(reader(long_tokens, long_reset), long_want)  # past the table
+        bare = copy.deepcopy(reader)
+        bare._rot_cos = bare._rot_sin = None  # MPS's path: no table
+        assert torch.equal(bare(tokens, reset), want)
+    # cast with the module, the table is made again with the base; cast behind it, the call
+    # computes the base's angles in the new dtype
+    other = torch.float64 if dtype == torch.float32 else torch.float32
+    moved = copy.deepcopy(reader).to(other)
+    table = reader_mod._rotary_angles(L, 4, CPU, base=base)
+    assert torch.equal(moved._rot_cos, table.cos().to(other))
+    behind = copy.deepcopy(reader)
+    behind.load_state_dict(
+        {name: value.to(other) for name, value in reader.state_dict().items()}, assign=True
+    )
+    assert behind._rot_cos is not None and behind._rot_cos.dtype == dtype
+    with torch.no_grad():
+        want = _forward_with_angles(moved, tokens, reset, base)
+        assert torch.equal(moved(tokens, reset), want) and torch.equal(behind(tokens, reset), want)
+
+
+@pytest.mark.parametrize("pairs", [None, [4, 2]])
+def test_with_another_base_the_reader_still_reads_distances_only(pairs: list[int] | None) -> None:
+    reader = _reader(reader_rotary_base=1_000_000.0, reader_rotary_pairs=pairs)
+    body = _bytes(1, 10, 4)
+    outs = []
+    for lead in (0, 3, 17):
+        tokens = torch.cat([_bytes(1, lead, 20 + lead), body], dim=1)
+        reset = _none(tokens)
+        reset[:, lead] = True  # the body is a document of its own
+        with torch.no_grad():
+            outs.append(reader(tokens, reset)[:, lead:])
+    assert _gap(outs[0], outs[1]) <= 1e-12 and _gap(outs[0], outs[2]) <= 1e-12
+
+
+@pytest.mark.parametrize(
+    ("path", "overrides"), [(READER_LM, ()), (NOMEM, ("model.reader_width=224",))]
+)
+def test_the_base_at_its_default_keeps_the_hash_and_the_memory_key_and_another_changes_them(
+    path: Path, overrides: tuple[str, ...]
+) -> None:
+    protocol = {"name": "train_eval", "eval_batch": 128, "probe_batch": 64, "diag_docs": 32}
+    base = load_config(path, list(overrides))
+    for text in ("10000", "10000.0", "1e4", "1.0e+4"):
+        named = load_config(path, [*overrides, f"model.reader_rotary_base={text}"])
+        assert named.model.reader_rotary_base == 10_000.0
+        assert "reader_rotary_base" not in json.loads(canonical_json(named))["model"]
+        assert config_hash(named) == config_hash(base)
+        assert memory_key(named, "none", protocol) == memory_key(base, "none", protocol)
+    hashes, keys = {config_hash(base)}, {memory_key(base, "none", protocol)}
+    for value in BASES:
+        other = load_config(path, [*overrides, f"model.reader_rotary_base={value}"])
+        assert json.loads(canonical_json(other))["model"]["reader_rotary_base"] == value
+        hashes.add(config_hash(other))
+        keys.add(memory_key(other, "none", protocol))
+    assert len(hashes) == len(keys) == 1 + len(BASES)
 
 
 # --------------------------------------------------------------------------------------------------

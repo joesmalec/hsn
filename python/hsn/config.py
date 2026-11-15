@@ -406,6 +406,12 @@ class ModelConfig(_StrictModel):
     # parameters (float32 master weights), the rotated queries and keys cast back for the
     # attention. Without autocast the two are the same computation.
     reader_rotary_dtype: Literal["working", "parameters"] = "working"
+    # reader_rotary_base = b: the base of the rotation's frequency ladder; pair i of a head
+    # (half = width / heads / 2 pairs) turns by t * b^(-i / half) at distance t. 10000
+    # (default) is the reader as it was. A larger base gives the slower pairs longer
+    # wavelengths (pair 0 keeps one radian a position). Must be finite and above 1. Read only
+    # by the rotary positions: refused with reader_position=learned, as the other rotation keys.
+    reader_rotary_base: float = 10_000.0
     # --- end the reader's positions ---
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
@@ -537,6 +543,13 @@ class ModelConfig(_StrictModel):
             )
         # --- end A8 ---
         # --- HSN-T: the window reader ---
+        base_default = type(self).model_fields["reader_rotary_base"].default
+        if not 1.0 < self.reader_rotary_base < float("inf"):  # also refuses NaN
+            raise ValueError(
+                f"model.reader_rotary_base={self.reader_rotary_base} must be a finite number "
+                f"above 1: the base of the rotation's frequency ladder ({base_default} is the "
+                "default)"
+            )
         if self.reader == "none":
             if self.address_gate_input == "reader_prev":
                 raise ValueError(
@@ -552,11 +565,12 @@ class ModelConfig(_StrictModel):
                 self.reader_position != "rotary"
                 or self.reader_rotary_pairs is not None
                 or self.reader_rotary_dtype != "working"
+                or self.reader_rotary_base != base_default
             ):
                 raise ValueError(
-                    "model.reader_position / reader_rotary_pairs / reader_rotary_dtype are the "
-                    "positions of model.reader; set model.reader=transformer or leave them at "
-                    "their defaults"
+                    "model.reader_position / reader_rotary_pairs / reader_rotary_dtype / "
+                    "reader_rotary_base are the positions of model.reader; set "
+                    "model.reader=transformer or leave them at their defaults"
                 )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
@@ -572,11 +586,14 @@ class ModelConfig(_StrictModel):
                     "positions rotate pairs of the attention's query and key)"
                 )
             if self.reader_position == "learned" and (
-                self.reader_rotary_pairs is not None or self.reader_rotary_dtype != "working"
+                self.reader_rotary_pairs is not None
+                or self.reader_rotary_dtype != "working"
+                or self.reader_rotary_base != base_default
             ):
                 raise ValueError(
                     "model.reader_position=learned has no rotation: leave "
-                    "model.reader_rotary_pairs and model.reader_rotary_dtype at their defaults"
+                    "model.reader_rotary_pairs, model.reader_rotary_dtype and "
+                    "model.reader_rotary_base at their defaults"
                 )
             pairs = self.reader_rotary_pairs
             if isinstance(pairs, list) and len(pairs) != self.reader_layers:
@@ -1906,6 +1923,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.reader_positions",
     "model.reader_rotary_pairs",
     "model.reader_rotary_dtype",
+    "model.reader_rotary_base",
 )
 
 
