@@ -177,98 +177,68 @@ def _with_train(cfg: RunConfig, **changes: Any) -> RunConfig:
 # --------------------------------------------------------------------------------------------------
 
 
-def test_p1_7_resume_bit_exact_cpu_20_steps(
+def test_p1_7_checkpoint_state_and_validation(
     train_docs: list[Example], dev_docs: list[Example], tmp_path: Path
 ) -> None:
-    """Train 20 steps; resume from the step-10 checkpoint into a differently initialised trainer;
-    every per-step number, the weights, the optimiser, the carried state and the resync counters
-    agree bit for bit; checkpoints that lack the P1.7 entries are refused."""
+    """Checkpoint metadata, carried state and invalid payloads round-trip after three windows.
+
+    P1.8's test_p1_8_checkpoint_exact owns the long, bit-exact resumed training trajectory.
+    This test covers the protocol, packing and refusal cases without training that twice.
+    """
     cfg = _config(
-        "train.steps=20",
-        "train.eval_every=10",
-        "train.ckpt_every=10",
-        "train.stats_every=5",
-        "train.q_resync_every=3",
+        "train.steps=6",
+        "train.eval_every=3",
+        "train.ckpt_every=1",
+        "train.stats_every=1",
+        "train.q_resync_every=2",
         "train.deterministic=true",
-        "train.warmup_steps=4",
+        "train.warmup_steps=1",
         "train.schedule=cosine",
     )
-    train_ds, dev_ds = ByteDataset(train_docs), ByteDataset(dev_docs)
-
     run_a = tmp_path / "a"
     model_a = _build(cfg)
-    assert isinstance(model_a, SequenceModel)  # HSN satisfies the P0.5 protocol (reset_state)
+    assert isinstance(model_a, SequenceModel)
     trainer_a = TBPTTTrainer(model_a, cfg, _cpu(), run_dir=run_a)
-    history_a = trainer_a.fit(train_ds, dev_ds, 20)
-    assert [Path(p).name for p in history_a.checkpoints] == ["step_00000010.pt", "step_00000020.pt"]
-    assert latest_checkpoint(run_a) == run_a / "step_00000020.pt"
-    assert (trainer_a.windows, trainer_a.resyncs, trainer_a.windows_since_resync) == (20, 6, 2)
-    assert [r.resyncs for r in history_a.steps] == [n // 3 for n in range(1, 21)]
-    assert history_a.measured["windows"] == 20 and history_a.measured["resyncs"] == 6
-    assert history_a.measured["param_count"] == model_a.param_report()["total_trainable"]
+    history = trainer_a.fit(ByteDataset(train_docs), ByteDataset(dev_docs), 3)
+    checkpoint = run_a / "step_00000003.pt"
+    assert [Path(p).name for p in history.checkpoints] == [
+        "step_00000001.pt",
+        "step_00000002.pt",
+        "step_00000003.pt",
+    ]
+    assert latest_checkpoint(run_a) == checkpoint
+    assert (trainer_a.windows, trainer_a.resyncs, trainer_a.windows_since_resync) == (3, 1, 1)
+    assert [r.resyncs for r in history.steps] == [0, 1, 1]
+    assert history.measured["windows"] == 3 and history.measured["resyncs"] == 1
+    assert history.measured["param_count"] == model_a.param_report()["total_trainable"]
 
-    run_b = tmp_path / "b"
-    model_b = _build(cfg, seed=1)  # different initial weights: everything must come from the file
-    trainer_b = TBPTTTrainer(model_b, cfg, _cpu(), run_dir=run_b)
-    assert trainer_b.resume(run_a / "step_00000010.pt") == 10
-    assert (trainer_b.windows, trainer_b.resyncs, trainer_b.windows_since_resync) == (10, 3, 1)
-    history_b = trainer_b.fit(train_ds, dev_ds, 20)
-
-    assert [r.step for r in history_b.steps] == list(range(11, 21))
-    for rec_a, rec_b in zip(history_a.steps[10:], history_b.steps, strict=True):
-        assert isinstance(rec_a, TBPTTStepRecord) and isinstance(rec_b, TBPTTStepRecord)
-        assert rec_a.loss == rec_b.loss and rec_a.accuracy == rec_b.accuracy, (rec_a, rec_b)
-        assert rec_a.total == rec_b.total and rec_a.parts == rec_b.parts, (rec_a, rec_b)
-        assert rec_a.stats == rec_b.stats, (rec_a.stats, rec_b.stats)
-        assert rec_a.grad_norm == rec_b.grad_norm and rec_a.lr == rec_b.lr
-        assert (rec_a.windows, rec_a.resyncs) == (rec_b.windows, rec_b.resyncs)
-        assert rec_a.loss_positions == rec_b.loss_positions and rec_a.tokens == rec_b.tokens
-    assert history_a.evals[-1]["loss"] == history_b.evals[-1]["loss"]
-    for key, value in model_a.state_dict().items():
-        other = model_b.state_dict()[key]
-        assert torch.equal(value, other) if isinstance(value, Tensor) else value == other, key
-    state_a, state_b = trainer_a.optimizer.state_dict(), trainer_b.optimizer.state_dict()
-    for index, entry in state_a["state"].items():
-        for key, value in entry.items():
-            other = state_b["state"][index][key]
-            assert torch.equal(value, other) if isinstance(value, Tensor) else value == other
-    assert (
-        trainer_a.scheduler.state_dict()["last_epoch"]
-        == trainer_b.scheduler.state_dict()["last_epoch"]
-    )
-    # the step-20 checkpoints of both runs are the same: weights, RNG, loader, state, counters
-    file_a = torch.load(run_a / "step_00000020.pt", weights_only=True)
-    file_b = torch.load(run_b / "step_00000020.pt", weights_only=True)
-    for key, value in file_a["model"].items():
-        other = file_b["model"][key]
-        assert torch.equal(value, other) if isinstance(value, Tensor) else value == other, key
-    assert torch.equal(file_a["rng_state"]["torch"], file_b["rng_state"]["torch"])
-    assert file_a["loader_state"] == file_b["loader_state"]
+    trainer_b = TBPTTTrainer(_build(cfg, seed=1), cfg, _cpu(), run_dir=tmp_path / "b")
+    assert trainer_b.resume(checkpoint) == 3
+    assert (trainer_b.windows, trainer_b.resyncs, trainer_b.windows_since_resync) == (3, 1, 1)
+    payload = torch.load(checkpoint, weights_only=True)
     for name in ("h", "q", "age", "pos"):
-        assert torch.equal(
-            file_a["extra"]["carried_state"][name], file_b["extra"]["carried_state"][name]
-        )
-        assert file_a["extra"]["carried_state"][name].device.type == "cpu"
-    assert file_a["extra"]["q_resync"] == file_b["extra"]["q_resync"]
-    assert file_a["extra"]["q_resync"] == {"windows": 20, "since_resync": 2, "resyncs": 6}
-    assert file_a["extra"]["model_name"] == "hsn" and file_a["extra"]["scaler"] is None
-    # the carried state restores through the helpers with the P1.3 layout checks
-    restored = unpack_cell_state(file_a["extra"]["carried_state"], torch.device("cpu"))
+        saved = payload["extra"]["carried_state"][name]
+        assert saved.device.type == "cpu"
+        assert torch.equal(saved, getattr(trainer_b._carried_state, name))
+    assert payload["extra"]["q_resync"] == {"windows": 3, "since_resync": 1, "resyncs": 1}
+    assert payload["extra"]["model_name"] == "hsn" and payload["extra"]["scaler"] is None
+
+    # The helpers validate the P1.3 state layout independently of training continuation.
+    restored = unpack_cell_state(payload["extra"]["carried_state"], torch.device("cpu"))
     assert isinstance(restored, CellGraphState) and restored.batch_size == cfg.train.batch
-    assert torch.equal(pack_cell_state(restored)["h"], file_a["extra"]["carried_state"]["h"])
+    assert torch.equal(pack_cell_state(restored)["h"], payload["extra"]["carried_state"]["h"])
     with pytest.raises(ValueError, match="missing"):
         unpack_cell_state({"h": restored.h, "q": restored.q}, "cpu")
     with pytest.raises(TypeError):
         pack_cell_state(restored.h)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="q_resync"):
         check_q_resync({"windows": 1, "since_resync": 2, "resyncs": 0}, "test")
-    # a checkpoint of another configuration is refused; one without the P1.7 entries too
-    other_cfg = _config("train.lr=2e-3", "train.steps=20")
+    other_cfg = _config("train.lr=2e-3", "train.steps=6")
     trainer_c = TBPTTTrainer(_build(other_cfg), other_cfg, _cpu(), run_dir=tmp_path / "c")
     with pytest.raises(ValueError, match="configuration"):
-        trainer_c.resume(run_a / "step_00000010.pt")
+        trainer_c.resume(checkpoint)
     for key, message in (("q_resync", "q_resync counters"), ("carried_state", "carried cell")):
-        payload = torch.load(run_a / "step_00000010.pt", weights_only=True)
+        payload = torch.load(checkpoint, weights_only=True)
         del payload["extra"][key]
         tampered = tmp_path / f"no_{key}.pt"
         torch.save(payload, tampered)

@@ -30,7 +30,9 @@ def test_p1_8_gradcheck_tiny_fp64(
     """``torch.autograd.gradcheck`` of the window function over 3 positions (a document reset at
     position 1 of row 0) with respect to the incoming state ``h_0`` and every parameter tensor of
     the model, the edge logits and the gate among them, in double precision on the CPU with
-    nondeterministic kernels disabled; every element of the Jacobian is compared (slow mode).
+    nondeterministic kernels disabled. Fast gradcheck compares numerical and analytical
+    directional derivatives for every input/output tensor pair, falling back to the full
+    Jacobian to diagnose a mismatch. The component tests retain elementwise gradchecks.
     The same scalar's backward then shows that every gradient is finite and non-zero, except the
     halting head's, which is unused while ``r_max = 1`` (``None``)."""
     model = tiny_model
@@ -66,7 +68,7 @@ def test_p1_8_gradcheck_tiny_fp64(
     n_outputs = sum(int(o.numel()) for o in outputs)
     assert all(o.requires_grad and o.dtype is torch.float64 for o in outputs)
     started = time.perf_counter()
-    assert torch.autograd.gradcheck(window, (h0, *params), atol=1e-6, rtol=1e-4)
+    assert torch.autograd.gradcheck(window, (h0, *params), atol=1e-6, rtol=1e-4, fast_mode=True)
     seconds = time.perf_counter() - started
 
     # every input the outputs depend on receives a finite, non-zero gradient; the halting head is
