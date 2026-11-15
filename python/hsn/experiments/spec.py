@@ -14,7 +14,7 @@ ids. Imports without torch.
     rules: {verdicts: {...}, early_stop: [...]}     # hsn.experiments.rules
     arms:
       - name: bridge
-        family: hsn                # checked against the resolved model_name
+        family: hsn                # checked against the resolved model_name (family_of)
         variant: pdg               # or {name: cell_offset, offset_std: 0.5}
         overrides: [train.lr=0.001]
         grid: {model.d: [64, 128]} # optional, cartesian product in the declared order
@@ -104,13 +104,15 @@ __all__ = [
     "canonical",
     "digest",
     "expand",
+    "family_of",
     "load_spec",
     "slug",
 ]
 
-FAMILIES = ("hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm")
-Family = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm"]
+FAMILIES = ("hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm")
+Family = Literal["hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm"]
 #: The families trained by the HSN's window trainer: the HSN and HSN-T (``docs/hsn_t.md``).
+#: ``hsn_t_nomem`` (HSN-T without its memory) is not one: the generic trainer trains it.
 HSN_FAMILIES = ("hsn", "hsn_t")
 # P1.14: the step-time guard's limit and approval decide whether an arm may run, not what it
 # computes; P1.16: neither do the kept mid-run checkpoints (keep_every, keep_last)
@@ -595,6 +597,17 @@ def arm_identity(
     return arm_id, digest(payload)
 
 
+def family_of(cfg: RunConfig) -> str:
+    """The experiment family of a configuration: its ``model_name``, except that HSN-T without
+    its memory (``model_name: hsn_t`` with ``model.memory = false``,
+    ``docs/hsn_t_no_memory.md``) is ``hsn_t_nomem``, a family of its own: a stateless model on
+    the generic trainer, kept apart from the HSN-T arms in reports and rule scopes and treated
+    as a baseline by every check of the expansion (variant ``none``, no compile mode)."""
+    if cfg.model_name == "hsn_t" and not cfg.model.memory:
+        return "hsn_t_nomem"
+    return cfg.model_name
+
+
 def _plain(value: Any) -> Any:
     """Tuples as lists (a dumped protocol and a stored one compare alike)."""
     if isinstance(value, (list, tuple)):
@@ -609,6 +622,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # stored memory and step-time estimates of the eager baselines still apply); a compiled
         # baseline has a key of its own
         del dump["hardware"]["baseline_compile"]
+    if dump["model"]["memory"] is True:
+        # model.memory at its default stays out, so the arms from before the key keep their
+        # memory key and with it their stored step-time and memory estimates
+        del dump["model"]["memory"]
     return digest(
         {
             "model_name": cfg.model_name,
@@ -711,7 +728,7 @@ def _expand_one(
     try:
         if entry.family is None:
             path = entry.config or spec.base.config
-            family = load_config(_resolve_path(path, repo), [*head, *tail]).model_name
+            family = family_of(load_config(_resolve_path(path, repo), [*head, *tail]))
         else:
             family = entry.family
         recipe = spec.families.get(family)
@@ -730,10 +747,11 @@ def _expand_one(
             "reduce-overhead) in its overrides: profile:rtx3060 compiles by default once P2.8 is "
             "merged, and an unpinned arm would change its id (and what it computes) with it"
         )
-    if cfg.model_name != family:
+    if family_of(cfg) != family:
         raise SpecError(
             f"arm {entry.name}: family {family} but the configuration's model_name is "
             f"{cfg.model_name}"
+            + ("" if cfg.model.memory else " with model.memory=false (family hsn_t_nomem)")
         )
     if family not in HSN_FAMILIES and cfg.hardware.compile_mode != "none":
         # P2.8: the generic trainer ignores the compile mode and trains a baseline eager, so a
@@ -745,7 +763,9 @@ def _expand_one(
             "hardware.compile_mode=none (hardware.baseline_compile compiles a baseline)"
         )
     variant, vparams = _variant(entry, family)
-    if (cfg.model.key_address or cfg.model.selected_readout) and variant != "pdg":
+    # (HSN-T without its memory keeps selected_readout for the decoder's width and has no cell)
+    a5 = cfg.model.memory and (cfg.model.key_address or cfg.model.selected_readout)
+    if a5 and variant != "pdg":
         raise SpecError(
             f"arm {entry.name}: A5 requires variant pdg; variant {variant} may replace its "
             "scorer, cell, or readout. Ablate A5 with key_address / selected_readout flags"

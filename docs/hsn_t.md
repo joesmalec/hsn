@@ -155,6 +155,17 @@ recipe and integration; separate learning-rate groups for reader and core are no
 
 No run of it exists yet.
 
+## Without the memory (`model.memory: false`)
+
+An opt-in switch of 14 Nov 2026 (`docs/hsn_t_no_memory.md`): the parts of HSN-T that are not
+the memory (embeddings, `E`, the reader, `S`, `D`), stateless and over all positions of a
+window at once, with zeros where `q` and `r` are read. It is a model of its own
+(`hsn.model.hsn_t.HSNTNoMemory`, 627,328 parameters at the default sizes, experiment family
+`hsn_t_nomem`, the generic trainer), built for a speed comparison with the GRU baseline. The
+default is `true`, and with it nothing in this document changes.
+
+No run of it exists yet.
+
 ## Tests (`tests/test_hsn_t.py`)
 
 The two families are kept apart (config, class, registry); the keys leave the HSN's hashes

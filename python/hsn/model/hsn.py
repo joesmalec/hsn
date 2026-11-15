@@ -401,6 +401,11 @@ class HSN(nn.Module):
         ste_scope: str = "selected",
     ) -> None:
         super().__init__()
+        if not cfg.memory:
+            raise ValueError(
+                "model.memory=false is HSN-T without its memory, a model of its own "
+                "(hsn.model.hsn_t.HSNTNoMemory, docs/hsn_t_no_memory.md): this class is the memory"
+            )
         if cfg.reader != "none" and not self._takes_reader:
             raise ValueError(
                 f"model.reader={cfg.reader!r} belongs to the HSN-T family "

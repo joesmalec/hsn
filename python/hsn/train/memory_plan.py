@@ -40,6 +40,7 @@ __all__ = [
     "expected_param_count",
     "format_bytes",
     "macs_per_token",
+    "memory_off_param_count",
     "memory_plan",
     "reader_param_count",
     "value_bytes_for",
@@ -146,6 +147,28 @@ def reader_param_count(m: ModelConfig) -> int:
         return 0
     w = m.reader_width
     return m.vocab_size * w + m.reader_layers * (12 * w * w + 13 * w) + 2 * w
+
+
+def memory_off_param_count(m: ModelConfig) -> dict[str, int]:
+    """HSN-T without its memory (``model.memory = false``, ``docs/hsn_t_no_memory.md``,
+    :class:`hsn.model.hsn_t.HSNTNoMemory`): parameters per module in the model's order, plus
+    ``"total"``. The five Appendix C.1 rows that are not the memory (``byte_emb``, ``ctx_emb``,
+    ``encoder``, ``shared``, ``decoder``) at HSN-T's widths, so ``S`` reads ``2d + context_dim
+    + w`` and ``D`` reads ``3d + w`` with ``w`` the reader's width, and the reader
+    (:func:`reader_param_count`). 627,328 for the default sizes (``d`` 64, ``H`` 512, ``V``
+    256, 16 context symbols, the reader ``w`` 64 with two blocks); in general, with ``L``
+    blocks and those other sizes, ``445,312 + 1,282 w + L (12 w² + 13 w)``."""
+    if m.reader == "none" or not m.selected_readout or m.fast_readout:
+        raise ValueError(
+            "HSN-T without memory has a reader, A5's decoder columns and no fast read: "
+            f"got reader={m.reader!r}, selected_readout={m.selected_readout}, "
+            f"fast_readout={m.fast_readout}"
+        )
+    full = expected_param_count(m)
+    rows = {name: full[name] for name in ("byte_emb", "ctx_emb", "encoder", "shared", "decoder")}
+    rows["reader"] = reader_param_count(m)
+    rows["total"] = sum(rows.values())
+    return rows
 
 
 def macs_per_token(m: ModelConfig) -> dict[str, int]:
