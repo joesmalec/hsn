@@ -59,7 +59,11 @@ logits_t = D([q_t ; u_t ; r_t ; c_t])              (A8: … ; f_t])
 `R` is a pre-norm causal Transformer: byte embedding, `reader_layers` blocks (multi-head
 self-attention, then a GELU MLP of width `4w`, both residual), a final LayerNorm. Positions
 enter as rotations of the attention's queries and keys (rotary), so only distances are read
-and there is no position parameter.
+and there is no position parameter. Since 15 Nov 2026 the rotations' cos / sin are read from a
+table of the first 1,024 window positions, made when the reader is built and made again on its
+device when the model is moved or cast: bit for bit the float64 computation that the forward
+pass repeated in every call and that `torch.compile` inlined into the rotation kernels. The
+table is not in the state dict; a longer window, and MPS, still compute the angles in the call.
 
 **What `c_t` may depend on** (each line is a test):
 - the bytes `x_s`, `s ≤ t`, of the same window and the same document (a reset column starts a
@@ -160,7 +164,8 @@ parameters' initialisation and the global random stream are untouched; with the 
 zero the window equals the window of the model without the key (float64, 1e-12); logits read
 no later byte; gradients reach the reader and the new columns under the candidate's cut; `S`
 is the only other way in; bf16 autocast; fast cells beside the reader; the compiled window
-equals the eager one; thirty trainer steps fall.
+equals the eager one; thirty trainer steps fall. The rotary table has its own file,
+`tests/test_reader_rotary_table.py`.
 
 ## What it has to show (rung 1 of the design)
 
