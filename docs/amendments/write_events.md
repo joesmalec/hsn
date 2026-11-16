@@ -226,10 +226,26 @@ whether it ended on an apostrophe not yet placed, and the last event's key.
 previous, info)` returns it, and the trainer checkpoints it as it does the bytes. Cutting a
 window anywhere gives the same events and codes (tested down to windows of one byte).
 
-**Tests** (`tests/test_word_address.py`, 22): the rule against a per-row reading of it;
+**The compiled window and the padding** (16 Nov, after the first launch). The compiled event
+loop gave each block slices of `[B, E, …]`, so `E` stood in their strides, and dynamo (static
+shapes) compiled a new graph for every new `E`; with `fullgraph` the ninth raised
+`FailOnRecompileLimitHit`. The byte address never showed it on TinyStories: its `E` was 64 in
+every window. The word address makes every byte of a context that is not text an event, and
+under `data.align_docs` the padding behind every document is `PAD` under context 0: in 400
+training windows (`B` 32, `T` 256, the spec's loader) `E` took 10 values from 64 to 256, mean
+238, and 44 % of the events were padding bytes. The two arms compiled for 20 minutes on an
+RTX 3070 without a step. The blocks now read columns of `[B, T, …]` tensors
+(`hsn.train.compile._full_width`): one graph for every `E`, the eager window unchanged. The
+padding events remain: they cost slots (about 3.7 times the byte address's per window) and
+are valid slots of the statistics, though no loss position reads them. With
+`model.word_contexts=[0,6]` (context 0 read as text, a configuration change and another arm
+id) the same windows have `E` = 64 throughout and no event on padding. Not decided.
+
+**Tests** (`tests/test_word_address.py`, 24): the rule against a per-row reading of it;
 `none` against the outputs written at 1096531; another context bit for bit; one address for
 `Lily`, `LILY` and `lily`; the carry, also through the trainer and a checkpoint; no later byte and no earlier document; the
-configuration and its hash; `train_eval` end to end with the audit.
+configuration and its hash; `train_eval` end to end with the audit; the compiled window
+over five windows of 2 to `T` event slots: one graph, and equal to the eager one.
 
 **Cost, CPU** (as the table below: eager fp32, `B` 32, `T` 128, two threads, forward plus
 backward, on a loaded machine, so compare within the row only):
@@ -279,7 +295,8 @@ the CPU (`tests/test_write_events.py`):
   event is the slot's tensor.
 - The compiled window against the eager one (fp32, `word` and `all`, soft, hard and
   evaluation) agrees within the tolerances of the compile tests, and a window with more
-  blocks of slots runs on the same graph.
+  blocks of slots runs on the same graph (dynamo's graph count since 16 Nov; before, the
+  check read only the window's own compile counter, and every new number of slots compiled).
 
 ## Cost
 
