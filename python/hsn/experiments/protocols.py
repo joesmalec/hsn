@@ -49,7 +49,7 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
 **P1.15.**
 - Every reads_state evaluation is labelled by query slot (:class:`hsn.experiments.split.QuerySlots`,
   the trainer's ``eval_position_groups``): each evaluation entry carries ``split`` (``first``,
-  ``later``, ``later/1`` to ``later/3``: accuracy, loss, ``n``), checked against the frozen
+  ``later``, ``later/1`` to ``later/7``: accuracy, loss, ``n``), checked against the frozen
   delayed/in_range metric, and ``final`` carries it flattened (``split/<g>/<key>``).
 - The gradient-spike guard (``train.spike_factor``): ``final.skipped_spike_steps`` (``None`` with
   the guard off), ``skipped_steps`` (every step a guard skipped, with its reason), a ``skipped``
