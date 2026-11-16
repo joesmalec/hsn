@@ -492,6 +492,27 @@ def _event_block(
     )
 
 
+def _full_width(x: Tensor, width: int) -> Tensor:
+    """The event slots ``x [B, E, …]`` (:meth:`HSN._event_slots`) as the first ``E`` columns of
+    a contiguous ``[B, width, …]`` tensor (zeros after them, which no block reads), so that a
+    block of its columns has the same strides whatever ``E`` is.
+
+    Dynamo guards on the strides of a compiled function's tensor inputs (static shapes), and a
+    block of ``[B, E, …]`` carries ``E`` in its first stride: every new number of event slots
+    compiled a new graph of :func:`_event_block`, and with ``fullgraph`` the ninth one raised
+    ``FailOnRecompileLimitHit``. ``model.word_address`` makes every byte of a context that is
+    not text an event (the padding behind a document under ``data.align_docs`` among them), so
+    on TinyStories ``E`` took 10 values in 400 training windows of B32 (64 to 256; the byte
+    address's events: 64 in all of them), and the runs compiled for 20 minutes on a card without
+    a step. The byte loop's blocks (:meth:`CompiledWindow._run`) are columns of ``[B, T, …]``
+    tensors already."""
+    E = int(x.shape[1])
+    if E == width:
+        return x.contiguous()
+    tail = x.new_zeros((int(x.shape[0]), width - E, *x.shape[2:]))
+    return torch.cat([x, tail], dim=1)
+
+
 #: The parameters autocast casts at every use (the linears of P, S, the scorer, V, the gate,
 #: W_out and the unit bank): the ones a :class:`SweepTwin` holds pre-cast.
 SWEEP_CAST_PREFIXES: tuple[str, ...] = (
@@ -1580,11 +1601,18 @@ class CompiledWindow:
     ) -> WindowOut:
         """:meth:`_run` with ``model.write_events``: the compiled :func:`_event_block` over the
         window's event slots, a block at a time. The number of blocks follows the batch (its
-        largest event count); the loop over blocks is eager, so no new graph is compiled for
-        it. The per-byte reads run after the loop (:meth:`HSN._event_epilogue`)."""
+        largest event count); the loop over blocks is eager, and every block's inputs are
+        columns of ``[B, T, …]`` tensors (:func:`_full_width`), so no new graph is compiled for
+        another number of slots. The per-byte reads run after the loop
+        (:meth:`HSN._event_epilogue`)."""
         model = self.model
-        blk = block_size(int(reset.shape[1]))
+        T = int(reset.shape[1])
+        blk = block_size(T)
         ev = model._event_slots(pro, reset, blk)
+        # the blocks read the slots as columns of [B, T, …] tensors: strides without E
+        z, context, scalars, slot_reset, valid, pos = (
+            _full_width(x, T) for x in (ev.z, ev.context, ev.scalars, ev.reset, ev.valid, ev.pos)
+        )
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age = state.h, state.q, state.age
@@ -1609,12 +1637,12 @@ class CompiledWindow:
                     h,
                     q,
                     age,
-                    ev.z[:, cols],
-                    ev.context[:, cols],
-                    ev.scalars[:, cols],
-                    ev.reset[:, cols],
-                    ev.valid[:, cols],
-                    ev.pos[:, cols],
+                    z[:, cols],
+                    context[:, cols],
+                    scalars[:, cols],
+                    slot_reset[:, cols],
+                    valid[:, cols],
+                    pos[:, cols],
                     dense_rows,
                     dense_indices,
                     consts,
