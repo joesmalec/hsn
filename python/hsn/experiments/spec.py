@@ -632,6 +632,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
     if dump["model"]["write_events"] == "byte":
         # likewise: a model that writes at every byte keeps its memory key
         del dump["model"]["write_events"]
+    if dump["model"]["word_address"] == "none":
+        # likewise: without the word address (and its contexts, read only with it)
+        del dump["model"]["word_address"]
+        del dump["model"]["word_contexts"]
     return digest(
         {
             "model_name": cfg.model_name,

@@ -414,6 +414,28 @@ class ModelConfig(_StrictModel):
     # L_pred is taken at the events. all: every byte is an event, through the same event
     # path; a test value (it must reproduce byte), not for runs.
     write_events: Literal["byte", "word", "all"] = "byte"
+    # word_address (docs/amendments/write_events.md, "The word address"; opt-in candidate, needs
+    # write_events=word): what A5's two address features read at an event. none (default): the
+    # byte at the event and the byte before it, the event loop as it was. exact | bag: the
+    # whole word. The key of an event is the word it closes (the word of letters that ended
+    # just before it; at a document start or under a context that is not text, the byte at the
+    # event); a_cur reads the code of the event's key and a_prev the code of the key of the
+    # event before (BOS at a document start), so a fact "k v" is written at v's event under
+    # k's code in a_prev and read at k's later event under k's code in a_cur. The event rule
+    # becomes the word rule: under a text context (word_contexts) a word byte is an ASCII
+    # letter or digit or an apostrophe directly between two letters, and every other byte is
+    # a word of one byte; under every other context each byte is its own word and an event,
+    # so there the model is the loop over bytes with A5's address. The address folds A-Z to
+    # a-z (text contexts only); the content path still reads the capital. exact: the product
+    # of one fixed ±1 table per byte position, d^(-1/2) s_1[f_1] * ... * s_j[f_j] (positions
+    # past 16 reuse the 16th table). bag: the unit sum of fixed ±1 codes of the word's 2- and
+    # 3-grams with a start and an end mark. A word of one byte keeps A5's byte code under
+    # both. The tables are buffers drawn from the run seed after everything A5 and A9 draw;
+    # nothing in the address is trained. A9's features (address_ngram > 1) still read bytes.
+    word_address: Literal["none", "exact", "bag"] = "none"
+    # word_contexts: the context ids whose bytes are text for word_address (TinyStories is
+    # 6). Read only with word_address; every other context keeps one word per byte.
+    word_contexts: list[int] = [6]
     # --- end HSN-T ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
@@ -628,6 +650,19 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     f"{key}: model.write_gate (A10) is not built into the event loop (its "
                     "write cost is a mean over positions, and an event slot is not one)"
+                )
+        if self.word_address != "none":
+            key = f"model.word_address={self.word_address}"
+            if self.write_events != "word":
+                raise ValueError(
+                    f"{key} is the address of the loop over word ends: set "
+                    f"model.write_events=word (it is {self.write_events})"
+                )
+            bad = [c for c in self.word_contexts if not 0 <= c < self.n_context]
+            if bad or len(set(self.word_contexts)) != len(self.word_contexts):
+                raise ValueError(
+                    f"{key}: model.word_contexts={self.word_contexts} must be distinct context "
+                    f"ids below model.n_context={self.n_context}"
                 )
         # --- end HSN-T ---
         return self
@@ -1928,6 +1963,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.memory",
     "model.cell_attention_heads",
     "model.write_events",
+    "model.word_address",
+    "model.word_contexts",
 )
 
 

@@ -191,6 +191,7 @@ from hsn.model.halting import HaltingHead
 from hsn.model.reader import Reader
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
+from hsn.model.word_address import state_width
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
@@ -348,6 +349,9 @@ class _Prologue(NamedTuple):
     #: :func:`event_positions`) and ``pos`` before each step (``[B, T]``); ``None`` at ``byte``.
     events: Tensor | None = None
     positions: Tensor | None = None
+    #: ``model.word_address``: what the next window of the same rows takes as ``prev_tokens``
+    #: (:func:`address_history`): the address bytes, then the word state; ``None`` without it.
+    address_carry: Tensor | None = None
 
     def dense_counters(self, t: int) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         """The P1.10b dense window's ``(age, pos)`` before and after position ``t`` (``None``
@@ -424,7 +428,12 @@ class _Events(NamedTuple):
     before: Tensor
 
 
-def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = None) -> Tensor:
+def address_history(
+    cfg: ModelConfig,
+    tokens: Tensor,
+    previous: Tensor | None = None,
+    info: dict[str, Tensor] | None = None,
+) -> Tensor:
     """What a caller carries from the window ``tokens [B, T]`` to the next window of the same
     rows, as that window's ``prev_tokens`` (A5 / A9's address features).
 
@@ -432,7 +441,25 @@ def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = 
     last ``n = model.address_ngram`` bytes, newest first, ``[B, n]``; a window shorter than ``n``
     is completed from ``previous`` (what was carried into it; BOS where there is nothing). The
     receiving window masks whatever a row's document does not reach back to, so bytes of an
-    earlier document in the carry are never read."""
+    earlier document in the carry are never read.
+
+    ``model.word_address``: the carry also holds the running word code, which only the window
+    itself can compute (it reads the contexts, the resets and the fixed tables). It is
+    ``info["address_carry"]`` of that window's forward pass (int64 ``[B, n + 2d + 6]``: the
+    bytes above, then :func:`hsn.model.word_address.state_width` integers), so ``info`` is
+    required."""
+    if cfg.word_address != "none":
+        if info is None or "address_carry" not in info:
+            raise ValueError(
+                f"model.word_address={cfg.word_address}: the carried address holds the running "
+                "word code; pass the info of the window's forward pass to address_history"
+            )
+        return info["address_carry"].detach().clone()
+    return _byte_history(cfg, tokens, previous)
+
+
+def _byte_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None) -> Tensor:
+    """:func:`address_history`'s bytes: ``[B]``, or ``[B, n]`` with ``address_history=ngram``."""
     if cfg.address_history == "byte":
         return tokens[:, -1].detach().clone()
     n = cfg.address_ngram
@@ -1485,6 +1512,10 @@ class HSN(nn.Module):
                 before = torch.cat([torch.zeros_like(reader_out[:, :1]), reader_out[:, :-1]], 1)
                 context = torch.cat([context, before.masked_fill(reset[:, :, None], 0.0)], dim=-1)
         positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
+        word_state: Tensor | None = None
+        if cfg.word_address != "none":  # the carry is A5's bytes, then the word state
+            prev_tokens, word_state = self._split_address_carry(prev_tokens, B)
+        byte_carry = prev_tokens
         previous_window: Tensor | None = None
         carried: Tensor | None = None  # x_{-2} .. x_{-n} of the window before, when carried
         if cfg.key_address:
@@ -1515,6 +1546,20 @@ class HSN(nn.Module):
                 lag = lag.masked_fill(positions < back, BOS)
                 lags.append(lag)
             older_window = {"older": torch.stack(lags, dim=-1)}
+        events: Tensor | None = None
+        address_carry: Tensor | None = None
+        if cfg.word_address != "none":
+            # model.word_address: the events follow the word rule, and at an event a_cur and
+            # a_prev read the word it closes and the word of the event before; A9's features
+            # (older_window) keep reading the bytes
+            text = torch.zeros_like(reset)
+            for context_id in cfg.word_contexts:
+                text = text | (ctx == context_id)
+            words = self.scorer.word_codes(tokens, text, reset, word_state)
+            events = words.events
+            older_window["codes"] = (words.current, words.previous)
+            history = _byte_history(cfg, tokens, byte_carry).reshape(B, -1).to(torch.int64)
+            address_carry = torch.cat([history, words.state], dim=1)
         scalars = self.scorer.window_scalars(
             ctx,
             positions,
@@ -1525,12 +1570,11 @@ class HSN(nn.Module):
             prev_tokens=previous_window,
             **older_window,
         )  # [B, T, N, 7] (9 with A5; 7 + 2n with A9)
-        # P1.10b: the dense round writes every cell, so its counters are known for the window
-        events: Tensor | None = None
-        if cfg.write_events != "byte":
+        if cfg.write_events != "byte" and events is None:
             # the byte before each position is A5's (BOS at a reset, which is an event anyway)
             assert previous_window is not None  # the configuration requires model.key_address
             events = event_positions(cfg.write_events, tokens, previous_window, reset)
+        # P1.10b: the dense round writes every cell, so its counters are known for the window;
         # the event loop keeps the per-position bookkeeping: a slot is not a byte
         dense_window = mode == "dense" and not self.cell.disabled_cells and events is None
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
@@ -1553,7 +1597,28 @@ class HSN(nn.Module):
             reader=reader_out,
             events=events,
             positions=positions if events is not None else None,
+            address_carry=address_carry,
         )
+
+    def _split_address_carry(
+        self, carry: Tensor | None, B: int
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """``model.word_address``: a window's ``prev_tokens`` (:func:`address_history`: int64
+        ``[B, n + 2d + 6]``) as A5 / A9's bytes (``[B]``, or ``[B, n]`` with
+        ``address_history=ngram``) and the word state; ``(None, None)`` for ``None``."""
+        if carry is None:
+            return None, None
+        cfg = self.cfg
+        n = cfg.address_ngram if cfg.address_history == "ngram" else 1
+        shape = (B, n + state_width(cfg.d))
+        if not isinstance(carry, Tensor) or carry.dtype != torch.int64 or carry.shape != shape:
+            raise ValueError(
+                f"model.word_address={cfg.word_address}: prev_tokens must be the int64 {shape} "
+                "address carry of the window before (info['address_carry'], address_history), "
+                f"got {tuple(carry.shape) if isinstance(carry, Tensor) else type(carry).__name__}"
+            )
+        history = carry[:, :n] if cfg.address_history == "ngram" else carry[:, 0]
+        return history, carry[:, n:]
 
     def _position(
         self,
@@ -1987,6 +2052,8 @@ class HSN(nn.Module):
         # what the per-slot stacks of info (z_hat, eps, the selections) are aligned to
         info["event_valid"] = ev.valid
         info["event_pos"] = ev.where
+        if pro.address_carry is not None:  # model.word_address: the next window's prev_tokens
+            info["address_carry"] = pro.address_carry
         return logits, final, info
 
     def _previous_tokens(self, tokens: Tensor, previous: Tensor | None) -> Tensor:

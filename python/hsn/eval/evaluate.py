@@ -234,9 +234,9 @@ def evaluate_windows(
                 targets = window["targets"].to(device)
                 with ctx:
                     kwargs = {"prev_tokens": prev_tokens} if key_address else {}
-                    logits, state, _info = model(tokens, context, state, reset, **kwargs)
+                    logits, state, info = model(tokens, context, state, reset, **kwargs)
                 if key_address:
-                    prev_tokens = address_history(underlying.cfg, tokens, prev_tokens)
+                    prev_tokens = address_history(underlying.cfg, tokens, prev_tokens, info)
                 group_ids: Tensor | None = None
                 if groups is not None:
                     doc = window["doc"].to(device)

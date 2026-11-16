@@ -156,6 +156,7 @@ from hsn.kernels.costs import CostTable, cost_table_from_config
 from hsn.model.embeddings import init_weight_, parse_init
 from hsn.model.encoder import MLP2
 from hsn.model.state import CellGraphState
+from hsn.model.word_address import WordAddress, word_address, word_tables
 from hsn.profiler import Profiler
 from hsn.train.memory_plan import SCORER_SCALAR_FEATURES
 
@@ -360,6 +361,10 @@ class Scorer(nn.Module):
         self.position = cfg.scorer_position
         self.kind = cfg.scorer
         self.key_address = cfg.key_address
+        #: ``model.word_address``: which word code the event loop's address reads (``none``:
+        #: A5's byte codes) and the names of its table buffers.
+        self.word_address = cfg.word_address if cfg.key_address else "none"
+        self._word_tables: tuple[str, ...] = ()
         #: A9: the longest byte n-gram with an address (1: A5's a_cur and a_prev only)
         self.address_ngram = cfg.address_ngram if cfg.key_address else 1
         ngram_names = tuple(
@@ -439,6 +444,14 @@ class Scorer(nn.Module):
             first.in_features = self.in_features
             if isinstance(self.net, MLP2):
                 self.net.in_dim = self.in_features
+            if cfg.word_address != "none":
+                # model.word_address: the fixed sign tables of the word codes, drawn last, after
+                # everything A5 and A9 draw, so every other buffer and parameter starts as it
+                # does without the key. Buffers, never trained (hsn.model.word_address).
+                signs = word_tables(cfg.word_address, cfg.vocab_size, cfg.d, generator)
+                self._word_tables = tuple(signs)
+                for name, table in signs.items():
+                    self.register_buffer(name, table)
 
         #: A12 (``model.address_gate``): ``G``, a linear map of ``u`` to one weight per (unit,
         #: address feature), added to the unit's own weight on that feature. Zero at the start
@@ -593,6 +606,7 @@ class Scorer(nn.Module):
         tokens: Tensor | None = None,
         prev_tokens: Tensor | None = None,
         older: Tensor | None = None,
+        codes: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         """The features of a window that do not depend on the step (P1.10a): ``[B, T, N, 7]`` in
         ``dtype``, the scalars after ``age`` in layout order (budget, round, context, the two P2.3
@@ -619,14 +633,29 @@ class Scorer(nn.Module):
         self._check_round(round_idx)
         scalars = self._scalars(ctx, pos, budget_frac, round_idx, ema, dtype, ctx.device)
         if self.key_address:
-            addresses = self.address_features(tokens, prev_tokens, older)
+            addresses = self.address_features(tokens, prev_tokens, older, codes)
             if addresses.shape != (*ctx.shape, self.n_cells, 2 * self.address_ngram):
                 raise ValueError("key-address window tokens and prev_tokens must have shape [B, T]")
             scalars = torch.cat([scalars, addresses.to(dtype)], dim=-1)
         return scalars
 
+    def word_codes(
+        self, tokens: Tensor, text: Tensor, reset: Tensor, state: Tensor | None
+    ) -> WordAddress:
+        """``model.word_address``: the events of a window and the word codes that ``a_cur`` and
+        ``a_prev`` read at them (:func:`hsn.model.word_address.word_address`, with this
+        scorer's fixed tables and A5's byte codes)."""
+        if self.word_address == "none":
+            raise ValueError("word_codes requires model.word_address (exact | bag)")
+        tables = {name: getattr(self, name) for name in self._word_tables}
+        return word_address(self.word_address, tables, self.byte_codes, tokens, text, reset, state)
+
     def address_features(
-        self, tokens: Tensor | None, prev_tokens: Tensor | None, older: Tensor | None = None
+        self,
+        tokens: Tensor | None,
+        prev_tokens: Tensor | None,
+        older: Tensor | None = None,
+        codes: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         """A5's fixed similarities ``[..., N, 2]`` in ``a_cur, a_prev`` order.
 
@@ -643,6 +672,11 @@ class Scorer(nn.Module):
         reads the bytes ``x_{t−m+1} .. x_t`` and ``a_prev<m>`` the bytes ``x_{t−m} .. x_{t−1}``,
         so a key of ``m`` bytes has one address at its fact's value and at its query's last
         key byte.
+
+        ``codes`` (``model.word_address``): the codes ``[..., d]`` that ``a_cur`` and ``a_prev``
+        read in place of the byte codes of ``tokens`` and ``prev_tokens`` (:meth:`word_codes`:
+        the word an event closes and the word of the event before). A9's features still read
+        the bytes.
         """
         if not self.key_address:
             raise ValueError("address_features requires model.key_address=true")
@@ -671,8 +705,11 @@ class Scorer(nn.Module):
                 )
         with torch.autocast(device_type=tokens.device.type, enabled=False):
             addresses = self.cell_addresses.transpose(0, 1)
-            current = F.embedding(tokens, self.byte_codes) @ addresses
-            previous = F.embedding(prev_tokens, self.byte_codes) @ addresses
+            if codes is None:
+                current = F.embedding(tokens, self.byte_codes) @ addresses
+                previous = F.embedding(prev_tokens, self.byte_codes) @ addresses
+            else:
+                current, previous = codes[0] @ addresses, codes[1] @ addresses
             feats = [current, previous]
             if n > 1:
                 assert older is not None

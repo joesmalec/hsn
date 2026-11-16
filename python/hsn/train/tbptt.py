@@ -1096,7 +1096,7 @@ class TBPTTTrainer(Trainer):
                 )
                 if self.cfg.model.key_address:
                     self._prev_tokens = address_history(
-                        self.cfg.model, fwd["tokens"], self._prev_tokens
+                        self.cfg.model, fwd["tokens"], self._prev_tokens, info
                     )
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
@@ -1518,7 +1518,11 @@ class TBPTTTrainer(Trainer):
                 raise ValueError(f"{path}: an A5 checkpoint must hold prev_tokens")
             previous = extra["prev_tokens"]
             if previous is not None:
-                if (
+                if self.cfg.model.word_address != "none":
+                    # model.word_address: the bytes, then the word state (checked by the window)
+                    if not isinstance(previous, Tensor) or previous.dtype != torch.int64:
+                        raise ValueError(f"{path}: prev_tokens must be the int64 address carry")
+                elif (
                     not isinstance(previous, Tensor)
                     or previous.dtype not in (torch.int32, torch.int64)
                     or tuple(previous.shape)
