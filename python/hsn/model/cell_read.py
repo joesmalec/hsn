@@ -96,9 +96,11 @@ class CellAttentionRead(nn.Module):
         byte reads) → ``m [B, T, d]``. The same read as :meth:`read` at every byte; the map of
         the cell states runs once per stage and its result is gathered per byte."""
         B, T = (int(n) for n in index.shape)
-        N = int(h.shape[2])
+        S, N = int(h.shape[1]), int(h.shape[2])
         both = self.state(h)  # [B, S, N, 2d]
-        both = both.gather(1, index.view(B, T, 1, 1).expand(-1, -1, N, 2 * self.d))
+        # whole [N, 2d] slices per byte: index_select, far cheaper than an expanded gather
+        flat = (index + torch.arange(B, device=index.device)[:, None] * S).reshape(-1)
+        both = both.reshape(B * S, N, 2 * self.d).index_select(0, flat).view(B, T, N, 2 * self.d)
         return self._attend(c, both, addresses)[0]
 
     def _attend(self, c: Tensor, both: Tensor, addresses: Tensor) -> tuple[Tensor, Tensor]:

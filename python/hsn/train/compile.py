@@ -1568,7 +1568,6 @@ class CompiledWindow:
             readouts=joined("readouts") if model.cfg.selected_readout else None,
         )
 
-
     def _run_events(
         self,
         pro: _Prologue,

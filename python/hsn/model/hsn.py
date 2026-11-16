@@ -393,6 +393,16 @@ def event_positions(kind: str, tokens: Tensor, previous: Tensor, reset: Tensor) 
     return (wordy(previous) & ~wordy(tokens)) | reset
 
 
+def _take_rows(x: Tensor, index: Tensor) -> Tensor:
+    """``x [B, S, …]`` at ``index [B, T]`` along dim 1, ``[B, T, …]``. Whole slices are copied
+    (``index_select`` on the flattened ``[B · S, …]``): for wide slices that, and its
+    backward, cost far less than ``gather`` with an expanded index."""
+    B, S = int(x.shape[0]), int(x.shape[1])
+    flat = (index + torch.arange(B, device=index.device)[:, None] * S).reshape(-1)
+    taken = x.reshape(B * S, *x.shape[2:]).index_select(0, flat)
+    return taken.view(*index.shape, *x.shape[2:])
+
+
 class _Events(NamedTuple):
     """The event slots of a window (:meth:`HSN._event_slots`, ``model.write_events``): every
     row's event positions in order in the first slots, padding behind them. ``E`` slots, a
@@ -1306,7 +1316,9 @@ class HSN(nn.Module):
         B, T = self._check_window_inputs(tokens, ctx, state, reset)
         if not isinstance(capture, bool):
             raise TypeError(f"capture must be a bool, got {capture!r}")
-        if self.cfg.write_events != "byte":  # the loop over events (docs/amendments/write_events.md)
+        if (
+            self.cfg.write_events != "byte"
+        ):  # the loop over events (docs/amendments/write_events.md)
             if reset_columns is not None:  # validated; every slot resets as tensor ops
                 self._reset_columns(reset, reset_columns)
             return self._forward_events(tokens, ctx, state, reset, capture, prev_tokens)
@@ -1748,19 +1760,14 @@ class HSN(nn.Module):
         order = torch.argsort((~events).to(torch.int8), dim=1, stable=True)[:, :E]
         valid = torch.arange(E, device=events.device)[None, :] < count[:, None]
         at = events.cumsum(dim=1)
-
-        def take(x: Tensor) -> Tensor:
-            index = order.view(B, E, *([1] * (x.ndim - 2))).expand(-1, -1, *x.shape[2:])
-            return x.gather(1, index)
-
         return _Events(
             valid=valid,
             where=order,
-            z=take(pro.z),
-            context=take(pro.context),
-            scalars=take(pro.scalars),
-            reset=take(reset),
-            pos=take(positions),
+            z=_take_rows(pro.z, order),
+            context=_take_rows(pro.context, order),
+            scalars=_take_rows(pro.scalars, order),
+            reset=_take_rows(reset, order),
+            pos=_take_rows(positions, order),
             at=at,
             before=at - events.to(at.dtype),
         )
@@ -1934,24 +1941,20 @@ class HSN(nn.Module):
         in the loop over bytes."""
         events, positions = pro.events, pro.positions
         assert events is not None and positions is not None
-        B, T = (int(n) for n in events.shape)
-        d = self.cfg.d
 
         def joined(key: str) -> Tensor:
             return blocks[0][key] if len(blocks) == 1 else torch.cat([b[key] for b in blocks], 1)
 
         def latest(first: Tensor, slots: Tensor, index: Tensor) -> Tensor:
             stack = torch.cat([first[:, None].to(slots.dtype), slots], dim=1)  # [B, 1 + E, …]
-            wide = index.view(B, T, *([1] * (stack.ndim - 2))).expand(-1, -1, *stack.shape[2:])
-            return stack.gather(1, wide)
+            return _take_rows(stack, index)
 
         slot_q, slot_r = joined("qs"), joined("readouts")
         q_at = latest(start.q, slot_q, ev.at)
         q_before = latest(start.q, slot_q, ev.before)
         u_between = self.shared(self._shared_input(pro.z, q_before, pro.context, start.h))
-        slot_u = joined("u")
-        own = (ev.at - 1).clamp_min(0)[:, :, None].expand(-1, -1, int(slot_u.shape[-1]))
-        us = torch.where(events[:, :, None], slot_u.gather(1, own), u_between.to(slot_u.dtype))
+        slot_u = _take_rows(joined("u"), (ev.at - 1).clamp_min(0))  # an event's own slot
+        us = torch.where(events[:, :, None], slot_u, u_between.to(slot_u.dtype))
         readouts = latest(torch.zeros_like(slot_r[:, 0]), slot_r, ev.at)
         if self.cell_read is not None:
             assert pro.reader is not None

@@ -202,7 +202,9 @@ ANCHOR = {
 }
 
 
-def _window_of(cfg: RunConfig, model: HSNT) -> tuple[Tensor, Tensor, CellGraphState, Tensor, Tensor]:
+def _window_of(
+    cfg: RunConfig, model: HSNT
+) -> tuple[Tensor, Tensor, CellGraphState, Tensor, Tensor]:
     tokens, ctx, reset, prev = _text(cfg)
     return tokens, ctx, _start(model, tokens.shape[0]), reset, _carry(cfg, prev)
 
@@ -329,7 +331,9 @@ def _rows(state: CellGraphState, rows: slice) -> CellGraphState:
 
 
 @pytest.mark.parametrize("name", ["cattn", "soft_cattn"])
-def test_padding_slots_leave_the_state_unchanged(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_padding_slots_leave_the_state_unchanged(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cfg = _ev_cfg("word", *WORD[name], T_LONG)
     model = _model(cfg)
     tokens, ctx, state, reset, carry = _window_of(cfg, model)
@@ -600,7 +604,9 @@ def test_compiled_event_window_equals_eager(
 
 
 @pytest.mark.parametrize("extra", [(), (CATTN,)])
-def test_recipe_with_word_events_trains_and_evaluates(extra: tuple[str, ...], tmp_path: Path) -> None:
+def test_recipe_with_word_events_trains_and_evaluates(
+    extra: tuple[str, ...], tmp_path: Path
+) -> None:
     """Thirty TBPTT steps of the small A6 recipe with the candidate's cut on the tiny CPU
     configuration of the trainer tests, the memory writing at word ends only: finite losses
     that fall, the route guard and the statistics fed per event slot, and two evaluations."""
