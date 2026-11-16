@@ -109,6 +109,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.memory",  # HSN-T without its memory
         "train.content_dropout",  # the byte-content options (opt-in, docs/key_content.md)
         "model.zero_unseen_bytes",
+        "train.content_dropout_target",  # the learned unknown rows (opt-in)
+        "model.unseen_bytes_as",
     )
 
 

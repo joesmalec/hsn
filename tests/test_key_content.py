@@ -6,6 +6,11 @@ row in place of the byte's row of the two content tables. The tests hold them to
 defaults are the model of f3f271a, the blanked positions are exactly the drawn ones (training
 only) and exactly the bytes no training window held, nothing else of the window changes, and
 the trainer, the compiled window and the split window run with them.
+
+``train.content_dropout_target = unknown`` and ``model.unseen_bytes_as`` (the last section):
+the same positions read a learned unknown row of each table instead of zero; the rows are
+drawn like their tables from generators of their own, get the gradient of exactly the
+positions that read them, and train, resume and run in the compiled and the split window.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import test_p2_8_compile as p28
 import torch
@@ -25,8 +31,9 @@ from hsn.config import HASH_OMIT_AT_DEFAULT, RunConfig, canonical_json, config_h
 from hsn.data.dataset import ByteDataset
 from hsn.device import resolve, seed_everything
 from hsn.experiments.spec import arm_identity, memory_key
+from hsn.model.embeddings import init_weight_, replace_content
 from hsn.model.hsn import HSN
-from hsn.runner import build_model, warm_start
+from hsn.runner import build_model, load_datasets, warm_start
 from hsn.train import tbptt
 from hsn.train.checkpoint import load_checkpoint
 from hsn.train.compile import compile_window
@@ -48,6 +55,16 @@ READER_LM = REPO / "configs" / "baselines" / "reader_w64l2.yaml"
 
 DROP = "train.content_dropout=0.3"
 ZERO = "model.zero_unseen_bytes=true"
+#: the learned unknown rows: dropout to them, and the never-trained bytes read them too
+TO_UNKNOWN = "train.content_dropout_target=unknown"
+UNSEEN_UNKNOWN = "model.unseen_bytes_as=unknown"
+#: the two option sets of the windows below: zero rows, and the learned unknown rows
+BLANKS: dict[str, tuple[str, ...]] = {
+    "zero": (DROP, ZERO),
+    "unknown": (DROP, TO_UNKNOWN, UNSEEN_UNKNOWN),
+}
+#: the learned unknown rows' parameter names
+UNKNOWN_ROWS = ("byte_emb.unknown", "reader.emb_unknown")
 #: the candidate's cut: the cell's read of the state keeps its gradient
 CUT_C = "train.feedback_detach=[summary,eps,router]"
 #: the reader of the six-cell model of the A6 tests (d = 8), short-sighted
@@ -165,15 +182,23 @@ def _reads(model: HSN, blank: Tensor | None = None) -> Iterator[_Reads]:
         reads.close()
 
 
-def _assert_blanked(model: HSN, reads: _Reads, tokens: Tensor, blank: Tensor) -> None:
-    """``E`` and the reader read the tables' rows, zero exactly where ``blank`` is True."""
+def _assert_blanked(
+    model: HSN, reads: _Reads, tokens: Tensor, blank: Tensor, *, unknown: bool = False
+) -> None:
+    """``E`` and the reader read the tables' rows, zero exactly where ``blank`` is True (with
+    ``unknown``: their learned unknown row there)."""
     assert 0 < int(blank.sum()) < blank.numel()  # the case holds both kinds of position
-    tables = [(reads.encoder, model.byte_emb(tokens).detach())]
+    byte_row, reader_row = model.unknown_rows()
+    tables = [(reads.encoder, model.byte_emb(tokens).detach(), byte_row)]
     if model.reader is not None:
-        tables.append((reads.reader, model.reader.emb(tokens).detach()))
-    for read, rows in tables:
+        tables.append((reads.reader, model.reader.emb(tokens).detach(), reader_row))
+    for read, rows, row in tables:
         assert read is not None
-        assert bool((read[blank] == 0.0).all())
+        if unknown:
+            assert row is not None
+            assert torch.equal(read[blank], row.detach().expand(int(blank.sum()), -1))
+        else:
+            assert bool((read[blank] == 0.0).all())
         assert torch.equal(read[~blank], rows[~blank]) and bool((rows[blank] != 0.0).any())
 
 
@@ -225,11 +250,25 @@ def test_keys_are_opt_in_and_the_defaults_keep_every_identity() -> None:
     assert base.train.content_dropout == 0.0 and base.model.zero_unseen_bytes is False
     dump = json.loads(canonical_json(base))
     assert "content_dropout" not in dump["train"] and "zero_unseen_bytes" not in dump["model"]
-    assert {"train.content_dropout", "model.zero_unseen_bytes"} <= set(HASH_OMIT_AT_DEFAULT)
+    assert base.train.content_dropout_target == "zero" and base.model.unseen_bytes_as == "own"
+    assert "content_dropout_target" not in dump["train"] and "unseen_bytes_as" not in dump["model"]
+    assert {
+        "train.content_dropout",
+        "model.zero_unseen_bytes",
+        "train.content_dropout_target",
+        "model.unseen_bytes_as",
+    } <= set(HASH_OMIT_AT_DEFAULT)
     for overrides, (hashed, memory, arm) in F3F271A.items():
         cfg = load_config(RECIPE_A6, list(overrides))
         named = load_config(
-            RECIPE_A6, [*overrides, "train.content_dropout=0.0", "model.zero_unseen_bytes=false"]
+            RECIPE_A6,
+            [
+                *overrides,
+                "train.content_dropout=0.0",
+                "model.zero_unseen_bytes=false",
+                "train.content_dropout_target=zero",
+                "model.unseen_bytes_as=own",
+            ],
         )
         for config in (cfg, named):
             assert config_hash(config) == hashed
@@ -255,7 +294,7 @@ def test_defaults_build_the_model_without_the_options(family: str) -> None:
     assert off.content_dropout == 0.0 and off.byte_seen is None
     assert "byte_seen" not in off.state_dict() and not list(off.buffers(recurse=False))
     tokens, _, _ = _window(_cfg(*FAMILIES[family]))
-    assert off._content_blank(tokens) is None  # training mode: nothing is drawn or computed
+    assert off._content_masks(tokens) == (None, None)  # training: nothing is drawn or computed
     off.mark_bytes_seen(tokens)  # a no-op with the key off
     assert off.byte_seen is None
     # the options leave the initialisation alone: every tensor the models share starts equal
@@ -514,10 +553,11 @@ def test_both_options_blank_the_union() -> None:
         _assert_blanked(model, reads, tokens, unseen)
 
 
-def test_window_under_bf16_autocast_with_both_options() -> None:
+@pytest.mark.parametrize("blanks", list(BLANKS))
+def test_window_under_bf16_autocast_with_both_options(blanks: str) -> None:
     """The card's precision (float32 masters under bf16 autocast): the rows are blanked where
     the tables are read, before any cast, and the window and its gradients are finite."""
-    cfg = _cfg(*FAMILIES["hsn_t"], "train.gate_mode=ste", DROP, ZERO)
+    cfg = _cfg(*FAMILIES["hsn_t"], "train.gate_mode=ste", *BLANKS[blanks])
     model = _build(cfg, torch.float32)
     model.set_train_step(2)
     tokens, ctx, reset = _window(cfg)
@@ -526,7 +566,7 @@ def test_window_under_bf16_autocast_with_both_options() -> None:
     state = _start(model, B)
     with _reads(model) as reads, torch.autocast("cpu", dtype=torch.bfloat16):
         logits, new_state, _ = model(tokens, ctx, state, reset)
-        _assert_blanked(model, reads, tokens, blank)
+        _assert_blanked(model, reads, tokens, blank, unknown=blanks == "unknown")
     assert bool(torch.isfinite(logits).all()) and new_state.h.dtype == torch.float32
     logits.float().square().mean().backward()
     assert model.reader is not None
@@ -536,6 +576,11 @@ def test_window_under_bf16_autocast_with_both_options() -> None:
         read = torch.zeros(model.cfg.vocab_size, dtype=torch.bool)
         read[tokens[~blank]] = True
         assert not bool(table.grad[~read].any()) and bool(table.grad[read].any())
+    for row in model.unknown_rows():  # (None, None) with zero rows
+        assert (row is None) == (blanks == "zero")
+        if row is not None:
+            assert row.grad is not None and row.grad.dtype == torch.float32
+            assert bool(torch.isfinite(row.grad).all()) and bool(row.grad.any())
 
 
 def test_seen_bytes_are_saved_with_the_model_only_with_the_key_on() -> None:
@@ -560,20 +605,22 @@ def test_seen_bytes_are_saved_with_the_model_only_with_the_key_on() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("family", list(FAMILIES))
+@pytest.mark.parametrize(
+    ("family", "blanks"), [("hsn", "zero"), ("hsn_t", "zero"), ("hsn_t", "unknown")]
+)
 @pytest.mark.usefixtures("small_blocks")
-def test_compiled_window_equals_eager_with_both_options(family: str) -> None:
+def test_compiled_window_equals_eager_with_both_options(family: str, blanks: str) -> None:
     """The options act in the window's prologue, which the compiled window runs eagerly: the
     compiled training window and the compiled evaluation window equal the eager ones."""
     reader = READER if family == "hsn_t" else ()
+    unknown = blanks == "unknown"
     cfg = p28._cfg(
         "model.routing=topk",
         "model.key_address=true",
         "model.selected_readout=true",
         "train.gate_mode=ste",
         *reader,
-        DROP,
-        ZERO,
+        *BLANKS[blanks],
     )
     seed_everything(0)
     model = build_model(cfg)
@@ -593,16 +640,22 @@ def test_compiled_window_equals_eager_with_both_options(family: str) -> None:
     ref = p28._run(lambda: model(tokens, cx, state, reset))
     with _reads(model) as reads:
         got = p28._run(lambda: window(tokens, cx, state, reset))
-        _assert_blanked(model, reads, tokens, blank)
+        _assert_blanked(model, reads, tokens, blank, unknown=unknown)
     diff = p28._max_diff(got, ref)
     assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], diff
-    assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"]
+    grads, grads_ref = p28._grads(model, got), p28._grads(model, ref)
+    assert p28._grad_diff(grads, grads_ref) <= tol["grads"]
+    if unknown:  # the unknown rows are trained in the compiled window too
+        named = [n for n, p in model.named_parameters() if p.requires_grad]
+        for name in UNKNOWN_ROWS if reader else UNKNOWN_ROWS[:1]:
+            grad = grads[named.index(name)]
+            assert grad is not None and bool(grad.any())
     model.eval()
     with torch.no_grad():
         ref = p28._run(lambda: model(tokens, cx, state, reset))
         with _reads(model) as reads:
             got = p28._run(lambda: window(tokens, cx, state, reset))
-            _assert_blanked(model, reads, tokens, unseen)
+            _assert_blanked(model, reads, tokens, unseen, unknown=unknown)
     diff = p28._max_diff(got, ref)
     assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], diff
 
@@ -619,7 +672,8 @@ def _terms(logits: Tensor, info: dict[str, Tensor], mask: Tensor) -> dict[str, T
     }
 
 
-def test_split_window_equals_the_autograd_window_with_both_options() -> None:
+@pytest.mark.parametrize("blanks", list(BLANKS))
+def test_split_window_equals_the_autograd_window_with_both_options(blanks: str) -> None:
     """``hardware.window=split`` (the HSN's): the sweep and the replay start from the same
     prologue, so the split window's values and gradients are the autograd window's.
 
@@ -630,8 +684,9 @@ def test_split_window_equals_the_autograd_window_with_both_options() -> None:
     with the same reads zeroed from outside in the model without them: gaps up to 2e-9 of
     the largest entry in one term and 7e-9 in a summed objective, the largest of them in
     the scorer's linear layer. A window that blanked other positions than the other would
-    differ by its whole size."""
-    cfg = _cfg(*A5, ALL, "model.cand_norm=rms", DROP, ZERO)
+    differ by its whole size. With the unknown rows, their gradients are among those
+    compared."""
+    cfg = _cfg(*A5, ALL, "model.cand_norm=rms", *BLANKS[blanks])
     model = _build(cfg)
     model.set_train_step(1)
     tokens, ctx, reset = _window(cfg)
@@ -643,10 +698,12 @@ def test_split_window_equals_the_autograd_window_with_both_options() -> None:
     mask = torch.zeros_like(reset)
     mask[:, 3::4] = True
     params = [p for _, p in model.named_parameters()]
+    names = [n for n, _ in model.named_parameters()]
+    assert ("byte_emb.unknown" in names) == (blanks == "unknown")
     logits, ref_state, ref_info = model(tokens, ctx, state, reset)
     with _reads(model) as reads:
         s_logits, s_state, s_info = SplitWindow(model, cfg, None)(tokens, ctx, state, reset)
-        _assert_blanked(model, reads, tokens, blank)
+        _assert_blanked(model, reads, tokens, blank, unknown=blanks == "unknown")
     torch.testing.assert_close(s_logits, logits, rtol=1e-10, atol=1e-12)
     for field in ("h", "q"):
         torch.testing.assert_close(
@@ -655,17 +712,19 @@ def test_split_window_equals_the_autograd_window_with_both_options() -> None:
     for key in ("cell_idx", "unit_idx", "valid"):
         assert torch.equal(s_info[key], ref_info[key])
     ref_terms, got_terms = _terms(logits, ref_info, mask), _terms(s_logits, s_info, mask)
-    live = 0
+    live, row_live = 0, 0
     for name, term in ref_terms.items():
         ref = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
         got = torch.autograd.grad(got_terms[name], params, retain_graph=True, allow_unused=True)
-        for want, have in zip(ref, got, strict=True):
+        for param, want, have in zip(names, ref, got, strict=True):
             assert (want is None) == (have is None), name
             if want is not None and have is not None:
                 largest = float(want.abs().max())
                 assert float((have - want).abs().max()) <= 1e-6 * largest + 1e-12, name
                 live += int(largest > 0)
+                row_live += int(param in UNKNOWN_ROWS and largest > 0)
     assert live >= 20  # real gradients, not zeros
+    assert (row_live > 0) == (blanks == "unknown")
 
 
 def test_sweep_twin_holds_the_seen_bytes_and_sweeps_the_same_tape() -> None:
@@ -723,23 +782,36 @@ def _trainer(cfg: RunConfig, run_dir: Path) -> TBPTTTrainer:
 
 
 @pytest.mark.parametrize(
-    "options", [("train.content_dropout=0.1",), (ZERO,), ("train.content_dropout=0.1", ZERO)]
+    "options",
+    [
+        ("train.content_dropout=0.1",),
+        (ZERO,),
+        ("train.content_dropout=0.1", ZERO),
+        ("train.content_dropout=0.1", TO_UNKNOWN, UNSEEN_UNKNOWN),
+    ],
 )
 @pytest.mark.parametrize("family", list(TRAINED_FAMILIES))
 def test_recipe_with_the_options_trains(
     family: str, options: tuple[str, ...], tmp_path: Path
 ) -> None:
     """Thirty TBPTT steps on the tiny CPU configuration of the trainer tests: finite losses
-    that fall, and a final evaluation."""
+    that fall, and a final evaluation; the unknown rows are trained."""
     steps = 30
     cfg = hsn_config(steps, *TRAINED_FAMILIES[family], *options)
     trainer = _trainer(cfg, tmp_path / "run")
+    start = [None if r is None else r.detach().clone() for r in trainer.hsn.unknown_rows()]
     history = trainer.fit(*datasets(), steps)
     losses = [s.loss for s in history.steps]
     assert len(losses) == steps and all(math.isfinite(x) for x in losses)
     first, last = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
     assert last < first - 0.05, (first, last)
     assert history.evals and math.isfinite(history.evals[-1]["loss"])
+    rows = trainer.hsn.unknown_rows()
+    expected = 2 if TO_UNKNOWN in options and family == "hsn_t" else int(TO_UNKNOWN in options)
+    assert sum(r is not None for r in rows) == expected
+    for row, before in zip(rows, start, strict=True):
+        if row is not None and before is not None:
+            assert bool(torch.isfinite(row).all()) and not torch.equal(row.detach(), before)
 
 
 def _log_blank_rows(model: HSN) -> list[tuple[int, Tensor]]:
@@ -875,3 +947,492 @@ def test_resume_draws_the_same_positions_and_keeps_the_seen_bytes(tmp_path: Path
     ]
     with pytest.raises(ValueError, match="configuration"):
         plain.resume(tmp_path / "full" / "step_00000004.pt")
+
+
+# --------------------------------------------------------------------------------------------------
+# train.content_dropout_target = unknown and model.unseen_bytes_as: the learned unknown rows
+# --------------------------------------------------------------------------------------------------
+
+#: the seed tags of the two rows' generators (b"KCUB", b"KCUR")
+UNKNOWN_TAGS = {"byte_emb.unknown": 0x4B435542, "reader.emb_unknown": 0x4B435552}
+UNSEEN_ZERO = "model.unseen_bytes_as=zero"
+
+
+def _rows_of(family: str) -> tuple[str, ...]:
+    return UNKNOWN_ROWS if family == "hsn_t" else UNKNOWN_ROWS[:1]
+
+
+def _build_unknown(cfg: RunConfig, dtype: torch.dtype = torch.float64) -> HSN:
+    """:func:`_build` for a model with the unknown rows: the shared parameters get the offsets
+    :func:`_build` gives the model without them (the rows are moved after every other one), so
+    the two models hold the same weights."""
+    seed_everything(0)
+    model = build_model(cfg).to(dtype)
+    assert isinstance(model, HSN)
+    generator = torch.Generator().manual_seed(7)
+    named = list(model.named_parameters())
+    order = [p for n, p in named if n not in UNKNOWN_ROWS] + [
+        p for n, p in named if n in UNKNOWN_ROWS
+    ]
+    with torch.no_grad():
+        for p in order:
+            p.add_(0.3 * torch.randn(p.shape, generator=generator, dtype=p.dtype))
+    return model.train()
+
+
+class _Swapped(_Reads):
+    """The reads of a model without the unknown rows, with ``rows`` (byte row, reader row) put
+    in from outside where ``unknown`` is True and zero where ``zero`` is: the reference that a
+    model with the rows is compared with."""
+
+    def __init__(
+        self,
+        model: HSN,
+        zero: Tensor | None,
+        unknown: Tensor | None,
+        rows: tuple[Tensor, Tensor | None],
+    ) -> None:
+        super().__init__(model)
+        self.zero, self.unknown, self.rows = zero, unknown, rows
+
+    def __enter__(self) -> _Swapped:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _encoder(self, module: Any, args: tuple[Any, ...]) -> tuple[Any, ...]:
+        x = replace_content(args[0], self.zero, self.unknown, self.rows[0])
+        self.encoder = x.detach().clone()
+        return (x, *args[1:])
+
+    def _reader(self, module: Any, args: tuple[Any, ...]) -> tuple[Any, ...]:
+        x = replace_content(args[0], self.zero, self.unknown, self.rows[1])
+        self.reader = x.detach().clone()
+        return (x, *args[1:])
+
+
+def _outside_rows(model: HSN) -> tuple[Tensor, Tensor | None]:
+    """Leaf copies of ``model``'s unknown rows, to put into a model without them."""
+    byte_row, reader_row = model.unknown_rows()
+    assert byte_row is not None
+    outside = byte_row.detach().clone().requires_grad_()
+    return outside, None if reader_row is None else reader_row.detach().clone().requires_grad_()
+
+
+def _assert_same_window_and_row_gradients(
+    on: HSN, got: p28.Window, off: HSN, ref: p28.Window, outside: tuple[Tensor, Tensor | None]
+) -> None:
+    """The window of ``on`` (with the rows) is the window of ``off`` (rows put in from outside)
+    bit for bit, every shared parameter has the same gradient, and each unknown row has the
+    gradient of its outside copy: what the positions that read it send back, and nothing
+    else."""
+    _assert_same_window(got, ref)
+    names = [n for n, p in on.named_parameters() if p.requires_grad]
+    params = [p for n, p in on.named_parameters() if p.requires_grad]
+    grads = dict(
+        zip(names, torch.autograd.grad(p28._loss(got), params, allow_unused=True), strict=True)
+    )
+    off_names = [n for n, p in off.named_parameters() if p.requires_grad]
+    off_params = [p for n, p in off.named_parameters() if p.requires_grad]
+    extra = [r for r in outside if r is not None]
+    off_grads = torch.autograd.grad(p28._loss(ref), [*off_params, *extra], allow_unused=True)
+    assert set(names) - set(off_names) == set(UNKNOWN_ROWS[: len(extra)])
+    live = 0
+    for name, g in zip(off_names, off_grads[: len(off_names)], strict=True):
+        assert (g is None) == (grads[name] is None), name
+        if g is not None:
+            assert torch.equal(grads[name], g), name
+            live += int(bool(g.abs().max() > 0))
+    assert live >= 20
+    for name, g in zip(UNKNOWN_ROWS, off_grads[len(off_names) :], strict=False):
+        assert g is not None and bool(g.any()), name  # the row is trained
+        assert torch.equal(grads[name], g), name
+
+
+@pytest.mark.parametrize("family", list(FAMILIES))
+def test_unknown_rows_exist_only_with_the_target_and_are_drawn_like_their_tables(
+    family: str,
+) -> None:
+    plain_cfg = _cfg(*FAMILIES[family], DROP)
+    cfg = _cfg(*FAMILIES[family], DROP, TO_UNKNOWN)
+    seed_everything(0)
+    off = build_model(plain_cfg)
+    stream_off = torch.get_rng_state()
+    seed_everything(0)
+    on = build_model(cfg)
+    stream_on = torch.get_rng_state()
+    assert isinstance(on, HSN) and isinstance(off, HSN)
+    assert torch.equal(stream_on, stream_off)  # the rows do not read the global stream
+    rows = _rows_of(family)
+    on_state, off_state = on.state_dict(), off.state_dict()
+    assert set(on_state) - set(off_state) == set(rows) and set(off_state) <= set(on_state)
+    assert all(_same(on_state[key], value) for key, value in off_state.items())
+    assert off.unknown_rows() == (None, None) and off.content_dropout_target == "zero"
+    # drawn as their tables' rows are, from generators seeded with (run seed, tag) alone
+    drawn = dict(zip(UNKNOWN_ROWS, on.unknown_rows(), strict=True))
+    for name in UNKNOWN_ROWS:
+        row = drawn[name]
+        if name not in rows:
+            assert row is None
+            continue
+        state = np.random.SeedSequence([cfg.seed, UNKNOWN_TAGS[name]]).generate_state(1)[0]
+        generator = torch.Generator().manual_seed(int(state))
+        if name == "byte_emb.unknown":
+            expected = init_weight_(
+                torch.empty(1, cfg.model.d), cfg.model.state_init, generator=generator
+            )
+        else:
+            expected = torch.nn.init.normal_(
+                torch.empty(1, cfg.model.reader_width), std=0.02, generator=generator
+            )
+        assert row is not None and row.ndim == 2 and row.requires_grad
+        assert torch.equal(row.detach(), expected), name
+        assert row is on.get_parameter(name)
+    # parameters of their tables' modules: counted in the tables' report rows
+    report_on, report_off = on.param_report(), off.param_report()
+    assert report_on["byte_emb"] - report_off["byte_emb"] == cfg.model.d
+    width = cfg.model.reader_width if family == "hsn_t" else 0
+    assert report_on["total_trainable"] - report_off["total_trainable"] == cfg.model.d + width
+    if family == "hsn_t":
+        assert report_on["reader"] - report_off["reader"] == width
+    # another seed draws other rows
+    other = build_model(_cfg(*FAMILIES[family], DROP, TO_UNKNOWN, "seed=1"))
+    assert isinstance(other, HSN)
+    other_row, byte_row = other.unknown_rows()[0], on.unknown_rows()[0]
+    assert other_row is not None and byte_row is not None
+    assert not torch.equal(other_row, byte_row)
+    assert "content_dropout_target='unknown'" in on.extra_repr()
+    assert "content_dropout_target" not in off.extra_repr()
+    # a checkpoint with the rows does not load into a model without them, nor the reverse
+    with pytest.raises(RuntimeError, match="unknown"):
+        off.load_state_dict(on.state_dict())
+    with pytest.raises(RuntimeError, match="unknown"):
+        on.load_state_dict(off.state_dict())
+
+
+@pytest.mark.parametrize("family", list(FAMILIES))
+def test_unknown_target_puts_the_learned_row_at_exactly_the_dropped_positions(
+    family: str,
+) -> None:
+    """In training the dropped positions read the unknown row and every other position its
+    byte's row; the window is, bit for bit and in every gradient, the window of the model
+    without the keys whose two reads get the row from outside at those positions, and the
+    row gets exactly the gradient of the positions that read it. In evaluation nothing
+    changes (the bytes keep their own rows here)."""
+    cfg = _cfg(*FAMILIES[family], DROP, TO_UNKNOWN)
+    on, off = _build_unknown(cfg), _build(_cfg(*FAMILIES[family]))
+    on.set_train_step(3)
+    tokens, ctx, reset = _window(cfg)
+    B, T = tokens.shape
+    drop = on.content_drop_mask(B, T)
+    with _reads(on) as reads:
+        got = on(tokens, ctx, _start(on, B), reset)
+        _assert_blanked(on, reads, tokens, drop, unknown=True)
+    assert torch.equal(got[2]["z_target"], on.byte_emb(tokens).detach())  # the target is kept
+    outside = _outside_rows(on)
+    with _Swapped(off, None, drop, outside):
+        ref = off(tokens, ctx, _start(off, B), reset)
+    _assert_same_window_and_row_gradients(on, got, off, ref, outside)
+    # the row is not a zero row: the window differs from the window with zero rows
+    with _reads(off, drop):
+        zeroed = off(tokens, ctx, _start(off, B), reset)
+    assert not torch.equal(zeroed[0], got[0])
+    on.eval()
+    off.eval()
+    with torch.no_grad():
+        _assert_same_window(
+            on(tokens, ctx, _start(on, B), reset), off(tokens, ctx, _start(off, B), reset)
+        )
+
+
+@pytest.mark.parametrize("training", [True, False])
+@pytest.mark.parametrize("family", list(FAMILIES))
+def test_unseen_bytes_as_unknown_reads_the_row_at_exactly_the_unseen_bytes(
+    family: str, training: bool
+) -> None:
+    """Never-trained bytes read the unknown row and the other bytes their own rows, in both
+    modes; in training the dropped positions read it too. Nothing else changes, and the row
+    gets the gradient of the positions that read it."""
+    cfg = _cfg(*FAMILIES[family], DROP, TO_UNKNOWN, UNSEEN_UNKNOWN)
+    on, off = _build_unknown(cfg).train(training), _build(_cfg(*FAMILIES[family])).train(training)
+    assert on.unseen_bytes_as == "unknown" and on.byte_seen is not None
+    on.set_train_step(5)
+    tokens, ctx, reset = _window(cfg)
+    B, T = tokens.shape
+    unseen = _half_seen(on, tokens)
+    reads_row = unseen | on.content_drop_mask(B, T) if training else unseen
+    assert bool((reads_row & ~unseen).any()) == training
+    with torch.set_grad_enabled(training):
+        with _reads(on) as reads:
+            got = on(tokens, ctx, _start(on, B), reset)
+            _assert_blanked(on, reads, tokens, reads_row, unknown=True)
+        outside = _outside_rows(on)
+        with _Swapped(off, None, reads_row, outside):
+            ref = off(tokens, ctx, _start(off, B), reset)
+        if training:
+            _assert_same_window_and_row_gradients(on, got, off, ref, outside)
+        else:
+            _assert_same_window(got, ref)
+        # with every byte of the window seen, only the dropped positions read the row
+        on.mark_bytes_seen(tokens)
+        with _reads(on) as reads:
+            got = on(tokens, ctx, _start(on, B), reset)
+        if training:
+            _assert_blanked(on, reads, tokens, on.content_drop_mask(B, T), unknown=True)
+        else:
+            _assert_same_window(got, off(tokens, ctx, _start(off, B), reset))
+
+
+def test_unseen_bytes_as_unknown_in_a_single_position() -> None:
+    """:meth:`HSN.step` (evaluation mode) reads the unknown row at a never-trained byte."""
+    cfg = _cfg(*FAMILIES["hsn"], DROP, TO_UNKNOWN, UNSEEN_UNKNOWN)
+    on, off = _build_unknown(cfg).eval(), _build(_cfg(*FAMILIES["hsn"])).eval()
+    tokens, ctx, _ = _window(cfg)
+    x, c = tokens[:, 0], ctx[:, 0]
+    on.mark_bytes_seen(x[:1])
+    unseen = x != x[0]
+    assert bool(unseen.any()) and not bool(unseen.all())
+    with torch.no_grad():
+        got = on.step(x, c, _start(on, x.shape[0]))
+        with _Swapped(off, None, unseen, _outside_rows(on)):
+            ref = off.step(x, c, _start(off, x.shape[0]))
+        plain = off.step(x, c, _start(off, x.shape[0]))
+    assert torch.equal(got.logits, ref.logits) and torch.equal(got.state.h, ref.state.h)
+    assert torch.equal(got.z_target, plain.z_target)  # the target keeps the byte's row
+    assert not torch.equal(got.logits, plain.logits)
+
+
+def test_zero_unseen_bytes_with_dropout_to_the_unknown_row() -> None:
+    """``model.unseen_bytes_as=zero`` with ``train.content_dropout_target=unknown``: a dropped
+    position reads the unknown row whatever its byte, an unseen byte that is not dropped reads
+    zero, and in evaluation the unseen bytes read zero."""
+    cfg = _cfg(*FAMILIES["hsn_t"], DROP, TO_UNKNOWN, UNSEEN_ZERO)
+    on, off = _build_unknown(cfg), _build(_cfg(*FAMILIES["hsn_t"]))
+    on.set_train_step(2)
+    tokens, ctx, reset = _window(cfg)
+    B, T = tokens.shape
+    unseen = _half_seen(on, tokens)
+    drop = on.content_drop_mask(B, T)
+    assert bool((drop & unseen).any()) and bool((unseen & ~drop).any())
+    zero, unknown = on._content_masks(tokens)
+    assert zero is not None and unknown is not None
+    assert torch.equal(unknown, drop) and torch.equal(zero, unseen & ~drop)
+    outside = _outside_rows(on)
+    got = on(tokens, ctx, _start(on, B), reset)
+    with _Swapped(off, unseen & ~drop, drop, outside):
+        ref = off(tokens, ctx, _start(off, B), reset)
+    _assert_same_window_and_row_gradients(on, got, off, ref, outside)
+    on.eval()
+    with _reads(on) as reads, torch.no_grad():
+        on(tokens, ctx, _start(on, B), reset)
+        _assert_blanked(on, reads, tokens, unseen)
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_zero_unseen_bytes_is_unseen_bytes_as_zero(training: bool) -> None:
+    """The older spelling and the new one build the same model: the same state-dict keys,
+    the same window bit for bit, and one's checkpoint loads into the other."""
+    old_cfg = _cfg(*FAMILIES["hsn_t"], DROP, ZERO)
+    new_cfg = _cfg(*FAMILIES["hsn_t"], DROP, UNSEEN_ZERO)
+    assert old_cfg.model.unseen_bytes_mode == new_cfg.model.unseen_bytes_mode == "zero"
+    old, new = _build(old_cfg).train(training), _build(new_cfg).train(training)
+    assert old.unseen_bytes_as == new.unseen_bytes_as == "zero"
+    assert "zero_unseen_bytes=True" in new.extra_repr()
+    tokens, ctx, reset = _window(old_cfg)
+    B = tokens.shape[0]
+    _half_seen(old, tokens)
+    new.load_state_dict(old.state_dict())  # strict: byte_seen with the marks
+    old.set_train_step(4)
+    new.set_train_step(4)
+    with torch.set_grad_enabled(training):
+        got = new(tokens, ctx, _start(new, B), reset)
+        ref = old(tokens, ctx, _start(old, B), reset)
+        _assert_same_window(got, ref)
+        if training:
+            _assert_same_gradients(new, got, old, ref)
+    # two spellings of one model, two configuration hashes
+    assert config_hash(old_cfg) != config_hash(new_cfg)
+
+
+@pytest.mark.parametrize(
+    ("path", "overrides", "message"),
+    [
+        (RECIPE_A6, [UNSEEN_UNKNOWN], "only train.content_dropout_target=unknown builds"),
+        (RECIPE_A6, ["train.content_dropout=0.1", UNSEEN_UNKNOWN], "builds and trains"),
+        (RECIPE_A6, [TO_UNKNOWN], "no position is dropped"),
+        (RECIPE_A6, [TO_UNKNOWN, UNSEEN_UNKNOWN], "no position is dropped"),
+        (RECIPE_A6, [ZERO, UNSEEN_ZERO], "older spelling"),
+        (RECIPE_A6, [ZERO, "train.content_dropout=0.1", TO_UNKNOWN, UNSEEN_UNKNOWN], "older"),
+        (RECIPE_A6, ["train.content_dropout_target=blank"], "content_dropout_target"),
+        (RECIPE_A6, ["model.unseen_bytes_as=random"], "unseen_bytes_as"),
+        (GRU_2M, ["train.content_dropout=0.1", TO_UNKNOWN], "generic trainer"),
+        (GRU_2M, [UNSEEN_ZERO], "generic trainer"),
+        (READER_LM, ["train.content_dropout=0.1", TO_UNKNOWN, UNSEEN_UNKNOWN], "generic trainer"),
+        (READER_LM, [UNSEEN_ZERO], "generic trainer"),
+        (NO_MEMORY, [UNSEEN_ZERO], "model.memory=false"),
+        (NO_MEMORY, ["train.content_dropout=0.1", TO_UNKNOWN], "model.memory=false"),
+    ],
+)
+def test_unknown_configuration_refusals(path: Path, overrides: list[str], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        load_config(path, overrides)
+
+
+def test_unknown_options_refuse_the_fused_window_and_the_probes() -> None:
+    recipe = (*A5, ALL, "model.cand_norm=rms")
+    for options in ((DROP, TO_UNKNOWN), (DROP, TO_UNKNOWN, UNSEEN_UNKNOWN), (UNSEEN_ZERO,)):
+        with pytest.raises(ValueError, match="hardware.window=fused is untested"):
+            _cfg(*recipe, "hardware.window=fused", *options)
+        assert _cfg(*recipe, "hardware.window=split", *options).hardware.window == "split"
+    probes = ("train.lambda_u=0.1", "train.probe_horizon=4")
+    with pytest.raises(ValueError, match="counterfactual probes"):
+        _cfg(*A5, *probes, DROP, TO_UNKNOWN, UNSEEN_UNKNOWN)
+    assert _cfg(*A5, *probes, UNSEEN_ZERO).model.unseen_bytes_mode == "zero"
+
+
+def test_model_and_trainer_refuse_unknown_settings_that_are_not_the_configurations(
+    tmp_path: Path,
+) -> None:
+    cfg = hsn_config(4, *A5)
+    unroll = cfg.train.unroll
+    with pytest.raises(ValueError, match="content_dropout_target must be"):
+        HSN(cfg.model, seed=0, unroll=unroll, content_dropout=0.1, content_dropout_target="blank")
+    with pytest.raises(ValueError, match="needs content_dropout > 0"):
+        HSN(cfg.model, seed=0, unroll=unroll, content_dropout_target="unknown")
+    unseen = hsn_config(4, *A5, "train.content_dropout=0.1", TO_UNKNOWN, UNSEEN_UNKNOWN)
+    with pytest.raises(ValueError, match="model.unseen_bytes_as=unknown"):
+        HSN(unseen.model, seed=0, unroll=unroll, content_dropout=0.1)
+    ctx = resolve(cfg.hardware)
+    drop = hsn_config(4, *A5, "train.content_dropout=0.1")
+    to_unknown = hsn_config(4, *A5, "train.content_dropout=0.1", TO_UNKNOWN)
+    with pytest.raises(ValueError, match="train.content_dropout_target"):
+        TBPTTTrainer(build_model(to_unknown), drop, ctx, run_dir=tmp_path)
+    with pytest.raises(ValueError, match="train.content_dropout_target"):
+        TBPTTTrainer(build_model(drop), to_unknown, ctx, run_dir=tmp_path)
+    zero_model = build_model(
+        hsn_config(4, *A5, "train.content_dropout=0.1", TO_UNKNOWN, UNSEEN_ZERO)
+    )
+    with pytest.raises(ValueError, match="model.unseen_bytes_as"):
+        TBPTTTrainer(zero_model, unseen, ctx, run_dir=tmp_path)
+
+
+def test_unknown_keys_are_hashed_and_only_the_model_key_is_in_the_memory_key() -> None:
+    drop = load_config(RECIPE_A6, [*RD32, "train.content_dropout=0.1"])
+    target = load_config(RECIPE_A6, [*RD32, "train.content_dropout=0.1", TO_UNKNOWN])
+    both = load_config(RECIPE_A6, [*RD32, "train.content_dropout=0.1", TO_UNKNOWN, UNSEEN_UNKNOWN])
+    zero = load_config(RECIPE_A6, [*RD32, "train.content_dropout=0.1", TO_UNKNOWN, UNSEEN_ZERO])
+    configs = (drop, target, both, zero)
+    assert len({config_hash(c) for c in configs}) == 4
+    assert len({_arm_id(c) for c in configs}) == 4
+    assert memory_key(target, "pdg", PROTOCOL) == memory_key(drop, "pdg", PROTOCOL)
+    assert memory_key(both, "pdg", PROTOCOL) != memory_key(drop, "pdg", PROTOCOL)
+    assert memory_key(zero, "pdg", PROTOCOL) not in {
+        memory_key(c, "pdg", PROTOCOL) for c in (drop, both)
+    }
+    dump = json.loads(canonical_json(both))
+    assert dump["train"]["content_dropout_target"] == "unknown"
+    assert dump["model"]["unseen_bytes_as"] == "unknown"
+
+
+def test_resume_with_the_unknown_rows(tmp_path: Path) -> None:
+    """The rows are in the checkpoint with their optimiser state (decayed like their tables):
+    a resumed run takes the steps of the uninterrupted one, bit for bit."""
+    steps = 8
+    options = (
+        "train.content_dropout=0.2",
+        TO_UNKNOWN,
+        UNSEEN_UNKNOWN,
+        "train.ckpt_every=4",
+        "train.eval_every=4",
+    )
+    cfg = hsn_config(steps, *TRAINED_FAMILIES["hsn_t"], *options)
+    train_ds, dev_ds = datasets()
+    full = _trainer(cfg, tmp_path / "full")
+    byte_row, reader_row = full.hsn.unknown_rows()
+    assert byte_row is not None and reader_row is not None
+    decayed = [p for g in full.optimizer.param_groups if g["weight_decay"] > 0 for p in g["params"]]
+    for row, table in (
+        (byte_row, full.hsn.byte_emb.weight),
+        (reader_row, full.hsn.reader.emb.weight),
+    ):
+        assert any(p is row for p in decayed) == any(p is table for p in decayed)
+    start = byte_row.detach().clone()
+    expected = full.fit(train_ds, dev_ds, steps)
+    assert not torch.equal(byte_row.detach(), start)
+    resumed = _trainer(cfg, tmp_path / "resumed")
+    assert resumed.resume(tmp_path / "full" / "step_00000004.pt") == 4
+    actual = resumed.fit(train_ds, dev_ds, steps)
+    assert [s.loss for s in actual.steps] == [s.loss for s in expected.steps[4:]]
+    assert [e["loss"] for e in actual.evals] == [e["loss"] for e in expected.evals[1:]]
+    state, other = full.model.state_dict(), resumed.model.state_dict()
+    assert set(UNKNOWN_ROWS) <= set(state)
+    assert state.keys() == other.keys() and all(_same(other[k], v) for k, v in state.items())
+
+
+HOLD_MANIFEST = REPO / "data" / "synthetic_hold" / "manifest.json"
+#: the hold-out arm of key_unknown.yaml (hsn-experiments/remote/specs) on the CPU: its base
+#: overrides without the card's (profile, compile mode, graph aliasing), at a small batch
+HOLD_ARM = (
+    "model_name=hsn_t",
+    "data.dataset=synthetic_hold",
+    f"data.manifest={HOLD_MANIFEST}",
+    "data.tasks=[kv, delayed2h]",
+    "data.variants=[in_range]",
+    "model.k_select=12",
+    "model.reader=transformer",
+    "model.reader_span=32",
+    "model.address_gate=true",
+    "model.address_gate_input=summary",
+    "model.n_cells=64",
+    "train.feedback_detach=[summary, eps, router]",
+    "model.scorer_position=wrap",
+    "model.address_ngram=2",
+    "model.address_history=ngram",
+    "train.unit_credit=executed",
+    "train.soft_until_step=0",
+)
+
+
+@pytest.mark.skipif(not HOLD_MANIFEST.is_file(), reason="needs data/synthetic_hold")
+def test_hold_arm_trains_with_the_unknown_rows(tmp_path: Path) -> None:
+    """Three steps of the hold-out arm's own recipe (its schedule, update limits, weight
+    average and route guard) on the hold data through the real trainer, with dropout 0.1 to
+    the unknown rows and the never-trained bytes reading them: finite losses, the rows move,
+    their gradients are in the byte_emb and reader groups, bytes 112 to 143 stay unseen and
+    the evaluation runs."""
+    steps = 3
+    overrides = [
+        "profile=cpu",
+        *HOLD_ARM,
+        "train.batch=2",
+        "train.micro_batch=2",
+        f"train.steps={steps}",
+        "train.warmup_steps=1",  # the recipe's warm-up of 200 ends inside its decay
+        f"train.eval_every={steps}",
+        "train.ckpt_every=1000",
+        "train.stats_every=1",
+        "train.content_dropout=0.1",
+        TO_UNKNOWN,
+        UNSEEN_UNKNOWN,
+    ]
+    cfg = load_config(RECIPE_A6, overrides)
+    assert cfg.train.weight_ema and cfg.train.update_limit is not None
+    train_ds, dev_ds = load_datasets(cfg)
+    dev_ds = ByteDataset(dev_ds.examples[:16])  # a short evaluation
+    trainer = _trainer(cfg, tmp_path / "run")
+    rows = trainer.hsn.unknown_rows()
+    start = [r.detach().clone() for r in rows if r is not None]
+    assert len(start) == 2
+    history = trainer.fit(train_ds, dev_ds, steps)
+    losses = [s.loss for s in history.steps]
+    assert len(losses) == steps and all(math.isfinite(x) for x in losses)
+    for row, before in zip(rows, start, strict=True):
+        assert row is not None and bool(torch.isfinite(row).all())
+        assert not torch.equal(row.detach(), before)
+    for group in ("byte_emb", "reader"):
+        assert history.steps[-1].stats[f"grad_norm/{group}"] > 0.0
+    seen = trainer.hsn.byte_seen
+    assert seen is not None and bool(seen.any())
+    assert not bool(seen[112:144].any())  # the held-out key bytes are never in a training window
+    assert history.evals and math.isfinite(history.evals[-1]["loss"])

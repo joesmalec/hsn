@@ -442,9 +442,19 @@ class TBPTTTrainer(Trainer):
                 f"configuration's train.content_dropout {cfg.train.content_dropout}; build the "
                 "model with HSN.from_config(cfg)"
             )
-        if (model.byte_seen is not None) != cfg.model.zero_unseen_bytes:
+        if model.content_dropout_target != cfg.train.content_dropout_target:
             raise ValueError(
-                f"model.zero_unseen_bytes={cfg.model.zero_unseen_bytes} but the model "
+                f"the model's content_dropout_target {model.content_dropout_target!r} is not "
+                f"the configuration's train.content_dropout_target "
+                f"{cfg.train.content_dropout_target!r}; build the model with HSN.from_config(cfg)"
+            )
+        if model.unseen_bytes_as != cfg.model.unseen_bytes_mode or (
+            (model.byte_seen is not None) != (cfg.model.unseen_bytes_mode != "own")
+        ):
+            raise ValueError(
+                f"model.zero_unseen_bytes={cfg.model.zero_unseen_bytes} / model.unseen_bytes_as="
+                f"{cfg.model.unseen_bytes_as!r} but the model reads {model.unseen_bytes_as!r} "
+                f"at a never-trained byte and "
                 f"{'keeps' if model.byte_seen is not None else 'does not keep'} the bytes it "
                 "has seen; build the model with HSN.from_config(cfg)"
             )

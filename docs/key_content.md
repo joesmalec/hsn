@@ -1,7 +1,9 @@
-# Byte-content options: content dropout and zero rows for never-trained bytes (experimental)
+# Byte-content options: content dropout, zero rows and a learned unknown row for never-trained bytes (experimental)
 
-Status: **two opt-in keys for the HSN and HSN-T, built on 15 Nov 2026 (branch
-`claude/key-content`, from main f3f271a); not adopted; no run exists.**
+Status: **four opt-in keys for the HSN and HSN-T, built on 15 Nov 2026 (branch
+`claude/key-content`, from main f3f271a); not adopted. The runs of `key_content.yaml` are
+quoted (not filed) in the section on the learned unknown row; none of `key_unknown.yaml`
+exists.**
 - `train.content_dropout = p` (default 0.0): training only. In every training window a random
   share `p` of the positions reads a zero row in place of its byte's content.
 - `model.zero_unseen_bytes` (default false): a byte that no training window has held as an
@@ -18,6 +20,14 @@ Status: **two opt-in keys for the HSN and HSN-T, built on 15 Nov 2026 (branch
   global random state, bit for bit.
 - They change no cell, graph, unit, gate, router, address code, summary or loss equation, no
   metric, threshold or task.
+- Two more opt-in keys of the same day (section "The learned unknown row" below):
+  `train.content_dropout_target = zero | unknown` (what a dropped position reads) and
+  `model.unseen_bytes_as = own | zero | unknown` (what a never-trained byte reads; `zero` is
+  `model.zero_unseen_bytes = true`). With `unknown`, a learned row per content table takes the
+  place of the zero row. Left out of the configuration hash at their defaults; compared with
+  the code before them on the CPU, all 1,971 arms of the 46 specs in
+  `hsn-experiments/remote/specs/` that expand on this branch keep their arm id, group id,
+  memory key, run id and configuration hash.
 
 ## Cause
 
@@ -142,6 +152,74 @@ with the key does not load into a model without it, and the reverse; a warm star
 are not otherwise known. The weight average (`train.weight_ema`) holds parameters only; the
 averaged model reads the run's `byte_seen`.
 
+## The learned unknown row (`train.content_dropout_target`, `model.unseen_bytes_as`)
+
+**Why.** Measured on 15 Nov 2026 with HSN-T on the held-out keys, 18,000 steps
+(`key_content.yaml`): content dropout to a zero row with the unseen bytes read as zero
+repairs kv recall on the unseen keys on all three seeds, but on seed 3 it breaks delayed2h
+for never-seen bytes (76.7 / 84.3 / 91.8 % at 12,000 / 15,000 / 18,000 steps, against 98 to
+99 % on the seen pairs). With every key byte looking up one shared trained key's row instead,
+delayed2h on never-seen bytes is 98.1 / 98.3 / 99.6 % and kv stays fine. Inferred, not
+measured: the network has to learn that a missing content means "a byte whose content is not
+known", not "blank". The usual way is one shared learned "unknown" row, which these keys build.
+
+**What they do.** Two keys, both opt-in:
+
+- `train.content_dropout_target`: `zero` (default, the dropout above, bit for bit) or
+  `unknown`. With `unknown` the positions that `train.content_dropout` draws read a learned
+  row in place of the byte's row: `byte_emb.unknown` (`[1, d]`) for `E`, and in HSN-T
+  `reader.emb_unknown` (`[1, w]`) for the reader. The two rows are new parameters that exist
+  only with this value. Each is drawn as its table's rows are (the byte row with
+  `model.state_init` like `byte_emb`, the reader row from a normal of std 0.02 like the
+  reader's table), from a CPU generator seeded with `(run seed, tag)` alone, after every
+  other parameter: every other parameter starts as it does without the key, and the global
+  random stream is not read. They are shaped as one row of their table, so a `fan_in` init
+  reads the table's fan-in and the weight decay treats them as their tables. They get the
+  gradient of exactly the positions that read them. Needs `train.content_dropout > 0`.
+- `model.unseen_bytes_as`: what a byte reads that no training window has held as an input
+  (the bytes of `model.zero_unseen_bytes`, marked the same way, the same `byte_seen` buffer),
+  in training, at evaluation and at inference. `own` (default): its own rows, bit for bit.
+  `zero`: a zero row, which is `model.zero_unseen_bytes = true` (the older spelling is kept;
+  setting both is refused, so each configuration has one spelling: the two spellings give
+  different configuration hashes for the same model, and one's checkpoint loads into the
+  other). `unknown`: the learned rows of `train.content_dropout_target = unknown`, which it
+  needs (without it the rows would not exist, or would never be trained: refused).
+
+At a position the model reads, in this order: the byte's own row, or for a never-trained
+byte what `model.unseen_bytes_as` names; then, in a training window, a drawn position reads
+what `train.content_dropout_target` names, whatever it held before. So with
+`unseen_bytes_as = zero` and the target `unknown` (allowed, not in any spec) a dropped
+position reads the unknown row even at an unseen byte, and an unseen byte that is not
+dropped reads zero. In a training window the trainer marks the window's bytes before it runs,
+so with `unseen_bytes_as = unknown` the training lookups read the row only where dropped;
+the unseen bytes read it at evaluation. Everything listed above as unchanged at a blank
+position is unchanged here too (address features, prediction target, cells, router, gate).
+
+In the code: `HSN._content_masks` returns the zero positions and the unknown positions
+apart (never overlapping); `hsn.model.embeddings.replace_content` puts a zero row and the
+unknown row in place in the lookup; `HSN.unknown_rows()` returns the two rows;
+`ByteEmbedding.add_unknown_row` and `Reader.add_unknown_row` register them;
+`Reader.forward(..., unknown=None)`. The rows are parameters of their tables' modules, so they
+count in the `byte_emb` and `reader` rows of `param_report` (`d + w` more parameters: 128 at
+the hold arm's sizes) and in the `grad_norm/byte_emb` and `grad_norm/reader` groups; the
+weight average holds them; the update limits of the recipes (`cell.*`, `router.*`) do not
+reach them. A checkpoint with the rows does not load into a model without them, nor the
+reverse. `train.content_dropout_target` is a `train.*` key and not in the memory key;
+`model.unseen_bytes_as` at a non-default value is (as `model.zero_unseen_bytes` is), so an arm
+with it has no stored step-time or memory estimate.
+
+Refused where the zero-row keys are refused: the baselines, the reader alone,
+`model.memory = false`, `hardware.window = fused`, and (through `train.content_dropout`)
+`train.lambda_u > 0`.
+
+Cost: one `torch.where` per table and its backward in the eager prologue, beside the
+`masked_fill` of the zero rows; not measured on the card.
+
+Spec `key_unknown.yaml` (`hsn-experiments/remote/specs/`): `key_content.yaml`'s base,
+protocol and 18,000 steps; `_cdunk10` (dropout 0.1 to the unknown row, unseen bytes read it)
+on seeds 0, 2 and 3, and `_cdunk05` (the same at 0.05) on seed 0. `key_content.yaml`'s
+`_main` and `_cd10` runs are the references.
+
 ## Where they can be set
 
 | | |
@@ -207,6 +285,22 @@ of both, for the memory core and for HSN-T; the trainer marks the bytes of its t
 windows and no others (the evaluations between the steps mark none), the checkpoint holds
 them and a warm start takes them over; the key alone takes the same training steps as the
 model without it; a resumed run draws the same positions and keeps the seen bytes.
+
+The learned unknown row: the named defaults (`zero`, `own`) keep the configuration hash,
+memory key and arm id; the rows exist only with the target `unknown`, are their generators'
+draws in their tables' init, leave every other start value and the global stream alone, and
+count in their tables' report rows; in a training window the dropped positions read exactly
+the row, and the window equals, bit for bit and in every gradient, the window of the model
+without the keys with the row put in from outside at those positions, the row's gradient
+being that of its outside copy; never-trained bytes read the row in both modes (and with the
+dropout the union) and `step` reads it; with `unseen_bytes_as = zero` and the target `unknown`
+the dropped positions read the row and the other unseen bytes zero; `zero_unseen_bytes` and
+`unseen_bytes_as = zero` give the same window; the refusals; the keys are hashed and only the
+model key is in the memory key; bf16 autocast, the compiled window and the split window with
+the rows (their gradients compared); thirty trainer steps for the memory core and HSN-T move
+the rows; a resumed run takes the uninterrupted run's steps, the rows decayed like their
+tables; three steps of the hold-out arm's own recipe on the hold data (skipped without
+`data/synthetic_hold`), where bytes 112 to 143 stay unseen.
 
 ## What it has to show
 

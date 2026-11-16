@@ -188,6 +188,11 @@ training window has held reads a zero row in both tables, in every mode; it chan
 model reads at an untrained byte, which may be decided as an amendment). Both are off by
 default, and with them off nothing in this document changes. Not available with
 `model.memory: false` or for the reader alone. No run of them exists yet.
+Two more opt-in keys put a learned "unknown" row in place of the zero row:
+`train.content_dropout_target: unknown` (the dropped positions read it; one row per table,
+`byte_emb.unknown` and `reader.emb_unknown`, which exist only with the key) and
+`model.unseen_bytes_as: unknown` (the never-trained bytes read it too; `zero` is
+`model.zero_unseen_bytes`).
 
 ## What it has to show (rung 1 of the design)
 

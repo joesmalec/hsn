@@ -155,7 +155,7 @@ beside the reader, ``S`` reads ``[z ; q ; ctx ; c ; f]`` and ``D`` reads ``[q ; 
 The byte-content options (``docs/key_content.md``; both opt-in, HSN and HSN-T): at some
 positions ``E`` and the reader read a zero row in place of the byte's row of their content
 tables (``emb`` and the reader's embedding), the same positions for both
-(:meth:`HSN._content_blank`). ``train.content_dropout = p``: a random share ``p`` of the
+(:meth:`HSN._content_masks`). ``train.content_dropout = p``: a random share ``p`` of the
 positions of every training window (:meth:`HSN.content_drop_mask`; training only).
 ``model.zero_unseen_bytes``: every byte that no training window has held, in every mode
 (the buffer ``byte_seen``, which the trainer fills through :meth:`HSN.mark_bytes_seen`).
@@ -165,6 +165,11 @@ as before. The mask is applied in :meth:`_window_prologue`, which every window r
 compiled, split). :meth:`step` reads the zero rows of never-trained bytes too; it has no
 window to draw positions for, so a training step with content dropout is refused. With both
 keys at their defaults the lookups are the code they were and nothing is drawn or masked.
+``train.content_dropout_target = unknown`` puts a learned "unknown" row in place of the zero
+row at the dropped positions, one per table (``byte_emb.unknown``, ``reader.emb_unknown``:
+:meth:`HSN.unknown_rows`), and ``model.unseen_bytes_as = unknown`` gives the never-trained
+bytes the same rows (``zero`` is ``model.zero_unseen_bytes``); :meth:`HSN._content_masks`
+returns the zero and the unknown positions apart.
 
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
@@ -184,7 +189,7 @@ from torch import Tensor, nn
 from hsn.config import FEEDBACK_PATHS, GateMode, ModelConfig, RunConfig
 from hsn.data.synthetic import BOS
 from hsn.model.cell import PDGCell, WindowConsts, profiler_segment
-from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
+from hsn.model.embeddings import ByteEmbedding, ContextEmbedding, replace_content
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.gradclip import clip_row_grad
 from hsn.model.halting import HaltingHead
@@ -201,6 +206,18 @@ _INDEX_DTYPES = (torch.int64, torch.int32)
 #: ``train.content_dropout``: the constant in the seed of a window's draw (``b"KCDO"``), which
 #: keeps it apart from every other generator seeded with the run seed.
 _CONTENT_DROP_TAG = 0x4B43444F
+#: ``train.content_dropout_target = unknown``: the constants in the seeds of the generators
+#: that draw the learned unknown rows of the byte embedding (``b"KCUB"``) and of the reader's
+#: embedding (``b"KCUR"``).
+_UNKNOWN_BYTE_TAG = 0x4B435542
+_UNKNOWN_READER_TAG = 0x4B435552
+
+
+def _tagged_generator(seed: int, tag: int) -> torch.Generator:
+    """A CPU generator seeded from ``(seed, tag)`` alone, apart from every other generator."""
+    state = np.random.SeedSequence([seed, tag]).generate_state(1)[0]
+    return torch.Generator(device="cpu").manual_seed(int(state))
+
 
 #: Appendix C.1 rows in table order, keyed as :func:`hsn.train.memory_plan.expected_param_count`
 #: keys them.
@@ -399,7 +416,8 @@ class HSN(nn.Module):
     exploration, no dense fallback). ``feedback_detach`` is A6's ``train.feedback_detach`` (module
     docstring; empty: full backpropagation through time) and ``state_grad_clip`` its
     ``train.state_grad_clip`` (``None``: off). ``content_dropout`` is
-    ``train.content_dropout`` (module docstring; 0.0: off)."""
+    ``train.content_dropout`` (module docstring; 0.0: off) and ``content_dropout_target`` its
+    ``train.content_dropout_target`` ("zero": a zero row; "unknown": the learned unknown rows)."""
 
     #: Whether this class may own a window reader (``model.reader``). ``False`` here: the HSN
     #: has no sequence attention. :class:`hsn.model.hsn_t.HSNT` is the family that does.
@@ -419,6 +437,7 @@ class HSN(nn.Module):
         unit_credit: str = "softmax",
         ste_scope: str = "selected",
         content_dropout: float = 0.0,
+        content_dropout_target: str = "zero",
     ) -> None:
         super().__init__()
         if not cfg.memory:
@@ -444,6 +463,27 @@ class HSN(nn.Module):
         #: ``train.content_dropout`` (opt-in, ``docs/key_content.md``): the probability with
         #: which a position of a training window reads no byte content; 0.0: off.
         self.content_dropout = float(content_dropout)
+        if content_dropout_target not in ("zero", "unknown"):
+            raise ValueError(
+                "content_dropout_target must be 'zero' or 'unknown', got "
+                f"{content_dropout_target!r}"
+            )
+        if content_dropout_target == "unknown" and self.content_dropout == 0.0:
+            raise ValueError(
+                "content_dropout_target='unknown' needs content_dropout > 0: the unknown rows "
+                "are trained at the dropped positions only"
+            )
+        #: ``train.content_dropout_target`` (opt-in): what a dropped position reads, a zero
+        #: row ("zero") or the learned unknown row of each content table ("unknown").
+        self.content_dropout_target = content_dropout_target
+        #: ``model.unseen_bytes_as`` (or ``model.zero_unseen_bytes``): what a never-trained
+        #: byte reads, its own rows ("own"), a zero row or the learned unknown row.
+        self.unseen_bytes_as = cfg.unseen_bytes_mode
+        if self.unseen_bytes_as == "unknown" and content_dropout_target != "unknown":
+            raise ValueError(
+                "model.unseen_bytes_as=unknown reads the learned unknown rows, which only "
+                "content_dropout_target='unknown' builds and trains"
+            )
         if state_grad_clip is not None and (
             isinstance(state_grad_clip, bool)
             or not isinstance(state_grad_clip, int | float)
@@ -497,11 +537,11 @@ class HSN(nn.Module):
         self.ema_tau = ema_tau
         self.schedule = schedule if schedule is not None else SelectionSchedule.neutral()
         self.train_step = 0
-        #: ``model.zero_unseen_bytes`` (opt-in, ``docs/key_content.md``): the bytes a training
-        #: window has held as an input, bool ``[V]``; a buffer, and so in the state dict, only
-        #: with the key on. ``None``: off.
+        #: ``model.zero_unseen_bytes`` / ``model.unseen_bytes_as`` (opt-in,
+        #: ``docs/key_content.md``): the bytes a training window has held as an input, bool
+        #: ``[V]``; a buffer, and so in the state dict, only with a key on. ``None``: off.
         self.byte_seen: Tensor | None
-        if cfg.zero_unseen_bytes:
+        if self.unseen_bytes_as != "own":
             self.register_buffer("byte_seen", torch.zeros(cfg.vocab_size, dtype=torch.bool))
         else:
             self.byte_seen = None
@@ -540,6 +580,14 @@ class HSN(nn.Module):
         #: HSN-T (``model.reader``): the window reader, or ``None``. Built last and from its own
         #: generator: no other parameter's initialisation depends on it.
         self.reader: Reader | None = Reader(cfg, seed=seed) if cfg.reader != "none" else None
+        # train.content_dropout_target = unknown: the learned unknown rows, byte_emb.unknown
+        # [1, d] and HSN-T's reader.emb_unknown [1, w] (unknown_rows()); each is drawn as its
+        # table's rows are, from a generator of its own (seed, tag), after every other
+        # parameter, so every other parameter starts as it does without the key
+        if content_dropout_target == "unknown":
+            self.byte_emb.add_unknown_row(_tagged_generator(seed, _UNKNOWN_BYTE_TAG))
+            if self.reader is not None:
+                self.reader.add_unknown_row(_tagged_generator(seed, _UNKNOWN_READER_TAG))
         #: ``model.address_gate_input = reader_prev``: the width of ``c_{t−1}`` at the end of a
         #: window's context columns (behind ``c_t``), which only the address gate reads; else 0.
         self._gate_rides: int = cfg.reader_width if self.scorer.gate_input == "reader_prev" else 0
@@ -573,6 +621,7 @@ class HSN(nn.Module):
             unit_credit=run.train.unit_credit,
             ste_scope=run.train.ste_scope,
             content_dropout=run.train.content_dropout,
+            content_dropout_target=run.train.content_dropout_target,
         )
 
     def set_train_step(self, step: int) -> None:
@@ -609,19 +658,42 @@ class HSN(nn.Module):
             index = tokens.reshape(-1).to(device=self.byte_seen.device, dtype=torch.int64)
             self.byte_seen.index_fill_(0, index, True)
 
-    def _content_blank(self, tokens: Tensor, *, window: bool = True) -> Tensor | None:
-        """The positions of ``tokens`` at which ``E`` and the reader read a zero row in place
-        of the byte's row of their content tables (bool, the shape of ``tokens``), or ``None``
-        when no option acts: with both keys at their defaults nothing is computed and the
-        lookups are the code they were. ``model.zero_unseen_bytes``: the bytes no training
-        window has held, in every mode. ``train.content_dropout``: the positions of
-        :meth:`content_drop_mask`, in training only, and only in a window (``window=False`` is
+    def unknown_rows(self) -> tuple[Tensor | None, Tensor | None]:
+        """``train.content_dropout_target = unknown``: the learned unknown rows of the byte
+        embedding (``byte_emb.unknown``, ``[1, d]``) and of HSN-T's reader
+        (``reader.emb_unknown``, ``[1, w]``; ``None`` without a reader). ``(None, None)``
+        without the key."""
+        if self.content_dropout_target != "unknown":
+            return None, None
+        byte_row = self.byte_emb.unknown
+        reader_row = None if self.reader is None else self.reader.emb_unknown
+        return byte_row, reader_row
+
+    def _content_masks(
+        self, tokens: Tensor, *, window: bool = True
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """``(zero, unknown)``: the positions of ``tokens`` at which ``E`` and the reader read
+        a zero row, and those at which they read the learned unknown row
+        (:meth:`unknown_rows`), in place of the byte's row of their content tables (bool, the
+        shape of ``tokens``; the two never overlap), each ``None`` where no position does: with
+        every key at its default nothing is computed and the lookups are the code they were.
+
+        A byte's content is its own row, or for a byte no training window has held
+        (``byte_seen``) what ``model.unseen_bytes_as`` names (``zero_unseen_bytes``: zero), in
+        every mode. ``train.content_dropout`` then puts its target
+        (``train.content_dropout_target``) at the positions of :meth:`content_drop_mask`,
+        whatever they held, in training only, and only in a window (``window=False`` is
         :meth:`step`, which has no window to draw for and refuses). Only the content lookups
-        read this mask: the byte codes and address features of the scorer, the context symbol
-        and the prediction loss's target see the bytes as they are."""
-        blank: Tensor | None = None
+        read these masks: the byte codes and address features of the scorer, the context
+        symbol and the prediction loss's target see the bytes as they are."""
+        zero: Tensor | None = None
+        unknown: Tensor | None = None
         if self.byte_seen is not None:
-            blank = ~self.byte_seen[tokens]
+            unseen = ~self.byte_seen[tokens]
+            if self.unseen_bytes_as == "zero":
+                zero = unseen
+            else:
+                unknown = unseen
         if self.training and self.content_dropout > 0.0:
             if not window:
                 raise ValueError(
@@ -631,8 +703,14 @@ class HSN(nn.Module):
                 )
             drop = self.content_drop_mask(int(tokens.shape[0]), int(tokens.shape[1]))
             drop = drop.to(tokens.device)
-            blank = drop if blank is None else blank | drop
-        return blank
+            if self.content_dropout_target == "zero":
+                zero = drop if zero is None else zero | drop
+                # (unseen_bytes_as=unknown needs the target unknown: no unknown mask here)
+            else:
+                unknown = drop if unknown is None else unknown | drop
+                if zero is not None:
+                    zero = zero & ~drop  # a dropped position reads the dropout's target
+        return zero, unknown
 
     # -- placement --------------------------------------------------------------------------------
 
@@ -837,8 +915,9 @@ class HSN(nn.Module):
         q_prev = state.q
         z_hat = self.predictor(q_prev)  # before x_t is encoded
         emb = self.byte_emb(x_t)
-        blank = self._content_blank(x_t, window=False)  # None unless a byte-content option acts
-        z = self.encoder(emb if blank is None else emb.masked_fill(blank[..., None], 0.0))
+        # (None, None) unless a byte-content option acts
+        zero, unknown = self._content_masks(x_t, window=False)
+        z = self.encoder(replace_content(emb, zero, unknown, self.unknown_rows()[0]))
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         eps = z - z_hat
         u = self.shared(self._shared_input(z, q_prev, self.ctx_emb(ctx_t), state.h))
@@ -1455,9 +1534,10 @@ class HSN(nn.Module):
         B, T = (int(n) for n in tokens.shape)
         emb = self.byte_emb(tokens)  # [B, T, d]
         # the byte-content options (docs/key_content.md): where E and the reader read a zero
-        # row; None (both keys at their defaults): the lookups as they were
-        blank = self._content_blank(tokens)
-        z = self.encoder(emb if blank is None else emb.masked_fill(blank[..., None], 0.0))
+        # row and where their learned unknown row; (None, None) (every key at its default):
+        # the lookups as they were
+        zero, unknown = self._content_masks(tokens)
+        z = self.encoder(replace_content(emb, zero, unknown, self.unknown_rows()[0]))
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
         context = self.ctx_emb(ctx)  # [B, T, context_dim]
         reader_out: Tensor | None = None
@@ -1466,8 +1546,8 @@ class HSN(nn.Module):
             # position with the loop, the compiled block and _position unchanged
             reader_out = (
                 self.reader(tokens, reset)
-                if blank is None
-                else self.reader(tokens, reset, blank=blank)
+                if zero is None and unknown is None
+                else self.reader(tokens, reset, blank=zero, unknown=unknown)
             )  # [B, T, w]
             context = torch.cat([context, reader_out], dim=-1)
             if self._gate_rides:
@@ -1847,8 +1927,12 @@ class HSN(nn.Module):
             text += f", state_grad_ratio={self.state_grad_ratio}"
         if self.content_dropout:
             text += f", content_dropout={self.content_dropout}"
-        if self.byte_seen is not None:
+        if self.content_dropout_target != "zero":
+            text += f", content_dropout_target={self.content_dropout_target!r}"
+        if self.unseen_bytes_as == "zero":
             text += ", zero_unseen_bytes=True"
+        elif self.unseen_bytes_as != "own":
+            text += f", unseen_bytes_as={self.unseen_bytes_as!r}"
         return text
 
     # -- validation -------------------------------------------------------------------------------

@@ -51,6 +51,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import ModelConfig
+from hsn.model.embeddings import replace_content
 
 __all__ = ["Reader"]
 
@@ -189,24 +190,54 @@ class Reader(nn.Module):
             near = near & (distance < self.span)
         return (same & near)[:, None]
 
-    def forward(self, tokens: Tensor, reset: Tensor, *, blank: Tensor | None = None) -> Tensor:
+    def add_unknown_row(self, generator: torch.Generator) -> nn.Parameter:
+        """``train.content_dropout_target = unknown`` (``docs/key_content.md``): register and
+        return the learned "unknown" row ``emb_unknown`` ``[1, w]`` of the embedding table,
+        drawn as the table's rows are (normal, std 0.02) from ``generator``: the global random
+        stream is not read and no other parameter's start value changes. :meth:`forward` reads
+        it at the positions it is told to (``unknown``). Without this call the reader has no
+        such parameter."""
+        if "emb_unknown" in self._parameters:
+            raise ValueError("this reader already has its unknown row")
+        weight = self.emb.weight
+        row = torch.empty(1, self.width, dtype=weight.dtype, device=weight.device)
+        nn.init.normal_(row, std=_INIT_STD, generator=generator)
+        self.emb_unknown = nn.Parameter(row)
+        return self.emb_unknown
+
+    def forward(
+        self,
+        tokens: Tensor,
+        reset: Tensor,
+        *,
+        blank: Tensor | None = None,
+        unknown: Tensor | None = None,
+    ) -> Tensor:
         """``blank`` (bool ``[B, T]``; the byte-content options of ``docs/key_content.md``):
         the positions at which the reader reads a zero row in place of the byte's row of its
-        embedding table. The attention mask and the rotary positions are those of the bytes as
-        they are. ``None`` (default): every row is read, the lookup unchanged."""
+        embedding table; ``unknown`` (bool ``[B, T]``, never True where ``blank`` is): the
+        positions at which it reads its learned unknown row (:meth:`add_unknown_row`). The
+        attention mask and the rotary positions are those of the bytes as they are. ``None``
+        (default): every row is read, the lookup unchanged."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
                 f"{tuple(tokens.shape)} and {reset.dtype} {tuple(reset.shape)}"
             )
         x = self.emb(tokens)
-        if blank is not None:
-            if blank.shape != tokens.shape or blank.dtype is not torch.bool:
+        for name, mask in (("blank", blank), ("unknown", unknown)):
+            if mask is not None and (mask.shape != tokens.shape or mask.dtype is not torch.bool):
                 raise ValueError(
-                    f"blank must be a bool tensor of the tokens' shape {tuple(tokens.shape)}, "
-                    f"got {blank.dtype} {tuple(blank.shape)}"
+                    f"{name} must be a bool tensor of the tokens' shape {tuple(tokens.shape)}, "
+                    f"got {mask.dtype} {tuple(mask.shape)}"
                 )
-            x = x.masked_fill(blank[..., None], 0.0)
+        if unknown is not None and "emb_unknown" not in self._parameters:
+            raise ValueError(
+                "positions read the reader's unknown row, but it has none (add_unknown_row)"
+            )
+        if blank is not None or unknown is not None:
+            row = self.emb_unknown if unknown is not None else None
+            x = replace_content(x, blank, unknown, row)
         cos, sin = self._rotation(int(tokens.shape[1]), x)
         mask = self.attention_mask(reset)
         for block in self.blocks:
