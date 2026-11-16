@@ -38,10 +38,9 @@ window loop::
   all its segments; checkpoints and evaluations stay at step boundaries with the state detached.
   A per-row document reset (``masked_fill``) cuts the gradient of that row only. Document
   resets are the loader's ``reset`` mask (True at every document start) and are applied by the
-  model itself,
-  position by position, before the position is processed (P1.5). The trainer passes the columns
-  that hold a reset, read from the CPU window, as ``reset_columns`` (P1.10b), so the model resets
-  only there without a device-to-host copy.
+  model itself, position by position, before the position is processed (P1.5). The trainer
+  passes the columns that hold a reset, read from the CPU window, as ``reset_columns`` (P1.10b),
+  so the model resets only there without a device-to-host copy.
 * **Periodic ``q`` resync.** Every ``train.q_resync_every`` windows the summary is replaced by the
   exact mean over cells (:meth:`~hsn.model.state.CellGraphState.recompute_q`) at the window start,
   which removes the floating-point drift incremental sparse updates accumulate (P1.3 pitfall). The

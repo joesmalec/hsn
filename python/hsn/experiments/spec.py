@@ -658,6 +658,11 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
             "protocol": {
                 k: protocol.get(k) for k in ("name", "eval_batch", "probe_batch", "diag_docs")
             },
+            # the windows per step and per gradient segment (train.tbptt_windows, 16 Nov 2026):
+            # they set the step time and the activations held; at their defaults (one window,
+            # one per segment) they stay out, so every earlier arm keeps its memory key
+            **({"grad_accum": cfg.train.grad_accum} if cfg.train.grad_accum != 1 else {}),
+            **({"tbptt_windows": cfg.train.tbptt_windows} if cfg.train.tbptt_windows != 1 else {}),
         }
     )
 

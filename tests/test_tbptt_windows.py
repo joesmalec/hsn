@@ -240,6 +240,22 @@ def test_refused_outside_its_scope(config: Path, overrides: list[str], message: 
         load_config(config, overrides)
 
 
+def test_memory_key_holds_the_windows_only_when_set() -> None:
+    """The sweep's memory key (stored step-time and memory estimates) gains ``grad_accum`` and
+    ``tbptt_windows`` when they are not 1, and stays what it was at their defaults."""
+    from hsn.experiments.spec import memory_key
+
+    protocol = {"name": "train_eval", "eval_batch": 128}
+    base = memory_key(load_config(RECIPE), "pdg", protocol)
+    named = load_config(RECIPE, ["train.grad_accum=1", "train.tbptt_windows=1"])
+    assert memory_key(named, "pdg", protocol) == base
+    keys = {
+        memory_key(load_config(RECIPE, overrides), "pdg", protocol)
+        for overrides in (["train.grad_accum=2"], ["train.grad_accum=2", "train.tbptt_windows=2"])
+    }
+    assert len(keys | {base}) == 3
+
+
 def test_compiled_scope_accumulates_without_cuda_graphs_only() -> None:
     """The compiled window refuses ``train.grad_accum > 1`` in the CUDA-graph modes (on every
     device: one configuration means one thing) and takes it in ``default``."""
