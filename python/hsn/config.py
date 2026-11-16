@@ -138,7 +138,7 @@ BaselineCompileMode = Literal[
 ]
 #: The model names whose windows ``hardware.baseline_compile`` compiles; ``hsn_t`` is one more
 #: with ``model.memory = false`` (HSN-T without its memory: stateless, on the generic trainer).
-BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "reader")
+BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "selective_ssm", "reader")
 #: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
 #: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
 #: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut); ``fused`` is ``split``

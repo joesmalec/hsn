@@ -24,6 +24,15 @@ the HSN's compiled window):
   as two graphs. The recurrence between them is ``torch.nn.GRU``, which ``torch.compile`` does not
   take (dynamo breaks the graph at RNN modules, and tracing through one would replace cuDNN's
   kernel by an unrolled loop of small ones); it stays the call it was, cuDNN on CUDA.
+* ``selective_ssm``: the whole forward of a window as one graph, with the scan of every block
+  run as :func:`hsn.baselines.mamba._plain_scan`: the same recurrence as plain tensor
+  operations, with autograd's backward and the resets applied at every position. The eager
+  scan (``_SelectiveScan``) writes every position's state into one window-sized tensor in
+  place and has a hand-written backward that does the same; a compiled graph has no in-place
+  writes, and that loop compiled costs a pass over the tensor per position, quadratic in the
+  window (the document has the measurements). This is the one place where the compiled window
+  does not run the eager forward's own code; its values equal the eager ones to rounding, and
+  it reads no reset columns from the device (the eager forward's one host sync per window).
 
 **Variants.** A compiled function is built per batch shape, grad mode, training mode and autocast
 state, each with its own code object, so the evaluation (``no_grad``, evaluation mode, its own
@@ -37,14 +46,13 @@ call of a function compiles; under CUDA graphs the second records.
 graph step (``torch.compiler.cudagraph_mark_step_begin``). The logits a window returns are graph
 memory, which the next window's replay overwrites: read them before the next window, as the
 trainer and the evaluation do. ``train.grad_accum > 1`` is refused (a gradient held in ``.grad``
-across windows would be overwritten too), as for the HSN.
+across windows would be overwritten too), as for the HSN. The state and the info tensor of a
+``selective_ssm`` window, and a carried reader cache (``model.reader_carry``), come out of a
+compiled graph and are cloned out of graph memory.
 
-**Scope** (errors over silence, :func:`check_baseline_scope`): the four families above; no
+**Scope** (errors over silence, :func:`check_baseline_scope`): the five families above; no
 dropout (a compiled random draw differs from the eager one); ``train.grad_accum = 1`` under CUDA
 graphs. On MPS a backend that cannot compile falls back to the eager model with a logged notice.
-``selective_ssm`` is outside the scope: its scan writes every position's state into one
-window-sized tensor in place, a compiled graph has no in-place writes, and the compiled loop's
-cost grows with the square of the window (the document has the measurements).
 
 The compiled window equals the eager forward to rounding (fused kernels round differently), not
 bit for bit.
@@ -61,6 +69,7 @@ import torch
 from torch import Tensor, nn
 
 from hsn.baselines.gru import GRUBaseline
+from hsn.baselines.mamba import MambaBaseline
 from hsn.baselines.reader_lm import ReaderLM
 from hsn.baselines.transformer import TransformerBaseline
 from hsn.config import RunConfig
@@ -86,6 +95,9 @@ _SCOPE: dict[type[nn.Module], str] = {
     "between them is the eager call (cuDNN on CUDA)",
     TransformerBaseline: "the whole forward of a window and its backward",
     ReaderLM: "the whole forward of a window and its backward",
+    MambaBaseline: "the whole forward of a window and its backward, with the selective scan "
+    "run as plain tensor operations under autograd (_plain_scan), not the eager run's "
+    "in-place loop with its hand-written backward",
     HSNTNoMemory: "the whole forward of a window and its backward",
 }
 
@@ -121,6 +133,12 @@ def _gru_embed(model: GRUBaseline, tokens: Tensor, context: Tensor, reset: Tenso
 
 def _gru_readout(model: GRUBaseline, y: Tensor) -> Tensor:
     return model._readout(y)
+
+
+def _mamba_window(
+    model: MambaBaseline, tokens: Tensor, context: Tensor, h: Tensor, conv: Tensor, reset: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    return model._window(tokens, context, h, conv, reset, None)  # None: the plain scan
 
 
 def _uses_cuda_graphs(ctx: DeviceContext, mode: str, backend: Backend) -> bool:
@@ -254,6 +272,14 @@ class CompiledBaseline:
             out = self._fn(_carried_forward, *key)(model, tokens, context, state, reset)
             if self.cuda_graphs:  # graph memory, which the next window's replay overwrites
                 out = (out[0], tuple(t.clone() for t in out[1]), out[2])
+        elif isinstance(model, MambaBaseline):
+            h, conv = model._check_inputs(tokens, context, state, reset)
+            logits, h, conv, top = self._fn(_mamba_window, *key)(
+                model, tokens, context, h.contiguous(), conv.contiguous(), reset
+            )
+            if self.cuda_graphs:  # out of graph memory: the next replay overwrites it
+                h, conv, top = h.clone(), conv.clone(), top.clone()
+            out = logits, (h, conv), {"state_abs_max": top}
         else:
             if state is not None:
                 raise ValueError(f"{type(model).__name__} carries no state, got a state")
