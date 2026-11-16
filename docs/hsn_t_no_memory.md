@@ -243,6 +243,53 @@ multiply-accumulates count the reader's attention at a window of 256):
 | 256 | 248 × 2 | 1,905,056 | 1,546,528 | 2.07 M |
 | 128 | 264 × 2 | 1,939,936 | 1,747,680 | 2.12 M |
 
+## Reading past the window (opt-in keys, 15 Nov 2026; untested candidates)
+
+Measured before the keys (9k TinyStories steps, bits per byte): the memory-off model w160 × 4
+with its top block unrotated (`model.reader_rotary_pairs: [20, 20, 20, 0]`) scores 0.940; its
+top block's heads all look 32 or more bytes back. Trained at a window of 256 and read in
+windows of 1024 it breaks (3.95 bits at positions 256 to 511, 5.26 at 512 to 1023): it is
+asked for distances it never saw. And every window starts cold, while a story (median about
+720 bytes) spans about three windows of 256. The two keys below let the reader read on from
+the windows before without ever reading a distance it was not trained on. Neither has been
+trained yet: what they do to the score is not known.
+
+**`model.reader_carry: C`** (default 0: no cache, the model as before, bit for bit). Every
+reader block keeps the keys and values of the last `C` positions of the windows before, in the
+dtype of the parameters, detached: no gradient crosses a window, as for the GRU's carried
+state. Position `t` of a window reads the positions `s` of its own document with
+`0 ≤ t − s ≤ C`, cached or in the window: a sliding span. With `C = 256` every byte sees up to
+256 bytes behind it at every window length and every document length, and no distance beyond
+256 is ever read (the window of 256 alone reads up to 255).
+
+- **Cache.** `(keys, values, valid)`: `keys` / `values [L, B, H, C, w / H]` (block, row, head,
+  slot, channel), `valid [B, C]` (bool). Fixed shapes, no data-dependent branch, so the
+  window compiles as one graph with the cache going in and out
+  (`hardware.baseline_compile`: under CUDA graphs the cache returned is copied out of graph
+  memory). Memory: `2 L B C w` values; w160 × 4 at batch 32 and `C = 256` is 10.5 M floats,
+  42 MB in float32.
+- **Rotation.** The keys are cached un-rotated. Slot `j` holds the position `j − C` before the
+  window; it is rotated by that position (the rotary table's rows `C … 1` with the sine's sign
+  turned: cosine is even, sine odd) and the window's keys and queries by `0 … T − 1` as
+  without the cache, so a query and a key are rotated by their distance as before. An
+  unrotated block (pairs 0) rotates nothing.
+- **Documents.** `reset` acts as before: a slot is valid while its document goes on (a reset
+  anywhere in a row's window invalidates the row's older slots), a window position reads a
+  cached slot only when no reset lies at or before it, and a window position reads window
+  positions of its own document only. A document's first position reads itself alone.
+- **State.** `HSNTNoMemory` and `ReaderLM` (the reader alone, `model_name: reader`) return the
+  cache from `init_state` and carry it through `forward`, so the generic trainer carries it
+  from window to window in training and in the dev evaluation, detaches it at every window and
+  writes it into checkpoints, as for the GRU. `scripts/reader_reach.py` carries it for the
+  loss by window position.
+- **Refused:** without a reader; HSN-T with its memory (the cells carry the state across
+  windows and the reader's cache has no place in it; the HSN's memory code is not touched);
+  `model.reader_position: learned` (a learned position is the position in the window, which a
+  carried key would share with a key of the current window); `model.reader_span` (the carry is
+  a sliding span itself).
+- **Cost.** Each block's attention reads `C + T` keys in place of `T`; the MLPs, projections and
+  everything outside the reader are unchanged.
+
 ## How to time it
 
 The coordinating session times it alone on the card with its own script. The configuration
@@ -281,6 +328,13 @@ trained HSN-T's weights load and give its logits with the memory's reads at zero
 starting weights; the closed form of the parameter count and the three widened sizes; the
 refusals; the experiment family; thirty generic-trainer steps lower the loss; the generic
 trainer's own controllers run; the forward and backward compile as one graph and match eager.
+
+`tests/test_reader_carry.py` (`model.reader_carry`): the default keeps hashes, memory keys,
+arm identities, parameters and outputs; a stream read window by window with the cache equals
+the stream read in one pass with a sliding span of `C` (a direct computation and the reader
+with `reader_span = C + 1`), at window lengths below, at and above `C`; a document reads
+nothing of the one before it; the cache is detached; the refusals; the generic trainer trains,
+evaluates and checkpoints with the cache; the carrying window compiles as one graph.
 
 ## Limits
 

@@ -66,12 +66,28 @@ outputs, bit for bit (``tests/test_reader_positions.py``).
   Transformer baseline's. The reader then reads the position in the window: its output is no
   longer a function of distances alone, and with a span not of the last ``n`` bytes alone. The
   table is drawn after the other parameters, which therefore start as the rotary reader's.
+
+Reading past the window (``docs/hsn_t_no_memory.md``; opt-in, 15 Nov 2026, untested
+candidates). ``model.reader_carry = C``: every block keeps the un-rotated keys and the values of
+the last ``C`` positions of the windows before, detached, in a cache ``(keys, values, valid)``
+with ``keys`` / ``values [L, B, H, C, w / H]`` (block, row, head, slot, channel; slot ``j`` is
+the position ``j − C`` before the window) and ``valid [B, C]`` (bool: the slot holds a position
+of the document going on). :meth:`Reader.read` takes the cache and returns the next one; the
+models that hold the reader carry it as their state (``init_state``), so the trainer carries it
+from window to window and detaches it as it does the GRU's. Window position ``t`` reads the
+cached and window positions ``s`` of its document with ``0 ≤ t − s ≤ C``: a sliding span, the
+same at every window and document length, so no distance beyond ``C`` is ever read. The cached
+keys are rotated by their positions ``−C … −1`` (the table's rows ``C … 1`` with the sine's
+sign turned) and the window's by ``0 … T − 1``, as without the cache; a block that rotates
+nothing needs nothing. ``reset`` acts as before: a position reads nothing of a document before
+its own, cached or not. The shapes do not depend on the data; at ``C = 0`` (the default)
+:meth:`Reader.forward` is the reader above and there is no cache.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Self
+from typing import Self, cast
 
 import torch
 import torch.nn.functional as F
@@ -79,7 +95,7 @@ from torch import Tensor, nn
 
 from hsn.config import ModelConfig
 
-__all__ = ["Reader"]
+__all__ = ["Cache", "Reader"]
 
 #: The default of ``model.reader_rotary_base``: the base of the rotary frequency ladder.
 _ROTARY_BASE = 10_000.0
@@ -156,6 +172,47 @@ class _ReaderBlock(nn.Module):
         out: Tensor = x + self.fc_out(F.gelu(self.fc_in(self.norm_mlp(x))))
         return out
 
+    def forward_carry(
+        self,
+        x: Tensor,
+        mask: Tensor,
+        cos: Tensor | None,
+        sin: Tensor | None,
+        keys: Tensor,
+        values: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """:meth:`forward` over the carried keys and values as well (``model.reader_carry``,
+        :meth:`Reader.read`). ``keys`` / ``values [B, H, C, w / H]``: the un-rotated keys and
+        the values of the ``C`` positions before the window; ``cos`` / ``sin [C + T, half]``:
+        the angles of the positions ``−C … T − 1`` (None: no rotation); ``mask
+        [B, 1, T, C + T]``, the cached columns first. Returns the output and the window's
+        un-rotated keys and its values ``[B, H, T, w / H]`` (the next cache's)."""
+        B, T, w = x.shape
+        C = keys.shape[2]
+        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
+        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
+        k = k.view(B, T, self.heads, -1).transpose(1, 2)
+        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        all_k = torch.cat([keys.to(k.dtype), k], dim=2)  # [B, H, C + T, w / H]
+        all_v = torch.cat([values.to(v.dtype), v], dim=2)
+        if cos is not None and sin is not None:
+            if self.rotate_in == "parameters":  # in the cos / sin's dtype, then cast back
+                working = q.dtype
+                q = _rotate(q.to(cos.dtype), cos[C:], sin[C:]).to(working)
+                all_k = _rotate(all_k.to(cos.dtype), cos, sin).to(working)
+            else:
+                cos, sin = cos.to(q.dtype), sin.to(q.dtype)
+                q, all_k = _rotate(q, cos[C:], sin[C:]), _rotate(all_k, cos, sin)
+        attn = F.scaled_dot_product_attention(q, all_k, all_v, attn_mask=mask)
+        x = x + self.proj(attn.transpose(1, 2).reshape(B, T, w))
+        out: Tensor = x + self.fc_out(F.gelu(self.fc_in(self.norm_mlp(x))))
+        return out, k, v
+
+
+#: ``model.reader_carry``: the cache of :meth:`Reader.read`, ``(keys, values, valid)`` (the
+#: module docstring has the shapes). A plain tuple: the trainer walks it as it walks a state.
+Cache = tuple[Tensor, ...]
+
 
 class Reader(nn.Module):
     """``c = Reader(tokens, reset)``: ``[B, T] → [B, T, model.reader_width]`` (module docstring)."""
@@ -183,6 +240,16 @@ class Reader(nn.Module):
         self.rotary_base: float = float(cfg.reader_rotary_base)
         #: ``model.reader_rotary_pairs`` as configured: one count, one for each block, or None
         self.rotary_pairs: int | list[int] | None = cfg.reader_rotary_pairs
+        #: ``model.reader_carry``: the positions of the windows before that every block keeps
+        #: (0: none, every window read alone; :meth:`read` reads with the cache)
+        self.carry: int = cfg.reader_carry
+        if self.carry and self.position != "rotary":
+            raise ValueError(
+                "model.reader_carry needs the rotary positions: a learned position is the "
+                "position in the window"
+            )
+        if self.carry and self.span is not None:
+            raise ValueError("model.reader_carry is a sliding span itself: leave reader_span null")
         half = width // heads // 2
         counts = (
             list(self.rotary_pairs)
@@ -296,6 +363,11 @@ class Reader(nn.Module):
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
                 f"{tuple(tokens.shape)} and {reset.dtype} {tuple(reset.shape)}"
             )
+        if self.carry:
+            raise ValueError(
+                f"a reader with model.reader_carry={self.carry} reads with "
+                "read(tokens, reset, cache), the cache from init_cache"
+            )
         x = self.emb(tokens)
         T = int(tokens.shape[1])
         cos: Tensor | None
@@ -317,6 +389,113 @@ class Reader(nn.Module):
         out: Tensor = self.norm(x)
         return out
 
+    # model.reader_carry ----------------------------------------------------------------------
+
+    def init_cache(self, B: int, device: torch.device | str) -> Cache | None:
+        """The cache of ``B`` fresh streams (module docstring, "Reading past the window"),
+        nothing valid; None without ``model.reader_carry``. In the dtype of the parameters:
+        keys and values are stored in it whatever the working dtype (a bf16 value is exact in
+        float32), so the cache's dtype and shapes are the same at every window."""
+        if B < 1:
+            raise ValueError(f"B must be >= 1, got {B}")
+        if not self.carry:
+            return None
+        weight = self.emb.weight
+        shape = (len(self.blocks), B, self.heads, self.carry, self.width // self.heads)
+        keys = torch.zeros(shape, device=device, dtype=weight.dtype)
+        valid = torch.zeros(B, self.carry, device=device, dtype=torch.bool)
+        return keys, torch.zeros_like(keys), valid
+
+    def _cache_layout(self, B: int) -> list[tuple[tuple[int, ...], str]]:
+        """The shape and kind (``float`` | ``bool``) of every tensor of the cache."""
+        kv = (len(self.blocks), B, self.heads, self.carry, self.width // self.heads)
+        return [(kv, "float"), (kv, "float"), ((B, self.carry), "bool")]
+
+    def check_cache(self, cache: object, B: int) -> Cache:
+        """``cache`` as :meth:`init_cache` makes it for ``B`` streams, or a ``ValueError``."""
+        if not self.carry:
+            raise ValueError("a reader without model.reader_carry has no cache")
+        layout = self._cache_layout(B)
+
+        def kind(t: Tensor) -> str:
+            return "bool" if t.dtype is torch.bool else "float" if t.is_floating_point() else "int"
+
+        got: object = type(cache).__name__
+        if isinstance(cache, tuple) and all(isinstance(t, Tensor) for t in cache):
+            got = [(tuple(t.shape), kind(t)) for t in cache]
+            if got == layout:
+                return cache
+        raise ValueError(
+            f"model.reader_carry={self.carry}: the cache must be {layout} (init_cache), got {got}"
+        )
+
+    def reset_cache(self, cache: Cache, mask: Tensor) -> Cache:
+        """``cache`` with nothing valid in the rows where ``mask`` (``[B]`` bool) is True."""
+        if mask.dtype is not torch.bool or mask.dim() != 1:
+            raise ValueError(f"mask must be a bool [B] tensor, got {tuple(mask.shape)}")
+        keys, values, valid = self.check_cache(cache, int(mask.shape[0]))
+        return keys, values, valid & ~mask.to(valid.device)[:, None]
+
+    def carry_mask(self, reset: Tensor, valid: Tensor) -> Tensor:
+        """Bool ``[B, 1, T, C + T]``: True where window position ``t`` (row) may read a
+        cached position (the first ``C`` columns, slot ``j`` at the position ``j − C``) or a
+        window position ``s`` (the last ``T``). ``t − s ≤ C`` and ``s ≤ t`` for both; a cached
+        position needs ``valid`` (``[B, C]``, its document is the one going on) and no reset at
+        or before ``t``; a window position needs the document of ``t``. Every row holds its own
+        position."""
+        T = int(reset.shape[1])
+        C = self.carry
+        segment = reset.to(torch.int64).cumsum(dim=1)  # the document index of every position
+        same = segment[:, :, None] == segment[:, None, :]
+        index = torch.arange(T, device=reset.device)
+        distance = index[:, None] - index[None, :]  # t − s
+        near = (distance >= 0) & (distance <= C)
+        going_on = segment == 0  # [B, T]: no reset at or before t, the cached document goes on
+        slot = torch.arange(C, device=reset.device)
+        reach = slot[None, :] >= index[:, None]  # [T, C]: t − (j − C) ≤ C
+        cached = valid[:, None, :] & going_on[:, :, None] & reach
+        return torch.cat([cached, same & near], dim=-1)[:, None]
+
+    def read(self, tokens: Tensor, reset: Tensor, cache: Cache) -> tuple[Tensor, Cache]:
+        """``model.reader_carry``: ``(c, cache)`` for the window ``tokens`` after the windows
+        ``cache`` holds (module docstring, "Reading past the window"). ``c [B, T, w]`` is the
+        reader's output, as :meth:`forward`'s; the cache returned holds the last ``C``
+        positions of the stream after this window, detached."""
+        if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
+            raise ValueError(
+                f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
+                f"{tuple(tokens.shape)} and {reset.dtype} {tuple(reset.shape)}"
+            )
+        if not self.carry:
+            raise ValueError("read() is the reader with model.reader_carry; call the reader")
+        B, T = (int(n) for n in tokens.shape)
+        keys, values, valid = self.check_cache(cache, B)
+        C = self.carry
+        x = self.emb(tokens)
+        # the angles of the positions −C … T − 1: the window's as forward's, the cached ones
+        # those of 1 … C with the sine's sign turned (cos is even, sin odd)
+        cos_all, sin_all = self._rotation(max(T, C + 1), x)
+        cos = torch.cat([cos_all[1 : C + 1].flip(0), cos_all[:T]])
+        sin = torch.cat([-sin_all[1 : C + 1].flip(0), sin_all[:T]])
+        mask = self.carry_mask(reset, valid)
+        kept_keys: list[Tensor] = []
+        kept_values: list[Tensor] = []
+        for i, module in enumerate(self.blocks):
+            block = cast(_ReaderBlock, module)
+            block_cos, block_sin = self._block_rotation(self._block_pairs[i], cos, sin)
+            x, k, v = block.forward_carry(x, mask, block_cos, block_sin, keys[i], values[i])
+            kept_keys.append(torch.cat([keys[i], k.to(keys.dtype)], dim=2)[:, :, T:])
+            kept_values.append(torch.cat([values[i], v.to(values.dtype)], dim=2)[:, :, T:])
+        segment = reset.to(torch.int64).cumsum(dim=1)
+        last = segment[:, -1:]  # the document the stream is in after the window
+        still = valid & (last == 0)  # cached positions of a document that goes on
+        # contiguous: the cache keeps one memory layout from window to window (a compiled
+        # window is specialised to its inputs' strides)
+        valid_next = torch.cat([still, segment == last], dim=1)[:, T:].contiguous()
+        out: Tensor = self.norm(x)
+        kept = (torch.stack(kept_keys).detach(), torch.stack(kept_values).detach(), valid_next)
+        return out, kept
+
     def extra_repr(self) -> str:
         text = f"width={self.width}, heads={self.heads}, span={self.span}"
         if self.position != "rotary":
@@ -325,4 +504,6 @@ class Reader(nn.Module):
             text += f", rotary_pairs={self.rotary_pairs}"
         if self.rotary_base != _ROTARY_BASE:
             text += f", rotary_base={self.rotary_base:g}"
+        if self.carry:
+            text += f", carry={self.carry}"
         return text
