@@ -485,7 +485,7 @@ def test_key_is_opt_in_and_the_default_keeps_its_hash() -> None:
     base = load_config(RECIPE_A6)
     assert base.model.write_events == "byte"
     assert "write_events" not in json.loads(canonical_json(base))["model"]
-    assert HASH_OMIT_AT_DEFAULT[-1] == "model.write_events"
+    assert "model.write_events" in HASH_OMIT_AT_DEFAULT
     hybrid = load_config(RECIPE_A6, HYBRID)
     named = load_config(RECIPE_A6, [*HYBRID, _ev("byte")])
     assert config_hash(named) == config_hash(hybrid)
