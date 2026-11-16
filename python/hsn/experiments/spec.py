@@ -626,6 +626,9 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates
         del dump["model"]["memory"]
+    if dump["model"]["cell_attention_heads"] == 0:
+        # likewise: without the attention read of the cells an arm keeps its memory key
+        del dump["model"]["cell_attention_heads"]
     return digest(
         {
             "model_name": cfg.model_name,

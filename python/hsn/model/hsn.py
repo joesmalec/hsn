@@ -152,6 +152,20 @@ compiled block and :meth:`_position` are the code they were. :meth:`step` has no
 and refuses the key; the split and fused windows refuse it too. With ``model.fast_cells`` kept
 beside the reader, ``S`` reads ``[z ; q ; ctx ; c ; f]`` and ``D`` reads ``[q ; u ; r ; f ; c]``.
 
+The attention read of the cells (``model.cell_attention_heads = H > 0``, HSN-T only,
+``docs/amendments/cell_attention_read.md``; opt-in candidate): at every position ``c_t`` queries
+all cells (:class:`~hsn.model.cell_read.CellAttentionRead`: keys from each cell's state and its
+fixed address code, values from its state, softmax over every cell) and the result ``m_t``
+(``[B, d]``) is one more input of the decoder, ``D([q_t ; u_t ; r_t ; c_t ; m_t])``. It reads the
+state ``r_t`` reads, ``h`` after position ``t``, with its gradient and on ``r_t``'s terms: no
+path of ``train.feedback_detach`` cuts it (none cuts ``r_t``), and what it passes back into the
+state meets ``train.state_grad_clip`` at the entry of the position like every other gradient.
+In a window ``m_t`` travels behind ``r_t`` in the per-position readout
+(:meth:`HSN._window_readout`) and :meth:`HSN._window_epilogue` puts it after ``c_t``, so the
+loop, the compiled block and :meth:`_position` are the code they were. The cells, the router
+and its selection, the units, the gates, the graph, ``q`` and the write path do not read it.
+:meth:`step` refuses HSN-T as before, and the split and fused windows refuse the key.
+
 Still out of scope: one round only (the :class:`~hsn.model.halting.HaltingHead` is owned but not
 called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 """
@@ -169,6 +183,7 @@ from torch import Tensor, nn
 from hsn.config import FEEDBACK_PATHS, GateMode, ModelConfig, RunConfig
 from hsn.data.synthetic import BOS
 from hsn.model.cell import PDGCell, WindowConsts, profiler_segment
+from hsn.model.cell_read import CellAttentionRead
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.gradclip import clip_row_grad
@@ -411,6 +426,12 @@ class HSN(nn.Module):
                 f"model.reader={cfg.reader!r} belongs to the HSN-T family "
                 "(hsn.model.hsn_t.HSNT, model_name: hsn_t): the HSN has no sequence attention"
             )
+        if cfg.cell_attention_heads and not self._takes_reader:
+            raise ValueError(
+                f"model.cell_attention_heads={cfg.cell_attention_heads} is HSN-T's attention "
+                "read of the cells (hsn.model.hsn_t.HSNT, model_name: hsn_t): the HSN has no "
+                "attention"
+            )
         if ste_scope not in ("selected", "all"):
             raise ValueError(f"ste_scope must be 'selected' or 'all', got {ste_scope!r}")
         #: ``train.ste_scope`` (opt-in): "all" trains the routed window on the masked round.
@@ -506,6 +527,11 @@ class HSN(nn.Module):
         #: ``model.address_gate_input = reader_prev``: the width of ``c_{t−1}`` at the end of a
         #: window's context columns (behind ``c_t``), which only the address gate reads; else 0.
         self._gate_rides: int = cfg.reader_width if self.scorer.gate_input == "reader_prev" else 0
+        #: ``model.cell_attention_heads`` (HSN-T, opt-in): the attention read of the cells, or
+        #: ``None``. Built after everything else and from its own generator, like the reader.
+        self.cell_read: CellAttentionRead | None = (
+            CellAttentionRead(cfg, seed=seed) if cfg.cell_attention_heads else None
+        )
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
         self._fixed_route: Tensor | None = (
             torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
@@ -1258,7 +1284,9 @@ class HSN(nn.Module):
                 state = result.state
                 if self.cfg.selected_readout:
                     readouts.append(
-                        self._selected_readout(state, result.selection, controls.gate, mode)
+                        self._window_readout(
+                            state, result.selection, controls.gate, mode, pro.ctx_steps[t]
+                        )
                     )
                 z_hats.append(result.z_hat)
                 epss.append(result.eps)
@@ -1565,7 +1593,13 @@ class HSN(nn.Module):
         if pro.reader is not None:  # HSN-T: the decoder reads c_t after [q; u; r] (and A8's f)
             if readouts is None:
                 raise ValueError("HSN-T's reader needs A5's per-position readouts")
-            readouts = torch.cat([readouts, pro.reader], dim=-1)
+            if self.cell_read is not None:
+                # the attention read m_t rode behind r_t (_window_readout): D reads it last,
+                # [q; u; r; c; m]
+                d = self.cfg.d
+                readouts = torch.cat([readouts[..., :-d], pro.reader, readouts[..., -d:]], dim=-1)
+            else:
+                readouts = torch.cat([readouts, pro.reader], dim=-1)
         logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
             "z": pro.z,
@@ -1651,6 +1685,28 @@ class HSN(nn.Module):
         logits: Tensor = self.decoder(torch.cat(inputs, dim=-1))
         return logits
 
+    def _window_readout(
+        self,
+        state: CellGraphState,
+        selection: Selection | None,
+        gate: GateMode | None,
+        mode: StepMode | None,
+        ctx_t: Tensor,
+    ) -> Tensor:
+        """What a position of a window reads of the cells for the decoder: A5's ``r_t``
+        (:meth:`_selected_readout`, and A8's ``f_t`` behind it), and with
+        ``model.cell_attention_heads`` (HSN-T) the attention read ``m_t`` of all cells behind
+        that, ``[B, … + d]``. ``state`` is the state after position ``t`` for both reads, with
+        its gradient for both. ``ctx_t`` is the position's context columns, which hold the
+        reader's ``c_t`` behind the context embedding (:meth:`_window_prologue`)."""
+        readout = self._selected_readout(state, selection, gate, mode)
+        if self.cell_read is None:
+            return readout
+        start = self.cfg.context_dim
+        c_t = ctx_t[..., start : start + self.cfg.reader_width]
+        m_t = self.cell_read(c_t, state.h, self.scorer.cell_addresses)
+        return torch.cat([readout, m_t.to(readout.dtype)], dim=-1)
+
     def _selected_readout(
         self,
         state: CellGraphState,
@@ -1700,7 +1756,9 @@ class HSN(nn.Module):
         """Measured parameter counts: the Appendix C.1 rows in table order and their ``total``
         (the closed form of :func:`hsn.train.memory_plan.expected_param_count`), then ``edges``
         (the P1.4 edge logits, outside Appendix C), with ``model.reader`` (HSN-T) ``reader``
-        (:func:`hsn.train.memory_plan.reader_param_count`), and ``total_trainable`` (every
+        (:func:`hsn.train.memory_plan.reader_param_count`), with
+        ``model.cell_attention_heads`` ``cell_read``
+        (:func:`hsn.train.memory_plan.cell_read_param_count`), and ``total_trainable`` (every
         parameter of this module; the run manifest's ``param_count``)."""
         modules: dict[str, nn.Module] = {
             "byte_emb": self.byte_emb,
@@ -1726,12 +1784,16 @@ class HSN(nn.Module):
         if self.reader is not None:  # HSN-T: outside Appendix C, like the edge logits
             report["reader"] = sum(p.numel() for p in self.reader.parameters())
             accounted += report["reader"]
+        if self.cell_read is not None:  # the attention read of the cells: outside Appendix C too
+            report["cell_read"] = sum(p.numel() for p in self.cell_read.parameters())
+            accounted += report["cell_read"]
         report["total_trainable"] = sum(p.numel() for p in self.parameters())
         if report["total_trainable"] != accounted:
             raise RuntimeError(
                 f"param_report: {report['total_trainable']} trainable parameters, but the Appendix "
                 f"C rows ({report['total']}), the edge logits ({report['edges']}) and HSN-T's "
-                f"reader ({report.get('reader', 0)}) give {accounted}; a submodule carries "
+                f"reader ({report.get('reader', 0)}) and attention read "
+                f"({report.get('cell_read', 0)}) give {accounted}; a submodule carries "
                 "unaccounted parameters"
             )
         return report

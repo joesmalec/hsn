@@ -415,7 +415,9 @@ def _block(
             gates.append(result.gate)
             written.append(result.written)
         if model.cfg.selected_readout:
-            readouts.append(model._selected_readout(state, result.selection, controls.gate, mode))
+            readouts.append(
+                model._window_readout(state, result.selection, controls.gate, mode, c_b[:, i])
+            )
         z_hats.append(result.z_hat)
         epss.append(result.eps)
         us.append(result.u)

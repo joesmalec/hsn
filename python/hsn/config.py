@@ -391,6 +391,16 @@ class ModelConfig(_StrictModel):
     # memory are then not read; the generic trainer trains it on the next-byte loss alone.
     # true (default): the model with its memory, unchanged.
     memory: bool = True
+    # cell_attention_heads (docs/amendments/cell_attention_read.md; opt-in candidate, HSN-T
+    # only): H > 0 adds an attention read of the cells beside the router's read. At every
+    # position the reader's output c_t queries all n_cells cells with H heads of width d / H
+    # (keys from each cell's state and its fixed address code, values from its state, softmax
+    # over every cell, no top-k), and the result m_t (width d) is one more input of the
+    # decoder: D([q; u; r; c; m]). The cells, the router and its selection, the units, the
+    # gates, the graph, q, the write path and the losses are unchanged. Needs model.reader
+    # (the queries), model.memory, model.key_address (the address codes) and d a multiple of
+    # H; built into the autograd window only. 0 (default): no read, the model as it was.
+    cell_attention_heads: int = Field(default=0, ge=0)
     # --- end HSN-T ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
@@ -552,6 +562,29 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     "model.memory=false: model.decoder_shortcut_dropout drops q and u so that "
                     "the decoder reads the selected cells, and there are none; leave it at 0"
+                )
+        if self.cell_attention_heads:
+            key = f"model.cell_attention_heads={self.cell_attention_heads}"
+            if self.reader == "none":
+                raise ValueError(
+                    f"{key} is HSN-T's attention read of the cells (model_name: hsn_t): its "
+                    "queries are the reader's output, so set model.reader=transformer. The "
+                    "HSN has no attention"
+                )
+            if not self.memory:
+                raise ValueError(
+                    f"{key} reads the cells of the memory, and model.memory=false has none; "
+                    "leave it at 0"
+                )
+            if not (self.key_address and self.selected_readout):
+                raise ValueError(
+                    f"{key} needs model.key_address=true (a key reads the cell's fixed address "
+                    "code) and model.selected_readout=true (the read stands beside r_t)"
+                )
+            if self.d % self.cell_attention_heads:
+                raise ValueError(
+                    f"{key}: the heads share the cell width, so model.d={self.d} must be a "
+                    "multiple of the number of heads"
                 )
         # --- end HSN-T ---
         return self
@@ -1396,6 +1429,12 @@ class RunConfig(_StrictModel):
                 "model_name=reader is the HSN-T reader alone with a next-byte head: set "
                 "model.reader=transformer and the reader_* keys of the reader it stands for"
             )
+        if self.model.cell_attention_heads and self.model_name != "hsn_t":
+            raise ValueError(
+                f"model.cell_attention_heads={self.model.cell_attention_heads} is HSN-T's "
+                f"attention read of the cells; model_name={self.model_name!r} has no cells to "
+                "read: leave it at 0"
+            )
         if not self.model.memory:
             if self.model_name != "hsn_t":
                 raise ValueError(
@@ -1831,6 +1870,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_history",
     "hardware.baseline_compile",
     "model.memory",
+    "model.cell_attention_heads",
 )
 
 
@@ -1863,7 +1903,7 @@ LOSS_WEIGHT_KEYS: tuple[str, ...] = tuple(
     f"lambda_{term}" for term in ("p", "r", "d", "e", "c", "b", "g", "u", "ponder", "w")
 )
 #: The top-level modules of an HSN-T that are its memory (the others stay with the memory off).
-MEMORY_MODULES: tuple[str, ...] = ("predictor", "cell", "router", "halting")
+MEMORY_MODULES: tuple[str, ...] = ("predictor", "cell", "router", "halting", "cell_read")
 
 
 def memory_off_refusals(cfg: RunConfig) -> list[str]:
@@ -1933,6 +1973,11 @@ def split_window_scope_error(
     sweep would cost more than the autograd window, and the configuration is never offered
     it."""
     model, train = cfg.model, cfg.train
+    if model.cell_attention_heads:
+        return (
+            f"model.cell_attention_heads={model.cell_attention_heads}: the attention read of "
+            "the cells is built into the autograd window only"
+        )
     if cfg.model_name != "hsn":  # HSN-T too: its reader is not built into the split window
         return f"model_name={cfg.model_name!r} is not the HSN"
     if model.routing != "topk":
