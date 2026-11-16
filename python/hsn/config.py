@@ -422,6 +422,13 @@ class ModelConfig(_StrictModel):
     # rotary positions and no reader_span; HSN-T with its memory refuses it (memory = false
     # and model_name = reader take it). 0 (default): no cache, every window read alone.
     reader_carry: int = Field(default=0, ge=0)
+    # reader_top_words = N: the top block also reads the keys and values at the last N word
+    # ends of its document before the window (a byte that is not a letter or digit directly
+    # after one; ASCII letters, digits and bytes >= 128 count as letters), carried and
+    # detached as the cache is; an entry inside the local span (distance <= reader_carry) is
+    # not read twice. Needs reader_carry > 0 and the top block unrotated (the last entry of
+    # reader_rotary_pairs 0, or 0 for all blocks). 0 (default): no word entries.
+    reader_top_words: int = Field(default=0, ge=0)
     # --- end the reader's carried context ---
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
@@ -582,10 +589,10 @@ class ModelConfig(_StrictModel):
                     "reader_rotary_base are the positions of model.reader; set "
                     "model.reader=transformer or leave them at their defaults"
                 )
-            if self.reader_carry:
+            if self.reader_carry or self.reader_top_words:
                 raise ValueError(
-                    "model.reader_carry carries the keys of model.reader across windows; set "
-                    "model.reader=transformer or leave it at 0"
+                    "model.reader_carry / model.reader_top_words: each carries the keys of "
+                    "model.reader across windows; set model.reader=transformer or leave them at 0"
                 )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
@@ -636,6 +643,19 @@ class ModelConfig(_StrictModel):
                     f"model.reader_carry={self.reader_carry} with model.reader_span="
                     f"{self.reader_span}: the carry is itself a sliding span (distances "
                     "0..reader_carry); leave model.reader_span null"
+                )
+            if self.reader_top_words and not self.reader_carry:
+                raise ValueError(
+                    f"model.reader_top_words={self.reader_top_words} extends the carried span "
+                    "of model.reader_carry, which is 0: set model.reader_carry > 0"
+                )
+            top = counts[-1] if counts else None  # None: every pair rotated (the default)
+            if self.reader_top_words and top != 0:
+                raise ValueError(
+                    f"model.reader_top_words={self.reader_top_words} needs the top block "
+                    "unrotated (the last entry of model.reader_rotary_pairs 0, got "
+                    f"{pairs}): a word entry keeps no position, and its distance to a query "
+                    "changes from window to window"
                 )
         table_rows = type(self).model_fields["reader_positions"].default
         if self.reader_position != "learned" and self.reader_positions != table_rows:
@@ -1960,6 +1980,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.reader_rotary_dtype",
     "model.reader_rotary_base",
     "model.reader_carry",
+    "model.reader_top_words",
 )
 
 

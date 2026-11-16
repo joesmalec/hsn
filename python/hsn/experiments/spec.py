@@ -623,6 +623,7 @@ _READER_POSITION_DEFAULTS: dict[str, Any] = {
     "reader_rotary_dtype": "working",
     "reader_rotary_base": 10_000.0,
     "reader_carry": 0,  # the reader's carried context (15 Nov 2026), likewise
+    "reader_top_words": 0,
 }
 
 

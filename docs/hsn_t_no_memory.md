@@ -288,7 +288,33 @@ state. Position `t` of a window reads the positions `s` of its own document with
   carried key would share with a key of the current window); `model.reader_span` (the carry is
   a sliding span itself).
 - **Cost.** Each block's attention reads `C + T` keys in place of `T`; the MLPs, projections and
-  everything outside the reader are unchanged.
+  everything outside the reader are unchanged. Measured roughly on the CPU (2 threads, a loaded
+  host, w160 × 4 top0, batch 8 × window 256, the cache full): forward 77.8 → 110.6 ms (× 1.42),
+  forward and backward 226 → 297 ms (× 1.31). Not timed on a card.
+
+**`model.reader_top_words: N`** (default 0; needs `model.reader_carry > 0` and the top block
+unrotated, the last entry of `model.reader_rotary_pairs` 0). The top block also reads the keys
+and values at the last `N` word ends of its document before the window, carried and detached as
+the cache is. A word end is a byte that is not a letter or digit (a space, punctuation, the
+newline and tab markers 16 and 17, the end symbol) directly after one; ASCII letters and
+digits and every byte of 128 and above count as letters. At a word end the model has read the
+whole word, so the entry is causal. With `N = 256` the top block reaches about 256 words (about
+1,300 bytes) back at a fixed cost.
+
+- **Slots.** `(word_keys, word_values [B, H, N, w / H], word_valid [B, N], word_pos [B, N],
+  last_letter [B])`: the most recent first, `word_pos` the slot's position from the window's
+  start (int64), `last_letter` whether the window's last byte was a letter (the next window's
+  first byte may end its word). After each window the slots are the `N` most recent word ends
+  of the document going on (a fixed-size `topk` over the old slots and the window's word ends).
+- **Not read twice.** A word slot within the span (`t − s ≤ C`) is masked: the span reads that
+  position already, with the same key (the top block rotates nothing, so its keys carry no
+  position). When the window is longer than `C + 1`, the top block also reads the window's own
+  word ends beyond the span, and of these and the slots together the last `N`; at a window of
+  256 with `C = 256` there are none.
+- **Documents.** As for the cache: a slot of an earlier document is never read, and a
+  document's first byte ends no word.
+- **Cost.** The top block's attention reads `N` more keys. CPU, as above, with `N = 256`:
+  forward × 1.45, forward and backward × 1.36 against no carry.
 
 ## How to time it
 
@@ -335,6 +361,12 @@ the stream read in one pass with a sliding span of `C` (a direct computation and
 with `reader_span = C + 1`), at window lengths below, at and above `C`; a document reads
 nothing of the one before it; the cache is detached; the refusals; the generic trainer trains,
 evaluates and checkpoints with the cache; the carrying window compiles as one graph.
+`tests/test_reader_top_words.py` (`model.reader_top_words`): word ends on hand-made bytes
+(UTF-8, the newline and tab markers, across a window boundary, after a reset); the default and
+0 change nothing; windows with word slots equal a direct computation whose word reads are
+chosen by loops (window lengths below and above `C + 1`, with `N` binding and not); word slots
+inside the span are masked; no word of an earlier document is read; the slots are detached and
+hold the last `N` word ends; refusals; trainer and compiled window as above.
 
 ## Limits
 

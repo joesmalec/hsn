@@ -82,6 +82,18 @@ sign turned) and the window's by ``0 … T − 1``, as without the cache; a bloc
 nothing needs nothing. ``reset`` acts as before: a position reads nothing of a document before
 its own, cached or not. The shapes do not depend on the data; at ``C = 0`` (the default)
 :meth:`Reader.forward` is the reader above and there is no cache.
+
+``model.reader_top_words = N`` (needs ``C > 0`` and the top block unrotated): the cache also
+holds the top block's keys and values at the last ``N`` word ends of the document before the
+window (:func:`word_ends`: a byte that is not a letter or digit right after one; bytes of 128
+and above count as letters), ``(word_keys, word_values [B, H, N, w / H], word_valid [B, N],
+word_pos [B, N], last_letter [B])``: the slots the most recent first, ``word_pos`` their
+positions from the window's start (int64), ``last_letter`` whether the window's last byte was a
+letter (a word end may be the next window's first byte). The top block reads them as more keys
+(it rotates nothing, so they need no position), and also the window's own word ends beyond the
+span when the window is longer than ``C + 1``: of these two together the last ``N``. An entry
+inside the span (``t − s ≤ C``) is read by the span only, never twice; ``reset`` acts as on
+the cache. With ``N = 256`` the top block reaches about 256 words back at a fixed cost.
 """
 
 from __future__ import annotations
@@ -95,7 +107,7 @@ from torch import Tensor, nn
 
 from hsn.config import ModelConfig
 
-__all__ = ["Cache", "Reader"]
+__all__ = ["Cache", "Reader", "word_bytes", "word_ends"]
 
 #: The default of ``model.reader_rotary_base``: the base of the rotary frequency ladder.
 _ROTARY_BASE = 10_000.0
@@ -124,6 +136,34 @@ def _rotary_angles(
     if pairs is not None:
         angles[:, pairs:] = 0.0
     return angles
+
+
+#: ``model.reader_top_words``: the position of an empty word slot (far below any real one, and
+#: far enough from the int64 limit that shifting it by a window never wraps)
+_NO_POSITION = -(2**62)
+
+
+def word_bytes(tokens: Tensor) -> Tensor:
+    """Bool, the shape of ``tokens``: the byte is a letter or digit for the word ends of
+    ``model.reader_top_words``: ASCII ``0-9``, ``A-Z``, ``a-z``, and every byte of 128 and
+    above (the bytes of a UTF-8 letter)."""
+    return (
+        ((tokens >= 48) & (tokens <= 57))
+        | ((tokens >= 65) & (tokens <= 90))
+        | ((tokens >= 97) & (tokens <= 122))
+        | (tokens >= 128)
+    )
+
+
+def word_ends(tokens: Tensor, reset: Tensor, last_letter: Tensor) -> Tensor:
+    """Bool ``[B, T]``: position ``t`` ends a word. Its byte is not a letter or digit
+    (:func:`word_bytes`: a space, punctuation, the newline and tab markers 16 and 17, a control
+    symbol) and the byte before it, of the same document, is one; for ``t = 0`` that byte is
+    the last of the window before (``last_letter [B]``). A document's first position ends
+    nothing. Causal: at a word end the whole word has been read."""
+    letters = word_bytes(tokens)
+    before = torch.cat([last_letter[:, None].to(torch.bool), letters[:, :-1]], dim=1)
+    return ~letters & before & ~reset
 
 
 def _rotate(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -180,13 +220,18 @@ class _ReaderBlock(nn.Module):
         sin: Tensor | None,
         keys: Tensor,
         values: Tensor,
+        word_keys: Tensor | None = None,
+        word_values: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """:meth:`forward` over the carried keys and values as well (``model.reader_carry``,
         :meth:`Reader.read`). ``keys`` / ``values [B, H, C, w / H]``: the un-rotated keys and
         the values of the ``C`` positions before the window; ``cos`` / ``sin [C + T, half]``:
         the angles of the positions ``−C … T − 1`` (None: no rotation); ``mask
-        [B, 1, T, C + T]``, the cached columns first. Returns the output and the window's
-        un-rotated keys and its values ``[B, H, T, w / H]`` (the next cache's)."""
+        [B, 1, T, C + T]``, the cached columns first. ``word_keys`` / ``word_values
+        [B, H, N, w / H]`` (``model.reader_top_words``, the top block, which rotates nothing):
+        ``N`` more columns after them, the mask ``[B, 1, T, C + T + N]``. Returns the output
+        and the window's un-rotated keys and its values ``[B, H, T, w / H]`` (the next
+        cache's)."""
         B, T, w = x.shape
         C = keys.shape[2]
         q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
@@ -203,6 +248,9 @@ class _ReaderBlock(nn.Module):
             else:
                 cos, sin = cos.to(q.dtype), sin.to(q.dtype)
                 q, all_k = _rotate(q, cos[C:], sin[C:]), _rotate(all_k, cos, sin)
+        if word_keys is not None and word_values is not None:  # position-free entries
+            all_k = torch.cat([all_k, word_keys.to(all_k.dtype)], dim=2)
+            all_v = torch.cat([all_v, word_values.to(all_v.dtype)], dim=2)
         attn = F.scaled_dot_product_attention(q, all_k, all_v, attn_mask=mask)
         x = x + self.proj(attn.transpose(1, 2).reshape(B, T, w))
         out: Tensor = x + self.fc_out(F.gelu(self.fc_in(self.norm_mlp(x))))
@@ -250,6 +298,10 @@ class Reader(nn.Module):
             )
         if self.carry and self.span is not None:
             raise ValueError("model.reader_carry is a sliding span itself: leave reader_span null")
+        #: ``model.reader_top_words``: the word ends the top block also reads (0: none)
+        self.top_words: int = cfg.reader_top_words
+        if self.top_words and not self.carry:
+            raise ValueError("model.reader_top_words needs model.reader_carry > 0")
         half = width // heads // 2
         counts = (
             list(self.rotary_pairs)
@@ -284,6 +336,8 @@ class Reader(nn.Module):
                 nn.init.normal_(self.pos, std=_INIT_STD)
             else:
                 self.register_parameter("pos", None)
+        if self.top_words and self._block_pairs[-1] != 0:
+            raise ValueError("model.reader_top_words needs the top block unrotated (pairs 0)")
         self.register_buffer("_rot_cos", None, persistent=False)
         self.register_buffer("_rot_sin", None, persistent=False)
         self._fill_rotary_table()
@@ -404,12 +458,31 @@ class Reader(nn.Module):
         shape = (len(self.blocks), B, self.heads, self.carry, self.width // self.heads)
         keys = torch.zeros(shape, device=device, dtype=weight.dtype)
         valid = torch.zeros(B, self.carry, device=device, dtype=torch.bool)
-        return keys, torch.zeros_like(keys), valid
+        cache: Cache = (keys, torch.zeros_like(keys), valid)
+        if self.top_words:  # the top block's word slots, all empty
+            N = self.top_words
+            words = (B, self.heads, N, self.width // self.heads)
+            word_keys = torch.zeros(words, device=device, dtype=weight.dtype)
+            cache += (
+                word_keys,
+                torch.zeros_like(word_keys),
+                torch.zeros(B, N, device=device, dtype=torch.bool),
+                torch.full((B, N), _NO_POSITION, device=device, dtype=torch.int64),
+                torch.zeros(B, device=device, dtype=torch.bool),
+            )
+        return cache
 
     def _cache_layout(self, B: int) -> list[tuple[tuple[int, ...], str]]:
-        """The shape and kind (``float`` | ``bool``) of every tensor of the cache."""
-        kv = (len(self.blocks), B, self.heads, self.carry, self.width // self.heads)
-        return [(kv, "float"), (kv, "float"), ((B, self.carry), "bool")]
+        """The shape and kind (``float`` | ``bool`` | ``int``) of every tensor of the cache."""
+        d = self.width // self.heads
+        kv = (len(self.blocks), B, self.heads, self.carry, d)
+        layout = [(kv, "float"), (kv, "float"), ((B, self.carry), "bool")]
+        if self.top_words:
+            N = self.top_words
+            words = (B, self.heads, N, d)
+            layout += [(words, "float"), (words, "float"), ((B, N), "bool"), ((B, N), "int")]
+            layout.append(((B,), "bool"))
+        return layout
 
     def check_cache(self, cache: object, B: int) -> Cache:
         """``cache`` as :meth:`init_cache` makes it for ``B`` streams, or a ``ValueError``."""
@@ -433,8 +506,13 @@ class Reader(nn.Module):
         """``cache`` with nothing valid in the rows where ``mask`` (``[B]`` bool) is True."""
         if mask.dtype is not torch.bool or mask.dim() != 1:
             raise ValueError(f"mask must be a bool [B] tensor, got {tuple(mask.shape)}")
-        keys, values, valid = self.check_cache(cache, int(mask.shape[0]))
-        return keys, values, valid & ~mask.to(valid.device)[:, None]
+        parts = list(self.check_cache(cache, int(mask.shape[0])))
+        rows = mask.to(parts[2].device)
+        parts[2] = parts[2] & ~rows[:, None]
+        if self.top_words:  # the word slots, and the byte before the next window
+            parts[5] = parts[5] & ~rows[:, None]
+            parts[7] = parts[7] & ~rows
+        return tuple(parts)
 
     def carry_mask(self, reset: Tensor, valid: Tensor) -> Tensor:
         """Bool ``[B, 1, T, C + T]``: True where window position ``t`` (row) may read a
@@ -456,11 +534,46 @@ class Reader(nn.Module):
         cached = valid[:, None, :] & going_on[:, :, None] & reach
         return torch.cat([cached, same & near], dim=-1)[:, None]
 
+    def word_masks(
+        self, reset: Tensor, ends: Tensor, word_valid: Tensor, word_pos: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """``model.reader_top_words``: what the top block reads of the word ends besides
+        :meth:`carry_mask`, as ``(window [B, T, T], cached [B, T, N])``. ``ends [B, T]``:
+        :func:`word_ends` of the window. ``window``: window position ``s`` for ``t``, a word end
+        of ``t``'s document beyond the span (``t − s > C``), one of the last ``N`` such ends
+        of the window. ``cached``: word slot ``j`` (the most recent first; ``word_pos`` is its
+        position from the window's start, negative) for ``t``: valid, no reset at or before
+        ``t``, beyond the span (``word_pos < t − C``), and one of the last ``N`` of the
+        window's word ends before ``t − C`` and the slots together. An entry inside the span
+        is read by the span (:meth:`carry_mask`) and is False in both."""
+        T = int(reset.shape[1])
+        C, N = self.carry, self.top_words
+        segment = reset.to(torch.int64).cumsum(dim=1)
+        same = segment[:, :, None] == segment[:, None, :]
+        index = torch.arange(T, device=reset.device)
+        distance = index[:, None] - index[None, :]  # t − s
+        count = ends.to(torch.int64).cumsum(dim=1)  # the window's word ends at or before s
+        # the window's word ends before t − C: count[t − C − 1], 0 for t ≤ C
+        start = torch.zeros_like(count[:, :1]).expand(-1, C + 1)
+        before = torch.cat([start, count], dim=1)[:, :T]
+        later = before[:, :, None] - count[:, None, :]  # word ends in (s, t − C − 1]
+        window = same & (distance > C) & ends[:, None, :] & (later < N)
+        going_on = segment == 0
+        slot = torch.arange(N, device=reset.device)
+        cached = (
+            word_valid[:, None, :]
+            & going_on[:, :, None]
+            & (word_pos[:, None, :] < (index - C)[None, :, None])
+            & (slot[None, None, :] < N - before[:, :, None])
+        )
+        return window, cached
+
     def read(self, tokens: Tensor, reset: Tensor, cache: Cache) -> tuple[Tensor, Cache]:
         """``model.reader_carry``: ``(c, cache)`` for the window ``tokens`` after the windows
         ``cache`` holds (module docstring, "Reading past the window"). ``c [B, T, w]`` is the
         reader's output, as :meth:`forward`'s; the cache returned holds the last ``C``
-        positions of the stream after this window, detached."""
+        positions of the stream after this window, and with ``model.reader_top_words`` its
+        last ``N`` word ends, detached."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
@@ -469,8 +582,9 @@ class Reader(nn.Module):
         if not self.carry:
             raise ValueError("read() is the reader with model.reader_carry; call the reader")
         B, T = (int(n) for n in tokens.shape)
-        keys, values, valid = self.check_cache(cache, B)
-        C = self.carry
+        cache = self.check_cache(cache, B)
+        keys, values, valid = cache[:3]
+        C, N = self.carry, self.top_words
         x = self.emb(tokens)
         # the angles of the positions −C … T − 1: the window's as forward's, the cached ones
         # those of 1 … C with the sine's sign turned (cos is even, sin odd)
@@ -478,12 +592,32 @@ class Reader(nn.Module):
         cos = torch.cat([cos_all[1 : C + 1].flip(0), cos_all[:T]])
         sin = torch.cat([-sin_all[1 : C + 1].flip(0), sin_all[:T]])
         mask = self.carry_mask(reset, valid)
+        word_keys = word_values = None
+        top_mask = mask
+        if N:  # the top block also reads word ends beyond the span: the window's and the slots
+            word_keys, word_values, word_valid, word_pos, last_letter = cache[3:]
+            ends = word_ends(tokens, reset, last_letter)
+            window_words, cached_words = self.word_masks(reset, ends, word_valid, word_pos)
+            spans = mask[:, 0]
+            window_reads = spans[:, :, C:] | window_words
+            top_mask = torch.cat([spans[:, :, :C], window_reads, cached_words], dim=-1)[:, None]
         kept_keys: list[Tensor] = []
         kept_values: list[Tensor] = []
+        top = len(self.blocks) - 1
         for i, module in enumerate(self.blocks):
             block = cast(_ReaderBlock, module)
             block_cos, block_sin = self._block_rotation(self._block_pairs[i], cos, sin)
-            x, k, v = block.forward_carry(x, mask, block_cos, block_sin, keys[i], values[i])
+            words = N > 0 and i == top
+            x, k, v = block.forward_carry(
+                x,
+                top_mask if words else mask,
+                block_cos,
+                block_sin,
+                keys[i],
+                values[i],
+                word_keys if words else None,
+                word_values if words else None,
+            )
             kept_keys.append(torch.cat([keys[i], k.to(keys.dtype)], dim=2)[:, :, T:])
             kept_values.append(torch.cat([values[i], v.to(values.dtype)], dim=2)[:, :, T:])
         segment = reset.to(torch.int64).cumsum(dim=1)
@@ -493,7 +627,29 @@ class Reader(nn.Module):
         # window is specialised to its inputs' strides)
         valid_next = torch.cat([still, segment == last], dim=1)[:, T:].contiguous()
         out: Tensor = self.norm(x)
-        kept = (torch.stack(kept_keys).detach(), torch.stack(kept_values).detach(), valid_next)
+        kept: Cache = (
+            torch.stack(kept_keys).detach(),
+            torch.stack(kept_values).detach(),
+            valid_next,
+        )
+        if N:  # the next word slots: the last N word ends of the document going on
+            assert word_keys is not None and word_values is not None
+            index = torch.arange(T, device=tokens.device)
+            position = torch.cat([word_pos, index.expand(B, T)], dim=1)  # [B, N + T]
+            ok = torch.cat([word_valid & (last == 0), ends & (segment == last)], dim=1)
+            pick = torch.where(ok, position, _NO_POSITION).topk(N, dim=1).indices
+            ok_next = ok.gather(1, pick)  # the most recent first, the empty slots last
+            pos_next = torch.where(ok_next, position.gather(1, pick) - T, _NO_POSITION)
+            rows = pick[:, None, :, None].expand(-1, self.heads, -1, word_keys.shape[-1])
+            all_keys = torch.cat([word_keys, k.to(word_keys.dtype)], dim=2)  # k: the top's
+            all_values = torch.cat([word_values, v.to(word_values.dtype)], dim=2)
+            kept += (
+                all_keys.gather(2, rows).detach(),
+                all_values.gather(2, rows).detach(),
+                ok_next,
+                pos_next,
+                word_bytes(tokens[:, -1]),
+            )
         return out, kept
 
     def extra_repr(self) -> str:
@@ -506,4 +662,6 @@ class Reader(nn.Module):
             text += f", rotary_base={self.rotary_base:g}"
         if self.carry:
             text += f", carry={self.carry}"
+        if self.top_words:
+            text += f", top_words={self.top_words}"
         return text
