@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,7 +17,8 @@ from hsn.runner import build_model
 from reader_speed_reference import BeforeCarrySpeed
 from test_reader_rotary_table import _Float64Ops
 
-RECIPE = Path(__file__).resolve().parents[1] / "configs/experiments/hsn_t_nomem.yaml"
+REPO = Path(__file__).resolve().parents[1]
+RECIPE = REPO / "configs/experiments/hsn_t_nomem.yaml"
 
 
 def _model(carry: int, *, full: bool = False, words: int = 0):
@@ -197,11 +201,10 @@ def test_carry_1024_fullgraph_reuses_graph_and_has_no_trigonometry():
         torch._dynamo.reset()
 
 
-@pytest.mark.cuda
-@pytest.mark.parametrize("autocast", [False, True])
-def test_cuda_carry_1024_matches_old_eager(autocast):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
+def _cuda_carry_1024_matches_old_eager(autocast):
+    # The caller sets cuBLAS's workspace environment before this process imports torch.
+    # warn_only=True still permits nondeterministic backward kernels; require determinism.
+    torch.use_deterministic_algorithms(True)
     model = _model(1024, full=True).cuda()
     old = _reference(model).cuda()
     tokens = torch.arange(1024, device="cuda")[None].expand(2, -1).remainder(256)
@@ -217,6 +220,40 @@ def test_cuda_carry_1024_matches_old_eager(autocast):
                 loss = out.float().square().mean()
             loss.backward()
             results.append((out.detach(), [p.grad.clone() for p in m.parameters()]))
-        assert torch.equal(results[0][0], results[1][0])
-        assert all(torch.equal(a, b) for a, b in zip(results[0][1], results[1][1], strict=True))
-        assert all(torch.equal(a, b) for a, b in zip(*states, strict=True))
+        assert torch.equal(results[0][0], results[1][0]), "CUDA logits changed"
+        for (name, _), a, b in zip(
+            model.named_parameters(), results[0][1], results[1][1], strict=True
+        ):
+            assert torch.equal(a, b), f"CUDA gradient changed: {name}"
+        assert all(torch.equal(a, b) for a, b in zip(*states, strict=True)), "CUDA cache changed"
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("autocast", [False, True])
+def test_cuda_carry_1024_matches_old_eager(autocast):
+    """Exact CUDA parity needs deterministic backward, including its cuBLAS workspace.
+
+    RTX 3060 / torch 2.15 audit (16 Nov 2026): even old/old gradients differ with
+    nondeterminism allowed. Strict determinism gives zero old/new difference for
+    all 65 gradients, logits and cache, in both windows and both fp32/bf16 modes.
+    Keep torch.equal throughout. A fresh process configures cuBLAS before its
+    first CUDA operation, regardless of test order, and leaves parent settings alone.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    env = dict(os.environ, CUBLAS_WORKSPACE_CONFIG=":4096:8")
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(REPO / "python"), str(REPO / "tests"), env.get("PYTHONPATH")))
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from test_reader_carry_speed import _cuda_carry_1024_matches_old_eager; "
+            f"_cuda_carry_1024_matches_old_eager({autocast!r})",
+        ],
+        cwd=REPO,
+        env=env,
+        check=True,
+        timeout=120,
+    )
