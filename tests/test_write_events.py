@@ -590,15 +590,20 @@ def test_compiled_event_window_equals_eager(
         assert p28._grad_diff(grads, ref_grads) <= tol["grads"]
         assert sum(g is not None and float(g.abs().sum()) > 0.0 for g in grads) > 10
     if kind == "word":
+        from torch._dynamo.utils import counters
+
         calls, seconds = window.calls, window.compile_seconds
+        graphs = counters["stats"]["unique_graphs"]
         tokens = tokens.clone()
         tokens[1, 0::2], tokens[1, 1::2] = 97, 32  # more events: another block of slots
         ref = p28._run(lambda: model(tokens, cx, state, reset))
-        got = p28._run(lambda: window(tokens, cx, state, reset))
+        with torch.compiler.set_stance("fail_on_recompile"):  # strides without E: one graph
+            got = p28._run(lambda: window(tokens, cx, state, reset))
         assert int(ref[2]["event_valid"].shape[1]) > slots
         diff = p28._max_diff(got, ref)
         assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], diff
         assert window.calls == calls + 1 and window.compile_seconds == seconds  # no new graph
+        assert counters["stats"]["unique_graphs"] == graphs
         with torch.no_grad(), pytest.raises(NotImplementedError, match="event loop"):
             window(tokens, cx, state, reset, capture=True)
 

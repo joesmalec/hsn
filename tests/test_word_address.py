@@ -11,15 +11,17 @@ completes.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
 from pathlib import Path
 
 import pytest
+import test_p2_8_compile as p28
 import torch
 from hsn.config import HASH_OMIT_AT_DEFAULT, RunConfig, canonical_json, config_hash, load_config
-from hsn.data.synthetic import BOS, EOS
+from hsn.data.synthetic import BOS, EOS, PAD
 from hsn.device import resolve, seed_everything
 from hsn.experiments.protocols import ArmRun, run_protocol
 from hsn.experiments.rules import parse_rules
@@ -39,6 +41,7 @@ from p1_11_support import (
 from p1_15_support import datasets, hsn_config
 from test_a6_feedback_detach import A5, _start
 from test_hsn_t import CUT_C, READER, _gap, _model
+from test_p2_8_compile import _release_compiled_state, small_blocks  # noqa: F401
 from test_write_events import CATTN, HYBRID, NGRAM, RECIPE_A6, STE, _ev, _ev_cfg, _window_of
 from torch import Tensor
 
@@ -440,6 +443,95 @@ def test_trainer_carries_and_checkpoints_the_word_state(tmp_path: Path) -> None:
     again = trainer_in(tmp_path / "again")
     again.resume(sorted((tmp_path / "run").glob("step_*.pt"))[-1])
     assert again._prev_tokens is not None and torch.equal(again._prev_tokens.cpu(), carry.cpu())
+
+
+# --------------------------------------------------------------------------------------------------
+# The compiled window
+# --------------------------------------------------------------------------------------------------
+
+
+def _compiled_windows(T: int) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """Consecutive windows of three rows (``tokens``, ``ctx``, ``reset``) with other word
+    lengths, so other numbers of event slots: words of two to four letters; words of one
+    letter (every other byte an event); a document that ends in padding (``PAD`` under context
+    0, which is not text: every byte an event, ``E = T``, as behind every document under
+    ``data.align_docs``); words longer than a block; capitals, digits and apostrophes. No
+    document start inside a window: a reset zeroes the cells, and the routed compiled tests
+    keep every top-K margin away from ties (``tests/test_p2_8_compile.py``)."""
+    texts = [
+        ["the cat sat on a mat", "big dog ran far away", "an ox is in it, so  "],
+        ["a b c d e f g h i j ", "mat and rug and cup ", "x y z we go now so  "],
+        ["a.", "Tom ran home. It is", "it is red, not blue "],
+        ["elephants trumpeted ", "hippopotamuses swim ", "unbelievably quietly"],
+        ["don't Tom's 42 X'd q", "IT'S 1999, 'ok' now ", "Lily said: 'hello!' "],
+    ]
+    windows = []
+    for rows in texts:
+        tokens = torch.tensor([_ids(text.ljust(T, chr(PAD))[:T]) for text in rows])
+        ctx = torch.full_like(tokens, TEXT)
+        ctx[tokens == PAD] = 0  # the collation's padding context
+        windows.append((tokens, ctx, torch.zeros_like(tokens, dtype=torch.bool)))
+    return windows
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.usefixtures("small_blocks")
+def test_compiled_word_events_compile_once(kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The compiled event window (the window the mem_events2 arms train on: top-K with
+    straight-through gates, A9's two-byte features, the address gate) compiles one graph and
+    keeps it for consecutive windows whose event slots number 2 to ``T`` (dynamo's
+    ``fail_on_recompile`` stance stays silent and the graph count does not move), and every
+    window equals the eager event loop (values, integer outputs, the carried address and the
+    parameter gradients). The cause it guards: the blocks read slices of ``[B, E, …]``, whose
+    stride holds ``E``, and every new ``E`` compiled a new graph (FailOnRecompileLimitHit after
+    eight; ``hsn.train.compile._full_width``)."""
+    from torch._dynamo.utils import counters
+
+    monkeypatch.setattr("hsn.model.hsn.EVENT_BLOCK", p28.compile_mod.MAX_BLOCK)  # small_blocks
+    T = 20
+    cfg = p28._cfg(
+        "model.routing=topk",
+        "model.key_address=true",
+        "model.selected_readout=true",
+        STE,
+        CUT_C,
+        *READER,
+        *NGRAM,
+        "model.address_gate=true",
+        "model.address_gate_input=summary",
+        _ev("word"),
+        _wa(kind),
+    )
+    seed_everything(0)
+    model = HSNT.from_config(cfg)
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    with torch.no_grad():  # as p28._model(cfg, training=True, scale=0.3)
+        for p in model.parameters():
+            p.add_(torch.randn(p.shape, generator=generator) * 0.3)
+    model.train(True)
+    window = p28._window(model, p28._ctx())
+    tol = p28.TOL[("cpu", "fp32")]
+    state = p28._inputs(model, b=3, t=T)[2]
+    carry: Tensor | None = None
+    graphs, slots = -1, []
+    for i, (tokens, ctx, reset) in enumerate(_compiled_windows(T)):
+        ref = p28._run(functools.partial(model, tokens, ctx, state, reset, prev_tokens=carry))
+        compiled = functools.partial(window, tokens, ctx, state, reset, prev_tokens=carry)
+        if i == 0:
+            got = p28._run(compiled)
+            graphs = counters["stats"]["unique_graphs"]
+        else:
+            with torch.compiler.set_stance("fail_on_recompile"):
+                got = p28._run(compiled)
+        diff = p28._max_diff(got, ref)  # address_carry, event_valid, event_pos: exact
+        assert diff["exact"] == 0.0 and diff["values"] <= tol["values"], (i, diff)
+        assert p28._grad_diff(p28._grads(model, got), p28._grads(model, ref)) <= tol["grads"], i
+        slots.append(int(ref[2]["event_valid"].shape[1]))
+        carry = address_history(cfg.model, tokens, carry, ref[2])
+        state = got[1].detach()
+    assert counters["stats"]["unique_graphs"] == graphs
+    assert window.calls == len(slots)
+    assert len(set(slots)) == len(slots) and T in slots and min(slots) <= T // 4, slots
 
 
 # --------------------------------------------------------------------------------------------------
