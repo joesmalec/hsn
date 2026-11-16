@@ -67,6 +67,7 @@ model: # Appendix A.1
   reader_heads: 4 # HSN-T: attention heads per block
   reader_span: null # HSN-T: n = a position reads itself and the n - 1 bytes before it only (short-sighted); null = the document up to the position, inside the window
   memory: true # HSN-T only (docs/hsn_t_no_memory.md): false = HSN-T without its memory, stateless and parallel over the window (embeddings, E, reader, S, D; zeros where q and r are read), trained by the generic trainer
+  cell_attention_heads: 0 # HSN-T only, opt-in candidate (docs/amendments/cell_attention_read.md): H > 0 = at every position the reader's output attends over all cells (H heads of width d / H; keys from each cell's state and its address code) and the result is one more decoder input, D([q; u; r; c; m]); needs reader, memory, key_address and d a multiple of H; 0 = no read
   address_ngram: 1 # amendment A9: longest byte n-gram with an address feature pair (needs key_address); 1 = A5 only
   address_history: byte # A9 across windows: byte = one byte carried (every run before 14 Nov 2026; the older bytes read as BOS at a continuing window's first column) | ngram = the last address_ngram bytes carried (needs address_ngram > 1)
   state_schema_version: 1 # bumped on any state layout change
