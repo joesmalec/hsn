@@ -688,6 +688,23 @@ class TBPTTTrainer(Trainer):
         self._cut_pending = cut < T
         return cut
 
+    @staticmethod
+    def _slot_view(info: Mapping[str, Tensor], batch: Batch) -> Batch:
+        """``batch`` as the window's selection stacks are aligned. With ``model.write_events``
+        they are per event slot (``info["event_pos"]``, ``info["event_valid"]``): the bytes,
+        loss positions and documents at each slot's column, a padding slot counting as padding
+        (no loss position, ``doc = -1``). Otherwise ``batch`` itself."""
+        where = info.get("event_pos")
+        if where is None:
+            return batch
+        live = info["event_valid"]
+        return {
+            **batch,
+            "tokens": batch["tokens"].gather(1, where),
+            "loss_mask": batch["loss_mask"].gather(1, where) & live,
+            "doc": batch["doc"].gather(1, where).masked_fill(~live, -1),
+        }
+
     def _window_start(self, state: CellGraphState) -> CellGraphState:
         """The state a window starts from: detached, and with ``q`` recomputed exactly every
         ``train.q_resync_every`` windows."""
@@ -737,6 +754,7 @@ class TBPTTTrainer(Trainer):
         ``unit_idx`` stands in for ``info["unit_idx"]``."""
         if "unit_idx" not in info or self.hsn.schedule.gate(self.step) == "soft":
             return None
+        batch = self._slot_view(info, batch)
         units = self.cfg.model.n_units
         indices, valid = info["unit_idx"] if unit_idx is None else unit_idx, info["valid"]
         counts = torch.zeros(*indices.shape[:2], units, dtype=torch.int32, device=indices.device)
@@ -1078,7 +1096,7 @@ class TBPTTTrainer(Trainer):
                 )
                 if self.cfg.model.key_address:
                     self._prev_tokens = address_history(
-                        self.cfg.model, fwd["tokens"], self._prev_tokens
+                        self.cfg.model, fwd["tokens"], self._prev_tokens, info
                     )
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
@@ -1120,7 +1138,8 @@ class TBPTTTrainer(Trainer):
                         if statistics.unit_idx is None
                         else {**info, "unit_idx": statistics.unit_idx}
                     )
-                    self.route_guard.observe(fwd["tokens"], fwd["loss_mask"], observed)
+                    slots = self._slot_view(info, fwd)  # model.write_events: per event slot
+                    self.route_guard.observe(slots["tokens"], slots["loss_mask"], observed)
                 if self.counterfactual:  # P2.3: once per window, after its selections ran
                     self._update_ema(info, fwd, probe)
 
@@ -1499,7 +1518,11 @@ class TBPTTTrainer(Trainer):
                 raise ValueError(f"{path}: an A5 checkpoint must hold prev_tokens")
             previous = extra["prev_tokens"]
             if previous is not None:
-                if (
+                if self.cfg.model.word_address != "none":
+                    # model.word_address: the bytes, then the word state (checked by the window)
+                    if not isinstance(previous, Tensor) or previous.dtype != torch.int64:
+                        raise ValueError(f"{path}: prev_tokens must be the int64 address carry")
+                elif (
                     not isinstance(previous, Tensor)
                     or previous.dtype not in (torch.int32, torch.int64)
                     or tuple(previous.shape)

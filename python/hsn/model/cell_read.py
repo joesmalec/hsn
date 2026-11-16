@@ -86,17 +86,36 @@ class CellAttentionRead(nn.Module):
     def read(self, c: Tensor, h: Tensor, addresses: Tensor) -> tuple[Tensor, Tensor]:
         """``(m [B, d], α [B, H, N])``: the read and the attention weights of every head over
         the cells (each row sums to 1)."""
-        B, N, d = h.shape
-        H, e = self.heads, self.head_dim
-        query = self.query(c).view(B, H, e, 1)
         both = self.state(h)  # [B, N, 2d]: one matrix product for the keys and the values
+        return self._attend(c, both, addresses)
+
+    def read_latest(self, c: Tensor, h: Tensor, index: Tensor, addresses: Tensor) -> Tensor:
+        """The read of a window whose cells change only at events (``model.write_events``):
+        ``c [B, T, w]`` (every byte's query), ``h [B, S, N, d]`` (the cell states of ``S``
+        stages: the window's start and after each event slot), ``index [B, T]`` (the stage each
+        byte reads) → ``m [B, T, d]``. The same read as :meth:`read` at every byte; the map of
+        the cell states runs once per stage and its result is gathered per byte."""
+        B, T = (int(n) for n in index.shape)
+        S, N = int(h.shape[1]), int(h.shape[2])
+        both = self.state(h)  # [B, S, N, 2d]
+        # whole [N, 2d] slices per byte: index_select, far cheaper than an expanded gather
+        flat = (index + torch.arange(B, device=index.device)[:, None] * S).reshape(-1)
+        both = both.reshape(B * S, N, 2 * self.d).index_select(0, flat).view(B, T, N, 2 * self.d)
+        return self._attend(c, both, addresses)[0]
+
+    def _attend(self, c: Tensor, both: Tensor, addresses: Tensor) -> tuple[Tensor, Tensor]:
+        """The attention of :meth:`read` from the queries' input ``c [..., w]`` and the mapped
+        cell states ``both [..., N, 2d]`` (keys' state half, then values)."""
+        *lead, N, _ = both.shape
+        d, H, e = self.d, self.heads, self.head_dim
+        query = self.query(c).view(*lead, H, e, 1)
         keys = both[..., :d] + self.address(addresses)  # the address half, [N, d] for all rows
-        keys = keys.view(B, N, H, e).transpose(1, 2)  # [B, H, N, e]
-        values = both[..., d:].view(B, N, H, e).transpose(1, 2)  # [B, H, N, e]
-        scores = (keys @ query.to(keys.dtype)).squeeze(-1) * self.scale  # [B, H, N]
+        keys = keys.view(*lead, N, H, e).transpose(-3, -2)  # [..., H, N, e]
+        values = both[..., d:].view(*lead, N, H, e).transpose(-3, -2)  # [..., H, N, e]
+        scores = (keys @ query.to(keys.dtype)).squeeze(-1) * self.scale  # [..., H, N]
         alpha = torch.softmax(scores, dim=-1)
-        mixed = (alpha.unsqueeze(-2).to(values.dtype) @ values).squeeze(-2)  # [B, H, e]
-        m: Tensor = self.out(mixed.reshape(B, d))
+        mixed = (alpha.unsqueeze(-2).to(values.dtype) @ values).squeeze(-2)  # [..., H, e]
+        m: Tensor = self.out(mixed.reshape(*lead, d))
         return m, alpha
 
     def extra_repr(self) -> str:

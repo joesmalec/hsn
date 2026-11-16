@@ -49,6 +49,7 @@ forward.
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections.abc import Callable, Collection
@@ -62,6 +63,8 @@ from hsn.data.dataset import ByteDataset, collate_windows
 from hsn.device import DeviceContext
 from hsn.model.hsn import HSN
 from hsn.train.checkpoint import capture_rng_state, restore_rng_state
+
+_LOG = logging.getLogger(__name__)
 
 __all__ = [
     "Diagnostics",
@@ -442,10 +445,27 @@ def trained_state(
     documents) plus, new in P1.11, the edge logits' absolute maximum and spread (``max - min``),
     which are exactly 0 while the dense cells stay symmetric. ``{}`` for a non-HSN model. A graph
     without edges (``model.in_degree = 0``, the no-graph ablation) has no edge logit: both are
-    reported as 0."""
+    reported as 0.
+
+    With ``model.write_events`` other than ``byte`` the state statistics are skipped (they read
+    ``capture=True``, which the loop over events does not build): the result holds the edge
+    logits and ``state_stats_skipped = 1.0``, and a warning is logged."""
     if not isinstance(model, HSN):
         return {}
-    out = window_state_stats(model, state_window(cfg, ctx, docs, n_docs))
+    out: dict[str, float] = {}
+    if model.cfg.write_events == "byte":
+        out = window_state_stats(model, state_window(cfg, ctx, docs, n_docs))
+    else:
+        # the loop over events keeps cell states, gates and written masks per event slot, and
+        # the state statistics read them per byte (capture=True, refused by that loop): they
+        # are left out, the edge logits below are still reported
+        _LOG.warning(
+            "trained_state: the per-byte state statistics are skipped with "
+            "model.write_events=%s (capture=True is not built into the event loop); only the "
+            "edge logits are reported",
+            model.cfg.write_events,
+        )
+        out["state_stats_skipped"] = 1.0
     edge = model.cell.graph.edge_logit.detach().float()
     has_edges = edge.numel() > 0
     out["edge_logit/absmax"] = float(edge.abs().max()) if has_edges else 0.0

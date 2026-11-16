@@ -13,8 +13,10 @@ Results on TinyStories: "Results (16 Nov 2026)" below. No amendment number.
   width. Checked against f3f271a: the eager window of two HSN-T arms (logits, state, gradients,
   initial weights; 12.5 million values) is bit-identical, and nine expanded arms keep their arm
   ids, memory keys and configuration hashes.
-- It is the read half of a larger idea, "the memory as the reader's long-range keys". The write
-  half is not built; the last section sketches it and lists its problems.
+- It is the read half of a larger idea, "the memory as the reader's long-range keys". The last
+  section sketches the rest and lists its problems. The write half (writes at word ends, the
+  loop over events) was built afterwards as `model.write_events`: `write_events.md`. The
+  reader's top block reading the cells is not built.
 
 ## Cause
 
@@ -219,7 +221,8 @@ the recipe. No spec used the recipe, so no run id changes.
 
 ## Sketch of the full idea: the memory as the reader's long-range keys
 
-Not built. For the discussion after the reset.
+Written before the write half was built. `write_events.md` says what was built of it (the
+events, the slots, the masked update, the gathers, `L_pred` at events) and what is left.
 
 **The idea.**
 - **Writes at word boundaries only.** A boundary is a byte that is not a letter or digit
