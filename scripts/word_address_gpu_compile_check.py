@@ -78,14 +78,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     os.chdir(REPO)
     torch._logging.set_logs(recompiles=True, graph_breaks=True)
-    from torch._dynamo.utils import counters
-
     from hsn.config import load_config
     from hsn.device import resolve, seed_everything
     from hsn.experiments.spec import expand, load_spec
     from hsn.model.hsn import HSN
     from hsn.runner import build_model, load_datasets
     from hsn.train.tbptt import TBPTTTrainer
+    from torch._dynamo.utils import counters
 
     logging.basicConfig(level=logging.WARNING)
     spec, _ = load_spec(args.spec)
