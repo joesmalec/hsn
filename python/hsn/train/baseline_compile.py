@@ -15,7 +15,10 @@ compiled with it, and the loss, the clipping, the guards and the optimiser stay 
 the HSN's compiled window):
 
 * ``transformer``, ``reader`` and ``hsn_t`` without its memory (``model.memory = false``,
-  :class:`hsn.model.hsn_t.HSNTNoMemory`): the whole forward of a window as one graph.
+  :class:`hsn.model.hsn_t.HSNTNoMemory`): the whole forward of a window as one graph. With
+  ``model.reader_carry`` the reader's cache goes in and out of that graph (fixed shapes);
+  under CUDA graphs the cache returned is copied out of graph memory, as the next window reads
+  it after the next replay began.
 * ``gru``: the embeddings before the recurrence and the read-out after it
   (:meth:`~hsn.baselines.gru.GRUBaseline._embed`, :meth:`~hsn.baselines.gru.GRUBaseline._readout`),
   as two graphs. The recurrence between them is ``torch.nn.GRU``, which ``torch.compile`` does not
@@ -44,7 +47,8 @@ graph step (``torch.compiler.cudagraph_mark_step_begin``). The logits a window r
 memory, which the next window's replay overwrites: read them before the next window, as the
 trainer and the evaluation do. ``train.grad_accum > 1`` is refused (a gradient held in ``.grad``
 across windows would be overwritten too), as for the HSN. The state and the info tensor of a
-``selective_ssm`` window come out of a compiled graph and are cloned out of graph memory.
+``selective_ssm`` window, and a carried reader cache (``model.reader_carry``), come out of a
+compiled graph and are cloned out of graph memory.
 
 **Scope** (errors over silence, :func:`check_baseline_scope`): the five families above; no
 dropout (a compiled random draw differs from the eager one); ``train.grad_accum = 1`` under CUDA
@@ -106,6 +110,21 @@ def _whole_forward(
     """A stateless model's forward (``transformer``, ``reader``, ``hsn_t`` without memory)."""
     out: tuple[Tensor, None, dict[str, Any]] = model(tokens, context, None, reset)
     return out
+
+
+def _carried_forward(
+    model: nn.Module, tokens: Tensor, context: Tensor, state: Any, reset: Tensor
+) -> tuple[Tensor, Any, dict[str, Any]]:
+    """The forward of a reader that carries its cache (``model.reader_carry``: ``reader`` and
+    ``hsn_t`` without memory): the window and the cache in, the logits and the next cache out,
+    one graph (the cache has the same shapes at every window)."""
+    out: tuple[Tensor, Any, dict[str, Any]] = model(tokens, context, state, reset)
+    return out
+
+
+def _carries(model: nn.Module) -> bool:
+    """A reader model with ``model.reader_carry`` (its state is the reader's cache)."""
+    return isinstance(model, ReaderLM | HSNTNoMemory) and bool(model.reader.carry)
 
 
 def _gru_embed(model: GRUBaseline, tokens: Tensor, context: Tensor, reset: Tensor) -> Tensor:
@@ -249,6 +268,10 @@ class CompiledBaseline:
                 return out
 
             out = model._window(tokens, context, state, reset, embed, readout)
+        elif _carries(model):  # model.reader_carry: the cache in and out of the one graph
+            out = self._fn(_carried_forward, *key)(model, tokens, context, state, reset)
+            if self.cuda_graphs:  # graph memory, which the next window's replay overwrites
+                out = (out[0], tuple(t.clone() for t in out[1]), out[2])
         elif isinstance(model, MambaBaseline):
             h, conv = model._check_inputs(tokens, context, state, reset)
             logits, h, conv, top = self._fn(_mamba_window, *key)(

@@ -8,7 +8,9 @@ directory (a ``config.resolved.yaml`` and a ``step_*.pt`` checkpoint of a Transf
 a reader alone or an HSN-T without its memory) the script prints the dev loss in bits per byte
 by window position and, with ``--attention``, the share of each attention head's weight that
 lies ``--far`` or more positions back, for the queries at window positions ``--from`` and
-later. CPU, float32, no gradient; nothing is written.
+later. CPU, float32, no gradient; nothing is written. A reader with ``model.reader_carry``
+carries its cache from window to window of a stream for the loss (its attention's reach is
+not measured).
 
 Usage::
 
@@ -61,9 +63,12 @@ def position_loss(model: nn.Module, windows: Iterable[Batch]) -> tuple[Tensor, T
     attention_blocks(model)  # refuses a model with state
     nll: Tensor | None = None
     count: Tensor | None = None
+    state = None  # model.reader_carry: the reader's cache, carried as the trainer carries it
     with torch.no_grad():
-        for batch in windows:
-            logits, _, _ = model(batch["tokens"], batch["context"], None, batch["reset"])
+        for i, batch in enumerate(windows):
+            if i == 0:
+                state = model.init_state(int(batch["tokens"].shape[0]), "cpu")  # type: ignore[operator]
+            logits, state, _ = model(batch["tokens"], batch["context"], state, batch["reset"])
             mask = batch["loss_mask"]
             targets = batch["targets"].clamp(0, logits.shape[-1] - 1)  # PAD where no loss counts
             loss = -F.log_softmax(logits.float(), dim=-1).gather(-1, targets[..., None])[..., 0]
@@ -86,6 +91,11 @@ def attention_reach(
     The blocks' own inputs are read by forward pre-hooks and the attention weights recomputed
     from them (the blocks call ``scaled_dot_product_attention``, which returns none)."""
     blocks = attention_blocks(model)
+    if isinstance(model, ReaderLM | HSNTNoMemory) and model.reader.carry:
+        raise ValueError(
+            "model.reader_carry: the attention also reads the cache of the windows before, "
+            "which this measure does not recompute; the loss by position is carried"
+        )
     seen: list[tuple[Tensor, ...]] = []
     hooks = [
         block.register_forward_pre_hook(lambda _m, args: seen.append(args)) for block in blocks
