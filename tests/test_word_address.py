@@ -47,7 +47,18 @@ from torch import Tensor
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
 
+#: The first build, written by the code of commit 1096531 (``git archive 1096531 python tests
+#: configs``, that tree on the path, x86-64 Linux): per anchor, ``_model(_ev_cfg("word",
+#: *extra)).eval()`` on ``_window_of``'s window under ``no_grad``; ``state`` holds the
+#: parameters and buffers the outputs were computed from (``meta`` says where it was made).
 GOLDEN = Path(__file__).resolve().parent / "fixtures" / "write_events_1096531.pt"
+#: How far a drawn weight may lie from the fixture's. A model's first values are drawn in
+#: float32 (``trunc_normal_``, ``normal_``, the scorer's ``randn`` codes) and torch's float32
+#: samplers round differently under its AVX2 kernels and its scalar ones (float64 draws are
+#: bit for bit the same): 6.3e-7 at a weight between the two on the fixture's machine and
+#: from it 2.2e-6 at the logits, the gap macos-arm64 showed against the first fixture, which
+#: held no weights. Another draw (order, seed, scale) is off by about the weight itself.
+DRAWN = 1e-5
 TEXT = 6  # the default text context (TinyStories)
 KINDS = ["exact", "bag"]
 
@@ -283,19 +294,40 @@ def test_one_address_across_case_and_for_an_unseen_word(kind: str) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
+def _pin(model: HSNT, pinned: dict[str, Tensor]) -> None:
+    """Check that the model was built as the one of ``pinned`` was (the same tensors in the
+    same order, integers and flags equal, floats within ``DRAWN``), then give it the values of
+    ``pinned``, so that what follows runs on the same weights on every machine."""
+    mine = dict([*model.named_parameters(), *model.named_buffers()])
+    assert list(mine) == list(pinned)
+    with torch.no_grad():
+        for key, value in mine.items():
+            assert value.shape == pinned[key].shape and value.dtype == pinned[key].dtype, key
+            if value.is_floating_point():
+                assert _gap(value, pinned[key]) <= DRAWN, key
+                value.copy_(pinned[key])
+            else:
+                assert torch.equal(value, pinned[key]), key
+
+
 @pytest.mark.parametrize("name", ["soft", "ngram_cattn"])
 def test_none_reproduces_the_first_build(name: str) -> None:
     """The event loop's outputs as commit 1096531 computed them (before the key existed), for
-    two of the anchor configurations with ``write_events=word`` in evaluation mode."""
+    two of the anchor configurations with ``write_events=word`` in evaluation mode: the model
+    is built as that one was (its weights up to the float32 sampling, ``DRAWN``) and, on that
+    build's own weights, computes its outputs in float64."""
     extra = {"soft": (), "ngram_cattn": (STE, CUT_C, CATTN, *NGRAM)}[name]
     golden = torch.load(GOLDEN)[name]
     cfg = _ev_cfg("word", *extra, _wa("none"))
     model = _model(cfg).eval()
     assert sorted(k for k, _ in model.named_buffers()) == golden["buffers"]
+    _pin(model, golden["state"])
     tokens, ctx, state, reset, carry = _window_of(cfg, model)
     with torch.no_grad():
         logits, final, info = model(tokens, ctx, state, reset, prev_tokens=carry)
     assert "address_carry" not in info
+    # on the same weights only float64 rounding is left: at most 7e-15 at the logits between
+    # torch's AVX2 and scalar kernels and between MKL's code paths, on the fixture's machine
     assert _gap(logits[:, :, ::8], golden["logits"]) <= 1e-12
     assert _gap(final.h, golden["h"]) <= 1e-12 and _gap(final.q, golden["q"]) <= 1e-12
     assert torch.equal(info["event_valid"], golden["event_valid"])
