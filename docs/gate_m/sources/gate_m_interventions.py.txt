@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""Frozen-checkpoint Gate M necessity and binding diagnostics, CPU only.
+
+Why: recall accuracy alone does not establish memory necessity or key/value binding.
+All interventions are temporary evaluation hooks; repository files are never edited.
+The generator, masks, batch ordering and bootstrap are taken from hold_matrix.py.
+Fresh diagnostic documents include its test-key alphabet; no saved/final test set is read.
+
+Run from /home/joe/hsn-gate-m (detached at 76c2aec):
+  CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/joe/hsn-gate-m/python nice -n 10 \
+  /home/joe/hsn-p2.10/.venv/bin/python \
+  /home/joe/hsn-handoff/gate_m/gate_m_interventions.py --smoke
+Replace --smoke with --models reader32-s1,core-s0,all for the full resumable campaign.
+Only completed groups are resumed. A failed invariant stops the campaign.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import types
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["OMP_NUM_THREADS"] = "8"
+os.environ["MKL_NUM_THREADS"] = "8"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+sys.dont_write_bytecode = True
+ROOT = Path("/home/joe/hsn-gate-m")
+OUT = Path(__file__).resolve().parent
+EXPS = Path("/home/joe/hsn-experiments")
+sys.path.insert(0, str(ROOT / "python"))
+
+import numpy as np
+import torch
+from hsn.config import load_config
+from hsn.data.synthetic import generate, reference_targets, check_example, SEP, QRY
+from hsn.device import seed_everything
+from hsn.model.hsn import _RoundResult
+from hsn.model.state import CellGraphState
+from hsn.runner import build_model
+from hsn.train.checkpoint import load_checkpoint
+from hsn.experiments.probe import _draw
+
+torch.set_num_threads(8)
+torch.set_num_interop_threads(1)
+BUCKETS = ("near", "mid", "far", "far-strict", "all")
+VERSION = 1
+
+# Explicit roots avoid accidentally selecting duplicate copies of a run.
+RUNS = {
+    "reader32-s1": ("vast2/exp/gpu3/runs/a14_reader", "hold_k12nw_rd32_ag_ng2_cutC_cells64_18k_gsum-s1-6c214ef6b4d3", 18000),
+    "core-s0": ("vast2/exp/gpu3/runs/a14_reader", "hold_k12nw_ag_ng2_cutC_cells64_18k_gsum-s0-e4384c6e12d3", 18000),
+    "reader32-s0-15k": ("vast2/exp/gpu3/runs/a14_reader", "hold_k12nw_rd32_ag_ng2_cutC_cells64_18k_gsum-s0-80a58acbb9a8", 15000),
+    "reader32-s0": ("vast2/exp/gpu3/runs/a14_reader", "hold_k12nw_rd32_ag_ng2_cutC_cells64_18k_gsum-s0-80a58acbb9a8", 18000),
+    "reader32-s2": ("vast2/exp/gpu2/runs/a14_reader", "hold_k12nw_rd32_ag_ng2_cutC_cells64_18k_gsum-s2-b70deebc05c0", 18000),
+    "reader-full-s0": ("vast2/exp/gpu1/runs/a14_reader", "hold_k12nw_rd_ag_ng2_cutC_cells64_18k_gsum-s0-885ec24099ee", 18000),
+    "core-s2": ("vast2/exp/gpu2/runs/a14_reader", "hold_k12nw_ag_ng2_cutC_cells64_18k_gsum-s2-ac1019110d5b", 18000),
+    "core-s1": ("p2.10-split/runs/a14_reader", "hold_k12nw_ag_ng2_cutC_cells64_18k_gsum-s1-c3df8cc1c448", 18000),
+    "candidate-s0": ("p2.10-split/runs/loc_a13", "hold_f8ru20nw_ag_ng2_cutC_cells64_18k_gsum-s0-1dc7391b32fe", 18000),
+    "candidate-s1": ("p2.10-split/runs/loc_a13", "hold_f8ru20nw_ag_ng2_cutC_cells64_18k_gsum-s1-35eac7593071", 18000),
+    "candidate-s2": ("vast2/exp/gpu0/runs/loc_a13", "hold_f8ru20nw_ag_ng2_cutC_cells64_18k_gsum-s2-8941ea2de1d2", 18000),
+    "candidate-s3": ("vast2/exp/gpu2/runs/a13_follow", "hold_f8ru20nw_ag_ng2_cutC_cells64_18k_gsum-s3-a4029b7f8fbc", 18000),
+    "candidate-s4": ("vast2/exp/gpu2/runs/a13_follow", "hold_f8ru20nw_ag_ng2_cutC_cells64_18k_gsum-s4-143bb5d39ca5", 18000),
+}
+
+
+def save(path, value):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, indent=1) + "\n")
+    tmp.replace(path)
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1048576), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def hold_module(n_docs, run):
+    """Execute the unchanged evaluator's definitions, excluding its checkpoint loop."""
+    path = Path("/home/joe/hsn-handoff/hold_matrix.py")
+    source = path.read_text().split("\nresults = json.loads", 1)[0]
+    module = types.ModuleType("hold_matrix_reference")
+    argv = sys.argv
+    try:
+        sys.argv = [str(path), str(OUT / "unused.json"), str(run), "--docs", str(n_docs)]
+        exec(compile(source, str(path), "exec"), module.__dict__)
+    finally:
+        sys.argv = argv
+    return module
+
+
+class Hooks(contextlib.AbstractContextManager):
+    """Intercept the original methods; N0 calls each original unchanged.
+
+    N1 retains routed h exactly and advances its ages without writes. Fast cells
+    execute normally. N3 also zeros q before predictor/shared/gate, per-cell h/age
+    and EMA/position scorer features, and q/r at decode. N3-fast-kept retains only
+    the explicit fast read f (and fast recurrence); N3-fast-zero removes f too.
+    B3 replaces h,q,age,pos immediately BEFORE the target query position, using
+    donor rows in the same batch. EMA scorer buffers are fixed and asserted zero.
+    """
+
+    def __init__(self, model, condition="N0", answer_mask=None, swaps=None, capture_at=None):
+        self.m, self.condition = model, condition
+        self.answer_mask, self.swaps = answer_mask, swaps or {}
+        self.originals, self.handles = [], []
+        self.t = 0
+        self.n3 = condition.startswith("N3")
+        self.zero_fast = condition == "N3-fast-zero"
+        self.no_writes = condition == "N1" or self.n3
+        self.swap_count = 0
+        self.capture_at = capture_at or {}
+        self.captured = {}
+        self.disabled_restore = None
+
+    def patch(self, obj, name, fn):
+        old = getattr(obj, name)
+        had_local = name in obj.__dict__
+        self.originals.append((obj, name, old, had_local))
+        setattr(obj, name, fn)
+        return old
+
+    def __enter__(self):
+        m, d, fast = self.m, self.m.cfg.d, self.m.cfg.fast_cells
+        if self.no_writes and fast and not self.zero_fast:
+            # Use the cell's existing disabled-cell path so routed deltas never
+            # enter the incremental summary, even transiently or by cancellation.
+            self.disabled_restore = (m.cell.disabled_cells, m.cell.disabled)
+            m.cell.disabled_cells = tuple(range(fast, m.cfg.n_cells))
+            disabled = m.cell.disabled.clone()
+            disabled[fast:] = True
+            m.cell.disabled = disabled
+        orig_position = m._position
+        def position(state, *args, **kwargs):
+            if self.t in self.capture_at:
+                self.captured[self.t] = [(row, {k: getattr(state, k)[row].clone()
+                    for k in ("h", "q", "age", "pos")}) for row in self.capture_at[self.t]]
+            for recipient, donor in self.swaps.get(self.t, []):
+                fields = {k: getattr(state, k).clone() for k in ("h", "q", "age", "pos")}
+                for k in fields:
+                    fields[k][recipient] = donor[k] if isinstance(donor, dict) else getattr(state, k)[donor]
+                state = CellGraphState._make(**fields)
+                self.swap_count += 1
+            if self.n3:
+                state = CellGraphState._make(h=state.h, q=torch.zeros_like(state.q),
+                                            age=state.age, pos=state.pos)
+            self.t += 1
+            return orig_position(state, *args, **kwargs)
+        self.patch(m, "_position", position)
+
+        orig_update = m._update
+        def update(u, eps, state, *args, **kwargs):
+            if not self.no_writes:
+                return orig_update(u, eps, state, *args, **kwargs)
+            if not fast or self.zero_fast:
+                # No candidate can affect the state when every write is suppressed.
+                return _RoundResult(CellGraphState._make(
+                    h=state.h, q=state.q, age=state.age + 1, pos=state.pos + 1))
+            return orig_update(u, eps, state, *args, **kwargs)
+        self.patch(m, "_update", update)
+
+        orig_assemble = m.scorer._assemble
+        def assemble(u, eps, h, age, scalars, gate_in=None):
+            if self.n3:
+                h = torch.zeros_like(h)
+                if age is not None:
+                    age = torch.zeros_like(age)
+                scalars = scalars.clone()
+                offset = 0 if age is not None else 1
+                if offset:
+                    scalars[..., 0] = 0
+                scalars[..., offset + 3:offset + 6] = 0  # EMA utility/selection, position
+            return orig_assemble(u, eps, h, age, scalars, gate_in)
+        self.patch(m.scorer, "_assemble", assemble)
+
+        orig_fast = m._fast_read
+        def fast_read(h):
+            v = orig_fast(h)
+            return torch.zeros_like(v) if self.zero_fast else v
+        self.patch(m, "_fast_read", fast_read)
+
+        orig_decode = m._decode
+        def decode(q, u, readout):
+            zero_r = self.condition == "N2a" or self.condition.startswith("N2b") or self.n3
+            zero_q = self.condition.startswith("N2b") or self.n3
+            mask = self.answer_mask[..., None] if self.condition == "N2b-answer" else None
+            if zero_q:
+                q = q.masked_fill(mask, 0) if mask is not None else torch.zeros_like(q)
+            if zero_r:
+                readout = readout.clone()
+                r = readout[..., :d]
+                readout[..., :d] = r.masked_fill(mask, 0) if mask is not None else 0
+            # f is a separate read, retained for N2 and N3-fast-kept.
+            if self.zero_fast and fast:
+                readout[..., d:2*d] = 0
+            return orig_decode(q, u, readout)
+        self.patch(m, "_decode", decode)
+        if self.condition == "N4":
+            assert m.reader is not None
+            self.handles.append(m.reader.register_forward_hook(lambda module, inputs, output: torch.zeros_like(output)))
+        return self
+
+    def __exit__(self, *exc):
+        if self.disabled_restore is not None:
+            self.m.cell.disabled_cells, self.m.cell.disabled = self.disabled_restore
+        for handle in self.handles:
+            handle.remove()
+        for obj, name, old, local in reversed(self.originals):
+            if local:
+                setattr(obj, name, old)
+            else:
+                delattr(obj, name)
+        return False
+
+
+def pack(docs, idx, tokens_override=None):
+    T, B = max(len(docs[i].tokens) for i in idx), len(idx)
+    tokens = torch.zeros(B, T, dtype=torch.int64)
+    ctx = torch.zeros_like(tokens)
+    answer = torch.zeros(B, T, dtype=torch.bool)
+    for b, i in enumerate(idx):
+        ts = docs[i].tokens if tokens_override is None else tokens_override[b]
+        tokens[b, :len(ts)] = torch.from_numpy(ts.astype("int64"))
+        ctx[b] = int(docs[i].context[0])
+        answer[b, :len(ts)] = torch.from_numpy(docs[i].loss_mask.copy())
+    reset = torch.zeros_like(answer)
+    reset[:, 0] = True
+    return tokens, ctx, reset, answer
+
+
+def forward(model, batch, condition=None, swaps=None):
+    tokens, ctx, reset, answer = batch
+    with torch.no_grad():
+        if condition is None and not swaps:
+            return model(tokens, ctx, model.init_state(len(tokens)), reset)[0]
+        with Hooks(model, condition or "N0", answer, swaps) as hooks:
+            logits = model(tokens, ctx, model.init_state(len(tokens)), reset)[0]
+            if swaps:
+                assert hooks.swap_count == sum(map(len, swaps.values()))
+            return logits
+
+
+def capture_forward(model, batch, capture_at):
+    tokens, ctx, reset, answer = batch
+    with torch.no_grad(), Hooks(model, "N0", answer, capture_at=capture_at) as hooks:
+        logits = model(tokens, ctx, model.init_state(len(tokens)), reset)[0]
+    assert sum(map(len, hooks.captured.values())) == sum(map(len, capture_at.values()))
+    return logits, hooks.captured
+
+
+def make_probes(docs, hold, spec):
+    """One edit per queried binding, with explicit skips and original-bucket membership.
+
+    Teacher-forced answer bytes stay fixed, as do the query and every other token.
+    The generators ask each key once. Swap partners already asked are excluded,
+    following probe v3, so no earlier answer becomes stale under a swap.
+    Partners must differ in both key bytes to make exactly four byte changes.
+    """
+    probes = []
+    for i, doc in enumerate(docs):
+        positions, member = hold.masks(doc)
+        sep = int(np.flatnonzero(doc.tokens == SEP)[0])
+        facts = {}
+        params = spec.typed_params
+        if spec.name == "kv":
+            j = 1
+            markers = params.markers
+            while j < sep:
+                op = int(doc.tokens[j])
+                if op in (markers["ins"], markers["ovr"]):
+                    facts[(int(doc.tokens[j+1]),)] = j + 2
+                    j += 3
+                elif op == markers["del"]:
+                    facts[(int(doc.tokens[j+1]),)] = None
+                    j += 2
+                else:
+                    j += 1
+            klen = 1
+        else:
+            klen = 2
+            j = 1
+            while params.filler[0] <= doc.tokens[j] < params.filler[1]:
+                j += 1
+            while j < sep and any(lo <= doc.tokens[j] < hi for lo, hi in params.keys.values()):
+                facts[tuple(int(x) for x in doc.tokens[j:j+2])] = j+2
+                j += 3
+        absent = [v for v in range(*params.values) if v not in doc.tokens]
+        asked = set()
+        for slot, pos in enumerate(positions.tolist()):
+            assert doc.tokens[pos-klen] == QRY
+            key = tuple(int(x) for x in doc.tokens[pos-klen+1:pos+1])
+            assert key not in asked, "Earlier teacher-forced query of this binding"
+            source = facts[key]
+            item = {"doc": i, "doc_id": doc.meta["doc_id"], "slot": slot, "position": pos,
+                    "source": source, "key": list(key), "old": int(doc.targets[pos]),
+                    "buckets": [b for b in BUCKETS if member[b][slot]], "edits": {}, "skips": {}}
+            if source is None:
+                item["skips"]["B1"] = "last operation is DEL"
+            elif not absent:
+                item["skips"]["B1"] = "no absent value"
+            else:
+                assert pos-source == doc.meta["deps"][slot]
+                new = absent[_draw("value", doc.meta["doc_id"], slot, len(absent))]
+                edited = doc.tokens.copy()
+                edited[source] = new
+                assert np.count_nonzero(edited != doc.tokens) == 1
+                ps, targets, _ = reference_targets(spec, edited)
+                assert ps.tolist() == positions.tolist() and int(targets[slot]) == new
+                assert np.array_equal(edited[pos-klen:pos+1], doc.tokens[pos-klen:pos+1])
+                item["edits"]["B1"] = {"tokens": edited, "new": new, "changed": [source]}
+            if klen == 2:
+                partners = [(k, p) for k, p in facts.items() if k != key and k not in asked
+                            and all(a != b for a, b in zip(k, key)) and doc.tokens[p] != item["old"]]
+                if not partners:
+                    item["skips"]["B2"] = "no unasked different-value partner differing in both key bytes"
+                else:
+                    partner, at = partners[_draw("swap", doc.meta["doc_id"], slot, len(partners))]
+                    edited = doc.tokens.copy()
+                    edited[source-2:source] = partner
+                    edited[at-2:at] = key
+                    new = int(doc.tokens[at])
+                    assert np.count_nonzero(edited != doc.tokens) == 4
+                    ps, targets, _ = reference_targets(spec, edited)
+                    assert ps.tolist() == positions.tolist() and int(targets[slot]) == new
+                    assert np.array_equal(edited[pos-2:pos+1], doc.tokens[pos-2:pos+1])
+                    item["edits"]["B2"] = {"tokens": edited, "new": new,
+                                          "changed": [source-2, source-1, at-2, at-1]}
+            asked.add(key)
+            probes.append(item)
+    return probes
+
+
+def binding(model, docs, hold, spec, baseline):
+    probes = make_probes(docs, hold, spec)
+    lookup = {(p["doc"], p["slot"]): p for p in probes}
+    order = sorted(range(len(docs)), key=lambda i: len(docs[i].tokens))
+    start = time.monotonic()
+    identity = False
+    for lo in range(0, len(docs), 64):
+        idx = order[lo:lo+64]
+        plain_batch = pack(docs, idx)
+        if not identity and spec.name == "delayed2h":
+            capture_at = {}
+            for row, i in enumerate(idx):
+                p = int(np.flatnonzero(docs[i].loss_mask)[-1])
+                capture_at.setdefault(p, []).append(row)
+            original, states = capture_forward(model, plain_batch, capture_at)
+            same = forward(model, plain_batch, swaps=states)
+            assert torch.equal(original, same), "B3 A'=A must equal plain logits exactly"
+            # Capture is also a no-op hook; compare to a truly unpatched run.
+            assert torch.equal(original, forward(model, plain_batch))
+            identity = True
+        slots = max(len(baseline[i]) for i in idx)
+        for slot in range(slots):
+            for edit in ("B1", "B2") if spec.name == "delayed2h" else ("B1",):
+                chosen, overrides, capture_at = [], [], {}
+                for row, i in enumerate(idx):
+                    item = lookup.get((i, slot))
+                    eligible = item is not None and edit in item["edits"] and baseline[i][slot] == item["old"]
+                    overrides.append(item["edits"][edit]["tokens"] if eligible else docs[i].tokens)
+                    if eligible:
+                        chosen.append((row, item))
+                        capture_at.setdefault(item["position"], []).append(row)
+                if not chosen:
+                    continue
+                batch = pack(docs, idx, overrides)
+                if edit == "B1" and spec.name == "delayed2h":
+                    logits, states = capture_forward(model, batch, capture_at)
+                    swapped = forward(model, plain_batch, swaps=states).argmax(-1).numpy()
+                else:
+                    logits = forward(model, batch)
+                    swapped = None
+                pred = logits.argmax(-1).numpy()
+                for row, item in chosen:
+                    item.setdefault("predictions", {})[edit] = int(pred[row, item["position"]])
+                    if swapped is not None:
+                        item["predictions"]["B3"] = int(swapped[row, item["position"]])
+    conditions = ("B1", "B2", "B3") if spec.name == "delayed2h" else ("B1",)
+    result = {"identity_swap_logits_exact": identity if spec.name == "delayed2h" else None,
+              "query_fixed": True, "reference_solver_checked": True, "conditions": {}, "probes": []}
+    for condition in conditions:
+        counts = {b: np.zeros((len(docs), 4), dtype=np.int64) for b in BUCKETS}
+        available = {b: np.zeros((len(docs), 2), dtype=np.int64) for b in BUCKETS}
+        skips = {}
+        for item in probes:
+            kind = "B1" if condition == "B3" else condition
+            i, slot = item["doc"], item["slot"]
+            for b in item["buckets"]:
+                available[b][i, 1] += 1
+            if kind not in item["edits"]:
+                reason = item["skips"][kind]
+                skips[reason] = skips.get(reason, 0) + 1
+                continue
+            for b in item["buckets"]:
+                available[b][i, 0] += 1
+            if baseline[i][slot] != item["old"]:
+                continue
+            prediction = item["predictions"][condition]
+            new = item["edits"][kind]["new"]
+            col = 0 if prediction == new else 1 if prediction == item["old"] else 2
+            for b in item["buckets"]:
+                counts[b][i, col] += 1
+                counts[b][i, 3] += 1
+        outcomes = {name: stats({b: c[:, [col, 3]] for b, c in counts.items()})
+                    for col, name in enumerate(("follows", "unchanged", "other"))}
+        result["conditions"][condition] = {"outcomes": outcomes,
+            "eligible_fraction": stats(available), "skips": skips,
+            "counts": {b: c.tolist() for b, c in counts.items()}}
+    for item in probes:
+        raw = {k: v for k, v in item.items() if k != "edits"}
+        raw["baseline_prediction"] = baseline[item["doc"]][item["slot"]]
+        raw["edits"] = {k: {a: b for a, b in edit.items() if a != "tokens"}
+                        for k, edit in item["edits"].items()}
+        result["probes"].append(raw)
+    print(f"  binding {spec.name}: {time.monotonic()-start:.1f}s; {len(probes)} queries", flush=True)
+    return result
+
+
+def stats(counts):
+    """Exactly hold_matrix's document bootstrap (1000 draws, seed 0)."""
+    n_docs = len(next(iter(counts.values())))
+    draws = np.random.default_rng(0).integers(0, n_docs, size=(1000, n_docs))
+    out = {}
+    for name, c in counts.items():
+        right, n = int(c[:, 0].sum()), int(c[:, 1].sum())
+        if not n:
+            out[name] = {"accuracy": None, "n": 0, "docs": 0, "ci95": None}
+        else:
+            samples = c[draws, 0].sum(1) / np.maximum(c[draws, 1].sum(1), 1)
+            low, high = np.percentile(samples, [2.5, 97.5])
+            out[name] = {"accuracy": right/n, "n": n, "docs": int((c[:, 1] > 0).sum()), "ci95": [float(low), float(high)]}
+    return out
+
+
+def score(model, docs, hold, condition, exact_off=False):
+    counts = {b: np.zeros((len(docs), 2), dtype=np.int64) for b in BUCKETS}
+    predictions = [None] * len(docs)
+    order = sorted(range(len(docs)), key=lambda i: len(docs[i].tokens))
+    for lo in range(0, len(docs), 64):
+        idx = order[lo:lo+64]
+        batch = pack(docs, idx)
+        logits = forward(model, batch, condition)
+        if exact_off:
+            plain = forward(model, batch)
+            assert torch.equal(logits, plain), "Patched N0 differs from unpatched logits"
+        pred = logits.argmax(-1).numpy()
+        for b, i in enumerate(idx):
+            positions, member = hold.masks(docs[i])
+            predictions[i] = pred[b, positions].tolist()
+            hit = pred[b, positions] == docs[i].targets[positions]
+            for name, mask in member.items():
+                counts[name][i] = (hit[mask].sum(), mask.sum())
+    return {"matrix": stats(counts), "counts": {k: v.tolist() for k, v in counts.items()}, "predictions": predictions}
+
+
+def resolve(label):
+    base, name, step = RUNS[label]
+    paths = list((EXPS / base / name).glob(f"exp*/step_{step}.pt"))
+    if not paths:
+        paths = [p for p in (EXPS / base / name).glob("exp*/step_*.pt") if int(p.stem.split("_")[1]) == step]
+    if len(paths) != 1:
+        raise FileNotFoundError(f"Expected one checkpoint for {label}, found {paths}")
+    ckpt = paths[0]
+    if not (ckpt.parent / "result.json").exists():
+        raise FileNotFoundError(f"Run has not finished: {ckpt.parent}")
+    return ckpt
+
+
+def load_model(ckpt):
+    cfg = load_config(ckpt.parent / "config.resolved.yaml", [f"hardware={ROOT / 'configs/hardware/cpu.yaml'}", "profile=cpu"])
+    seed_everything(cfg.seed)
+    model = build_model(cfg)
+    load_checkpoint(ckpt, model, averaged=True)
+    model.eval()
+    assert model.device.type == "cpu"
+    assert not torch.count_nonzero(model.scorer.ema.utility)
+    assert not torch.count_nonzero(model.scorer.ema.selected)
+    return model, cfg
+
+
+def audit_state_removal(model, docs):
+    """Observe actual module inputs and final state, independently of score changes."""
+    batch = pack(docs, list(range(min(4, len(docs)))))
+    tokens, ctx, reset, answer = batch
+    d, fast = model.cfg.d, model.cfg.fast_cells
+    conditions = ["N1"] + (["N3-fast-kept", "N3-fast-zero"] if fast else ["N3"])
+    checks = {}
+    for condition in conditions:
+        handles = []
+        observed = {"fast_read_nonzero": False, "positions_checked": 0}
+        def predictor(module, inputs):
+            assert not torch.count_nonzero(inputs[0]), "N3 predictor read a nonzero summary"
+        def shared(module, inputs):
+            assert not torch.count_nonzero(inputs[0][..., d:2*d]), "N3 shared transform read q"
+            if fast:
+                f = inputs[0][..., -d:]
+                if condition == "N3-fast-zero":
+                    assert not torch.count_nonzero(f)
+                observed["fast_read_nonzero"] |= bool(torch.count_nonzero(f))
+        def scorer(module, inputs):
+            feats = inputs[0]
+            assert not torch.count_nonzero(feats[..., 2*d:3*d+1]), "N3 scorer read h/age"
+            assert not torch.count_nonzero(feats[..., 3*d+4:3*d+7]), "N3 scorer read EMA/position"
+            assert model.scorer.gate_input == "summary"
+            assert not torch.count_nonzero(feats[..., -d:]), "N3 address gate read q"
+            observed["positions_checked"] += 1
+        def decoder(module, inputs):
+            features = inputs[0]
+            assert not torch.count_nonzero(features[..., :d]), "N3 decoder read q"
+            assert not torch.count_nonzero(features[..., 2*d:3*d]), "N3 decoder read r"
+            if condition == "N3-fast-zero":
+                assert not torch.count_nonzero(features[..., 3*d:4*d]), "N3 decoder read f"
+        if condition.startswith("N3"):
+            for module, callback in ((model.predictor, predictor), (model.shared, shared),
+                                     (model.scorer, scorer), (model.decoder, decoder)):
+                handles.append(module.register_forward_pre_hook(callback))
+        try:
+            with torch.no_grad(), Hooks(model, condition, answer):
+                _, state, _ = model(tokens, ctx, model.init_state(len(tokens)), reset)
+            assert not torch.count_nonzero(state.h[:, fast:]), "A suppressed routed cell changed"
+            if not fast or condition == "N3-fast-zero":
+                assert not torch.count_nonzero(state.h)
+            elif fast:
+                assert torch.count_nonzero(state.h[:, :fast]), "Fast writes were unintentionally removed"
+                if condition == "N3-fast-kept":
+                    assert observed["fast_read_nonzero"], "Fast read was unintentionally removed"
+            checks[condition] = {**observed, "routed_state_zero": True}
+        finally:
+            for handle in handles:
+                handle.remove()
+    return checks
+
+
+def cell(value):
+    if value["accuracy"] is None:
+        return "NE (n=0, d=0)"
+    low, high = value["ci95"]
+    prefix = "NE: " if value["n"] < 100 else ""
+    return (f"{prefix}{100*value['accuracy']:.1f} [{100*low:.1f}, {100*high:.1f}]"
+            f"; n={value['n']}, d={value['docs']}")
+
+
+def gap_stats(n0, n3, bucket="far-strict"):
+    a, b = np.asarray(n0["counts"][bucket]), np.asarray(n3["counts"][bucket])
+    assert np.array_equal(a[:, 1], b[:, 1])
+    return stats({bucket: np.column_stack([a[:, 0]-b[:, 0], a[:, 1]])})[bucket]
+
+
+def render_report():
+    paths = [OUT / f"{label}_600.json" for label in RUNS]
+    results = [json.loads(p.read_text()) for p in paths if p.exists()]
+    lines = ["# Gate M: frozen-checkpoint memory interventions", "",
+        "Measured CPU diagnostics on fresh synthetic_hold documents, with averaged checkpoint weights. "
+        "This is a development analysis, not the locked final evaluation campaign or a formal gate decision.", "",
+        "All percentages below include 95% intervals from 1,000 document bootstrap resamples (seed 0). "
+        "n is the number of answers; d is the number of contributing documents. NE means fewer than 100 answers "
+        "and is not evaluable. Binding denominators contain only eligible queries answered correctly before the edit. "
+        "The original query's distance bucket is retained under every edit.", "",
+        "The generator, seed offset 104729, six key groups, length-sorted batches of 64, masks and bootstrap "
+        "are reused from hold_matrix.py. Each group has 600 documents. Near: d≤31; mid: 32≤d≤62; far: d≥63; "
+        "far-strict: far with no answer byte in input positions max(0,t−62)…t. "
+        "The fresh test-key diagnostic uses hold_matrix's test alphabet and offset seed; no saved final-test dataset is opened.", "",
+        "## Status and checks", "",
+        "Worktree: /home/joe/hsn-gate-m at detached commit 76c2aec. Repository source is unmodified. "
+        "One evaluation process, nice 10, eight intra-op CPU threads, one inter-op thread, CUDA hidden. "
+        "Raw JSON includes checkpoint SHA-256, document hashes, per-document counts and binding query records.", ""]
+    smoke_path = OUT / "smoke_reader32-s1.json"
+    if smoke_path.exists():
+        smoke = json.loads(smoke_path.read_text())
+        lines += [f"50-document N0/N1 smoke: {smoke['status']}; baseline matched the unchanged evaluator exactly "
+                  "and disabled-hook logits equalled plain logits bit-for-bit.", ""]
+    for label in RUNS:
+        result = next((r for r in results if r["label"] == label), None)
+        if result is None:
+            lines.append(f"- {label}: pending (no 600-document result yet).")
+        else:
+            lines.append(f"- {label}: {result['status']}; {len(result['groups'])}/6 groups started; "
+                         f"raw [{label}_600.json]({label}_600.json).")
+    lines += ["", "## What the interventions show", "",
+        "- N0: frozen model as trained. The hook wrapper must give exactly the plain logits. "
+        "Accuracy, counts and bootstrap intervals must equal the unchanged reference evaluator; available archived matrices are checked too.",
+        "- N1: suppress routed cell updates throughout the document, keep each routed h unchanged and advance its age. "
+        "The candidate's fast cells still write; its summary and fast read remain available.",
+        "- N2a: zero only the routed selected-cell read r at decode; preserve q, writes, and the candidate's separate fast read f.",
+        "- N2b-answer / N2b-all: reset decoder q and routed r at answer positions / all positions. "
+        "Writes, shared-transform inputs, and explicit fast read f remain as computed. "
+        "These should give identical answer predictions because decoder outputs do not feed the teacher-forced recurrence.",
+        "- N3: suppress routed writes, zero q before the predictor/shared transform/address gate, zero scorer h, age, "
+        "EMA and position features, and decoder q/r at every position. Exogenous context, address bytes and constants remain. "
+        "N3-fast-kept retains the candidate's fast-cell recurrence and explicit f; N3-fast-zero suppresses those fast writes and resets f too. "
+        "The latter is the candidate's whole-memory condition for gate feasibility. For models without fast cells, N1/N3 answers must be identical.",
+        "- N4: zero reader output everywhere it is used. This is a dependency probe; it does not establish or refute binding.",
+        "- B1: one source value byte changes to an absent legal value chosen with probe v3's seeded hash. "
+        "KV uses the last INS/OVR binding and skips DEL. Queries and teacher-forced answer tokens stay fixed. "
+        "All expected answers are re-derived with the dataset reference solver.",
+        "- B2: swap both key bytes of the queried delayed2h fact and an unasked partner with a different value. "
+        "Both bytes must differ, ensuring exactly four changed positions. Skips and eligibility are retained in raw JSON.",
+        "- B3: replay A and its B1 twin A′ from zero; immediately before the query, replace A's cells, summary, age and position "
+        "with A′'s. All A tokens, byte-address features and reader outputs stay A's. Scorer EMA buffers are fixed, equal and checked zero. "
+        "A′=A gives exactly plain logits in the identity check. This isolates the effect of stored state; "
+        "it does not independently establish the necessity of the fixed address code.",
+        "- Binding outcomes: follows = edited/partner value; unchanged = original value; other = neither. "
+        "These are conditional response rates, not full recall accuracy. Key swaps need competing facts and therefore have a different eligible population.",
+        "- These interventions measure necessity and binding in saved checkpoints. Engineering utility requires independently trained, "
+        "matched controls and is not decided by zeroing a trained model's inputs.", "",
+        "## Far-strict comparison", "",
+        "No pooling across task or key groups. Each cell is measured percent [95% CI]; n answers, d documents. "
+        "B3 reports follows among eligible baseline-correct delayed2h queries.", "",
+        "| Checkpoint | Task / keys | N0 | N1 | N3 (routed removed / f kept) | N3 (all memory removed) | B3 follows |",
+        "| --- | --- | --- | --- | --- | --- | --- |"]
+    for result in results:
+        for key, group in result["groups"].items():
+            ne = group["necessity"]
+            def val(c):
+                return cell(ne[c]["matrix"]["far-strict"]) if c in ne else "pending"
+            fast = result["fast_cells"]
+            b3 = group.get("binding", {}).get("conditions", {}).get("B3")
+            bcell = cell(b3["outcomes"]["follows"]["far-strict"]) if b3 else ("pending" if group["task"] == "delayed2h" else "not applicable")
+            lines.append(f"| {result['label']} | {key} | {val('N0')} | {val('N1')} | "
+                         f"{val('N3-fast-kept' if fast else 'N3')} | {val('N3-fast-zero' if fast else 'N3')} | {bcell} |")
+    lines += ["", "## Gate M feasibility on far-strict", "",
+        "The 50-point condition can be attainable only if N3≤50%; at observed N0 it requires N3≤N0−50 points. "
+        "The paired gap interval resamples the same documents for N0 and N3. The ceiling is inferred as 100−N3. "
+        "A positive diagnostic does not preregister a balanced gate population or establish utility.", "",
+        "| Checkpoint | Task / keys | N3 | N0−N3, points [95% CI] | Maximum gap, points [95% CI] | Point estimate reaches 50? |",
+        "| --- | --- | --- | --- | --- | --- |"]
+    for result in results:
+        condition = "N3-fast-zero" if result["fast_cells"] else "N3"
+        for key, group in result["groups"].items():
+            ne = group["necessity"]
+            if "N0" not in ne or condition not in ne:
+                continue
+            n3 = ne[condition]["matrix"]["far-strict"]
+            gap = gap_stats(ne["N0"], ne[condition])
+            if gap["accuracy"] is None:
+                continue
+            ceiling = {**n3, "accuracy": 1-n3["accuracy"], "ci95": [1-n3["ci95"][1], 1-n3["ci95"][0]]}
+            reaches = "NE" if n3["n"] < 100 else ("yes" if gap["accuracy"] >= .5 else "no")
+            lines.append(f"| {result['label']} | {key} | {cell(n3)} | {cell(gap)} | {cell(ceiling)} | {reaches} |")
+    for result in results:
+        label = result["label"]
+        meaning = ("Far lies beyond the 63-byte reader field." if result["reader_span"] == 32 else
+                   "Far is only a distance; this reader sees the whole window." if result["reader"] else
+                   "There is no reader; all buckets are distance strata only.")
+        lines += ["", f"## {label}", "", meaning, "",
+                  f"Checkpoint: `{result['checkpoint']}`. Status: **{result['status']}**.", "",
+                  "| Task / keys | Condition | Near | Mid | Far | Far-strict | All |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"]
+        for key, group in result["groups"].items():
+            for condition, measured in group["necessity"].items():
+                lines.append(f"| {key} | {condition} | " + " | ".join(cell(measured["matrix"][b]) for b in BUCKETS) + " |")
+            for condition, measured in group.get("binding", {}).get("conditions", {}).items():
+                for outcome, matrix in measured["outcomes"].items():
+                    lines.append(f"| {key} | {condition} {outcome} | " + " | ".join(cell(matrix[b]) for b in BUCKETS) + " |")
+    (OUT / "RESULTS.md").write_text("\n".join(lines) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--models", default="all")
+    parser.add_argument("--docs", type=int, default=600)
+    parser.add_argument("--report-only", action="store_true")
+    args = parser.parse_args()
+    os.chdir(ROOT)
+    if args.report_only:
+        render_report()
+        return
+    # Held until process exit: a second invocation cannot overlap evaluation.
+    lock = (OUT / "evaluation.lock").open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    lock.write(str(os.getpid()) + "\n")
+    lock.flush()
+    n_docs = 50 if args.smoke else args.docs
+    labels = ["reader32-s1"] if args.smoke else list(dict.fromkeys(x for item in args.models.split(",") for x in (RUNS if item == "all" else [item])))
+    for label in labels:
+        try:
+            ckpt = resolve(label)
+        except FileNotFoundError as exc:
+            if label == "core-s1":
+                save(OUT / "core-s1-pending.json", {"reason": str(exc), "checked_at": time.time()})
+                print(f"PENDING {label}: {exc}", flush=True)
+                continue
+            raise
+        model, cfg = load_model(ckpt)
+        hold = hold_module(n_docs, ckpt.parent)
+        path = OUT / (f"smoke_{label}.json" if args.smoke else f"{label}_{n_docs}.json")
+        result = json.loads(path.read_text()) if path.exists() else {
+            "version": VERSION, "label": label, "checkpoint": str(ckpt), "sha256": sha(ckpt),
+            "hold_matrix_sha256": sha(Path("/home/joe/hsn-handoff/hold_matrix.py")),
+            "docs": n_docs, "span": 32, "reach": 63, "averaged": True, "device": "cpu",
+            "reader_span": cfg.model.reader_span if model.reader is not None else None,
+            "reader": model.reader is not None, "fast_cells": cfg.model.fast_cells,
+            "torch": torch.__version__, "threads": 8, "groups": {}, "status": "running",
+            "script_sha256": sha(Path(__file__)), "config_sha256": sha(ckpt.parent / "config.resolved.yaml"),
+            "minimum_evaluable_answers": 100, "created_at": time.time()}
+        assert result["version"] == VERSION and result["sha256"] == sha(ckpt)
+        if not args.smoke and "state_removal_audit" not in result:
+            _, audit_spec, audit_split = hold.CONDITIONS["kv"][0]
+            result["state_removal_audit"] = audit_state_removal(model, [generate(audit_spec, audit_split, i) for i in range(min(n_docs, 4))])
+            save(path, result)
+        conditions = ["N0", "N1"] if args.smoke else ["N0", "N1", "N2a", "N2b-answer", "N2b-all"] + (["N3-fast-kept", "N3-fast-zero"] if cfg.model.fast_cells else ["N3"]) + (["N4"] if model.reader is not None else [])
+        for task, groups in hold.CONDITIONS.items():
+            for name, spec, split in groups:
+                key = f"{task}/{name}"
+                group = result["groups"].setdefault(key, {"task": task, "key_group": name, "necessity": {}})
+                docs = [generate(spec, split, i) for i in range(n_docs)]
+                for doc in docs:
+                    check_example(spec, doc)
+                group["documents_sha256"] = hashlib.sha256(b"".join(d.tokens.tobytes() for d in docs)).hexdigest()
+                for condition in conditions:
+                    if condition in group["necessity"]:
+                        continue
+                    start = time.monotonic()
+                    measured = score(model, docs, hold, condition, exact_off=condition == "N0")
+                    if condition == "N0":
+                        if args.smoke:
+                            reference = json.loads((OUT / "smoke_reference.json").read_text())
+                            reference = next(iter(reference.values()))["matrix"][task][name]
+                        else:
+                            reference = hold.score(model, spec, split)
+                        assert measured["matrix"] == reference, f"N0 mismatch: {label} {key}"
+                        archived = json.loads((EXPS / "a14-stage1-eval/matrix.json").read_text())
+                        archived = archived.get(f"{ckpt.parent.parent.name}:{ckpt.name}")
+                        if archived is not None and archived["docs"] == n_docs:
+                            assert measured["matrix"] == archived["matrix"][task][name], f"Archived N0 mismatch: {label} {key}"
+                            measured["archived_reference_match"] = True
+                        measured["reference_match"] = True
+                        measured["off_logits_bitwise_equal"] = True
+                    if condition == "N3":
+                        assert measured["predictions"] == group["necessity"]["N1"]["predictions"], f"N1/N3 mismatch: {label} {key}"
+                        measured["N1_answers_identical"] = True
+                    if condition == "N1":
+                        measured["far_recall_unchanged"] = (measured["matrix"]["far"]["accuracy"] ==
+                            group["necessity"]["N0"]["matrix"]["far"]["accuracy"])
+                    if condition == "N2b-all":
+                        assert measured["predictions"] == group["necessity"]["N2b-answer"]["predictions"], "N2b answer/all mismatch"
+                        measured["N2b_answer_predictions_identical"] = True
+                    group["necessity"][condition] = measured
+                    save(path, result)
+                    print(f"{label} {key} {condition}: {time.monotonic()-start:.1f}s", flush=True)
+                if not args.smoke and "binding" not in group:
+                    group["binding"] = binding(model, docs, hold, spec, group["necessity"]["N0"]["predictions"])
+                    save(path, result)
+                    if n_docs == 600:
+                        render_report()
+        result["status"] = "complete"
+        result["completed_at"] = time.time()
+        save(path, result)
+        render_report()
+        print(f"COMPLETE {path}", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        import traceback
+        save(OUT / "FAILURE.json", {"traceback": traceback.format_exc(), "time": time.time()})
+        raise
