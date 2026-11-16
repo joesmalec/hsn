@@ -7,16 +7,18 @@ P0.5 parameter groups, the learning-rate schedule, the AMP policy of :mod:`hsn.t
 evaluation, the step :class:`~hsn.train.loop.History` and the checkpoint files) and owns the HSN
 window loop::
 
-    per window:  state = state.detach()                          (every ``train.q_resync_every``
-                 q     = state.recompute_q()                      windows, at the window start)
+    per window:  state = state.detach()     (a segment's first window; each window by default)
+                 q     = state.recompute_q()     (every ``train.q_resync_every`` windows, at the
+                                                  window start)
                  logits, state, info = model(tokens, ctx, state, reset)
                  extras = auxiliary_terms(info, cfg, model.cell.graph)       (P2.4)
                  terms  = assemble_terms({"logits": logits, **info}, batch, cfg, extras)
                  terms  = _routing_terms(terms, info)                         (P2.2 REINFORCE)
                  total = terms_total(terms)
                  grad_norm_report(model, terms) on the first window of a stats step
-                 backward (scaled under fp16)
-                 the window's statistics, issued on the device, not read yet    (P2.10b)
+    per segment: backward of its windows' summed objectives (scaled under fp16)
+                 state = state.detach()
+                 its windows' statistics, issued on the device, not read yet    (P2.10b)
     per step:    unscale; grad_norm per group; clip to train.grad_clip; read the windows'
                  statistics (one transfer per window); optimiser step (with the
                  units the step's windows executed, P2.6); scheduler step; model.update_target();
@@ -25,8 +27,18 @@ window loop::
 * **Truncated BPTT.** Every window starts from ``state.detach()``: the carried
   :class:`~hsn.model.state.CellGraphState` keeps its values and loses its autograd history, so a
   window's gradient never reaches an earlier one (plan §2.6: fixed unroll, carried detached state;
-  one optimiser step is ``train.grad_accum`` windows, P0.5 semantics). Document resets are the
-  loader's ``reset`` mask (True at every document start) and are applied by the model itself,
+  one optimiser step is ``train.grad_accum`` windows, P0.5 semantics). ``train.tbptt_windows = K``
+  (opt-in, ``docs/tbptt_windows.md``; default 1, the behaviour just described) cuts the step's
+  windows into segments of ``K`` consecutive windows: the state is detached at a segment's first
+  window only and carried attached into the next ``K − 1`` windows (``age``, ``pos`` and the
+  address bytes as always), each window still reads its own ``T`` columns through its own call of
+  the model, and the segment's objectives (each window's, weighted as without the key) take one
+  backward pass at its last window, so a window's loss trains what the earlier windows of its
+  segment wrote. The optimiser, clipping and every per-step hook still run once per step, after
+  all its segments; checkpoints and evaluations stay at step boundaries with the state detached.
+  A per-row document reset (``masked_fill``) cuts the gradient of that row only. Document
+  resets are the loader's ``reset`` mask (True at every document start) and are applied by the
+  model itself,
   position by position, before the position is processed (P1.5). The trainer passes the columns
   that hold a reset, read from the CPU window, as ``reset_columns`` (P1.10b), so the model resets
   only there without a device-to-host copy.
@@ -310,6 +322,22 @@ class _WindowStatistics:
 
 
 @dataclass
+class _SegmentWindow:
+    """A window of the open gradient segment (``train.tbptt_windows``): what its statistics,
+    the route guard and the P2.3 features read once the segment's backward pass is issued."""
+
+    info: Mapping[str, Tensor]
+    fwd: Batch
+    logits: Tensor
+    terms: Mapping[str, Tensor]
+    total: Tensor
+    count: int
+    raw_task: float | None
+    tokens: int
+    probe: ProbeResult | None
+
+
+@dataclass
 class _StepStatistics:
     """A step's sums over its windows (the accumulators of :meth:`TBPTTTrainer.fit`)."""
 
@@ -573,6 +601,7 @@ class TBPTTTrainer(Trainer):
         reset_columns: list[int],
         probe: ProbeResult | None,
         reference_cost: float,
+        task_weight: float | None = None,
     ) -> dict[str, float]:
         """P2.4's per-term gradient norms of a statistics step under P2.8's compiled window: one
         extra compiled pass of the window per term with a gradient path (the window's forward from
@@ -580,8 +609,10 @@ class TBPTTTrainer(Trainer):
         that term), since a CUDA-Graph backward is replayed once per forward and cannot take the
         eager path's several retained backwards. The CPU generator is restored around the passes
         (the dense-fallback draw of every pass and of the window itself is the same). The norms
-        equal the eager ones to rounding; the keys come in the eager report's order. Compiled
-        windows require grad_accum=1, so their task weight is identically one."""
+        equal the eager ones to rounding; the keys come in the eager report's order.
+        ``task_weight`` is the window's weight of the task term under gradient accumulation
+        (``None``: one window per step, no weight), applied as :meth:`fit` applies it (a compiled
+        window without CUDA graphs, ``hardware.compile_mode=default``, may accumulate)."""
         cfg = self.cfg
         graph = self.hsn.cell.graph
         scale = self.scaler.get_scale() if self.scaler is not None else 1.0
@@ -601,6 +632,8 @@ class TBPTTTrainer(Trainer):
             terms = self._routing_terms(terms, info, int(fwd["loss_mask"].sum()))
             if self.counterfactual:
                 terms = {**terms, "utility": self._utility_term(probe)}
+            if task_weight is not None:
+                terms = {**terms, "task": terms["task"] * task_weight}
             return terms
 
         terms = objective()
@@ -688,10 +721,15 @@ class TBPTTTrainer(Trainer):
         self._cut_pending = cut < T
         return cut
 
-    def _window_start(self, state: CellGraphState) -> CellGraphState:
-        """The state a window starts from: detached, and with ``q`` recomputed exactly every
-        ``train.q_resync_every`` windows."""
-        state = state.detach()
+    def _window_start(self, state: CellGraphState, *, detach: bool = True) -> CellGraphState:
+        """The state a window starts from: detached at the start of a gradient segment (every
+        window while ``train.tbptt_windows = 1``; ``detach=False`` inside a segment keeps the
+        autograd history of the window before), and with ``q`` recomputed exactly every
+        ``train.q_resync_every`` windows. The resync is not under ``no_grad``: inside a segment
+        the recomputed ``q`` is a function of the attached ``h`` (the segment's gradient reaches
+        the earlier window through it)."""
+        if detach:
+            state = state.detach()
         self.windows += 1
         self.windows_since_resync += 1
         if self.windows_since_resync >= self.cfg.train.q_resync_every:
@@ -986,6 +1024,13 @@ class TBPTTTrainer(Trainer):
         groups = self._grad_groups()
         max_norm = train.grad_clip if train.grad_clip > 0.0 else math.inf
         n_windows = train.grad_accum
+        # train.tbptt_windows: the windows one gradient segment joins (1: every window detached)
+        per_segment = train.tbptt_windows
+        if n_windows % per_segment:  # the configuration refuses it; a hand-built one may not
+            raise ValueError(
+                f"train.grad_accum={n_windows} is not a multiple of train.tbptt_windows="
+                f"{per_segment}"
+            )
         reference_cost = self.hsn.router.costs.dense_cost()  # P2.4: the cost term's normaliser
         graph = self.hsn.cell.graph
         reset_peak(device)
@@ -1018,6 +1063,11 @@ class TBPTTTrainer(Trainer):
             # step's sums from then on
             totals = _StepStatistics()
             pending: list[_WindowStatistics] = []
+            # train.tbptt_windows: the open segment's loss (the sum of its windows' scaled
+            # objectives, one backward pass at its last window) and what each of its windows
+            # hands to its statistics after that backward pass
+            segment_loss: Tensor | None = None
+            segment_windows: list[_SegmentWindow] = []
             tokens_in_step = 0
             positions_sum = 0  # P1.10d: the columns the step's windows computed
             probe_counts = {
@@ -1040,7 +1090,8 @@ class TBPTTTrainer(Trainer):
                 # the columns the model computes: device views of the window (the probes of P2.3,
                 # routed runs only, read the full window)
                 fwd = batch if cut == window["doc"].shape[1] else _columns(batch, cut)
-                state = self._window_start(state)
+                # detached at a segment's first window only; attached to the window before inside
+                state = self._window_start(state, detach=window_index % per_segment == 0)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
                 if self._warm_up_recorded and self._split is not None and self._split.splits_now():
                     self._warm_up_recorded = False  # the first hard-gate step: once
@@ -1065,9 +1116,14 @@ class TBPTTTrainer(Trainer):
                 own_graph = self._compiled is None or (
                     self._split is not None and self._split.splits_now()
                 )
+                task_weight = (
+                    (n_windows * count / step_loss_positions if step_loss_positions else 0)
+                    if n_windows > 1
+                    else None
+                )
                 if stats_step and window_index == 0 and not own_graph:
                     term_norms = self._compiled_term_norms(
-                        fwd, state, reset_columns, probe, reference_cost
+                        fwd, state, reset_columns, probe, reference_cost, task_weight
                     )  # P2.8: before the window's own forward pass, from the same start state
                 logits, state, info = self._forward(
                     fwd,
@@ -1090,10 +1146,7 @@ class TBPTTTrainer(Trainer):
                         probe_counts["probe_pairs"] += float(probe.n_pairs)
                         probe_counts["probe_positions"] += float(probe.positions)
                 raw_task = float(terms["task"].detach()) if n_windows > 1 else None
-                if n_windows > 1:
-                    task_weight = (
-                        n_windows * count / step_loss_positions if step_loss_positions else 0
-                    )
+                if task_weight is not None:
                     terms = {**terms, "task": terms["task"] * task_weight}
                 total = terms_total(terms)
                 if stats_step and window_index == 0 and own_graph:  # P2.4: one window
@@ -1104,25 +1157,49 @@ class TBPTTTrainer(Trainer):
                 window_tokens = int((window["doc"] >= 0).sum())
                 tokens_in_step += window_tokens
                 scaled = total / n_windows
+                segment_loss = scaled if segment_loss is None else segment_loss + scaled
+                segment_windows.append(
+                    _SegmentWindow(
+                        info, fwd, logits, terms, total, count, raw_task, window_tokens, probe
+                    )
+                )
+                if (window_index + 1) % per_segment:
+                    continue  # the segment stays open: the next window reads this state attached
+                # the segment's one backward pass: every window's objective, through the
+                # carried state into the windows before it in the segment (one window: P1.7)
                 with self._segment("backward", tokens=tokens_in_step):
                     if self.scaler is not None:
-                        scaled = self.scaler.scale(scaled)
-                    scaled.backward()  # type: ignore[no-untyped-call]
-                # P2.10b: with the backward pass on its way, the statistics of the window (no
-                # host read here; read below, after the gradient norm) and the guard's counts
-                statistics = self._window_statistics(
-                    info, fwd, logits, terms, total, count, raw_task, window_tokens
-                )
-                pending.append(statistics)
-                if self.route_guard is not None:  # A6: slots per (input byte, unit)
-                    observed = (
-                        info
-                        if statistics.unit_idx is None
-                        else {**info, "unit_idx": statistics.unit_idx}
+                        segment_loss = self.scaler.scale(segment_loss)
+                    segment_loss.backward()  # type: ignore[no-untyped-call]
+                segment_loss = None
+                state = state.detach()  # the graph is released; the state leaves it
+                # P2.10b: with the backward pass on its way, the statistics of the segment's
+                # windows (no host read here; read below, after the gradient norm) and the
+                # guard's counts, window by window, from detached values
+                for done in segment_windows:
+                    statistics = self._window_statistics(
+                        done.info,
+                        done.fwd,
+                        done.logits,
+                        done.terms,
+                        done.total,
+                        done.count,
+                        done.raw_task,
+                        done.tokens,
                     )
-                    self.route_guard.observe(fwd["tokens"], fwd["loss_mask"], observed)
-                if self.counterfactual:  # P2.3: once per window, after its selections ran
-                    self._update_ema(info, fwd, probe)
+                    pending.append(statistics)
+                    if self.route_guard is not None:  # A6: slots per (input byte, unit)
+                        observed = (
+                            done.info
+                            if statistics.unit_idx is None
+                            else {**done.info, "unit_idx": statistics.unit_idx}
+                        )
+                        self.route_guard.observe(
+                            done.fwd["tokens"], done.fwd["loss_mask"], observed
+                        )
+                    if self.counterfactual:  # P2.3: once per window, after its selections ran
+                        self._update_ema(done.info, done.fwd, done.probe)
+                segment_windows.clear()
 
             def settle(
                 pending: list[_WindowStatistics] = pending,
