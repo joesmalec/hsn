@@ -20,12 +20,15 @@ import pytest
 import torch
 from hsn.config import HASH_OMIT_AT_DEFAULT, RunConfig, canonical_json, config_hash, load_config
 from hsn.data.synthetic import BOS, EOS
+from hsn.device import resolve, seed_everything
 from hsn.experiments.protocols import ArmRun, run_protocol
 from hsn.experiments.rules import parse_rules
 from hsn.experiments.spec import memory_key, protocol_params
 from hsn.model.hsn import address_history
 from hsn.model.hsn_t import HSNT
 from hsn.model.word_address import WORD_TABLES, state_width
+from hsn.runner import build_model
+from hsn.train.tbptt import TBPTTTrainer
 from p1_11_support import (
     REF_A1,
     TINY_HSN_OVERRIDES,
@@ -33,6 +36,7 @@ from p1_11_support import (
     restore_determinism,  # noqa: F401
     tiny_manifest,  # noqa: F401
 )
+from p1_15_support import datasets, hsn_config
 from test_a6_feedback_detach import A5, _start
 from test_hsn_t import CUT_C, READER, _gap, _model
 from test_write_events import CATTN, HYBRID, NGRAM, RECIPE_A6, STE, _ev, _ev_cfg, _window_of
@@ -406,6 +410,36 @@ def test_the_model_reads_no_later_byte_and_no_earlier_document(kind: str) -> Non
         changed, _, _ = model(before, ctx, _start(model, 3, seed=5), reset, prev_tokens=other)
         assert _gap(changed[0, :6], logits[0, :6]) > 1e-6
         assert _gap(changed[0, 6:], logits[0, 6:]) <= 1e-12
+
+
+def test_trainer_carries_and_checkpoints_the_word_state(tmp_path: Path) -> None:
+    steps = 4
+    cfg = hsn_config(
+        steps,
+        *A5,
+        CUT_C,
+        "train.soft_until_step=0",
+        *READER,
+        *NGRAM,
+        _ev("word"),
+        _wa("bag"),
+        "model.word_contexts=[1,2,3,4,5]",
+        "train.ckpt_every=2",
+    )
+
+    def trainer_in(run_dir: Path) -> TBPTTTrainer:
+        seed_everything(0)
+        return TBPTTTrainer(build_model(cfg), cfg, resolve(cfg.hardware), run_dir=run_dir)
+
+    trainer = trainer_in(tmp_path / "run")
+    history = trainer.fit(*datasets(), steps)
+    assert len(history.steps) == steps and all(math.isfinite(s.loss) for s in history.steps)
+    carry = trainer._prev_tokens
+    assert carry is not None and carry.dtype == torch.int64
+    assert tuple(carry.shape) == (cfg.train.batch, 2 + state_width(cfg.model.d))
+    again = trainer_in(tmp_path / "again")
+    again.resume(sorted((tmp_path / "run").glob("step_*.pt"))[-1])
+    assert again._prev_tokens is not None and torch.equal(again._prev_tokens.cpu(), carry.cpu())
 
 
 # --------------------------------------------------------------------------------------------------

@@ -226,9 +226,9 @@ whether it ended on an apostrophe not yet placed, and the last event's key.
 previous, info)` returns it, and the trainer checkpoints it as it does the bytes. Cutting a
 window anywhere gives the same events and codes (tested down to windows of one byte).
 
-**Tests** (`tests/test_word_address.py`, 21): the rule against a per-row reading of it;
+**Tests** (`tests/test_word_address.py`, 22): the rule against a per-row reading of it;
 `none` against the outputs written at 1096531; another context bit for bit; one address for
-`Lily`, `LILY` and `lily`; the carry; no later byte and no earlier document; the
+`Lily`, `LILY` and `lily`; the carry, also through the trainer and a checkpoint; no later byte and no earlier document; the
 configuration and its hash; `train_eval` end to end with the audit.
 
 **Cost, CPU** (as the table below: eager fp32, `B` 32, `T` 128, two threads, forward plus
