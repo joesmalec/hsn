@@ -45,10 +45,11 @@ The prologue is unchanged (embeddings, `E`, the reader over the window, the scor
 position-independent features with the byte positions). Then:
 
 1. **Slots.** Each row's event columns are gathered, in order, into `E` event slots.
-   - `E` is the batch's largest event count rounded up to a multiple of the block (16; the
-     compiled window's block size), at least one block and at most `T`. It is one host read
-     per window and the only data-dependent shape. The loop over blocks is eager, so the
-     number of blocks follows the batch without a new graph.
+   - `E` is the batch's largest event count rounded up to a multiple of the block, at least
+     one block. The block is the compiled window's: the largest divisor of `T` up to 16 (16
+     for `T` 256), in the eager window too. It is one host read per window and the only
+     data-dependent shape. The loop over blocks is eager, so the number of blocks follows
+     the batch without a new graph.
    - A row with fewer events has **padding slots** behind its events. A padding slot holds the
      inputs of one of the row's columns without an event (real inputs, never a reset).
 2. **Each slot runs `_position` unchanged** on that column's inputs: `z`, the context columns
@@ -157,18 +158,62 @@ a store.
 
 `model.write_events=all` builds every byte as an event through the slot gather, the masked
 update and the per-byte gathers. It must equal the loop over bytes, and does, in float64 on
-the CPU (`tests/test_write_events.py`): RESULTS_ANCHOR
+the CPU (`tests/test_write_events.py`):
+
+| | largest difference, `all` against `byte` |
+|---|---|
+| logits | 1.3e-15 |
+| final state (`h`, `q`; `age` and `pos` exact) | 0 |
+| gradients (every parameter and the carried `h`, `q`) | 3.6e-14 absolute, 1.5e-15 relative |
+
+- Eleven configurations: the soft warm-up and the hard gate, no cut and the candidate's cut,
+  with and without the attention read, two-byte addresses with the n-gram history, the
+  short-span reader, the address gate reading `c_{t−1}`, `train.state_grad_clip` and
+  `train.state_grad_ratio`, and a 40-byte window. Training and evaluation mode for the
+  forward pass.
+- Every window has resets in the middle of two rows, rows that continue a document from a
+  random carried state, and a carried last byte.
+- Without the attention read the logits are bit-identical: the gathers copy, and `u` at an
+  event is the slot's tensor.
+- The compiled window against the eager one (fp32, `word` and `all`, soft, hard and
+  evaluation) agrees within the tolerances of the compile tests, and a window with more
+  blocks of slots runs on the same graph.
 
 ## Cost
 
-RESULTS_COST
+Estimated on the CPU, rough: the eager fp32 window of the spec's model (`mem_events.yaml`:
+64 cells, 12 routed slots, 32-byte reader) on TinyStories bytes, `B` 32, `T` 128, two threads,
+forward plus backward.
+
+| | `byte` | `word` | `word` / `byte` |
+|---|---|---|---|
+| without the attention read | 2.07 s | 0.66 s | 0.32 (forward 0.31, backward 0.32) |
+| `cell_attention_heads=4` | 2.31 s | 1.11 s | 0.48 (forward 0.43, backward 0.52) |
+
+- 20.5 % of the bytes are events (26.2 per row of 128; 21 to 31), and the slots are 25 % of
+  the bytes (32): the loop is a quarter as long. What remains is the reader, `S` and `D` over
+  all bytes and the gathers.
+- With the attention read the per-byte read after the loop costs 0.45 s, against 0.24 s
+  inside the loop over bytes. It is one batched read over `[B, T, N, 2d]` gathered keys and
+  values (134 MB in fp32 at this size) and on the CPU it is bound by memory traffic. The
+  map of the cell states runs once per slot; the gather and the attention run per byte.
+- Not measured on the card. There the loop is bound by launches, which fall with the number
+  of slots, and the batched read is a few launches; so the ratio can be better than on the
+  CPU, most of all with the read. Padding slots are paid: a batch runs as many slots as its
+  longest row needs.
+- Saved for the backward pass, beyond the loop's own: the per-slot cell states `[B, E, N, d]`
+  with the read, and the gathered keys and values `[B, T, N, 2d]` (134 MB in bf16 at `B` 32,
+  `T` 256).
+- A tiny TinyStories run through the trainer (40 steps, `word`, 4 heads): the training loss
+  fell from 5.54 to 3.16 and the dev loss from 3.84 to 3.07; the same run at `byte` 5.54 to
+  3.15 and 4.14 to 3.06. It shows that it trains, nothing else.
 
 ## Where it is in the code
 
 - `python/hsn/config.py`: the key, its checks, `write_events_refusals`,
   `HASH_OMIT_AT_DEFAULT`, the split window's scope. `python/hsn/experiments/spec.py`: the
   memory key leaves the key out at `byte`.
-- `python/hsn/model/hsn.py`: `event_positions`, `_Events`, `HSN._event_slots`,
+- `python/hsn/model/hsn.py`: `event_positions`, `event_block`, `_Events`, `HSN._event_slots`,
   `HSN._event_block`, `HSN._forward_events`, `HSN._event_epilogue`; `_window_prologue` finds
   the events; `_window_epilogue` takes the valid mask for the statistics.
 - `python/hsn/model/cell_read.py`: `CellAttentionRead.read_latest`.
