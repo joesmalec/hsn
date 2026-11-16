@@ -166,6 +166,16 @@ default is `true`, and with it nothing in this document changes.
 
 No run of it exists yet.
 
+## The attention read of the cells (`model.cell_attention_heads`)
+
+An opt-in candidate of 15 Nov 2026 (`docs/amendments/cell_attention_read.md`), untested: with
+`H > 0` the reader's output `c_t` attends over all cells at every position (keys from each
+cell's state and its fixed address code, values from its state) and the result `m_t` is one
+more input of the decoder, `D([q; u; r; c; m])`. It stands beside the router's read `r_t`; the
+memory does not read it. The default is 0, and with it nothing in this document changes.
+
+No run of it exists yet.
+
 ## Tests (`tests/test_hsn_t.py`)
 
 The two families are kept apart (config, class, registry); the keys leave the HSN's hashes
