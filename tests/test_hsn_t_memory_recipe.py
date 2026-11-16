@@ -1,12 +1,13 @@
 """The recipe of HSN-T with its memory (``configs/experiments/hsn_t_memory.yaml``, the user's
 decision of 16 Nov 2026): main's HSN-T form, which the memory specs of 15-16 Nov 2026 pass as
-overrides on top of ``hsn_recipe_a6.yaml``, with the attention read of the cells on
-(``model.cell_attention_heads: 4``, ``docs/amendments/cell_attention_read.md``).
+overrides on top of ``hsn_recipe_a6.yaml``. The attention read of the cells
+(``model.cell_attention_heads``, ``docs/amendments/cell_attention_read.md``) is off in it since
+16 Nov 2026 (it costs the recall tasks) and stays an opt-in key for text runs.
 
-The recipe loads and validates; with the read set back to 0 it resolves to ``hsn_recipe_a6.yaml``
-with those overrides exactly (the same configuration hash once the run's name and notes are
-aligned, the same arm ids), so the recipe is "main's form + C-read"; and the code default of the
-key stays 0.
+The recipe loads and validates; it resolves to ``hsn_recipe_a6.yaml`` with those overrides
+exactly (the same configuration hash once the run's name and notes are aligned, the same arm
+ids); with the read set to 4 on top it is main's form with that key and nothing else; and the
+code default of the key stays 0.
 """
 
 from __future__ import annotations
@@ -59,19 +60,19 @@ def _named_as_a6(cfg: RunConfig) -> RunConfig:
     return cfg.model_copy(update={"run_id": a6.run_id, "notes": a6.notes})
 
 
-def test_recipe_loads_with_the_read_on() -> None:
+def test_recipe_loads_with_the_read_off() -> None:
     cfg = load_config(RECIPE)
     assert cfg.model_name == "hsn_t" and family_of(cfg) == "hsn_t"
-    assert cfg.model.cell_attention_heads == 4
+    assert cfg.model.cell_attention_heads == 0
     assert cfg.model.memory and cfg.model.reader == "transformer" and cfg.model.reader_span == 32
     assert cfg.model.k_select == 12 and cfg.model.n_cells == 64
     assert cfg.train.feedback_detach == ["summary", "eps", "router"]
     assert cfg.train.unit_credit == "executed" and cfg.train.soft_until_step == 0
     assert not cfg.hardware.graph_alias_index  # an override of the spec (module docstring)
-    # main's HSN-T model is 2,037,801 trainable parameters; the read adds 53,504 (its own
-    # 20,736 and d * hidden = 32,768 decoder columns)
-    on = HSNT.from_config(cfg).param_report()
-    off = HSNT.from_config(load_config(RECIPE, [OFF])).param_report()
+    # main's HSN-T model is 2,037,801 trainable parameters; the read, set on top, adds 53,504
+    # (its own 20,736 and d * hidden = 32,768 decoder columns)
+    off = HSNT.from_config(cfg).param_report()
+    on = HSNT.from_config(load_config(RECIPE, [ON])).param_report()
     assert (on["total_trainable"], off["total_trainable"]) == (2_091_305, 2_037_801)
     assert on["cell_read"] == 20_736 and "cell_read" not in off
     # the code default stays off
@@ -80,14 +81,16 @@ def test_recipe_loads_with_the_read_on() -> None:
 
 
 @pytest.mark.parametrize("hardware", HARDWARE, ids=["cpu", "card"])
-def test_recipe_without_the_read_is_mains_form(hardware: tuple[str, ...]) -> None:
-    recipe = load_config(RECIPE, [*hardware, OFF])
+def test_recipe_is_mains_form(hardware: tuple[str, ...]) -> None:
+    recipe = load_config(RECIPE, list(hardware))
     main = load_config(RECIPE_A6, [*hardware, *MAIN_FORM])
     assert config_view(recipe) == config_view(main)  # what the arm id reads
     assert config_hash(_named_as_a6(recipe)) == config_hash(main)
     assert recipe.run_id != main.run_id  # the only differences: the name and the notes
-    # with the read on it is main's form with the key set, and nothing else
-    on = load_config(RECIPE, list(hardware))
+    # the explicit 0 is the code default: setting it changes nothing
+    assert config_hash(load_config(RECIPE, [*hardware, OFF])) == config_hash(recipe)
+    # with the read set on top it is main's form with the key set, and nothing else
+    on = load_config(RECIPE, [*hardware, ON])
     main_on = load_config(RECIPE_A6, [*hardware, *MAIN_FORM, ON])
     assert config_view(on) == config_view(main_on)
     assert config_hash(_named_as_a6(on)) == config_hash(main_on)
@@ -123,8 +126,8 @@ def test_recipe_arms_share_the_arm_ids_of_mains_form(tmp_path: Path) -> None:
         "from_recipe",
         {"config": str(RECIPE), "overrides": list(CARD)},
         [
-            {"name": "rd32", "family": "hsn_t", "overrides": [OFF]},
-            {"name": "rd32_cattn4", "family": "hsn_t", "overrides": []},
+            {"name": "rd32", "family": "hsn_t", "overrides": []},
+            {"name": "rd32_cattn4", "family": "hsn_t", "overrides": [ON]},
         ],
     )
     assert len(from_a6) == 4 and len(set(from_a6)) == 4

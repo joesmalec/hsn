@@ -331,7 +331,9 @@ more input of the decoder, `D([q; u; r; c; m])`. It stands beside the router's r
 memory does not read it. The default is 0, and with it nothing in this document changes.
 
 The recipe of HSN-T with its memory, `configs/experiments/hsn_t_memory.yaml` (main's form, 16 Nov
-2026), sets `H = 4`; first TinyStories results are in the design note, "Results (16 Nov 2026)".
+2026), leaves it off (`H = 0`): it helps on TinyStories (the names) but costs the recall tasks
+(kv, delayed), so text runs set `H = 4`. Results in the design note, "Results (16 Nov 2026)" and
+"Results on the recall tasks (16 Nov 2026)".
 
 ## Tests (`tests/test_hsn_t.py`)
 
