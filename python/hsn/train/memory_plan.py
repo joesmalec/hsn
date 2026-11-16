@@ -43,6 +43,7 @@ __all__ = [
     "memory_off_param_count",
     "memory_plan",
     "reader_param_count",
+    "cell_read_param_count",
     "value_bytes_for",
 ]
 
@@ -116,6 +117,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
     d, h, v = m.d, m.hidden, m.vocab_size
     v_in = m.cell_input_width  # 4d: [u; eps; h_i; m_i]; 3d with model.ablate_shared_u
     c = m.reader_width if m.reader != "none" else 0  # HSN-T: S and D read the reader's output
+    a = m.d if m.cell_attention_heads else 0  # HSN-T: D reads the attention read of the cells
     rows = {
         "byte_emb": v * d,
         "ctx_emb": m.n_context * m.context_dim,
@@ -131,7 +133,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
         "cand_norm": d if m.cand_norm == "rms" else 0,  # P1.13 (amendment A4)
         "scorer": _scorer_params(m),
         "halting": 2 * d + 1,
-        "decoder": _mlp((2 + int(m.selected_readout) + int(m.fast_readout)) * d + c, h, v),
+        "decoder": _mlp((2 + int(m.selected_readout) + int(m.fast_readout)) * d + c + a, h, v),
     }
     rows["total"] = sum(rows.values())
     return rows
@@ -150,6 +152,18 @@ def reader_param_count(m: ModelConfig) -> int:
     w = m.reader_width
     table = m.reader_positions * w if m.reader_position == "learned" else 0
     return m.vocab_size * w + m.reader_layers * (12 * w * w + 13 * w) + 2 * w + table
+
+
+def cell_read_param_count(m: ModelConfig) -> int:
+    """HSN-T with ``model.cell_attention_heads``: the parameters of the attention read of the
+    cells (:class:`hsn.model.cell_read.CellAttentionRead`), outside Appendix C like the reader;
+    0 without the key. The query map ``w → d``, the keys' and values' map of the state
+    ``d → 2d``, the keys' map of the address ``d → d`` without a bias and the output map
+    ``d → d``: ``d (w + 4d + 4)``, 20,736 at ``d`` 64 with the default reader (``w`` 64). The
+    ``d`` decoder columns that read ``m_t`` are counted in the ``decoder`` row."""
+    if not m.cell_attention_heads:
+        return 0
+    return m.d * (m.reader_width + 4 * m.d + 4)
 
 
 def memory_off_param_count(m: ModelConfig) -> dict[str, int]:

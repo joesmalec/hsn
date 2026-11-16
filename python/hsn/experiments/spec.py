@@ -642,6 +642,9 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # the reader's position keys (15 Nov 2026) at their defaults stay out, for the same reason
         if dump["model"][key] == default:
             del dump["model"][key]
+    if dump["model"]["cell_attention_heads"] == 0:
+        # likewise: without the attention read of the cells an arm keeps its memory key
+        del dump["model"]["cell_attention_heads"]
     return digest(
         {
             "model_name": cfg.model_name,

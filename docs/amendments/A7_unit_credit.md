@@ -1,6 +1,13 @@
-# Amendment A7 (proposal): the executed unit's credit (`train.unit_credit`)
+# Amendment A7 (proposal; on in the HSN-T memory recipe): the executed unit's credit (`train.unit_credit`)
 
-Status: **proposed, not adopted** (12 Nov 2026). The key exists as opt-in code (default
+Status (16 Nov 2026): **on in the HSN-T memory recipe** (`configs/experiments/hsn_t_memory.yaml`,
+`train.unit_credit: executed`) by the user's decision of 16 Nov 2026. Every HSN-T memory spec
+since 14 Nov sets it (`a14_reader.yaml`, `key_content.yaml`, `mem_read.yaml`, `mem27k.yaml`). It
+is not in the HSN recipes (`hsn_recipe_a6.yaml` and the ones before it), and the code default
+stays `softmax`, so no earlier configuration hash or arm id changes. The recipe takes the key
+alone, not the arm proposed below (with the soft warm-up and the balance loss).
+
+Earlier status (12 Nov 2026): **proposed, not adopted**. The key exists as opt-in code (default
 `softmax`; `tests/test_unit_credit.py`); no recipe sets it and the code's defaults are unchanged.
 No forward value changes: it is a choice about which scores the router's straight-through
 gradient reaches. This document is the case for and against adopting it together with two
@@ -138,3 +145,7 @@ Each needs the card; none has been run.
 - **decide after experiments 1 and 2** (the recommendation: the arm is the best measured, its
   mechanism is understood, and it neither meets the rule nor beats the adopted recipe's mean); or
 - **leave it** as an opt-in key.
+
+Decided 16 Nov 2026 (the user): the key alone (`train.unit_credit: executed`) is on in the HSN-T
+memory recipe, `configs/experiments/hsn_t_memory.yaml`. The HSN recipes and the code default are
+unchanged.
