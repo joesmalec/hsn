@@ -4,10 +4,11 @@ step, without custom kernels.
 At the reference scale HSN is launch-bound (plan A.2): a training window is ``T`` positions of
 small kernels issued from Python, so the card waits on the host between launches. This module
 compiles the work of a window with ``torch.compile`` (``hardware.compile_mode``: ``none`` |
-``reduce-overhead`` | ``max-autotune``, passed through as the compile mode) and, on CUDA, replays
-it as CUDA Graphs. What it compiles is the same code the eager path runs
-(:meth:`hsn.model.hsn.HSN._position`), with three changes that make the shapes and the control flow
-static (plan P2.8, "static shapes are required for graph capture"):
+``default`` | ``reduce-overhead`` | ``max-autotune``, passed through as the compile mode) and, on
+CUDA, replays it as CUDA Graphs (``reduce-overhead`` and ``max-autotune``; ``default`` compiles
+without them, added 16 Nov 2026 for ``train.tbptt_windows``). What it compiles is the same code
+the eager path runs (:meth:`hsn.model.hsn.HSN._position`), with three changes that make the shapes
+and the control flow static (plan P2.8, "static shapes are required for graph capture"):
 
 * **Blocks of positions.** :func:`compile_window` compiles a block of ``block_size(T)``
   consecutive positions (at most :data:`MAX_BLOCK`, a divisor of ``T``) as one graph and calls it
@@ -64,9 +65,16 @@ CUDA Graphs and the trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`): the traine
 step per window, takes the carried state out of graph memory (a replay overwrites it), runs full
 windows (no trailing cut: one fixed ``T``), takes a statistics step's per-term gradient norms from
 one extra compiled pass per term (several retained backwards of one recorded graph are refused by
-CUDA Graph trees) and refuses ``train.grad_accum > 1`` (a gradient held in ``.grad`` from one
-window would live in graph memory the next window's replay overwrites). Compile time is reported
-apart from the steady state (the ``compile`` segment, never inside step timings).
+CUDA Graph trees) and refuses ``train.grad_accum > 1`` in the CUDA-graph modes (a gradient held
+in ``.grad`` from one window would live in graph memory the next window's replay overwrites).
+Compile time is reported apart from the steady state (the ``compile`` segment, never inside step
+timings). Without CUDA graphs (``default``) the trainer may accumulate windows and join them into
+gradient segments (``train.tbptt_windows``, ``docs/tbptt_windows.md``): a block's outputs keep
+their autograd edges to its inputs (AOTAutograd), so a window started from an attached state
+passes the gradient back into the window before; CUDA-graph replay stays refused for that
+(``tbptt_windows_scope_error``), since the next replay would overwrite what a live segment's
+backward pass still reads. Measured on the CPU only (inductor and ``aot_eager``); the CUDA step
+time of ``default`` is unmeasured.
 
 :func:`compile_step` is the serving step (P5.2's inference path in miniature): one position under
 ``no_grad`` on a preallocated state updated in place, so that its buffers keep their addresses and
