@@ -1,27 +1,24 @@
-# hsn_t_memory: the recipe for HSN-T with its memory in main's form, with the attention read of the cells on
-# (the user's decision of 16 Nov 2026).
+# hsn_t_memory: the recipe for HSN-T with its memory in main's form (the user's decision of 16 Nov 2026).
 #
 # HSN-T (docs/hsn_t.md) is the HSN's memory core behind a Transformer reader. This file is hsn_recipe_a6.yaml
 # with the overrides the HSN-T memory specs of 15-16 Nov 2026 pass on top of it (mem_read.yaml, mem_read_s1.yaml:
-# their base.overrides without the data, steps, profile and compile lines), written out, plus one key:
+# their base.overrides without the data, steps, profile and compile lines), written out:
 #   model_name hsn_t; model.k_select 12 and model.n_cells 64 (12 routed cells of 64, no fast cells);
 #   model.reader transformer with model.reader_span 32 (the short-sighted reader, the main form);
 #   A12's address gate reading the summary (A13); A9's two-byte addresses with their history carried
 #   (address_history ngram, required by HSN-T); A11's wrapped scorer position;
 #   train.feedback_detach [summary, eps, router] (the cell's read of the state keeps its gradient);
 #   train.unit_credit executed (amendment A7, on in this recipe by the user's decision of 16 Nov 2026; not in
-#   the HSN recipes); train.soft_until_step 0 (no soft warm-up);
-#   model.cell_attention_heads 4: the attention read of the cells, "C-read"
-#   (docs/amendments/cell_attention_read.md, results there).
-# With model.cell_attention_heads=0 it resolves to hsn_recipe_a6.yaml with those overrides exactly (the same arm
-# ids, and the same configuration hash once run_id and notes are aligned: tests/test_hsn_t_memory_recipe.py), so
-# the recipe is main's form plus C-read.
+#   the HSN recipes); train.soft_until_step 0 (no soft warm-up).
+# It resolves to hsn_recipe_a6.yaml with those overrides exactly (the same arm ids, and the same configuration
+# hash once run_id and notes are aligned: tests/test_hsn_t_memory_recipe.py).
 #
-# C-read is on here and off in the code (ModelConfig.cell_attention_heads = 0) on purpose: the code default
-# keeps every earlier configuration, checkpoint, configuration hash and run id meaning what it meant (the
-# project's rule: an equation change is an opt-in key), and new HSN-T memory runs get the read from this file.
-# Its cost: +53,504 parameters (2,037,801 -> 2,091,305); a step alone on the RTX 3060 0.205-0.211 s against
-# about 0.17 s. It is built into the autograd window only (the split and fused windows refuse it).
+# The attention read of the cells, "C-read" (model.cell_attention_heads, docs/amendments/cell_attention_read.md),
+# is off here since 16 Nov 2026 (the user's decision; PR #81 had it on, 4 heads, that morning) after the recall
+# tasks: five-task mix (9k, seed 0) overall 83.67 -> 88.58 % but kv 94.33 -> 83.38, delayed 99.34 -> 96.38; hold-out
+# (18k) seed 0 99.34 -> 98.43, seed 2 93.54 -> 89.33 (delayed2h 90.01 -> 67.55). It stays an opt-in key (code
+# default 0) for text, where it helps (TinyStories names, 27k: 0.53 -> 0.26 bits per letter): a text arm adds
+# model.cell_attention_heads=4 (+53,504 parameters, 2,037,801 -> 2,091,305; autograd window only).
 #
 # hardware.graph_alias_index=true (main's HSN-T specs set it: compiled CUDA graphs, bookkeeping only) is not in
 # this file: a `hardware` block in a configuration replaces the whole profile, so it stays an override. The
@@ -32,11 +29,12 @@
 #          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead, hardware.graph_alias_index=true]}
 #
 # Everything not listed keeps its Appendix A default (configs/_example.yaml).
-# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file. (The C-read
+# change of 16 Nov 2026 was made while no spec used this file.)
 
 run_id: hsn_t_memory
 seed: 0
-notes: "HSN-T with its memory in main's form (hsn_recipe_a6 + reader span 32, 12 of 64 cells, summary-gated A12, A9 ngram, A11 wrap, cut C, executed credit) with the attention read of the cells (4 heads)."
+notes: "HSN-T with its memory in main's form (hsn_recipe_a6 + reader span 32, 12 of 64 cells, summary-gated A12, A9 ngram, A11 wrap, cut C, executed credit); the attention read of the cells off."
 profile: cpu # hardware profile: configs/hardware/<profile>.yaml; override with `profile=<name>`
 model_name: hsn_t
 
@@ -85,7 +83,7 @@ model: # Appendix A.1
   ablate_shared_u: false # ablation: remove u from v (not covered by the P1.1 closed forms)
   reader: transformer # HSN-T: the reader in front of the memory core (width 64, 2 blocks, 4 heads by default)
   reader_span: 32 # the reader attends over the last 32 bytes only; a distant fact is the memory's
-  cell_attention_heads: 4 # C-read: c_t attends over all cells (4 heads of width 16), m_t feeds D; code default 0
+  cell_attention_heads: 0 # C-read off (16 Nov 2026: it costs kv and delayed recall); text arms may set 4
   state_schema_version: 1 # bumped on any state layout change
 
 data:
