@@ -27,7 +27,10 @@ memory and step-time estimates. A configuration that sets it is another configur
 `hardware.compile_mode` keeps its meaning: it is the HSN's window, and the generic trainer
 still ignores it. The sweep spec still refuses `hardware.compile_mode != none` on a baseline
 arm; a compiled baseline arm pins `hardware.compile_mode=none` and sets
-`hardware.baseline_compile`. An HSN configuration that sets the key is refused at load.
+`hardware.baseline_compile`. An HSN configuration that sets the key is refused at load. HSN-T
+without its memory (`model_name: hsn_t` with `model.memory: false`, family `hsn_t_nomem`,
+`docs/hsn_t_no_memory.md`) is a stateless model on the generic trainer and takes the key;
+HSN-T with its memory is an HSN and does not.
 
 ## What is compiled, and what is not
 
@@ -36,7 +39,7 @@ break raises) and static shapes. Nothing of a baseline's architecture changes.
 
 | Family | Compiled | Stays eager |
 | --- | --- | --- |
-| `transformer`, `reader` | The whole forward of a window, as one graph, and its backward. | |
+| `transformer`, `reader`, `hsn_t_nomem` | The whole forward of a window, as one graph, and its backward. | |
 | `gru` | The embeddings before the recurrence and the read-out after it (LayerNorm and head), as two graphs, and their backward. | The recurrence, `torch.nn.GRU`: cuDNN on CUDA, called between the two graphs as before. |
 | `selective_ssm` | The whole forward of a window, as one graph, and its backward, with every block's scan run as `_plain_scan` (below). | |
 
@@ -156,3 +159,24 @@ first two windows of each pass are its `compile` segment).
 
 In a sweep spec a compiled baseline arm is
 `{name: gru_2m_compiled, family: gru, overrides: [hardware.compile_mode=none, hardware.baseline_compile=reduce-overhead]}`.
+
+### HSN-T without its memory
+
+The recipe is `configs/experiments/hsn_t_nomem.yaml`; the overrides of the comparison with
+the baselines, and the key:
+
+```
+# reader width 64 (the recipe's size): 627,328 parameters
+profile=rtx3060 hardware.compile_mode=none train.batch=32 train.micro_batch=32
+hardware.baseline_compile=reduce-overhead
+
+# reader width 224 (the GRU's size): 1,942,528 parameters
+profile=rtx3060 hardware.compile_mode=none train.batch=32 train.micro_batch=32
+model.reader_width=224 hardware.baseline_compile=reduce-overhead
+```
+
+Without `hardware.baseline_compile` the same lines are the eager runs. The window is one
+graph (the reader's attention, `S` and `D` over all positions at once), compiled once for
+training and once for the evaluation. On the CPU with inductor it equals the eager forward
+and backward to 2.6e-7 of the largest logit and 2.9e-7 of the largest gradient at the test's
+size, and to 8.3e-7 and 3.3e-7 at width 224 (windows of 16 positions, batch 3).
