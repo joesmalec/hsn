@@ -109,6 +109,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.memory",  # HSN-T without its memory
         "model.cell_attention_heads",  # HSN-T's attention read of the cells (opt-in candidate)
         "model.write_events",  # HSN-T's loop over events (opt-in candidate)
+        "model.word_address",  # the event loop's word address (opt-in candidate)
+        "model.word_contexts",  # the text contexts of the word address
     )
 
 
