@@ -629,6 +629,9 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
     if dump["model"]["cell_attention_heads"] == 0:
         # likewise: without the attention read of the cells an arm keeps its memory key
         del dump["model"]["cell_attention_heads"]
+    if dump["model"]["write_events"] == "byte":
+        # likewise: a model that writes at every byte keeps its memory key
+        del dump["model"]["write_events"]
     return digest(
         {
             "model_name": cfg.model_name,

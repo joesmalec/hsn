@@ -91,7 +91,7 @@ def test_key_is_opt_in_and_the_default_keeps_its_hash() -> None:
     base = load_config(RECIPE_A6)
     assert base.model.cell_attention_heads == 0
     assert "cell_attention_heads" not in json.loads(canonical_json(base))["model"]
-    assert HASH_OMIT_AT_DEFAULT[-1] == "model.cell_attention_heads"
+    assert "model.cell_attention_heads" in HASH_OMIT_AT_DEFAULT
     assert config_hash(load_config(RECIPE_A6, ["model.cell_attention_heads=0"])) == config_hash(
         base
     )

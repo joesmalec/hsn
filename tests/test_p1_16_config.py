@@ -108,6 +108,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "hardware.baseline_compile",  # the baselines' compiled windows (opt-in)
         "model.memory",  # HSN-T without its memory
         "model.cell_attention_heads",  # HSN-T's attention read of the cells (opt-in candidate)
+        "model.write_events",  # HSN-T's loop over events (opt-in candidate)
     )
 
 

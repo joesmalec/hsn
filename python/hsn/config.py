@@ -401,6 +401,19 @@ class ModelConfig(_StrictModel):
     # (the queries), model.memory, model.key_address (the address codes) and d a multiple of
     # H; built into the autograd window only. 0 (default): no read, the model as it was.
     cell_attention_heads: int = Field(default=0, ge=0)
+    # write_events (docs/amendments/write_events.md; opt-in candidate, HSN-T only): when the
+    # memory runs. byte (default): once per byte, the model as it was. word: only at events,
+    # and the position loop runs over those instead of over every byte. An event is a word
+    # end (a byte that is not an ASCII letter or digit directly after one that is; bytes >=
+    # 128 count as letters, every control and marker symbol as a separator) or a position
+    # where a document starts (reset). The cells, the router, the units, the gates, eps, the
+    # graph, q's update and the write equations are unchanged and run at events only; age
+    # counts events, pos keeps counting bytes. The decoder still reads every byte: q_t and
+    # r_t of the latest event at or before t, m_t (cell_attention_heads) with t's own query
+    # over the cells as that event left them, and u_t = S([z_t; q before t; ctx_t; c_t]).
+    # L_pred is taken at the events. all: every byte is an event, through the same event
+    # path; a test value (it must reproduce byte), not for runs.
+    write_events: Literal["byte", "word", "all"] = "byte"
     # --- end HSN-T ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
 
@@ -585,6 +598,36 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     f"{key}: the heads share the cell width, so model.d={self.d} must be a "
                     "multiple of the number of heads"
+                )
+        if self.write_events != "byte":
+            key = f"model.write_events={self.write_events}"
+            if self.reader == "none":
+                raise ValueError(
+                    f"{key} is HSN-T's event loop (model_name: hsn_t): the decoder reads "
+                    "every byte through the reader between two writes, so set "
+                    "model.reader=transformer. The HSN writes at every byte"
+                )
+            if not self.memory:
+                raise ValueError(
+                    f"{key} says when the memory writes, and model.memory=false has none; "
+                    "leave it at byte"
+                )
+            if not (self.key_address and self.selected_readout):
+                raise ValueError(
+                    f"{key} needs model.key_address=true (the last byte of the window before "
+                    "is carried with A5's previous bytes, so that a window's first byte can "
+                    "end a word) and model.selected_readout=true (r_t is kept per event)"
+                )
+            if self.fast_cells or self.fast_readout:
+                raise ValueError(
+                    f"{key}: model.fast_cells / model.fast_readout (A8) are not built into "
+                    "the event loop (S reads the fast group of the position before at every "
+                    "byte); leave them off"
+                )
+            if self.write_gate:
+                raise ValueError(
+                    f"{key}: model.write_gate (A10) is not built into the event loop (its "
+                    "write cost is a mean over positions, and an event slot is not one)"
                 )
         # --- end HSN-T ---
         return self
@@ -1435,6 +1478,19 @@ class RunConfig(_StrictModel):
                 f"attention read of the cells; model_name={self.model_name!r} has no cells to "
                 "read: leave it at 0"
             )
+        if self.model.write_events != "byte":
+            key = f"model.write_events={self.model.write_events}"
+            if self.model_name != "hsn_t":
+                raise ValueError(
+                    f"{key} is HSN-T's event loop; model_name={self.model_name!r} has no "
+                    "memory behind a reader: leave it at byte"
+                )
+            refused = write_events_refusals(self)
+            if refused:
+                raise ValueError(
+                    f"{key}: the memory's records are per event slot, not per byte, and "
+                    "these settings read them per byte: " + "; ".join(refused)
+                )
         if not self.model.memory:
             if self.model_name != "hsn_t":
                 raise ValueError(
@@ -1871,6 +1927,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "hardware.baseline_compile",
     "model.memory",
     "model.cell_attention_heads",
+    "model.write_events",
 )
 
 
@@ -1935,6 +1992,32 @@ def memory_off_refusals(cfg: RunConfig) -> list[str]:
     return refused
 
 
+def write_events_refusals(cfg: RunConfig) -> list[str]:
+    """``model.write_events`` other than ``byte`` (``docs/amendments/write_events.md``): the
+    training settings of ``cfg`` that cannot work with event slots, each with its reason;
+    empty when the configuration can be trained. In the event loop the memory's records
+    (selections, logits, costs) are per event slot, and a row's unused slots are padding."""
+    train = cfg.train
+    refused: list[str] = []
+    if train.gate_mode == "reinforce":
+        refused.append(
+            "train.gate_mode=reinforce (its log-probability is summed over the positions of "
+            "a window; padding slots would be counted)"
+        )
+    if "cost" in train.aux_enabled or train.lambda_c > 0.0:
+        refused.append(
+            "the cost term (train.aux_enabled / train.lambda_c: a batch mean per position; "
+            "padding slots would be counted)"
+        )
+    if train.lambda_u > 0.0:
+        refused.append(
+            f"train.lambda_u={train.lambda_u} (the counterfactual probes replay byte positions)"
+        )
+    if train.lambda_w > 0.0:
+        refused.append(f"train.lambda_w={train.lambda_w} (A10's write cost, per position)")
+    return refused
+
+
 def split_window_scope_error(
     cfg: RunConfig, *, state_gradient: bool | None = None, row_limit: bool = False
 ) -> str | None:
@@ -1973,6 +2056,11 @@ def split_window_scope_error(
     sweep would cost more than the autograd window, and the configuration is never offered
     it."""
     model, train = cfg.model, cfg.train
+    if model.write_events != "byte":
+        return (
+            f"model.write_events={model.write_events}: the event loop is built into the "
+            "autograd window only"
+        )
     if model.cell_attention_heads:
         return (
             f"model.cell_attention_heads={model.cell_attention_heads}: the attention read of "
