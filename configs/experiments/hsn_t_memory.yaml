@@ -9,8 +9,8 @@
 #   A12's address gate reading the summary (A13); A9's two-byte addresses with their history carried
 #   (address_history ngram, required by HSN-T); A11's wrapped scorer position;
 #   train.feedback_detach [summary, eps, router] (the cell's read of the state keeps its gradient);
-#   train.unit_credit executed (the key of A7, a proposal that is not adopted as an amendment; main's HSN-T
-#   specs set it); train.soft_until_step 0 (no soft warm-up);
+#   train.unit_credit executed (amendment A7, on in this recipe by the user's decision of 16 Nov 2026; not in
+#   the HSN recipes); train.soft_until_step 0 (no soft warm-up);
 #   model.cell_attention_heads 4: the attention read of the cells, "C-read"
 #   (docs/amendments/cell_attention_read.md, results there).
 # With model.cell_attention_heads=0 it resolves to hsn_recipe_a6.yaml with those overrides exactly (the same arm
@@ -136,8 +136,8 @@ train: # hsn_recipe_a6's, with the HSN-T specs' changes marked
   # A6: the route guard (its other keys at their defaults: configs/_example.yaml)
   route_guard:
     enabled: true
-  # A7's key (proposal, not adopted as an amendment; main's HSN-T specs set it): the straight-through unit
-  # weight of an executed slot differentiates the executed unit's score alone
+  # amendment A7 (on here by the user's decision of 16 Nov 2026; code default softmax): the straight-through
+  # unit weight of an executed slot differentiates the executed unit's score alone
   unit_credit: executed
   # P2.2 routing controls: the straight-through gate, no soft warm-up, the others at their defaults
   gate_mode: ste

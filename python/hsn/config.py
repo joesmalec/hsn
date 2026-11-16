@@ -1007,7 +1007,9 @@ class TrainConfig(_StrictModel):
     # other unit's score at that position, and a unit with most of the slots at a kind of position
     # pushes the others down there. "executed": the executed unit's score alone (the other units'
     # scores are constants of that softmax): a unit that did not run gets no gradient from the
-    # slot. Not adopted by any recipe: an amendment would have to do that.
+    # slot. Amendment A7 (docs/amendments/A7_unit_credit.md): "executed" is on in the HSN-T
+    # memory recipe (configs/experiments/hsn_t_memory.yaml, the user's decision of 16 Nov 2026);
+    # off by default and in the HSN recipes (hsn_recipe_a6 and before).
     unit_credit: Literal["softmax", "executed"] = "softmax"
     # Opt-in warm start (13 Nov 2026): the weights of a checkpoint written by another run whose
     # model has the same parameters (strict key match); the run's weight average is taken when
