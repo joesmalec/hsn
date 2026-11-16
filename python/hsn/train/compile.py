@@ -93,6 +93,7 @@ from typing import Any, Literal, cast
 import torch
 from torch import Tensor, nn
 
+from hsn.config import CUDA_GRAPH_COMPILE_MODES
 from hsn.device import DeviceContext
 from hsn.kernels import window as window_kernels
 from hsn.model.cell import WindowConsts
@@ -121,8 +122,8 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
-_MODES: tuple[CompileMode, ...] = ("none", "reduce-overhead", "max-autotune")
+CompileMode = Literal["none", "default", "reduce-overhead", "max-autotune"]
+_MODES: tuple[CompileMode, ...] = ("none", "default", "reduce-overhead", "max-autotune")
 
 #: The largest block of positions compiled as one graph: 16 (module docstring: half the compile of
 #: 32 for a step about 1 % slower; larger blocks only add compile time).
@@ -156,9 +157,13 @@ def block_size(T: int) -> int:
 # --------------------------------------------------------------------------------------------------
 
 
-def check_compile_scope(model: HSN, *, grad_accum: int = 1) -> None:
+def check_compile_scope(
+    model: HSN, *, grad_accum: int = 1, mode: CompileMode = "reduce-overhead"
+) -> None:
     """Raise ``NotImplementedError`` (with the reason) unless ``model`` is in the compiled scope
-    (module docstring): routing, gate, exploration, master dtype and ``train.grad_accum``."""
+    (module docstring): routing, gate, exploration, master dtype and, for a ``mode`` that replays
+    CUDA graphs (:data:`~hsn.config.CUDA_GRAPH_COMPILE_MODES`, on every device, so that a
+    configuration means the same everywhere), ``train.grad_accum``."""
     if not isinstance(model, HSN):
         raise TypeError(f"compile needs an HSN model, got {type(model).__name__}")
     cfg = model.cfg
@@ -194,11 +199,14 @@ def check_compile_scope(model: HSN, *, grad_accum: int = 1) -> None:
             "the fp64 master dtype is not compiled: the gradchecks (configs/tiny_gradcheck.yaml) "
             "stay eager (P2.8 'Do not')"
         )
-    if isinstance(grad_accum, bool) or not isinstance(grad_accum, int) or grad_accum != 1:
+    if isinstance(grad_accum, bool) or not isinstance(grad_accum, int) or grad_accum < 1:
+        raise ValueError(f"grad_accum must be an int >= 1, got {grad_accum!r}")
+    if grad_accum != 1 and mode in CUDA_GRAPH_COMPILE_MODES:
         raise NotImplementedError(
-            f"train.grad_accum={grad_accum!r} is not compiled: a CUDA-Graph backward output "
-            "held in .grad across windows would be overwritten by the next window's replay; use "
-            "train.grad_accum=1 or hardware.compile_mode=none"
+            f"train.grad_accum={grad_accum!r} is not compiled with CUDA graphs "
+            f"(hardware.compile_mode={mode}): a CUDA-Graph backward output held in .grad across "
+            "windows would be overwritten by the next window's replay; use train.grad_accum=1, "
+            "hardware.compile_mode=default (compiled without CUDA graphs) or none"
         )
 
 
@@ -322,7 +330,7 @@ def install_graph_alias_index() -> bool:
 
 
 def _uses_cuda_graphs(ctx: DeviceContext, mode: CompileMode, backend: Backend) -> bool:
-    return ctx.device.type == "cuda" and backend == "inductor" and mode != "none"
+    return ctx.device.type == "cuda" and backend == "inductor" and mode in CUDA_GRAPH_COMPILE_MODES
 
 
 def _mps_supported(backend: Backend, device: torch.device) -> tuple[bool, str]:
@@ -1637,7 +1645,7 @@ def compile_window(
     mode = _check_mode(mode)
     if mode == "none":
         return _eager_window(model)
-    check_compile_scope(model, grad_accum=grad_accum)
+    check_compile_scope(model, grad_accum=grad_accum, mode=mode)
     if ctx.device.type == "mps":
         ok, reason = _mps_supported(backend, ctx.device)
         if not ok:
