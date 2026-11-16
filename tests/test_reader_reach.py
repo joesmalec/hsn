@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -119,6 +120,46 @@ def test_attention_reach_of_a_span_and_of_uniform_attention(script: ModuleType) 
         reach = script.attention_reach(model, windows, far=far, first=first)
         assert reach.shape == (len(blocks), 2)
         assert torch.allclose(reach, torch.full_like(reach, expected / queries), atol=1e-5), name
+
+
+@pytest.mark.parametrize("name", list(CASES))
+def test_reach_is_bit_identical_with_boolean_or_additive_masks(
+    script: ModuleType, name: str
+) -> None:
+    model, windows = _model(name), _windows()
+    reaches = []
+    for additive in (False, True):
+
+        def mask_form(_block, args, additive=additive):
+            x, mask, *rotation = args
+            allowed = mask if mask.dtype == torch.bool else mask.isfinite()
+            mask = (
+                torch.zeros_like(mask, dtype=x.dtype).masked_fill(~allowed, -torch.inf)
+                if additive
+                else allowed
+            )
+            return x, mask, *rotation
+
+        hooks = [
+            block.register_forward_pre_hook(mask_form) for block in script.attention_blocks(model)
+        ]
+        try:
+            reaches.append(script.attention_reach(model, windows, far=5, first=10))
+        finally:
+            for hook in hooks:
+                hook.remove()
+    assert torch.equal(*reaches)
+
+
+def test_attention_weights_apply_finite_additive_bias(script: ModuleType) -> None:
+    block = script.attention_blocks(_model("reader"))[0]
+    with torch.no_grad():
+        block.qkv.weight.zero_()
+        block.qkv.bias.zero_()
+        bias = torch.tensor([0.0, math.log(2.0), -torch.inf])[None, None, None, :]
+        weights = script._attention_weights(block, torch.zeros(2, 3, 16), bias)
+    expected = torch.tensor([1 / 3, 2 / 3, 0.0]).expand_as(weights)
+    torch.testing.assert_close(weights, expected, rtol=0, atol=torch.finfo(weights.dtype).eps)
 
 
 def test_models_with_state_are_refused(script: ModuleType) -> None:
