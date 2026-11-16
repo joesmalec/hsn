@@ -31,7 +31,7 @@ from hsn.config import ModelConfig, RunConfig
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, Encoder, SharedTransform
 from hsn.model.hsn import HSN
-from hsn.model.reader import Reader
+from hsn.model.reader import Cache, Reader
 
 __all__ = ["MEMORY_OFF_MODULES", "HSNT", "HSNTNoMemory"]
 
@@ -88,6 +88,9 @@ class HSNTNoMemory(nn.Module):
     Stateless under :class:`hsn.train.loop.SequenceModel`, like the reader alone
     (:class:`hsn.baselines.reader_lm.ReaderLM`); unlike it, the context symbol is read. The
     forward holds no data-dependent branch, shape or host read, so it compiles as one graph.
+    ``model.reader_carry`` (opt-in) makes the reader's cache of the windows before the state
+    (``docs/hsn_t_no_memory.md``, "Reading past the window"): the reader's keys and values,
+    detached, of fixed shape. Nothing of the memory comes back with it.
 
     The model keeps no ``cfg`` attribute on purpose: the evaluation loop passes the carried
     address bytes (``prev_tokens``) to any model whose ``cfg.key_address`` is set.
@@ -132,13 +135,17 @@ class HSNTNoMemory(nn.Module):
 
     # SequenceModel protocol -----------------------------------------------------------------
 
-    def init_state(self, B: int, device: torch.device | str) -> None:
-        """Stateless: there is nothing to carry between windows."""
+    def init_state(self, B: int, device: torch.device | str) -> Cache | None:
+        """Stateless (None): there is nothing to carry between windows. With
+        ``model.reader_carry`` the reader's cache (:meth:`hsn.model.reader.Reader.init_cache`),
+        which the trainer carries from window to window as a recurrent model's state."""
         if B < 1:
             raise ValueError(f"B must be >= 1, got {B}")
-        return None
+        return self.reader.init_cache(B, device)
 
-    def reset_state(self, state: None, mask: Tensor) -> None:
+    def reset_state(self, state: Cache | None, mask: Tensor) -> Cache | None:
+        if self.reader.carry:
+            return self.reader.reset_cache(state, mask)  # type: ignore[arg-type]
         if state is not None:
             raise ValueError(f"HSN-T without memory carries no state, got {type(state).__name__}")
         if mask.dtype is not torch.bool or mask.dim() != 1:
@@ -146,23 +153,28 @@ class HSNTNoMemory(nn.Module):
         return None
 
     def forward(
-        self, tokens: Tensor, context: Tensor, state: None, reset: Tensor
-    ) -> tuple[Tensor, None, dict[str, Any]]:
+        self, tokens: Tensor, context: Tensor, state: Cache | None, reset: Tensor
+    ) -> tuple[Tensor, Cache | None, dict[str, Any]]:
         """``tokens`` / ``context`` / ``reset`` are ``[B, T]``; ``reset`` starts a document for
         the reader, which reads nothing before it. Returns ``logits [B, T, V]``, ``None`` and
-        an empty ``info``."""
-        if state is not None:
+        an empty ``info``; with ``model.reader_carry`` ``state`` is the reader's cache and the
+        next one is returned in its place."""
+        carry = self.reader.carry
+        if not carry and state is not None:
             raise ValueError(f"HSN-T without memory carries no state, got {type(state).__name__}")
         if context.shape != tokens.shape:
             raise ValueError(
                 f"context must have shape {tuple(tokens.shape)}, got {tuple(context.shape)}"
             )
-        c = self.reader(tokens, reset)  # [B, T, w]; checks tokens and reset
+        if carry:  # model.reader_carry: the reader reads the window after its cache
+            c, state = self.reader.read(tokens, reset, state)  # type: ignore[arg-type]
+        else:
+            c = self.reader(tokens, reset)  # [B, T, w]; checks tokens and reset
         z = self.encoder(self.byte_emb(tokens))  # [B, T, d]
         nothing = torch.zeros_like(z)  # the columns of q (and of r), both of width d
         u = self.shared(torch.cat([z, nothing, self.ctx_emb(context), c], dim=-1))
         logits: Tensor = self.decoder(torch.cat([nothing, u, nothing, c], dim=-1))
-        return logits, None, {}
+        return logits, state, {}
 
     def param_report(self) -> dict[str, int]:
         """Measured parameter counts: one row per module (:data:`MEMORY_OFF_MODULES`, the

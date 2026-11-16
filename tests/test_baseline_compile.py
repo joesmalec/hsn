@@ -20,7 +20,15 @@ from typing import Any
 import pytest
 import torch
 from cards import CUDA_PROFILE
-from hsn.config import RunConfig, canonical_json, config_hash, load_config, load_hardware_profile
+from hsn.baselines.mamba import _plain_scan, _SelectiveScan
+from hsn.config import (
+    BASELINE_COMPILE_MODEL_NAMES,
+    RunConfig,
+    canonical_json,
+    config_hash,
+    load_config,
+    load_hardware_profile,
+)
 from hsn.data.dataset import ByteDataset
 from hsn.device import DeviceContext, resolve, seed_everything
 from hsn.experiments.protocols import ArmRun, run_protocol
@@ -64,6 +72,11 @@ TINY: dict[str, tuple[Path, list[str], int]] = {
         ["model.reader_width=16", "model.reader_layers=1", "model.reader_heads=2"],
         2,
     ),
+    "selective_ssm": (
+        MAMBA,
+        [f"baseline.selective_ssm.{key}" for key in ("d_model=16", "n_layers=2", "d_state=4")],
+        2,  # one window for every reset pattern, and the evaluation's
+    ),
     "hsn_t_nomem": (
         NOMEM,
         [f"model.{key}" for key in ("d=8", "context_dim=8", "hidden=16", "reader_width=16")]
@@ -78,10 +91,15 @@ CPU_BACKEND = "inductor" if sys.platform.startswith("linux") else "aot_eager"
 B, T = 3, 16
 #: Compiled against eager in fp32 on the CPU: 10x the largest difference measured (14 Nov 2026,
 #: inductor, every family, both reset patterns, training and evaluation), rounded up: logits and
-#: state 3.3e-7, parameter gradients 8.8e-9; and relative to the largest eager value, 2.6e-7 for
-#: the logits and state and 8.7e-7 for the gradients (the tiny HSN-T without memory has logits
-#: of 1e-2 and gradients of 2e-5, which an absolute bound alone would not test).
-TOL = {"values": 4e-6, "grads": 1e-7, "relative": 1e-5}
+#: state 4.8e-7; parameter gradients 8.8e-9, and 1.5e-7 for ``selective_ssm`` (its gradients are
+#: ten times larger and come from autograd's backward of the scan, not the hand-written one:
+#: FAMILY_TOL); and relative to the largest eager value, 2.6e-7 for the logits and state and
+#: 8.7e-7 for the gradients (the tiny HSN-T without memory has logits of 1e-2 and gradients of
+#: 2e-5, which an absolute bound alone would not test). ``selective_ssm``'s relative differences
+#: are 1.6e-7 and 3.9e-7 (15 Nov 2026), so the relative bound holds for it as it is.
+TOL = {"values": 5e-6, "grads": 1e-7, "relative": 1e-5}
+#: A family's own bounds, where they are larger than TOL's.
+FAMILY_TOL: dict[str, dict[str, float]] = {"selective_ssm": {"grads": 2e-6}}
 Inputs = tuple[Tensor, Tensor, Any, Tensor]
 
 
@@ -131,7 +149,8 @@ def _run(fn: Any, model: nn.Module, inputs: Inputs) -> tuple[list[Tensor], list[
     values = [logits, *_tensors(state)]
     loss = torch.stack([value.float().square().mean() for value in values]).sum()
     grads = torch.autograd.grad(loss, [p for p in model.parameters() if p.requires_grad])
-    return [value.detach().float().clone() for value in values], list(grads)
+    # copies: under CUDA graphs the outputs are graph memory, which the next window overwrites
+    return [value.detach().float().clone() for value in values], [g.clone() for g in grads]
 
 
 def _diff(got: tuple[list[Tensor], list[Tensor]], ref: tuple[list[Tensor], list[Tensor]]) -> Any:
@@ -146,8 +165,13 @@ def _diff(got: tuple[list[Tensor], list[Tensor]], ref: tuple[list[Tensor], list[
     return diff
 
 
-def _within(diff: dict[str, float], scale: float = 1.0) -> bool:
-    return all(diff[name] <= scale * bound for name, bound in TOL.items())
+def _tol(family: str) -> dict[str, float]:
+    """The bounds of ``family``: TOL's, with its own from FAMILY_TOL in their place."""
+    return {**TOL, **FAMILY_TOL.get(family, {})}
+
+
+def _within(diff: dict[str, float], family: str, scale: float = 1.0) -> bool:
+    return all(diff[name] <= scale * bound for name, bound in _tol(family).items())
 
 
 # --------------------------------------------------------------------------------------------------
@@ -187,13 +211,14 @@ def test_key_is_opt_in_and_out_of_the_hash_at_its_default(path: Path) -> None:
 
 
 def test_key_is_for_the_baselines_in_the_scope() -> None:
-    """An HSN compiles its window under ``hardware.compile_mode``: the key is refused there, and
-    for a baseline outside the compiled scope. The HSN's key keeps its meaning."""
+    """An HSN compiles its window under ``hardware.compile_mode``: the key is refused there and
+    taken by every baseline family (``selective_ssm`` among them) and by HSN-T without its
+    memory, but not by HSN-T with it. The HSN's key keeps its meaning."""
     with pytest.raises(ValueError, match=r"hardware\.compile_mode"):
         load_config(REF_A1, ["hardware.baseline_compile=default"])
-    with pytest.raises(ValueError, match="outside the compiled scope"):
-        load_config(MAMBA, ["hardware.baseline_compile=default"])
-    assert load_config(READER, ["hardware.baseline_compile=default"]).model_name == "reader"
+    for path in (GRU_2M, TRANSFORMER_2M, READER, MAMBA):
+        on = load_config(path, ["hardware.baseline_compile=default"])
+        assert on.model_name in BASELINE_COMPILE_MODEL_NAMES
     # HSN-T without its memory is a stateless model on the generic trainer and takes the key;
     # with its memory it is an HSN
     nomem = load_config(NOMEM, ["hardware.baseline_compile=default"])
@@ -287,14 +312,15 @@ def test_compiled_equals_eager(family: str) -> None:
     cases = [_inputs(model, mid_reset=False), _inputs(model, mid_reset=True, seed=2)]
     for inputs in cases:
         diff = _diff(_run(compiled, model, inputs), _run(model, model, inputs))
-        assert _within(diff), diff
+        assert _within(diff, family), diff
     with torch.no_grad():
         small = _inputs(model.eval(), mid_reset=True, batch=2, seed=3)
         ref_logits, ref_state, _ = model(*small)
         logits, state, _ = compiled(*small)
         model.train()
     pairs = zip([logits, *_tensors(state)], [ref_logits, *_tensors(ref_state)], strict=True)
-    bound = min(TOL["values"], TOL["relative"] * float(ref_logits.abs().max()))
+    tol = _tol(family)
+    bound = min(tol["values"], tol["relative"] * float(ref_logits.abs().max()))
     assert max(float((a - b).abs().max()) for a, b in pairs) <= bound
 
     report = compiled.report()
@@ -307,9 +333,39 @@ def test_compiled_equals_eager(family: str) -> None:
         for tokens, context, state, reset in cases:  # the same windows as non-contiguous views
             wide = [torch.stack([x, x], dim=-1)[..., 0] for x in (tokens, context, reset)]
             got = _run(compiled, model, (wide[0], wide[1], state, wide[2]))
-            assert _within(_diff(got, _run(model, model, (tokens, context, state, reset))))
+            ref = _run(model, model, (tokens, context, state, reset))
+            assert _within(_diff(got, ref), family)
     assert compiled.compile_seconds == seconds and compiled.calls == 5
     assert compiled.graphs == report["graphs"]
+
+
+def test_plain_scan_equals_the_selective_scan() -> None:
+    """The scan the compiled ``selective_ssm`` window runs (plain tensor operations, autograd's
+    backward, resets at every position) against the eager one (in-place loop, hand-written
+    backward), in float64 from a non-zero state with document starts at the first, a middle and
+    the last position: the same values bit for bit, the same gradients to rounding."""
+    g = torch.Generator().manual_seed(11)
+    B_, T_, C, S = 2, 6, 3, 2
+
+    def rand(*shape: int) -> Tensor:
+        return torch.randn(*shape, generator=g, dtype=torch.float64)
+
+    delta, A = rand(B_, T_, C).abs() * 0.5 + 0.05, -rand(C, S).abs() - 0.1
+    leaves = [delta, A, rand(B_, T_, C), rand(B_, T_, S), rand(B_, T_, S), rand(B_, C, S)]
+    for leaf in leaves:
+        leaf.requires_grad_()
+    reset = torch.zeros(B_, T_, dtype=torch.bool)
+    reset[0, 0] = reset[1, 3] = reset[0, T_ - 1] = True
+    cols = tuple(reset.any(dim=0).nonzero().flatten().tolist())
+    weights = rand(B_, T_, C), rand(B_, C, S)
+    results = []
+    for y, last in (_SelectiveScan.apply(*leaves, reset, cols), _plain_scan(*leaves, reset)):
+        loss = (y * weights[0]).sum() + (last * weights[1]).sum()
+        results.append((y, last, torch.autograd.grad(loss, leaves)))
+    (y_a, last_a, grads_a), (y_b, last_b, grads_b) = results
+    assert torch.equal(y_a, y_b) and torch.equal(last_a, last_b)
+    for a, b in zip(grads_a, grads_b, strict=True):
+        assert torch.allclose(a, b, rtol=1e-12, atol=1e-12), float((a - b).abs().max())
 
 
 @pytest.mark.skipif(CPU_BACKEND != "inductor", reason="inductor needs a C++ toolchain")
@@ -323,7 +379,7 @@ def test_every_mode_compiles_and_equals_eager(mode: str) -> None:
     assert compiled is not None and compiled.mode == mode and not compiled.cuda_graphs
     inputs = _inputs(model, mid_reset=False)
     diff = _diff(_run(compiled, model, inputs), _run(model, model, inputs))
-    assert _within(diff), diff
+    assert _within(diff, "gru"), diff
     assert compiled.report()["backend"] == "inductor"
 
 
@@ -535,7 +591,7 @@ def test_compiled_equals_eager_cuda(family: str, mode: str) -> None:
     with torch.compiler.set_stance("fail_on_recompile"):
         got = _run(compiled, model, inputs)
     # CUDA kernels round differently from the CPU's: 10x the CPU tolerance until measured
-    assert _within(_diff(got, ref), scale=10.0), _diff(got, ref)
+    assert _within(_diff(got, ref), family, scale=10.0), _diff(got, ref)
     report = compiled.report()
     assert compiled.compile_seconds == seconds
     assert report["cudagraph_skips"] == 0 and report["graphs"] == report["functions"], report
