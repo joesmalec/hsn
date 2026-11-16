@@ -1,8 +1,12 @@
-# Attention read of the cells (HSN-T; opt-in candidate)
+# Attention read of the cells (HSN-T; opt-in key, on in the HSN-T memory recipe)
 
-Status: **opt-in candidate, untested.** Implemented on 15 Nov 2026 on the branch
-`claude/mem-attn-read` (from main f3f271a) and tested on the CPU only. No run on the card, no
-result, not adopted, no amendment number.
+Status: **on in the HSN-T memory recipe** (`configs/experiments/hsn_t_memory.yaml`,
+`cell_attention_heads: 4`) by the user's decision of 16 Nov 2026; the code default stays 0
+(off), so every earlier configuration, checkpoint, hash and run id keeps its meaning.
+Implemented on 15 Nov 2026 on the branch `claude/mem-attn-read` (from main f3f271a). First
+results on TinyStories: "Results (16 Nov 2026)" below. Not yet tested on the synthetic hold-out
+tasks (kv, delayed2h at 18,000 steps; runs queued) nor on the five-task mix. No amendment
+number.
 - `model.cell_attention_heads: H` (default 0 = off). HSN-T only.
 - At the default nothing changes: the key is left out of the configuration hash and of the
   experiment database's memory key, the model builds no new module and the decoder keeps its
@@ -107,8 +111,14 @@ decoder columns; 53,504 in total on the recipe's model.
   scope. `python/hsn/experiments/spec.py`: the memory key leaves the key out at 0.
 - `python/hsn/train/memory_plan.py`: `cell_read_param_count`, the `decoder` row.
 - Tests: `tests/test_cell_attention_read.py`.
-- Spec, not queued: `~/hsn-experiments/remote/specs/mem_read.yaml` (TinyStories, 9,000 steps,
-  seed 0; a 32-byte and a whole-window reader, each with and without `H = 4`).
+- Recipe: `configs/experiments/hsn_t_memory.yaml` (main's HSN-T form with `H = 4`;
+  `tests/test_hsn_t_memory_recipe.py`: with `H = 0` it is `hsn_recipe_a6.yaml` plus main's
+  HSN-T overrides: the same arm ids and, with the run's name and notes aligned, the same
+  configuration hash).
+- Specs (in `~/hsn-experiments/remote/specs/`): `mem_read.yaml` (TinyStories, 9,000 steps,
+  seed 0; a 32-byte and a whole-window reader, each with and without `H = 4`),
+  `mem_read_s1.yaml` (its 32-byte pair on seed 1), `mem27k.yaml` (the 32-byte pair at 27,000
+  steps), `hold_cread.yaml` and `five_cread.yaml` (the synthetic tasks).
 
 ## Cost
 
@@ -124,9 +134,10 @@ threads), forward plus backward, with `H = 4` against `H = 0`.
   3.26 million (`macs_per_token`, sparse total, the reader not counted). Nearly all of it is
   the `d → 2d` map over the 64 cells.
 - It adds about nine tensor operations per position to the forward pass.
-- Not measured on the card. The compiled window there is bound by launches more than by
-  arithmetic, so the share can differ in either direction. If it scaled as on the CPU, main's
-  0.26 s per step on synthetic data would become about 0.30 s, under the 0.5 s limit.
+- On the card: measured since, in "Results (16 Nov 2026)". The estimate before it: the
+  compiled window there is bound by launches more than by arithmetic, so the share can differ
+  in either direction. If it scaled as on the CPU, main's 0.26 s per step on synthetic data
+  would become about 0.30 s, under the 0.5 s limit.
 - Saved for the backward pass: the keys and values, about `2 N d` values per row and position
   (134 MB in bf16 at `B` 32, `T` 256).
 
@@ -139,6 +150,38 @@ threads), forward plus backward, with `H = 4` against `H = 0`.
   picks from a two-byte address.
 - The read attends over cells that were never written (zero state). It can tell them apart
   only by their address code and the bias.
+
+## Results (16 Nov 2026)
+
+TinyStories (`tinystories_v1`), HSN-T in main's form with the 32-byte reader unless stated,
+`H = 0` against `H = 4`. Dev bits per byte, lower is better:
+
+| Run | without | with |
+|---|---|---|
+| 32-byte reader, 9,000 steps, seed 0 | 0.9867 | 0.9720 |
+| 32-byte reader, 9,000 steps, seed 1 | 0.9773 | 0.9789 |
+| 32-byte reader, 27,000 steps, seed 0 | 0.8757 | 0.8546 |
+| Whole-window reader, 9,000 steps, seed 0 | 0.9798 | 0.9920 |
+
+Names ("which name": bits per letter of a name whose previous mention is 64 to 255 bytes back,
+in an earlier window), lower is better:
+
+| Run | without | with |
+|---|---|---|
+| 9,000 steps, seed 0 | 0.63 | 0.52 |
+| 9,000 steps, seed 1 | 0.69 | 0.58 |
+| 27,000 steps, seed 0 | 0.53 | 0.26 |
+
+References at 27,000 steps on the names: Mamba 0.12, GRU 0.68, Transformer 0.79.
+
+- The names cost less with the read on all three runs. The dev bits are lower with it on
+  seed 0 (9,000 and 27,000 steps) and slightly higher on seed 1 and with the whole-window
+  reader.
+- Cost: +53,504 parameters (2,037,801 -> 2,091,305). A step alone on the RTX 3060 takes 0.205
+  to 0.211 s against about 0.17 s without the read; runs sharing the card 0.309 against
+  0.256 s per step.
+- Not yet tested: the synthetic hold-out tasks (kv and delayed2h at 18,000 steps, spec
+  `hold_cread.yaml`; runs queued) and the five-task mix (spec `five_cread.yaml`).
 
 ## Sketch of the full idea: the memory as the reader's long-range keys
 

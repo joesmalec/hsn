@@ -324,13 +324,14 @@ baselines are in `docs/hsn_t_no_memory.md`, "Text: the gap to the baselines".
 
 ## The attention read of the cells (`model.cell_attention_heads`)
 
-An opt-in candidate of 15 Nov 2026 (`docs/amendments/cell_attention_read.md`), untested: with
+An opt-in key of 15 Nov 2026 (`docs/amendments/cell_attention_read.md`): with
 `H > 0` the reader's output `c_t` attends over all cells at every position (keys from each
 cell's state and its fixed address code, values from its state) and the result `m_t` is one
 more input of the decoder, `D([q; u; r; c; m])`. It stands beside the router's read `r_t`; the
 memory does not read it. The default is 0, and with it nothing in this document changes.
 
-No run of it exists yet.
+The recipe of HSN-T with its memory, `configs/experiments/hsn_t_memory.yaml` (main's form, 16 Nov
+2026), sets `H = 4`; first TinyStories results are in the design note, "Results (16 Nov 2026)".
 
 ## Tests (`tests/test_hsn_t.py`)
 
