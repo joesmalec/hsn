@@ -1,0 +1,49 @@
+# tinystories_w1024: tinystories_v1 at windows of 1024 positions (15 Nov 2026).
+#
+# What differs from configs/data/tinystories_v1.yaml: `unroll` (1024 instead of 256) and the name,
+# nothing else. The source files, their SHA-256, the document rules, the byte mapping and the
+# split sizes are v1's, so the build keeps the same stories in the same splits with the same bytes
+# (the same n_docs, n_tokens and n_loss per split); the shards differ from v1's only by the window
+# they record, so their hashes differ. A story (median about 720 bytes) mostly fits one window.
+# Source, as v1: TinyStories V2 (GPT-4), Hugging Face dataset roneneldan/TinyStories at commit
+# f54c09fd23315a6f9c86f9dc80f725de7d8f9c64, licence CDLA-Sharing-1.0. Read the v1 file for the
+# fetch commands and what the build makes.
+#
+# Built with the same raw files as v1 (fetch them as its header says), without the n-gram overlap
+# count (the stories are v1's, so v1's golden manifest has the counts):
+#
+#   python -I -m hsn.data.text build --spec configs/data/tinystories_w1024.yaml \
+#       --raw <folder with the source files> --out data/tinystories_w1024 --no-leakage \
+#       --golden configs/data/tinystories_w1024.manifest.json
+#
+# Golden manifest: configs/data/tinystories_w1024.manifest.json, byte-identical to the manifest of
+# the build the runs of 15-16 Nov 2026 trained on (its blake2b is the data hash in their arm ids).
+# A build with the overlap count writes a different manifest, so a different data hash.
+# Select it with
+#   data.dataset=tinystories_w1024 data.manifest=data/tinystories_w1024/manifest.json
+#   data.tasks=[tinystories] data.variants=[out_of_range] train.unroll=1024
+
+name: tinystories_w1024
+unroll: 1024
+task: tinystories
+variant: out_of_range # as in v1: a story can be longer than a window
+family: text
+context_id: 6 # synthetic_v1 uses 1 to 5
+separator: "<|endoftext|>"
+min_bytes: 64
+newline: 16
+tab: 17
+max_train_tokens: 200000000
+n_dev: 2000
+n_test: 2000
+n_gram: 32
+
+train:
+  file: TinyStoriesV2-GPT4-train.first256MiB.txt
+  sha256: cce19c15f7326df79083b0bdb868bc9f596d73c2e98f71bb44dad12e05992c2a
+  drop_last: true # a byte-range download ends inside a story
+
+heldout:
+  file: TinyStoriesV2-GPT4-valid.txt
+  sha256: 6874bae9a4c1a4e7edcf0e53b86c17817e9cf881fc75ff2368da457b80c0585d
+  drop_first: true # the file starts inside a story
