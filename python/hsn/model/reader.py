@@ -25,7 +25,9 @@ with a span the output is a function of the last ``n`` bytes alone, wherever the
 window.
 
 The rotation's cosines and sines are read from a table of the first ``_ROTARY_TABLE`` window
-positions (``tests/test_reader_rotary_table.py``). It holds what the forward pass computed on
+positions, extended through position ``C`` with a carry of ``C``
+(``tests/test_reader_rotary_table.py``, ``tests/test_reader_carry_speed.py``).
+It holds what the forward pass computed on
 every call until 15 Nov 2026: the float64 angles, computed on the device of the parameters and
 cast to their dtype. It is made when the reader is built and made again, not moved or cast,
 whenever the module is (``.to()``, ``.cuda()``, ``.double()``), so the outputs are the same bit
@@ -172,6 +174,35 @@ def _rotate(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.shape[-1] // 2
     first, second = x[..., :half], x[..., half:]
     return torch.cat([first * cos - second * sin, first * sin + second * cos], dim=-1)
+
+
+def _attention_bias(mask: Tensor, x: Tensor) -> Tensor:
+    """Share SDPA's bool-to-additive conversion across the blocks of one window.
+
+    CPU and CUDA SDPA convert True/False to 0/-inf in the queries' dtype. The
+    queries come from an autocast linear, while ``x`` comes from the embedding.
+    Float64 linears do not autocast. Keep other backends' existing bool path.
+    """
+    device = x.device.type
+    if device not in ("cpu", "cuda"):
+        return mask
+    dtype = x.dtype
+    if dtype != torch.float64 and torch.is_autocast_enabled(device):
+        dtype = torch.get_autocast_dtype(device)
+    return torch.where(mask, 0.0, torch.full((), -torch.inf, device=x.device, dtype=dtype))
+
+
+def _keep_tail(old: Tensor, new: Tensor, count: int, dim: int) -> Tensor:
+    """Last ``count`` entries of cat(old, new), without copying discarded entries.
+
+    The caller stacks/contiguates the result to keep the public cache layout.
+    Detach before copying: these entries are next-window state, never a loss input.
+    """
+    new = new.detach()
+    length = new.shape[dim]
+    if length >= count:
+        return new.narrow(dim, length - count, count).to(old.dtype)
+    return torch.cat([old.detach().narrow(dim, length, count - length), new.to(old.dtype)], dim)
 
 
 class _ReaderBlock(nn.Module):
@@ -344,13 +375,17 @@ class Reader(nn.Module):
 
     def _fill_rotary_table(self) -> None:
         """Compute the rotary table where the parameters are: the cos / sin the forward pass
-        would compute there for a window of ``_ROTARY_TABLE`` positions."""
+        would compute there, including position ``C`` for the negative carry positions.
+
+        Carry 1024 needs row 1024 (1025 rows): missing it used to put float64
+        trigonometry back into every forward, including compiled forwards.
+        """
         weight = self.emb.weight
         if weight.device.type == "mps" or self.position != "rotary":
             self._rot_cos = self._rot_sin = None
             return
         angles = _rotary_angles(
-            _ROTARY_TABLE,
+            max(_ROTARY_TABLE, self.carry + 1),
             self.width // self.heads // 2,
             weight.device,
             self._table_pairs,
@@ -436,7 +471,7 @@ class Reader(nn.Module):
             cos = sin = None
         else:
             cos, sin = self._rotation(T, x)
-        mask = self.attention_mask(reset)
+        mask = _attention_bias(self.attention_mask(reset), x)
         for i, block in enumerate(self.blocks):
             block_cos, block_sin = self._block_rotation(self._block_pairs[i], cos, sin)
             x = block(x, mask, block_cos, block_sin)
@@ -601,6 +636,8 @@ class Reader(nn.Module):
             spans = mask[:, 0]
             window_reads = spans[:, :, C:] | window_words
             top_mask = torch.cat([spans[:, :, :C], window_reads, cached_words], dim=-1)[:, None]
+        mask = _attention_bias(mask, x)
+        top_mask = _attention_bias(top_mask, x) if N else mask
         kept_keys: list[Tensor] = []
         kept_values: list[Tensor] = []
         top = len(self.blocks) - 1
@@ -618,14 +655,14 @@ class Reader(nn.Module):
                 word_keys if words else None,
                 word_values if words else None,
             )
-            kept_keys.append(torch.cat([keys[i], k.to(keys.dtype)], dim=2)[:, :, T:])
-            kept_values.append(torch.cat([values[i], v.to(values.dtype)], dim=2)[:, :, T:])
+            kept_keys.append(_keep_tail(keys[i], k, C, dim=2))
+            kept_values.append(_keep_tail(values[i], v, C, dim=2))
         segment = reset.to(torch.int64).cumsum(dim=1)
         last = segment[:, -1:]  # the document the stream is in after the window
         still = valid & (last == 0)  # cached positions of a document that goes on
         # contiguous: the cache keeps one memory layout from window to window (a compiled
         # window is specialised to its inputs' strides)
-        valid_next = torch.cat([still, segment == last], dim=1)[:, T:].contiguous()
+        valid_next = _keep_tail(still, segment == last, C, dim=1).contiguous()
         out: Tensor = self.norm(x)
         kept: Cache = (
             torch.stack(kept_keys).detach(),
