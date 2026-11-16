@@ -359,9 +359,16 @@ class _Prologue(NamedTuple):
         return age, positions[:, t], zero_age, positions_after[:, t]
 
 
-#: ``model.write_events``: the eager event loop's slots come in multiples of this many, the
-#: compiled window's block (:func:`hsn.train.compile.block_size`) for the A.1 unroll.
+#: ``model.write_events``: the most event slots per block of the eager event loop, the
+#: compiled window's ``MAX_BLOCK`` (:func:`hsn.train.compile.block_size`).
 EVENT_BLOCK = 16
+
+
+def event_block(T: int) -> int:
+    """The event slots per block for a window of ``T``: the largest divisor of ``T`` that is at
+    most :data:`EVENT_BLOCK` (16 for the A.1 unroll of 256), which is the compiled window's
+    block, so that the eager and the compiled event loop lay out the same slots."""
+    return max(b for b in range(1, min(T, EVENT_BLOCK) + 1) if T % b == 0)
 
 
 def event_positions(kind: str, tokens: Tensor, previous: Tensor, reset: Tensor) -> Tensor:
@@ -1871,7 +1878,7 @@ class HSN(nn.Module):
         pro = self._window_prologue(
             tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
         )
-        ev = self._event_slots(pro, reset, EVENT_BLOCK)
+        ev = self._event_slots(pro, reset, event_block(int(tokens.shape[1])))
         with self.cell.window():
             out = self._event_block(
                 state.h,

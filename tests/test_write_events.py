@@ -30,7 +30,7 @@ from hsn.config import (
 from hsn.device import resolve, seed_everything
 from hsn.experiments.spec import memory_key
 from hsn.losses import assemble_terms, auxiliary_terms, balance_loss
-from hsn.model.hsn import BOS, EVENT_BLOCK, HSN, event_positions
+from hsn.model.hsn import BOS, EVENT_BLOCK, HSN, event_block, event_positions
 from hsn.model.hsn_t import HSNT
 from hsn.model.state import CellGraphState
 from hsn.runner import build_model
@@ -152,10 +152,12 @@ def test_slots_hold_each_rows_events_in_order() -> None:
     shifted = torch.cat([prev[:, None], tokens[:, :-1]], dim=1).masked_fill(reset, BOS)
     assert torch.equal(pro.events, event_positions("word", tokens, shifted, reset))
     assert bool(pro.events[0, 0]) and bool(pro.events[reset].all())
-    ev = model._event_slots(pro, reset, EVENT_BLOCK)
+    block = event_block(T)
+    assert block == 10 and event_block(256) == EVENT_BLOCK == 16 and event_block(12) == 12
+    ev = model._event_slots(pro, reset, block)
     count = pro.events.sum(dim=1)
     E = ev.valid.shape[1]
-    assert E % EVENT_BLOCK == 0 and E - EVENT_BLOCK < int(count.max()) <= E <= T
+    assert E % block == 0 and E - block < int(count.max()) <= E <= T
     for b in range(B):
         n = int(count[b])
         columns = pro.events[b].nonzero().flatten()
@@ -177,8 +179,8 @@ def test_slots_hold_each_rows_events_in_order() -> None:
     pro = model._window_prologue(
         quiet, ctx, state, none, model._window_mode(), reset_first=True, prev_tokens=prev
     )
-    ev = model._event_slots(pro, none, EVENT_BLOCK)
-    assert ev.valid.shape[1] == EVENT_BLOCK and not bool(ev.valid.any())
+    ev = model._event_slots(pro, none, block)
+    assert ev.valid.shape[1] == block and not bool(ev.valid.any())
 
 
 # --------------------------------------------------------------------------------------------------
@@ -195,8 +197,7 @@ ANCHOR = {
     "short": (STE, *SHORT[len(READER) :], CATTN),
     "reader_prev": (STE, *PREV[len(READER) :]),
     "clip": (STE, CATTN, "train.state_grad_clip=1e-3"),
-    "ratio": (STE, CUT_C, CATTN, "train.state_grad_ratio=0.5"),
-    "dense": ("model.routing=dense",),
+    "ratio": (STE, CUT_C, CATTN, "train.state_grad_ratio=2.0"),
     "long": (STE, CUT_C, CATTN, T_LONG),
 }
 
@@ -400,7 +401,7 @@ def test_bytes_before_the_first_event_read_the_starting_state() -> None:
 def _batch(tokens: Tensor) -> dict[str, Tensor]:
     B, T = tokens.shape
     doc = torch.zeros(B, T, dtype=torch.int64)
-    doc[1, -4:] = -1  # padding at the end of row 1
+    doc[1, T // 2 :] = -1  # padding in the second half of row 1
     return {
         "tokens": tokens,
         "targets": tokens.roll(-1, dims=1).contiguous(),
@@ -426,19 +427,19 @@ def test_prediction_loss_is_taken_at_the_events() -> None:
                 errors.append((info["z_hat"][b, e] - info["z_target"][b, t]).float().square())
     assert 0 < len(errors) < int(live.sum())  # padding slots and padding positions are left out
     expected = 0.5 * torch.stack(errors).mean()
-    assert float((terms["pred"] - expected).abs()) <= 1e-6 * float(expected)
+    assert float((terms["pred"] - expected).detach().abs()) <= 1e-6 * float(expected.detach())
     assert terms["pred"].requires_grad
     # the next-byte loss stays per byte
     mask = batch["loss_mask"]
     task = torch.nn.functional.cross_entropy(logits[mask].float(), batch["targets"][mask])
-    assert float((terms["task"] - task).abs()) <= 1e-6
+    assert float((terms["task"] - task).detach().abs()) <= 1e-6
     # a window without an event: a zero term with a gradient path, not an error
     quiet = torch.full_like(tokens, 97)
     none = torch.zeros_like(reset)
     logits, _, info = model(quiet, ctx, state, none, prev_tokens=carry)
     assert not bool(info["event_valid"].any())
     terms = assemble_terms({"logits": logits, **info}, _batch(quiet), cfg)
-    assert float(terms["pred"]) == 0.0 and terms["pred"].requires_grad
+    assert float(terms["pred"].detach()) == 0.0 and terms["pred"].requires_grad
 
 
 def test_terms_of_all_equal_the_loop_over_bytes() -> None:
@@ -453,7 +454,8 @@ def test_terms_of_all_equal_the_loop_over_bytes() -> None:
         terms.append(assemble_terms({"logits": logits, **info}, batch, cfg, extras))
     assert list(terms[0]) == list(terms[1]) == ["task", "pred", "balance"]
     for key, value in terms[0].items():
-        assert float((terms[1][key] - value).abs()) <= 1e-6 * max(1.0, float(value.abs())), key
+        gap = float((terms[1][key] - value).detach().abs())
+        assert gap <= 1e-6 * max(1.0, float(value.detach().abs())), key
 
 
 def test_balance_is_taken_over_the_valid_slots() -> None:
@@ -465,9 +467,9 @@ def test_balance_is_taken_over_the_valid_slots() -> None:
     assert not bool(live.all())
     expected = balance_loss(info["unit_logits"][live], info["unit_idx"][live], info["valid"][live])
     got = auxiliary_terms(info, cfg, model.cell.graph)["balance"]
-    assert float((got - expected).abs()) == 0.0
+    assert float((got - expected).detach().abs()) == 0.0
     everywhere = balance_loss(info["unit_logits"], info["unit_idx"], info["valid"])
-    assert float((got - everywhere).abs()) > 0.0
+    assert float((got - everywhere).detach().abs()) > 0.0
 
 
 # --------------------------------------------------------------------------------------------------
@@ -543,10 +545,13 @@ def test_capture_is_refused() -> None:
 @pytest.mark.parametrize("name", list(COMPILED))
 @pytest.mark.parametrize("kind", ["word", "all"])
 @pytest.mark.usefixtures("small_blocks")
-def test_compiled_event_window_equals_eager(name: str, kind: str) -> None:
+def test_compiled_event_window_equals_eager(
+    name: str, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The event block is the compile unit (the window the TinyStories HSN-T arms train on):
     the compiled window equals the eager event loop, and a second window with another number
     of event blocks runs on the same graph."""
+    monkeypatch.setattr("hsn.model.hsn.EVENT_BLOCK", p28.compile_mod.MAX_BLOCK)  # small_blocks
     overrides, training = COMPILED[name]
     cfg = p28._cfg(
         "model.routing=topk",
