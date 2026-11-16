@@ -7,6 +7,9 @@ the card, no result, not adopted, no amendment number.
   test value: every byte is an event, through the same event path.
 - At the default nothing changes: the key is left out of the configuration hash and of the
   experiment database's memory key, and the window code takes the path it took before.
+- `model.word_address: none | exact | bag` (default `none`; 16 Nov 2026, needs
+  `write_events=word`): at an event the address reads the whole word. See "The word address"
+  below; with it the event rule is the word rule of that section, not the one under "Events".
 - It is the write half of "the memory as the reader's long-range keys"
   (`cell_attention_read.md` is the read half). The reader's top block reading the cells is
   still not built; see the last section.
@@ -142,9 +145,108 @@ logits_t = D([q_t ; u_t ; r_t ; c_t ; m_t])
   term (`train.aux_enabled=[cost]`, `train.lambda_c`: a batch mean per position);
   `train.lambda_u` (the probes replay byte positions); `capture=True` (the diagnostics read
   per-byte cell states; run specs with `diagnostics: false`).
+- **The audit after training** (`trained_state`) reads `capture=True` too, also with
+  `diagnostics: false`, and both runs of the first build ended "failed" there after training
+  and evaluation were done. Since 16 Nov it skips the per-byte state statistics when
+  `write_events` is not `byte`: the record's `trained_state` holds the edge logits and
+  `state_stats_skipped = 1.0`, and a warning is logged. Capture itself is still not built.
 - Built into the autograd window, eager and compiled. HSN-T has no `step()`; serving this
   needs a streaming reader and the event rule per byte.
 - Not adapted: the diagnostics of `hsn.experiments` that read per-position selections.
+
+## The word address (`model.word_address`, 16 Nov 2026)
+
+Status: **opt-in candidate, tested on the CPU only.** The user's decision after the first
+runs: rebuild word events with the address taken from the whole word.
+
+**Cause.** The first runs (TinyStories, 9,000 steps, seed 0) were 2.8 times faster per step
+(0.074 s against 0.205 s) and worse: 1.0048 / 0.9998 bits per byte without / with the attention
+read against 0.9867 / 0.9720 per byte, and 0.73 / 0.75 bits per letter on the names test
+against 0.63 / 0.52 (Mamba 0.17). Inferred: at an event the address was the last two bytes,
+the word's last letter and the separator, so the word never entered it.
+
+**Words** (fixed rule, nothing learned, no formatting read). Under a text context
+(`model.word_contexts`, default `[6]`, TinyStories) a word byte is an ASCII letter or digit,
+or an apostrophe directly between two letters; a word is a maximal run of word bytes; every
+other byte, bytes >= 128 included, is a word of one byte. Under every other context each
+byte is its own word.
+
+**Events.** Where a word is known to be complete: the byte after a word of letters; every
+byte of a context that is not text; every document start. `don't` is one word and one event.
+A word followed by an apostrophe and then no letter (`'a' `) closes at the byte after that
+apostrophe, one byte late, because the rule does not read ahead.
+
+**The mapping.** The key of an event is the word it closes: the word of letters that ended
+just before it, or else the byte at the event (a document start, a byte of another context).
+
+```
+a_cur[i]  = √d ⟨W(key of this event), A_i⟩      a_prev[i] = √d ⟨W(key of the event before), A_i⟩
+```
+
+`a_prev` is BOS's code at a document start. This is A5 with "byte" replaced by "word": a fact
+`k v` is written at `v`'s event under `k`'s code in `a_prev`, and read at `k`'s later event
+under `k`'s code in `a_cur`.
+
+```
+… named lily. …    event at "." (closes lily):   a_cur = W(lily),  a_prev = W(named)   the write
+… named ░░░░ …     event at " " (closes named):  a_cur = W(named)                      the read: the bytes after it read this event's state
+```
+
+and in `… lily said …` the event of `said` has `a_prev = W(lily)`.
+- The separator at the event is not the key, although it is the byte the slot runs on: with
+  it as `a_cur` every event would read the space's address. Separators and punctuation reach
+  the memory through `z`, the reader's `c_t` and A9's byte features, not through these two.
+- A9's features (`address_ngram > 1`) still read the last bytes, as in the first build.
+- With every byte its own word and an event, both features are A5's bit for bit, and the
+  model is `write_events=all`, which is the loop over bytes (tested with `torch.equal`).
+
+**Codes.** `f` are the word's bytes with A-Z folded to a-z (text contexts only; the embedding
+and the reader still read the capital, and nothing is allocated by capitalisation).
+
+```
+exact:  W = d^(−1/2) · s_1[f_1] ⊙ s_2[f_2] ⊙ … ⊙ s_j[f_j]        positions past 16 reuse s_16
+bag:    W = unit( Σ t_1[a] ⊙ t_2[b]  +  Σ u_1[a] ⊙ u_2[b] ⊙ u_3[c] )   over the 2- and 3-grams of  ^ f_1 … f_j $
+```
+
+A word of one byte keeps A5's `C[f_1]` under both.
+
+**Fixed and learned.** Fixed: the ±1 tables (`word_exact`, or `word_bag2` and `word_bag3`;
+integer buffers drawn from the run seed after everything A5 and A9 draw, so every other
+buffer and parameter starts as without the key), the byte classes, the fold, the list of
+text contexts, `C` and `A`. Learned: only what A5 already learns, the units' weights on the
+two address columns and the address gate `G`. No parameter is added. A word no run has seen
+has a unit code like any other.
+
+**Computed before the loop, carried outside the state.** Both codes are running sums over a
+word's bytes (sign bits modulo 2, or gram codes), so a window is one cumulative sum in the
+prologue and the loop is unchanged. A window hands the next one `2d + 6` integers per row
+behind A5 / A9's bytes: the running sum, length and last two bytes of the word in progress,
+whether it ended on an apostrophe not yet placed, and the last event's key.
+`info["address_carry"]` is the next window's `prev_tokens`; `address_history(cfg, tokens,
+previous, info)` returns it, and the trainer checkpoints it as it does the bytes. Cutting a
+window anywhere gives the same events and codes (tested down to windows of one byte).
+
+**Tests** (`tests/test_word_address.py`, 21): the rule against a per-row reading of it;
+`none` against the outputs written at 1096531; another context bit for bit; one address for
+`Lily`, `LILY` and `lily`; the carry; no later byte and no earlier document; the
+configuration and its hash; `train_eval` end to end with the audit.
+
+**Cost, CPU** (as the table below: eager fp32, `B` 32, `T` 128, two threads, forward plus
+backward, on a loaded machine, so compare within the row only):
+
+| | byte address | `exact` | `bag` |
+|---|---|---|---|
+| without the attention read | 0.83 s | 0.76 s | 0.76 s |
+| `cell_attention_heads=4` | 1.34 s | 1.28 s | |
+
+The prologue goes from 32.6 to 38.4 ms (`bag` 39.6); the loop has the same 32 slots (25.5
+events per row against 25.8: a word with an apostrophe is one event). Not run on the card.
+
+**Not built / open.** A9's pair features for words. The counterfactual probes and
+`hsn.experiments.stability` call `address_history` without `info` and raise with the key. A
+script that carries `prev_tokens` itself (the names test) must use the call above. Bytes >=
+128 are words of one byte here and counted as letters in the first build's rule. Spec, not
+queued: `~/hsn-experiments/remote/specs/mem_events2.yaml`.
 
 ## What is untouched
 
@@ -220,7 +322,10 @@ forward plus backward.
 - `python/hsn/train/compile.py`: `_event_block`, `CompiledWindow._run_events`.
 - `python/hsn/losses.py`: `L_pred` and the balance at events.
   `python/hsn/train/tbptt.py`: `_slot_view` for the route guard and the unit counts.
-- Tests: `tests/test_write_events.py`.
+- `python/hsn/model/word_address.py` (the rule, the codes, the carry), `Scorer.word_codes`
+  and the `codes` argument of `Scorer.address_features`, `HSN._split_address_carry`,
+  `address_history(…, info)`; `hsn.experiments.diagnostics.trained_state` (the audit).
+- Tests: `tests/test_write_events.py`, `tests/test_word_address.py`.
 - Spec, not queued: `~/hsn-experiments/remote/specs/mem_events.yaml`.
 
 ## What is left of the full idea
@@ -233,11 +338,10 @@ forward plus backward.
   the cells of the latest event, outside the reader.
 - **A written flag.** A cell never written in the document holds zeros; the read cannot tell
   "empty" from "written with a small state".
-- **What a write at a word end reads, and at which address.** The slot runs on the event
-  byte's inputs: `z` of the separator, `c_t` of the reader at the separator (which has read
-  the word), and A9's address of the last two bytes, the word's last letter and the
-  separator. Whether a word needs an address of its own (a hash of the word, the reader's
-  output) is open and is an equation change.
+- **What a write at a word end reads.** The slot runs on the event byte's inputs: `z` of the
+  separator and `c_t` of the reader at the separator (which has read the word). Its address
+  was the last two bytes; `model.word_address` gives the word an address of its own (above),
+  untested on the card.
 - **`L_pred` at events** predicts the separator's target. A target that describes the next
   word would be an equation change of its own.
 - **The card.** Not run: the step time of the compiled event loop, the memory of the kept
