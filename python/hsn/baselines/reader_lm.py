@@ -14,7 +14,9 @@ its output ``c_t`` to the next byte.
 Stateless under the :class:`hsn.train.loop.SequenceModel` protocol, like the Transformer
 baseline: every window is read on its own and the context symbol is not an input. What it can
 reach is what the reader can reach: the document's bytes up to ``t`` inside the window, the
-last ``1 + L (n − 1)`` of them with a span ``n`` and ``L`` blocks.
+last ``1 + L (n − 1)`` of them with a span ``n`` and ``L`` blocks. With ``model.reader_carry``
+(opt-in) the reader's cache of the windows before is its state, as for HSN-T without its memory
+(``docs/hsn_t_no_memory.md``, "Reading past the window").
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import torch
 from torch import Tensor, nn
 
 from hsn.config import RunConfig
-from hsn.model.reader import Reader
+from hsn.model.reader import Cache, Reader
 
 __all__ = ["ReaderLM"]
 
@@ -50,13 +52,17 @@ class ReaderLM(nn.Module):
 
     # SequenceModel protocol -----------------------------------------------------------------
 
-    def init_state(self, B: int, device: torch.device | str) -> None:
-        """Stateless: there is nothing to carry between windows."""
+    def init_state(self, B: int, device: torch.device | str) -> Cache | None:
+        """Stateless (None): there is nothing to carry between windows. With
+        ``model.reader_carry`` the reader's cache (:meth:`hsn.model.reader.Reader.init_cache`),
+        carried by the trainer as a recurrent model's state."""
         if B < 1:
             raise ValueError(f"B must be >= 1, got {B}")
-        return None
+        return self.reader.init_cache(B, device)
 
-    def reset_state(self, state: None, mask: Tensor) -> None:
+    def reset_state(self, state: Cache | None, mask: Tensor) -> Cache | None:
+        if self.reader.carry:
+            return self.reader.reset_cache(state, mask)  # type: ignore[arg-type]
         if state is not None:
             raise ValueError(f"ReaderLM carries no state, got {type(state).__name__}")
         if mask.dtype is not torch.bool or mask.dim() != 1:
@@ -64,17 +70,23 @@ class ReaderLM(nn.Module):
         return None
 
     def forward(
-        self, tokens: Tensor, context: Tensor, state: None, reset: Tensor
-    ) -> tuple[Tensor, None, dict[str, Any]]:
+        self, tokens: Tensor, context: Tensor, state: Cache | None, reset: Tensor
+    ) -> tuple[Tensor, Cache | None, dict[str, Any]]:
         """``tokens`` / ``reset`` are ``[B, T]``; ``context`` is accepted and not read (the
-        reader has no context input)."""
-        if state is not None:
+        reader has no context input). With ``model.reader_carry`` ``state`` is the reader's
+        cache and the next one is returned in its place."""
+        carry = self.reader.carry
+        if not carry and state is not None:
             raise ValueError(f"ReaderLM carries no state, got {type(state).__name__}")
         if context.shape != tokens.shape:
             raise ValueError(
                 f"context must have shape {tuple(tokens.shape)}, got {tuple(context.shape)}"
             )
-        logits: Tensor = self.head(self.reader(tokens, reset))
+        if carry:  # model.reader_carry: the reader reads the window after its cache
+            c, state = self.reader.read(tokens, reset, state)  # type: ignore[arg-type]
+            logits: Tensor = self.head(c)
+            return logits, state, {}
+        logits = self.head(self.reader(tokens, reset))
         return logits, None, {}
 
     def param_report(self) -> dict[str, int]:

@@ -107,6 +107,13 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.address_history",
         "hardware.baseline_compile",  # the baselines' compiled windows (opt-in)
         "model.memory",  # HSN-T without its memory
+        "model.reader_position",  # the reader's positions (opt-in, 15 Nov 2026)
+        "model.reader_positions",
+        "model.reader_rotary_pairs",
+        "model.reader_rotary_dtype",
+        "model.reader_rotary_base",  # the rotation's base (opt-in, 15 Nov 2026)
+        "model.reader_carry",  # the reader's carried keys (opt-in, 15 Nov 2026)
+        "model.reader_top_words",  # the top block's word ends (opt-in, 15 Nov 2026)
         "model.cell_attention_heads",  # HSN-T's attention read of the cells (opt-in candidate)
         "model.write_events",  # HSN-T's loop over events (opt-in candidate)
         "model.word_address",  # the event loop's word address (opt-in candidate)

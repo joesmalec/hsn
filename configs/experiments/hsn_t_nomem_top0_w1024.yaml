@@ -1,0 +1,72 @@
+# hsn_t_nomem_top0_w1024: HSN-T without its memory, the standard on text (docs/hsn_t_no_memory.md).
+#
+# Decision, 16 Nov 2026, the user: "i agree HSN-T top0, 1024 windows, no carry is the right
+# balance". The reader 160 wide x 4 blocks with the top block unrotated (top0: rotary pairs
+# [20, 20, 20, 0]), reading the whole window (no reader_span), no carry across windows
+# (reader_carry 0), trained on windows of 1024 bytes: batch 8 x 1024 = 8,192 positions a step,
+# the same as batch 32 x 256, on TinyStories built at 1024 (configs/data/tinystories_w1024.yaml).
+# 1,887,552 parameters (HSNTNoMemory.param_report(); the carry would add none).
+#
+# Measured at 27,000 steps on the RTX 3060, eager, dev bits per byte (lower is better), step time
+# alone on the card (spec w1024_27k, arm ts27_nomem_w160l4_top0_w1024, and the 27k round before it):
+#   this recipe                              seed 0 0.7412, seed 1 0.7375 (mean 0.7393)  26.1 ms
+#   Transformer baseline at 1024             0.7366 / 0.7304                             23.2 ms
+#   this recipe + model.reader_carry=1024    0.7349 (seed 0)                             38.4 ms
+#     (+47 % step time for 0.006 bits: not chosen)
+#   top0 trained at 256 with carry 256       0.7579 / 0.7569                             24.4 ms
+#   GRU baseline                             0.8788 / 0.8794                             16.7 ms
+#
+# The arms on the card add: profile=rtx3060 hardware.compile_mode=none, the steps
+# (train.steps=27000 train.ckpt_every=27000 train.eval_every=1500) and protocol eval_batch: 32 in
+# the spec (a dev batch of 1024-byte windows). In an experiment spec the family is hsn_t_nomem.
+# A `hardware:` block here would replace the whole profile, so the hardware stays with `profile=`.
+#
+# HSN-T with its memory stays at windows of 256 (configs/experiments/hsn_t_memory.yaml): its
+# per-byte loop over the cells would make a 1024-byte window about four times as long.
+#
+# Everything else is configs/experiments/hsn_t_nomem.yaml (that recipe is unchanged): AdamW at
+# 1e-3, the next-byte loss alone, no routing terms. The loader has no "extends", so the file is
+# complete. Everything not listed keeps its Appendix A default (configs/_example.yaml).
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
+
+run_id: hsn_t_nomem_top0_w1024
+seed: 0
+notes: "HSN-T without its memory, the text standard of 16 Nov 2026: reader 160 x 4, top block unrotated, whole window, no carry; 1024-byte windows."
+profile: cpu # override with `profile=<name>`
+model_name: hsn_t
+
+model:
+  memory: false # HSN-T without its memory
+  reader: transformer
+  reader_width: 160
+  reader_layers: 4
+  reader_heads: 4
+  reader_rotary_pairs: [20, 20, 20, 0] # top0: the top block compares queries and keys unrotated
+  reader_span: null # the whole window
+  reader_carry: 0 # no carry: every window is read on its own
+  selected_readout: true # HSN-T's decoder input [q; u; r; c]; q and r read zeros
+  routing: topk # required by selected_readout; no cell exists to route
+
+data:
+  dataset: tinystories_w1024
+  manifest: data/tinystories_w1024/manifest.json # built by `python -m hsn.data.text build`
+  tasks: [tinystories]
+  variants: [out_of_range]
+  align_docs: true # every story starts at a window boundary (as in hsn_t_nomem.yaml)
+
+train:
+  optimizer: adamw # the generic trainer's; lazy_adamw needs the unit bank
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 1024 # the window the model reads
+  batch: 8
+  micro_batch: 8
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  lambda_p: 0.0 # no predictor: the objective is the next-byte loss alone
+  search_trials: 1

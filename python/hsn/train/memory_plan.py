@@ -144,11 +144,14 @@ def reader_param_count(m: ModelConfig) -> int:
     outside Appendix C like the edge logits; 0 without ``model.reader``. The byte embedding
     ``V w``, per block ``12 w² + 13 w`` (two LayerNorms ``4 w``, the attention's ``w → 3w`` and
     ``w → w`` maps, the MLP ``w → 4w → w``) and the final LayerNorm ``2 w``: 116,480 for the
-    default reader (``w`` 64, two blocks) at ``V`` 256."""
+    default reader (``w`` 64, two blocks) at ``V`` 256. With ``model.reader_position =
+    learned`` the position table adds ``model.reader_positions × w``; the rotary positions
+    have no parameter."""
     if m.reader == "none":
         return 0
     w = m.reader_width
-    return m.vocab_size * w + m.reader_layers * (12 * w * w + 13 * w) + 2 * w
+    table = m.reader_positions * w if m.reader_position == "learned" else 0
+    return m.vocab_size * w + m.reader_layers * (12 * w * w + 13 * w) + 2 * w + table
 
 
 def cell_read_param_count(m: ModelConfig) -> int:

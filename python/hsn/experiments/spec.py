@@ -615,6 +615,18 @@ def _plain(value: Any) -> Any:
     return value
 
 
+#: The reader's position keys and their defaults: :func:`memory_key` leaves them out at these.
+_READER_POSITION_DEFAULTS: dict[str, Any] = {
+    "reader_position": "rotary",
+    "reader_positions": 256,
+    "reader_rotary_pairs": None,
+    "reader_rotary_dtype": "working",
+    "reader_rotary_base": 10_000.0,
+    "reader_carry": 0,  # the reader's carried context (15 Nov 2026), likewise
+    "reader_top_words": 0,
+}
+
+
 def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str:
     dump = cfg.model_dump(mode="json")
     if dump["hardware"]["baseline_compile"] == "none":
@@ -626,6 +638,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates
         del dump["model"]["memory"]
+    for key, default in _READER_POSITION_DEFAULTS.items():
+        # the reader's position keys (15 Nov 2026) at their defaults stay out, for the same reason
+        if dump["model"][key] == default:
+            del dump["model"][key]
     if dump["model"]["cell_attention_heads"] == 0:
         # likewise: without the attention read of the cells an arm keeps its memory key
         del dump["model"]["cell_attention_heads"]

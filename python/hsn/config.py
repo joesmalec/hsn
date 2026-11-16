@@ -138,7 +138,7 @@ BaselineCompileMode = Literal[
 ]
 #: The model names whose windows ``hardware.baseline_compile`` compiles; ``hsn_t`` is one more
 #: with ``model.memory = false`` (HSN-T without its memory: stateless, on the generic trainer).
-BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "reader")
+BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "selective_ssm", "reader")
 #: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
 #: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
 #: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut); ``fused`` is ``split``
@@ -383,6 +383,53 @@ class ModelConfig(_StrictModel):
     # short-sighted reader, which must leave everything further back to the memory).
     # null (default): every byte of the document up to the position, inside the window.
     reader_span: int | None = Field(default=None, ge=1)
+    # --- the reader's positions (docs/hsn_t.md, "The reader's positions"; opt-in, 15 Nov 2026) ---
+    # reader_position: how the reader learns where a byte is. "rotary" (default): the rotation
+    # of the attention's queries and keys, which reads distances only and has no parameter.
+    # "learned": a table of reader_positions rows added to the byte embedding by window
+    # position, as the Transformer baseline's, and no rotation; the reader then reads the
+    # position in the window, so its output is no longer a function of distances alone. A
+    # diagnostic: it tells the rotation's share of the text gap to the baseline.
+    reader_position: Literal["rotary", "learned"] = "rotary"
+    # The rows of the learned table: the longest window the reader then reads (train.unroll
+    # must not exceed it). Not read with rotary positions.
+    reader_positions: int = Field(default=256, ge=1)
+    # reader_rotary_pairs = n: only the first n pairs of each head's query and key (the n
+    # highest frequencies, unchanged) are rotated; the other pairs are compared as they are, at
+    # every distance. A list gives n for each block, first to last (the baseline adds its
+    # positions once, before the first block; the reader rotates in every block). 0 rotates
+    # nothing: that block's attention compares queries and keys as they are. null (default):
+    # all width / heads / 2 pairs in every block. Distances only, as before.
+    reader_rotary_pairs: int | list[int] | None = None
+    # reader_rotary_dtype: the arithmetic of the rotation. "working" (default): the dtype of
+    # the queries and keys, which is bf16 under bf16 autocast. "parameters": the dtype of the
+    # parameters (float32 master weights), the rotated queries and keys cast back for the
+    # attention. Without autocast the two are the same computation.
+    reader_rotary_dtype: Literal["working", "parameters"] = "working"
+    # reader_rotary_base = b: the base of the rotation's frequency ladder; pair i of a head
+    # (half = width / heads / 2 pairs) turns by t * b^(-i / half) at distance t. 10000
+    # (default) is the reader as it was. A larger base gives the slower pairs longer
+    # wavelengths (pair 0 keeps one radian a position). Must be finite and above 1. Read only
+    # by the rotary positions: refused with reader_position=learned, as the other rotation keys.
+    reader_rotary_base: float = 10_000.0
+    # --- end the reader's positions ---
+    # --- the reader's carried context (docs/hsn_t_no_memory.md, "Reading past the window";
+    # opt-in, 15 Nov 2026; untested candidates) ---
+    # reader_carry = C: every reader block keeps the keys and values of the last C positions of
+    # the windows before, detached (no gradient across windows), as model state the trainer
+    # carries; position t reads the keys at distances 0..C of its document, cached or of the
+    # window: a sliding span, so no distance exceeds C at any window or document length. Needs
+    # rotary positions and no reader_span; HSN-T with its memory refuses it (memory = false
+    # and model_name = reader take it). 0 (default): no cache, every window read alone.
+    reader_carry: int = Field(default=0, ge=0)
+    # reader_top_words = N: the top block also reads the keys and values at the last N word
+    # ends of its document before the window (a byte that is not a letter or digit directly
+    # after one; ASCII letters, digits and bytes >= 128 count as letters), carried and
+    # detached as the cache is; an entry inside the local span (distance <= reader_carry) is
+    # not read twice. Needs reader_carry > 0 and the top block unrotated (the last entry of
+    # reader_rotary_pairs 0, or 0 for all blocks). 0 (default): no word entries.
+    reader_top_words: int = Field(default=0, ge=0)
+    # --- end the reader's carried context ---
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
     # embeddings, E, the reader, S and D, with no cells, router, units, graph, predictor or
@@ -558,6 +605,13 @@ class ModelConfig(_StrictModel):
             )
         # --- end A8 ---
         # --- HSN-T: the window reader ---
+        base_default = type(self).model_fields["reader_rotary_base"].default
+        if not 1.0 < self.reader_rotary_base < float("inf"):  # also refuses NaN
+            raise ValueError(
+                f"model.reader_rotary_base={self.reader_rotary_base} must be a finite number "
+                f"above 1: the base of the rotation's frequency ladder ({base_default} is the "
+                "default)"
+            )
         if self.reader == "none":
             if self.address_gate_input == "reader_prev":
                 raise ValueError(
@@ -568,6 +622,22 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     f"model.reader_span={self.reader_span} (HSN-T) is the span of model.reader; "
                     "set model.reader=transformer or leave it null"
+                )
+            if (
+                self.reader_position != "rotary"
+                or self.reader_rotary_pairs is not None
+                or self.reader_rotary_dtype != "working"
+                or self.reader_rotary_base != base_default
+            ):
+                raise ValueError(
+                    "model.reader_position / reader_rotary_pairs / reader_rotary_dtype / "
+                    "reader_rotary_base are the positions of model.reader; set "
+                    "model.reader=transformer or leave them at their defaults"
+                )
+            if self.reader_carry or self.reader_top_words:
+                raise ValueError(
+                    "model.reader_carry / model.reader_top_words: each carries the keys of "
+                    "model.reader across windows; set model.reader=transformer or leave them at 0"
                 )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
@@ -582,6 +652,63 @@ class ModelConfig(_StrictModel):
                     f"model.reader_heads={self.reader_heads} with an even width per head (the "
                     "positions rotate pairs of the attention's query and key)"
                 )
+            if self.reader_position == "learned" and (
+                self.reader_rotary_pairs is not None
+                or self.reader_rotary_dtype != "working"
+                or self.reader_rotary_base != base_default
+            ):
+                raise ValueError(
+                    "model.reader_position=learned has no rotation: leave "
+                    "model.reader_rotary_pairs, model.reader_rotary_dtype and "
+                    "model.reader_rotary_base at their defaults"
+                )
+            pairs = self.reader_rotary_pairs
+            if isinstance(pairs, list) and len(pairs) != self.reader_layers:
+                raise ValueError(
+                    f"model.reader_rotary_pairs={pairs} names {len(pairs)} blocks and the "
+                    f"reader has model.reader_layers={self.reader_layers}: one count for each "
+                    "block, or one number for all of them"
+                )
+            counts = pairs if isinstance(pairs, list) else [] if pairs is None else [pairs]
+            if any(n < 0 or n > per_head // 2 for n in counts):
+                raise ValueError(
+                    f"model.reader_rotary_pairs={pairs} must lie between 0 and the "
+                    f"{per_head // 2} pairs of a head (model.reader_width / model.reader_heads "
+                    "/ 2); null rotates all of them"
+                )
+            if self.reader_carry and self.reader_position == "learned":
+                raise ValueError(
+                    f"model.reader_carry={self.reader_carry} with model.reader_position=learned: "
+                    "a learned position is the position in the window, so a key carried from "
+                    "an earlier window would hold a position the current window also has; "
+                    "the cache needs the rotary positions (distances only)"
+                )
+            if self.reader_carry and self.reader_span is not None:
+                raise ValueError(
+                    f"model.reader_carry={self.reader_carry} with model.reader_span="
+                    f"{self.reader_span}: the carry is itself a sliding span (distances "
+                    "0..reader_carry); leave model.reader_span null"
+                )
+            if self.reader_top_words and not self.reader_carry:
+                raise ValueError(
+                    f"model.reader_top_words={self.reader_top_words} extends the carried span "
+                    "of model.reader_carry, which is 0: set model.reader_carry > 0"
+                )
+            top = counts[-1] if counts else None  # None: every pair rotated (the default)
+            if self.reader_top_words and top != 0:
+                raise ValueError(
+                    f"model.reader_top_words={self.reader_top_words} needs the top block "
+                    "unrotated (the last entry of model.reader_rotary_pairs 0, got "
+                    f"{pairs}): a word entry keeps no position, and its distance to a query "
+                    "changes from window to window"
+                )
+        table_rows = type(self).model_fields["reader_positions"].default
+        if self.reader_position != "learned" and self.reader_positions != table_rows:
+            raise ValueError(
+                f"model.reader_positions={self.reader_positions} is the size of the learned "
+                "position table: set model.reader_position=learned or leave it at "
+                f"{table_rows}"
+            )
         if not self.memory:
             if self.reader == "none":
                 raise ValueError(
@@ -958,7 +1085,9 @@ class TrainConfig(_StrictModel):
     # other unit's score at that position, and a unit with most of the slots at a kind of position
     # pushes the others down there. "executed": the executed unit's score alone (the other units'
     # scores are constants of that softmax): a unit that did not run gets no gradient from the
-    # slot. Not adopted by any recipe: an amendment would have to do that.
+    # slot. Amendment A7 (docs/amendments/A7_unit_credit.md): "executed" is on in the HSN-T
+    # memory recipe (configs/experiments/hsn_t_memory.yaml, the user's decision of 16 Nov 2026);
+    # off by default and in the HSN recipes (hsn_recipe_a6 and before).
     unit_credit: Literal["softmax", "executed"] = "softmax"
     # Opt-in warm start (13 Nov 2026): the weights of a checkpoint written by another run whose
     # model has the same parameters (strict key match); the run's weight average is taken when
@@ -1513,6 +1642,22 @@ class RunConfig(_StrictModel):
                 f"attention read of the cells; model_name={self.model_name!r} has no cells to "
                 "read: leave it at 0"
             )
+        if self.model_name == "hsn_t" and self.model.memory and self.model.reader_carry:
+            raise ValueError(
+                f"model.reader_carry={self.model.reader_carry} is for HSN-T without its memory "
+                "(model.memory=false) and the reader alone (model_name: reader): with its "
+                "memory HSN-T carries the cells' state across windows, and the reader's cache "
+                "has no place in that state"
+            )
+        if (
+            self.model.reader_position == "learned"
+            and self.train.unroll > self.model.reader_positions
+        ):
+            raise ValueError(
+                f"model.reader_position=learned: the table has model.reader_positions="
+                f"{self.model.reader_positions} rows and a window has train.unroll="
+                f"{self.train.unroll} positions; raise model.reader_positions"
+            )
         if self.model.write_events != "byte":
             key = f"model.write_events={self.model.write_events}"
             if self.model_name != "hsn_t":
@@ -1961,6 +2106,13 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_history",
     "hardware.baseline_compile",
     "model.memory",
+    "model.reader_position",
+    "model.reader_positions",
+    "model.reader_rotary_pairs",
+    "model.reader_rotary_dtype",
+    "model.reader_rotary_base",
+    "model.reader_carry",
+    "model.reader_top_words",
     "model.cell_attention_heads",
     "model.write_events",
     "model.word_address",

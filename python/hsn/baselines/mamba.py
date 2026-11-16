@@ -31,7 +31,10 @@ memory and bfloat16 cannot represent that). The scan is a Python loop over the w
 backward written out (:class:`_SelectiveScan`), not the reference's fused CUDA scan, so its step
 time says nothing about Mamba's speed; it is here for accuracy at a matched parameter count.
 Training memory grows with ``B × T × d_inner × d_state`` per block (the decays and states the
-backward reads).
+backward reads). Under ``hardware.baseline_compile`` the window is compiled with the scan
+written as plain tensor operations (:func:`_plain_scan`: the same recurrence, autograd's
+backward), because the in-place loop of :class:`_SelectiveScan`, compiled, costs a pass over
+the window-sized state tensor per position (:mod:`hsn.train.baseline_compile`).
 
 Sizes come from ``baseline.selective_ssm.*``. With the defaults (d_model 256, 4 blocks, d_state
 16, d_conv 4, expand 2, V=256, 16 context symbols) the model has 1,887,744 parameters as measured
@@ -140,6 +143,30 @@ class _SelectiveScan(torch.autograd.Function):
         return grad_delta, grad_a, grad_drive, grad_b, grad_c, grad_h0, None, None
 
 
+def _plain_scan(
+    delta: Tensor, A: Tensor, drive: Tensor, b_in: Tensor, c_in: Tensor, h0: Tensor, reset: Tensor
+) -> tuple[Tensor, Tensor]:
+    """The recurrence of :class:`_SelectiveScan` (same arguments, same ``(y, h_T)``) as plain
+    tensor operations, differentiated by autograd, with ``reset`` applied at every position (a
+    position where no row resets is unchanged). For ``torch.compile``
+    (``hardware.baseline_compile``): a compiled graph has no in-place writes, so the loop of
+    :class:`_SelectiveScan`, which writes every state into one window-sized tensor, costs a pass
+    over that tensor per position there, and the autograd nodes that make this form slow in
+    eager mode are compiled away. The forward values are those of :class:`_SelectiveScan` bit
+    for bit in eager mode; the gradients equal its hand-written ones to rounding."""
+    B = delta.shape[0]
+    decays = torch.exp(delta.unsqueeze(-1) * A).unbind(1)  # T of [B, C, S]
+    driven = (drive.unsqueeze(-1) * b_in.unsqueeze(2)).unbind(1)
+    previous = h0
+    states: list[Tensor] = []
+    for t, (decay, drive_t) in enumerate(zip(decays, driven, strict=True)):
+        previous = previous.masked_fill(reset[:, t].view(B, 1, 1), 0.0)
+        previous = torch.addcmul(drive_t, decay, previous)
+        states.append(previous)
+    y = torch.matmul(torch.stack(states, dim=1), c_in.unsqueeze(-1)).squeeze(-1)  # [B, T, C]
+    return y, previous
+
+
 class _Block(nn.Module):
     """One Mamba block; see the module docstring for the recurrence."""
 
@@ -176,12 +203,13 @@ class _Block(nn.Module):
         h: Tensor,
         conv: Tensor,
         reset: Tensor,
-        reset_cols: list[int],
+        reset_cols: list[int] | None,
         last_reset: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """``x [B, T, d_model]``, ``h [B, d_inner, d_state]``, ``conv [B, d_conv - 1, d_inner]``;
         ``last_reset [B, T]`` is the position of the latest reset at or before each position
-        (``-d_conv`` when the window has none so far)."""
+        (``-d_conv`` when the window has none so far). ``reset_cols`` are the columns where a
+        row resets; ``None`` runs the scan as :func:`_plain_scan` (the compiled window)."""
         B, T, _ = x.shape
         K = self.d_conv
         stream, z = self.in_proj(self.norm(x)).chunk(2, dim=-1)
@@ -201,9 +229,11 @@ class _Block(nn.Module):
             [self.dt_rank, self.d_state, self.d_state], dim=-1
         )
         delta = F.softplus(self.dt_proj(delta_in))  # [B, T, d_inner]
-        y, h = _SelectiveScan.apply(
-            delta, -torch.exp(self.A_log), delta * u, b_in, c_in, h, reset, tuple(reset_cols)
-        )
+        scan = (delta, -torch.exp(self.A_log), delta * u, b_in, c_in, h, reset)
+        if reset_cols is None:
+            y, h = _plain_scan(*scan)
+        else:
+            y, h = _SelectiveScan.apply(*scan, tuple(reset_cols))
         y = y + u * self.D
         return x + self.out_proj(y * F.silu(z)), h, new_conv
 
@@ -260,6 +290,16 @@ class MambaBaseline(nn.Module):
         self, tokens: Tensor, context: Tensor, state: State, reset: Tensor
     ) -> tuple[Tensor, State, dict[str, Any]]:
         """``tokens``/``context``/``reset`` are ``[B, T]``; returns logits ``[B, T, V]``, state."""
+        h, conv = self._check_inputs(tokens, context, state, reset)
+        # one host sync per window: the columns where any row starts a document
+        reset_cols = reset.any(dim=0).nonzero().flatten().tolist()
+        logits, out_h, out_conv, state_abs_max = self._window(
+            tokens, context, h, conv, reset, reset_cols
+        )
+        return logits, (out_h, out_conv), {"state_abs_max": state_abs_max}
+
+    def _check_inputs(self, tokens: Tensor, context: Tensor, state: Any, reset: Tensor) -> State:
+        """The shape and dtype checks of :meth:`forward`; returns the state's two tensors."""
         if tokens.dim() != 2:
             raise ValueError(f"tokens must be [B, T], got shape {tuple(tokens.shape)}")
         B, T = tokens.shape
@@ -268,13 +308,26 @@ class MambaBaseline(nn.Module):
                 raise ValueError(f"{name} must have shape {(B, T)}, got {tuple(value.shape)}")
         if reset.dtype is not torch.bool:
             raise TypeError(f"reset must be a bool tensor, got {reset.dtype}")
-        h, conv = self._check_state(state, B)
+        return self._check_state(state, B)
+
+    def _window(
+        self,
+        tokens: Tensor,
+        context: Tensor,
+        h: Tensor,
+        conv: Tensor,
+        reset: Tensor,
+        reset_cols: list[int] | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """The tensor work of :meth:`forward`: ``(logits, h, conv, state_abs_max)``.
+        ``reset_cols`` are the columns where a row resets, which :meth:`forward` reads from the
+        device; ``None`` runs every block's scan as :func:`_plain_scan`, which needs no columns:
+        the window ``hardware.baseline_compile`` compiles (:mod:`hsn.train.baseline_compile`)."""
+        T = tokens.shape[1]
         with torch.autocast(device_type=tokens.device.type, enabled=False):
             x = self.tok_emb(tokens) + self.ctx_emb(context)
             if self.address is not None:
                 x = x + self.address(tokens, reset)
-            # one host sync per window: the columns where any row starts a document
-            reset_cols = reset.any(dim=0).nonzero().flatten().tolist()
             positions = torch.arange(T, device=tokens.device)
             marks = torch.where(reset, positions, torch.full_like(positions, -self.d_conv))
             last_reset = marks.cummax(dim=1).values
@@ -289,7 +342,7 @@ class MambaBaseline(nn.Module):
             logits = self.head(self.norm(x))
             out_h = torch.stack(new_h)
             out_conv = torch.stack(new_conv)
-        return logits, (out_h, out_conv), {"state_abs_max": out_h.detach().abs().max()}
+        return logits, out_h, out_conv, out_h.detach().abs().max()
 
     def param_report(self) -> dict[str, int]:
         """Measured parameter counts; ``active`` == ``stored`` for this dense model."""
