@@ -140,6 +140,28 @@ is P1.15's skip and counts as one. The count is ``History.measured["rollbacks"]`
 learning-rate cut, part of the checkpoint (the snapshots are not: a resumed run re-arms at its next
 multiple of ``rollback_every``). Refused under an fp16 ``GradScaler``.
 
+**Host reads (``train.host_sync``, ``docs/trainer_host_sync.md``; opt-in, 17 Nov 2026).** At
+``per_step`` (the default) a step reads its loss, accuracy and gradient norm on the host within
+the step, as above: the boolean index of the loss positions, the loss, the clipped norm and the
+correct count each wait for the card (five synchronisations a step). At ``stats`` they stay on
+the device: the loss is :func:`masked_cross_entropy` (the same mean, no boolean indexing), the
+optimiser is the fused AdamW (``train.fused_adamw``), whose ``found_inf`` skips a step with a
+non-finite gradient norm on the device (the weights, moments and step count stay as they were,
+as the host guard leaves them), and each step queues a copy of ``[loss sum, correct, norm]``
+into pinned host memory with an event (:class:`_HostReads`). The host waits for the event of
+the step before (never for the step just queued, so the card is never drained) and then books
+that step: its record's values, P1.12's skip count, warning and stop rule, the non-finite loss
+check. A stats step, an evaluation, a checkpoint and the end of ``fit`` book every step first,
+and reading a record's ``loss`` / ``accuracy`` / ``grad_norm`` reads it at once
+(:class:`_DeferredStepRecord`); every other field (``seconds`` among them) is the host's. A
+step's ``seconds`` therefore includes the wait for the step before, so in steady state it is the
+card's step period, as the step-time guard expects. What needs a step's value on the host before
+the next step is refused with ``stats`` (:func:`hsn.config.host_sync_refusals`): the spike guard,
+the rollback, ``adaptive_lr``, ``gradient_growth``, ``update_limit``, ``weight_ema``, the
+divergence dump, ``answer_weight``, the float64 norm, fp16; and :attr:`Trainer.grad_hook` /
+:attr:`Trainer.update_post_hooks` at ``fit``. ``train.fused_adamw`` alone builds
+``torch.optim.AdamW(fused=True)`` (the same update to rounding). The HSN trainer refuses both.
+
 **Optimiser (P2.6).** ``train.optimizer=adamw`` builds ``torch.optim.AdamW`` with weight decay on
 the tensors of ``ndim >= 2`` and none on the rest; ``train.optimizer=lazy_adamw`` builds the same
 groups as a :class:`~hsn.train.lazy_adam.LazyAdamW` with the unit bank's stacked tensors in unit
@@ -211,6 +233,7 @@ if TYPE_CHECKING:
     from hsn.train.baseline_compile import CompiledBaseline
 
 __all__ = [
+    "HOST_SYNC_LAG",
     "NONFINITE_MAX_CONSECUTIVE",
     "NONFINITE_MAX_FRACTION",
     "NONFINITE_MIN_SKIPS",
@@ -228,6 +251,7 @@ __all__ = [
     "Trainer",
     "Trial",
     "detach_state",
+    "masked_cross_entropy",
     "spike_decision",
 ]
 
@@ -297,6 +321,24 @@ def slow_burst_decision(
     recent = float(statistics.median(values[-window:]))
     threshold = factor * baseline
     return bool(recent > threshold and grad_norm > threshold), baseline
+
+
+def masked_cross_entropy(
+    logits: Tensor, targets: Tensor, mask: Tensor, count: int
+) -> tuple[Tensor, Tensor]:
+    """``train.host_sync = stats``: ``(loss, correct)``, the mean next-symbol cross-entropy over
+    the ``count`` positions where ``mask`` (``[B, T]`` bool) holds and how many of them the
+    argmax predicts, both on the device. The mean of ``F.cross_entropy(logits[mask].float(),
+    targets[mask])`` to rounding (the sums run in another order), without the boolean index,
+    whose size the host would have to read. ``count`` is the host's count of ``mask``."""
+    flat = logits.reshape(-1, logits.shape[-1]).float()
+    target = targets.reshape(-1)
+    keep = mask.reshape(-1)
+    total = F.cross_entropy(
+        flat, torch.where(keep, target, -100), ignore_index=-100, reduction="sum"
+    )
+    correct = ((flat.argmax(dim=-1) == target) & keep).sum()
+    return total / count, correct
 
 
 def _skipped_counter(extra: Mapping[str, Any], key: str, path: str) -> int:
@@ -575,6 +617,104 @@ class History:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
 
 
+#: ``train.host_sync = stats``: the steps whose values may still be on the device when a step
+#: ends (the host waits for the step before the one it just queued).
+HOST_SYNC_LAG = 1
+_DEFERRED_FIELDS = frozenset({"loss", "accuracy", "grad_norm"})
+
+
+class _DeferredStepRecord(StepRecord):
+    """``train.host_sync = stats``: a :class:`StepRecord` whose ``loss``, ``accuracy`` and
+    ``grad_norm`` are read from the device when first asked for (the steps before it are read
+    with it); every other field is the host's and reads as usual. Pickled or copied, it is a
+    plain :class:`StepRecord` with its values read."""
+
+    _reader: _HostReads | None = None
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in _DEFERRED_FIELDS:
+            reader = object.__getattribute__(self, "_reader")
+            if reader is not None:
+                reader.read(self)
+        return object.__getattribute__(self, name)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (StepRecord, tuple(getattr(self, name) for name in StepRecord.__dataclass_fields__))
+
+
+@dataclass
+class _Queued:
+    """One step of :class:`_HostReads`: its record, its values (on their way to the host) and
+    the event after their copy, until it is booked."""
+
+    record: _DeferredStepRecord
+    host: Tensor  # float64 [loss sum, correct, grad norm]: pinned on CUDA, filled by the copy
+    event: Any  # torch.cuda.Event after the copy (None on the CPU: the copy is done)
+    loss_positions: int
+    read: bool = False
+
+
+class _HostReads:
+    """``train.host_sync = stats`` (module docstring, "Host reads"): the steps whose loss sum,
+    correct count and gradient norm are on their way to the host, in step order. :meth:`push`
+    queues a step (a non-blocking copy into pinned memory and an event, no wait); :meth:`read`
+    fills the records up to one (waiting for its event only); :meth:`settle` books the oldest
+    steps through ``book`` until ``keep`` are left."""
+
+    def __init__(self, device: torch.device, book: Callable[[_DeferredStepRecord, int], None]):
+        self.device = device
+        self.book = book
+        self.queue: collections.deque[_Queued] = collections.deque()
+
+    def push(
+        self,
+        record: _DeferredStepRecord,
+        loss_sum: Tensor,
+        correct: Tensor,
+        grad_norm: Tensor,
+        loss_positions: int,
+    ) -> None:
+        values = torch.stack(
+            [loss_sum.to(self.device, torch.float64), correct.double(), grad_norm.double()]
+        )
+        event = None
+        if self.device.type == "cuda":
+            host = torch.empty(3, dtype=torch.float64, pin_memory=True)
+            host.copy_(values, non_blocking=True)
+            event = torch.cuda.Event()  # type: ignore[no-untyped-call]
+            event.record()
+        else:  # the CPU: the values are there
+            host = values
+        record._reader = self
+        self.queue.append(_Queued(record, host, event, loss_positions))
+
+    def read(self, upto: _DeferredStepRecord | None = None) -> None:
+        """Fill the records' loss, accuracy and gradient norm, oldest first, through ``upto``
+        (every queued step when None): each waits for its own copy only."""
+        for queued in self.queue:
+            if not queued.read:
+                if queued.event is not None:
+                    queued.event.synchronize()
+                loss_sum, correct, grad_norm = (float(x) for x in queued.host.tolist())
+                n = queued.loss_positions
+                record = queued.record
+                record.loss = loss_sum / n if n else math.nan
+                record.accuracy = correct / n if n else math.nan
+                record.grad_norm = grad_norm
+                record._reader = None
+                queued.read = True
+            if queued.record is upto:
+                return
+
+    def settle(self, keep: int = 0) -> None:
+        """Book the oldest queued steps, in order, until ``keep`` are left."""
+        while len(self.queue) > keep:
+            queued = self.queue[0]
+            self.read(queued.record)
+            self.queue.popleft()
+            self.book(queued.record, queued.loss_positions)
+
+
 # --------------------------------------------------------------------------------------------------
 # Trainer
 # --------------------------------------------------------------------------------------------------
@@ -676,6 +816,11 @@ class Trainer:
         self._adaptive_monitor: ByteDataset | None = None
         self.scheduler = self._make_scheduler()
         self.scaler = make_grad_scaler(ctx)
+        if train.host_sync == "stats" and ctx.device.type == "mps":
+            raise NotImplementedError(
+                "train.host_sync=stats on MPS: the device holds no float64 for the loss sum and "
+                "has no pinned copies; use per_step"
+            )
         if self.rollback is not None and self.scaler is not None:
             raise NotImplementedError(
                 f"train.rollback_every={self.rollback.every} under an fp16 GradScaler: the scaler "
@@ -798,6 +943,8 @@ class Trainer:
             groups.append({"params": decay, "weight_decay": train.weight_decay})
         if no_decay:
             groups.append({"params": no_decay, "weight_decay": 0.0})
+        if train.fused_adamw:  # opt-in: one kernel for every tensor, the same update to rounding
+            return torch.optim.AdamW(groups, lr=train.lr, betas=train.betas, fused=True)
         return torch.optim.AdamW(groups, lr=train.lr, betas=train.betas)
 
     def _make_cell_grouped_adamw(self) -> torch.optim.AdamW:
@@ -825,6 +972,8 @@ class Trainer:
                 groups.append({"params": decay, "lr": lr, "weight_decay": weight_decay})
             if no_decay:
                 groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+        if train.fused_adamw:  # opt-in: one kernel for every tensor, the same update to rounding
+            return torch.optim.AdamW(groups, lr=train.lr, betas=train.betas, fused=True)
         return torch.optim.AdamW(groups, lr=train.lr, betas=train.betas)
 
     def _make_scheduler(self) -> torch.optim.lr_scheduler.LambdaLR:
@@ -1006,6 +1155,13 @@ class Trainer:
         if self._can_roll_back():  # P1.16: a rollback, not a skip
             self._roll_back(step, "nonfinite", grad_norm, None)
             return True
+        self._count_nonfinite_skip(step, grad_norm)
+        return True
+
+    def _count_nonfinite_skip(self, step: int, grad_norm: float) -> None:
+        """P1.12: count, list and log the skip of ``step``, then the stop rule. Called by
+        :meth:`_guard_nonfinite`, and with ``train.host_sync = stats`` when a step the fused
+        optimiser skipped on the device is booked."""
         self.skipped_nonfinite += 1
         self._skip_streak += 1
         self.skipped_steps.append(
@@ -1018,7 +1174,20 @@ class Trainer:
             self.skipped_nonfinite,
         )
         self._stop_rule(step)
-        return True
+
+    def _book_host_values(self, record: StepRecord, loss_positions: int) -> None:
+        """``train.host_sync = stats``: what the host does with a step's values once they are
+        read (:class:`_HostReads`), in step order: P1.12 for a step the fused optimiser skipped
+        on the device (its non-finite norm), else the end of the run of skips; then the
+        non-finite loss check of an applied step."""
+        step, grad_norm, mean_loss = record.step, record.grad_norm, record.loss
+        skipped = not math.isfinite(grad_norm)
+        if skipped:
+            self._count_nonfinite_skip(step, grad_norm)
+        else:
+            self._skip_streak = 0
+        if loss_positions and not math.isfinite(mean_loss) and not skipped:
+            raise RuntimeError(f"loss is {mean_loss} at step {step}")
 
     def _guard_spike(self, grad_norm: float, step: int) -> bool:
         """P1.15's gradient-spike guard (module docstring) for ``step`` with the finite global
@@ -1440,6 +1609,16 @@ class Trainer:
         compiled = self._baseline
         compile_seconds = 0.0
         compile_steps = 0
+        # train.host_sync=stats (module docstring, "Host reads"): the steps' values on their
+        # way to the host; None: read within the step, as before
+        host_reads: _HostReads | None = None
+        if train.host_sync == "stats":
+            if self.grad_hook is not None or self.update_post_hooks:
+                raise RuntimeError(
+                    "train.host_sync=stats: Trainer.grad_hook / update_post_hooks read a step on "
+                    "the host before the next one; use train.host_sync=per_step"
+                )
+            host_reads = _HostReads(device, self._book_host_values)
         while self.step < steps:
             started = time.perf_counter()
             compiled_before = compiled.compile_seconds if compiled is not None else 0.0
@@ -1450,8 +1629,11 @@ class Trainer:
             if snapshot is not None:
                 snapshot.windows.extend(windows)
             self.optimizer.zero_grad(set_to_none=True)
-            # host-side float64 accumulator: MPS has no float64 (P0.8 fix for profile:m_series)
-            loss_sum = torch.zeros((), dtype=torch.float64)
+            # host-side float64 accumulator: MPS has no float64 (P0.8 fix for profile:m_series);
+            # train.host_sync=stats: on the device (MPS refuses it)
+            loss_sum = torch.zeros(
+                (), dtype=torch.float64, device=device if host_reads is not None else None
+            )
             correct = torch.zeros((), dtype=torch.int64, device=device)
             n_loss = 0
             tokens_in_step = 0
@@ -1461,7 +1643,12 @@ class Trainer:
                 logits, state, _info = self._forward(batch, state, window=compiled)
                 loss_mask = batch["loss_mask"]
                 tokens_in_step += int((window["doc"] >= 0).sum())
-                if count > 0:
+                if count > 0 and host_reads is not None:  # train.host_sync=stats
+                    loss, hits = masked_cross_entropy(logits, batch["targets"], loss_mask, count)
+                    correct += hits
+                    loss_sum += loss.detach().double() * count
+                    n_loss += count
+                elif count > 0:
                     flat_logits = logits[loss_mask].float()
                     flat_targets = batch["targets"][loss_mask]
                     weight = self.cfg.train.answer_weight
@@ -1493,47 +1680,71 @@ class Trainer:
                 if self.grad_hook is not None:  # P1.15: the replay's raw gradients
                     self.grad_hook(self)
                 growth_norms = self._growth_raw_norms()
-                grad_norm = float(
-                    clip_grad_norm_(params, max_norm, precision=train.grad_norm_precision)
-                )
+                norm = clip_grad_norm_(params, max_norm, precision=train.grad_norm_precision)
                 lr = float(self.optimizer.param_groups[0]["lr"])
-                skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
-                if not skipped and self.spike_factor is not None:  # P1.15
-                    skipped = self._guard_spike(grad_norm, self.step + 1)
-                self._capture_healthy(self.step + 1, grad_norm, skipped)
-                before = self._adaptive_before_step(skipped)
-                self._limit_before_step(skipped)
-                self._growth_before_step(skipped, grad_norm, growth_norms)
-                applied = not skipped
-                if self.scaler is not None:
-                    scale_before = (
-                        self.scaler.get_scale()
-                        if self.adaptive_lr is not None
-                        or self.update_limiter is not None
-                        or self.gradient_growth is not None
-                        else None
+                if host_reads is not None:  # train.host_sync=stats: P1.12 on the device
+                    # the fused step returns at once where found_inf is 1 (and takes its step
+                    # count back): the weights and moments stay as the host guard leaves them
+                    self.optimizer.found_inf = (  # type: ignore[attr-defined]
+                        torch.isfinite(norm).logical_not().to(torch.float32)
                     )
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    if scale_before is not None:
-                        applied = applied and self.scaler.get_scale() >= scale_before
-                elif not skipped:
                     self.optimizer.step()
-                self._limit_after_step(applied)
-                self._growth_after_step(applied)
-                if applied:
-                    for hook in self.update_post_hooks:
-                        hook(self)
-                self._record_captured_update(applied)
-                self._average_weights(applied)
-                self._adaptive_after_step(applied, grad_norm, before)
+                    grad_norm, skipped = math.nan, False  # booked when read (_HostReads)
+                else:
+                    grad_norm = float(norm)
+                    skipped = self._guard_nonfinite(grad_norm, self.step + 1)  # P1.12
+                    if not skipped and self.spike_factor is not None:  # P1.15
+                        skipped = self._guard_spike(grad_norm, self.step + 1)
+                    self._capture_healthy(self.step + 1, grad_norm, skipped)
+                    before = self._adaptive_before_step(skipped)
+                    self._limit_before_step(skipped)
+                    self._growth_before_step(skipped, grad_norm, growth_norms)
+                    applied = not skipped
+                    if self.scaler is not None:
+                        scale_before = (
+                            self.scaler.get_scale()
+                            if self.adaptive_lr is not None
+                            or self.update_limiter is not None
+                            or self.gradient_growth is not None
+                            else None
+                        )
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        if scale_before is not None:
+                            applied = applied and self.scaler.get_scale() >= scale_before
+                    elif not skipped:
+                        self.optimizer.step()
+                    self._limit_after_step(applied)
+                    self._growth_after_step(applied)
+                    if applied:
+                        for hook in self.update_post_hooks:
+                            hook(self)
+                    self._record_captured_update(applied)
+                    self._average_weights(applied)
+                    self._adaptive_after_step(applied, grad_norm, before)
                 self.scheduler.step()
             self.step += 1
             self._rollback_after_step(loader, skipped)  # P1.16
-            mean_loss = float(loss_sum) / n_loss if n_loss else float("nan")
-            accuracy = float(correct) / n_loss if n_loss else float("nan")
-            if self.scaler is None and n_loss and not math.isfinite(mean_loss) and not skipped:
-                raise RuntimeError(f"loss is {mean_loss} at step {self.step}")
+            deferred: _DeferredStepRecord | None = None
+            if host_reads is not None:  # train.host_sync=stats: the values on their way
+                deferred = _DeferredStepRecord(
+                    step=self.step,
+                    loss=math.nan,
+                    accuracy=math.nan,
+                    lr=lr,
+                    grad_norm=math.nan,
+                    tokens=tokens_in_step,
+                    loss_positions=n_loss,
+                    seconds=math.nan,
+                )
+                host_reads.push(deferred, loss_sum, correct, norm, n_loss)
+                host_reads.settle(keep=HOST_SYNC_LAG)  # the step before; no wait for this one
+                mean_loss = accuracy = math.nan  # read when the step is booked
+            else:
+                mean_loss = float(loss_sum) / n_loss if n_loss else float("nan")
+                accuracy = float(correct) / n_loss if n_loss else float("nan")
+                if self.scaler is None and n_loss and not math.isfinite(mean_loss) and not skipped:
+                    raise RuntimeError(f"loss is {mean_loss} at step {self.step}")
             seconds = time.perf_counter() - started
             if compiled is not None and compiled.compile_seconds > compiled_before:
                 compile_seconds += seconds  # a compile step: out of train_seconds and tokens/s
@@ -1541,19 +1752,27 @@ class Trainer:
             else:
                 train_seconds += seconds
                 total_tokens += tokens_in_step
-            history.steps.append(
-                StepRecord(
-                    step=self.step,
-                    loss=mean_loss,
-                    accuracy=accuracy,
-                    lr=lr,
-                    grad_norm=grad_norm,
-                    tokens=tokens_in_step,
-                    loss_positions=n_loss,
-                    seconds=seconds,
+            if deferred is not None:
+                deferred.seconds = seconds
+                history.steps.append(deferred)
+            else:
+                history.steps.append(
+                    StepRecord(
+                        step=self.step,
+                        loss=mean_loss,
+                        accuracy=accuracy,
+                        lr=lr,
+                        grad_norm=grad_norm,
+                        tokens=tokens_in_step,
+                        loss_positions=n_loss,
+                        seconds=seconds,
+                    )
                 )
-            )
             if self.step % train.stats_every == 0 or self.step == steps:
+                if host_reads is not None and deferred is not None:  # a stats step reads it all
+                    host_reads.settle()
+                    mean_loss, accuracy = deferred.loss, deferred.accuracy
+                    grad_norm = deferred.grad_norm
                 logger.info(
                     "step %d/%d loss %.4f acc %.4f lr %.2e grad_norm %.3f tokens/s %.0f",
                     self.step,
@@ -1565,6 +1784,8 @@ class Trainer:
                     tokens_in_step / seconds if seconds > 0 else 0.0,
                 )
             if self.step % train.eval_every == 0 or self.step == steps:
+                if host_reads is not None:  # every step booked before an evaluation
+                    host_reads.settle()
                 result = self.evaluate(dev_ds, metrics)
                 history.evals.append({"step": self.step, **result})
                 logger.info(
@@ -1574,14 +1795,20 @@ class Trainer:
                 )
             saved = False
             if self.step % train.ckpt_every == 0 or self.step == steps or self._kept_step():
+                if host_reads is not None:  # a checkpoint holds the counts of every step
+                    host_reads.settle()
                 path = self.save(self.run_dir, loader, state)
                 history.checkpoints.append(str(path))
                 saved = True
             if callback is not None and self.step < steps and callback(self, history):
                 if not saved:
+                    if host_reads is not None:
+                        host_reads.settle()
                     history.checkpoints.append(str(self.save(self.run_dir, loader, state)))
                 logger.info("stopped by callback at step %d of %d", self.step, steps)
                 break
+        if host_reads is not None:  # every step booked before fit returns
+            host_reads.settle()
         self._loader_state = loader.state_dict()
         self._carried_state = detach_state(state)
         synchronize(device)

@@ -1054,6 +1054,23 @@ class TrainConfig(_StrictModel):
     # wrote. The HSN trainer's eager or compiled window without CUDA graphs only. A trainer
     # option: no model equation changes. 1 (default): every window starts detached (P1.7).
     tbptt_windows: int = Field(default=1, ge=1)
+    # --- the generic trainer's host reads (docs/trainer_host_sync.md; opt-in, 17 Nov 2026) ---
+    # host_sync: when the generic trainer (HSN-T without its memory and the baselines; refused
+    # for the HSN trainer) reads a step's loss, accuracy and gradient norm on the host.
+    # "per_step" (default): within the step, as before (five synchronisations a step), bit for
+    # bit. "stats": they stay on the device; the loss is the masked mean (no boolean indexing),
+    # a non-finite step is skipped on the device by the fused optimiser (fused_adamw), and the
+    # host reads a step's values one step later without draining the card, at once at a stats,
+    # evaluation or checkpoint step, and when a step record is read; the skip count, its log and
+    # the stop rule follow then. Refuses what needs a step's value on the host before the next
+    # step (host_sync_refusals): spike_factor, rollback_every, adaptive_lr, gradient_growth,
+    # update_limit, weight_ema, divergence_dump, answer_weight != 1, grad_norm_precision
+    # float64, fp16. Both keys left out of the configuration hash at their defaults.
+    host_sync: Literal["per_step", "stats"] = "per_step"
+    # fused_adamw: torch.optim.AdamW(fused=True), one kernel for every tensor, in place of the
+    # foreach implementation; the same update to rounding. The generic trainer only.
+    fused_adamw: bool = False
+    # --- end the generic trainer's host reads ---
     precision: Precision = "bf16"  # autocast dtype (fp64 only for gradcheck)
     grad_clip: float = Field(default=1.0, ge=0.0)  # global norm clip
     # Opt-in wide norm reduction AND scaling; native preserves historical clipping bitwise.
@@ -1746,6 +1763,13 @@ class RunConfig(_StrictModel):
                     "settings could not act: " + "; ".join(refused)
                 )
         # --- end HSN-T ---
+        if self.train.host_sync != "per_step" or self.train.fused_adamw:
+            refused = host_sync_refusals(self)
+            if refused:
+                raise ValueError(
+                    "train.host_sync / train.fused_adamw (docs/trainer_host_sync.md): "
+                    + "; ".join(refused)
+                )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:
             ignored = []
@@ -2180,6 +2204,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.word_contexts",
     "train.tbptt_windows",
     "model.reader_mask",
+    "train.host_sync",
+    "train.fused_adamw",
 )
 
 
@@ -2388,6 +2414,59 @@ def split_window_scope_error(
     if train.grad_accum != 1:
         return f"train.grad_accum={train.grad_accum}: one window per step only"
     return None
+
+
+def host_sync_refusals(cfg: RunConfig) -> list[str]:
+    """``train.host_sync = stats`` and ``train.fused_adamw`` (``docs/trainer_host_sync.md``):
+    every setting of ``cfg`` they cannot run with, each with its reason; empty when they can.
+    Both are the generic trainer's (:class:`hsn.train.loop.Trainer`). With ``stats`` a step's
+    loss, accuracy and gradient norm reach the host one step later (or at a stats,
+    evaluation or checkpoint step), so a setting that needs one of them on the host before the
+    next step begins is refused rather than run late."""
+    train = cfg.train
+    refused: list[str] = []
+    if cfg.model_name in HSN_MODEL_NAMES and cfg.model.memory:
+        refused.append(
+            f"model_name={cfg.model_name} trains with the HSN trainer (TBPTTTrainer), whose step "
+            "these keys do not change; they are the generic trainer's (the baselines, HSN-T "
+            "with model.memory=false)"
+        )
+    if train.optimizer != "adamw":
+        refused.append(f"train.optimizer={train.optimizer} (they build torch.optim.AdamW)")
+    if train.host_sync != "stats":
+        return refused
+    what = "needs the step's {} on the host before the next step"
+    if not train.fused_adamw:
+        refused.append(
+            "train.fused_adamw=false: a non-finite step is skipped on the device by the fused "
+            "optimiser (its found_inf), so host_sync=stats needs train.fused_adamw=true"
+        )
+    keyed = {
+        "spike_factor": (train.spike_factor is not None, "gradient norm"),
+        "rollback_every": (train.rollback_every is not None, "gradient norm"),
+        "adaptive_lr.enabled": (train.adaptive_lr.enabled, "update and gradient norm"),
+        "gradient_growth.enabled": (train.gradient_growth.enabled, "gradient norms"),
+        "update_limit.groups": (bool(train.update_limit.groups), "update"),
+        "weight_ema": (train.weight_ema is not None, "applied update (a skip is on the device)"),
+        "divergence_dump": (
+            train.divergence_dump,
+            "skip (the dump holds the weights as the skipped step left them); set it false",
+        ),
+        "answer_weight": (train.answer_weight != 1.0, "loss positions (boolean indexing)"),
+        "grad_norm_precision": (train.grad_norm_precision != "native", "gradient norm"),
+        "precision": (train.precision == "fp16", "loss scale (GradScaler)"),
+    }
+    for key, (on, needs) in keyed.items():
+        if on:
+            refused.append(f"train.{key}={_getattr_dotted(train, key)!r} {what.format(needs)}")
+    return refused
+
+
+def _getattr_dotted(obj: object, dotted: str) -> object:
+    """``obj.a.b`` for ``dotted = "a.b"``."""
+    for part in dotted.split("."):
+        obj = getattr(obj, part)
+    return obj
 
 
 def tbptt_windows_scope_error(cfg: RunConfig) -> str | None:
