@@ -33,7 +33,7 @@
 # tests/test_word_hold.py::test_a_fact_binds_under_the_word_address):
 #   BOS ... l i l y v ... SEP QRY l i l y SPACE v EOS
 #   - Events: BOS, the byte after each key word, and nothing else (a value, a filler byte, SEP, QRY and EOS are one-byte
-#     words that close nothing under a text context). A delayedw document has 1 + facts + queries events (2 to 11).
+#     words that close nothing under a text context). A delayedw document has 1 + facts + queries events (3 to 11).
 #   - WRITE: the event at v (v closes "lily"): a_cur = W(lily), a_prev = W(the fact before; BOS for the first fact).
 #   - READ: the event at the query's SPACE (it closes "lily"): a_cur = W(lily), a_prev = W(the last fact's word for the
 #     first query, the query before's word for the others). v is predicted at this SPACE from that event's q and r.
@@ -63,6 +63,7 @@
 #   data.variants=[in_range]
 # Evaluation: /home/joe/hsn-handoff/word_keys/wh_score.py (far recall per task on training / dev / test key words, the 97 %
 # rule per task, the capitalised and one-letter probes). Golden manifest: configs/data/synthetic_wordhold.manifest.json.
+# Runs: /home/joe/hsn-experiments/remote/specs/wordhold_mem.yaml (word events exact / bag vs per-byte, 32-byte reader).
 
 name: synthetic_wordhold
 unroll: 256
