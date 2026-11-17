@@ -185,8 +185,8 @@ def test_the_key_is_opt_in_and_its_default_keeps_hashes_memory_keys_and_arm_ids(
     assert config_hash(named) == config_hash(base)
     assert memory_key(named, "none", PROTOCOL) == memory_key(base, "none", PROTOCOL)
     assert config_view(named) == config_view(base)
-    if base.model_name == "hsn_t" and base.model.memory:
-        return  # refused with the memory (below)
+    if base.model_name == "hsn_t" and base.model.memory and not base.model.key_address:
+        return  # with the memory the carry rides with A5's address carry (refused without)
     on = load_config(path, [*overrides, "model.reader_carry=256"])
     assert config_hash(on) != config_hash(base)
     assert memory_key(on, "none", PROTOCOL) != memory_key(base, "none", PROTOCOL)
@@ -199,10 +199,16 @@ def test_the_key_is_opt_in_and_its_default_keeps_hashes_memory_keys_and_arm_ids(
         (RECIPE_A6, ["model.reader_carry=8"], "carries the keys of model.reader"),
         (TRANSFORMER, ["model.reader_carry=8"], "carries the keys of model.reader"),
         (GRU, ["model.reader_carry=8"], "carries the keys of model.reader"),
-        (
+        (  # with the memory the carry is its own opt-in (test_reader_carry_memory.py)
             RECIPE_A6,
-            ["model_name=hsn_t", "model.reader=transformer", "model.reader_carry=8"],
-            "with its memory HSN-T carries the cells' state",
+            [
+                "model_name=hsn_t",
+                "model.reader=transformer",
+                "model.reader_carry=8",
+                "model.reader_top_words=4",
+                "model.reader_rotary_pairs=0",
+            ],
+            "built for HSN-T without its memory only",
         ),
         (
             READER_LM,

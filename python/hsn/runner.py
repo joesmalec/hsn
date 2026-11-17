@@ -69,7 +69,7 @@ from hsn.eval.results import (
     RunRecord,
     evidence_package,
 )
-from hsn.model.hsn import HSN, address_history
+from hsn.model.hsn import HSN, WindowCarry, address_history
 from hsn.model.hsn_t import HSNT, HSNTNoMemory
 from hsn.model.router import SCORED_MODES
 from hsn.profiler import (
@@ -327,7 +327,7 @@ def _profile_probe(
     state: Any,
     profiler: Profiler,
     index: int,
-    prev_tokens: Tensor | None = None,
+    prev_tokens: Tensor | WindowCarry | None = None,
 ) -> None:
     """Time one P2.3 probe of ``window`` from ``state`` (timing only; nothing is kept), at the
     first step whose gate is hard, from a generator seeded by ``(run.seed, index)``."""
@@ -439,7 +439,7 @@ def profile_run(
             warm_windows = 2
     first = "compile" if warm_windows > 1 else "startup"
     state: Any = api.init_state(batch_size, device)
-    prev_tokens: Tensor | None = None
+    prev_tokens: Tensor | WindowCarry | None = None
     key_address = isinstance(replica, HSN) and cfg.model.key_address
     for _ in range(warm_windows):
         window = _to_device(next(loader), device)

@@ -284,8 +284,9 @@ state. Position `t` of a window reads the positions `s` of its own document with
   from window to window in training and in the dev evaluation, detaches it at every window and
   writes it into checkpoints, as for the GRU. `scripts/reader_reach.py` carries it for the
   loss by window position.
-- **Refused:** without a reader; HSN-T with its memory (the cells carry the state across
-  windows and the reader's cache has no place in it; the HSN's memory code is not touched);
+- **Refused:** without a reader; until 17 Nov 2026 HSN-T with its memory (since then an
+  opt-in of its own, `docs/amendments/reader_carry_memory.md`: the cache is carried beside
+  the cells' state, with the address bytes, and the cells' state layout is not touched);
   `model.reader_position: learned` (a learned position is the position in the window, which a
   carried key would share with a key of the current window); `model.reader_span` (the carry is
   a sliding span itself).
@@ -372,8 +373,10 @@ above). The carry adds no parameters, so a model trained without it is read with
 **`model.reader_top_words`:** no gain on TinyStories (0.8774), whose stories have a median of
 about 720 bytes. Untested on long text.
 
-**Scope:** HSN-T without its memory (`model.memory: false`) only. HSN-T with its memory keeps
-its short reader, and refuses the carry by design. The HSN has no reader.
+**Scope:** HSN-T without its memory (`model.memory: false`). HSN-T with its memory takes
+`model.reader_carry` since 17 Nov 2026 as an opt-in of its own
+(`docs/amendments/reader_carry_memory.md`; in no recipe), and still refuses
+`model.reader_top_words`. The HSN has no reader.
 
 ## How to time it
 
