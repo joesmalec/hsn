@@ -343,6 +343,8 @@ forward plus backward.
   and the `codes` argument of `Scorer.address_features`, `HSN._split_address_carry`,
   `address_history(…, info)`; `hsn.experiments.diagnostics.trained_state` (the audit).
 - Tests: `tests/test_write_events.py`, `tests/test_word_address.py`.
+- Recipe: `configs/experiments/hsn_t_memory_words.yaml` (17 Nov 2026: `hsn_t_memory.yaml` with
+  `word`, `exact`, `word_contexts` [0, 6] and lr 1.25e-3; a spec adds its task's contexts).
 - Spec, not queued: `~/hsn-experiments/remote/specs/mem_events.yaml`.
 
 ## What is left of the full idea
