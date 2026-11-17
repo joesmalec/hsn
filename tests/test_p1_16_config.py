@@ -119,6 +119,9 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.word_address",  # the event loop's word address (opt-in candidate)
         "model.word_contexts",  # the text contexts of the word address
         "train.tbptt_windows",  # windows joined into one gradient segment (opt-in, 16 Nov 2026)
+        "model.reader_mask",  # the reader's causal mask (opt-in, 17 Nov 2026)
+        "train.host_sync",  # the generic trainer's host reads (opt-in, 17 Nov 2026)
+        "train.fused_adamw",  # the fused AdamW (opt-in, 17 Nov 2026)
     )
 
 

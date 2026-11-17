@@ -624,6 +624,7 @@ _READER_POSITION_DEFAULTS: dict[str, Any] = {
     "reader_rotary_base": 10_000.0,
     "reader_carry": 0,  # the reader's carried context (15 Nov 2026), likewise
     "reader_top_words": 0,
+    "reader_mask": "document",  # the reader's attention mask (17 Nov 2026), likewise
 }
 
 
@@ -670,6 +671,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
             # one per segment) they stay out, so every earlier arm keeps its memory key
             **({"grad_accum": cfg.train.grad_accum} if cfg.train.grad_accum != 1 else {}),
             **({"tbptt_windows": cfg.train.tbptt_windows} if cfg.train.tbptt_windows != 1 else {}),
+            # the generic trainer's host reads and fused optimiser (17 Nov 2026) set the step
+            # time too; at their defaults they stay out, likewise
+            **({"host_sync": cfg.train.host_sync} if cfg.train.host_sync != "per_step" else {}),
+            **({"fused_adamw": True} if cfg.train.fused_adamw else {}),
         }
     )
 

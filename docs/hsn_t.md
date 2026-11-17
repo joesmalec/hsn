@@ -322,6 +322,17 @@ default is `true`, and with it nothing in this document changes.
 Its first text runs (15 Nov 2026) and where they stand against the reader alone and the
 baselines are in `docs/hsn_t_no_memory.md`, "Text: the gap to the baselines".
 
+## The reader's causal mask (`model.reader_mask`, opt-in, 17 Nov 2026)
+
+`model.reader_mask: causal` runs the reader's attention as `scaled_dot_product_attention(...,
+is_causal=True)` with no mask, which the flash kernel takes on CUDA, in place of the additive
+document mask (the memory-efficient kernel). Where every reset of a window is at column 0, which
+`data.align_docs: true` guarantees, the two masks are the same and so is the reader. Refused with
+`reader_span`, `reader_carry` or `data.align_docs: false`; the reader asserts the condition on the
+device on every window (no host read). Allowed with the memory on and off and for the reader
+alone. The default `document` is the reader as it was, bit for bit. Design, tests and timings:
+`docs/reader_causal_flash.md`.
+
 ## The attention read of the cells (`model.cell_attention_heads`)
 
 An opt-in key of 15 Nov 2026 (`docs/amendments/cell_attention_read.md`): with
