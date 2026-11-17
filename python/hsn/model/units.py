@@ -46,7 +46,7 @@ from hsn.config import ModelConfig
 from hsn.model.embeddings import init_weight_
 from hsn.model.encoder import make_activation
 
-__all__ = ["UnitBank"]
+__all__ = ["UnitBank", "pick_hidden", "pick_unit"]
 
 _INDEX_DTYPES = (torch.int64, torch.int32)
 
@@ -95,6 +95,71 @@ def permute_rows(x: Tensor, perm: Tensor, inverse: Tensor) -> Tensor:
     window in the replay's grouped unit pass)."""
     out: Tensor = _PermuteRows.apply(x, perm, inverse)
     return out
+
+
+class _PickUnit(torch.autograd.Function):
+    """:func:`pick_unit`."""
+
+    @staticmethod
+    def forward(ctx: Any, x: Tensor, unit: Tensor) -> Tensor:
+        ctx.save_for_backward(unit)
+        ctx.n_units = int(x.shape[1])
+        rows, width = int(x.shape[0]), int(x.shape[2])
+        return x.gather(1, unit[:, None, None].expand(rows, 1, width)).squeeze(1)
+
+    @staticmethod
+    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor, None]:
+        (unit,) = ctx.saved_tensors
+        own = unit[:, None] == torch.arange(ctx.n_units, device=grad.device)[None, :]
+        zero = torch.zeros_like(grad[:1, None, :1])
+        return torch.where(own[:, :, None], grad[:, None, :], zero), None
+
+
+def pick_unit(x: Tensor, unit: Tensor) -> Tensor:
+    """``x[p, unit[p]]`` for ``x [P, M, W]`` and int64 ``unit [P]`` in ``[0, M)`` (not
+    checked): each pair's own unit, ``[P, W]``. The value is ``gather``'s, which reads the
+    chosen rows only. The backward writes each gradient row into its unit's place and zeros
+    into the others as one masked copy; ``gather``'s own backward fills a tensor of zeros and
+    scatters into it (the same values: every place is written at most once).
+
+    (:func:`pick_hidden` is the pick of the first layer, whose input is not ``[P, M, W]``.)"""
+    out: Tensor = _PickUnit.apply(x, unit)
+    return out
+
+
+class _PickHidden(torch.autograd.Function):
+    """:func:`pick_hidden`."""
+
+    @staticmethod
+    def forward(ctx: Any, first: Tensor, unit: Tensor, n_units: int, hidden: int) -> Any:
+        split = n_units * hidden
+        index = unit[:, None] * hidden + torch.arange(hidden, device=first.device)[None, :]
+        ctx.save_for_backward(index)
+        ctx.split = split
+        return first.gather(1, index), first[:, split:].clone()
+
+    @staticmethod
+    def backward(ctx: Any, grad_chosen: Tensor, grad_rider: Tensor) -> Any:
+        (index,) = ctx.saved_tensors
+        zeros = grad_chosen.new_zeros(int(grad_chosen.shape[0]), ctx.split)
+        full = torch.cat([zeros, grad_rider.to(grad_chosen.dtype)], dim=1)
+        return full.scatter(1, index, grad_chosen), None, None, None
+
+
+def pick_hidden(first: Tensor, unit: Tensor, n_units: int, hidden: int) -> tuple[Tensor, Tensor]:
+    """The merged first product ``first [P, M·H + r]`` (every unit's first layer, then ``r``
+    rider columns) as ``(chosen [P, H], rider [P, r])``: each pair's own unit's hidden row
+    (``unit [P]`` int64 in ``[0, M)``, not checked) and the rider columns. The values are a
+    gather's and a slice's. The backward builds the gradient of ``first`` in one piece: zeros
+    with the rider's columns behind them, and each pair's hidden gradient written into its
+    unit's place (every place at most once).
+
+    Measured on the card, 17 Nov 2026 (``docs/word_event_speed.md``): a masked copy of the
+    hidden gradient into all ``M`` places was fused with the activation's backward by the
+    compiler and evaluated it ``M`` times, 43 µs per round at 384 pairs; a masked sum for the
+    pick itself read all ``M`` rows, 25 µs."""
+    chosen, rider = _PickHidden.apply(first, unit, n_units, hidden)
+    return chosen, rider
 
 
 class UnitBank(nn.Module):
@@ -367,6 +432,84 @@ class UnitBank(nn.Module):
         every = self.forward_all(v.reshape(1, P, self.in_dim), w1_flat=w1_flat)[0]  # [P, M, d]
         index = unit_idx.to(torch.int64)[:, None, None].expand(P, 1, self.d)
         return every.gather(1, index).squeeze(1)
+
+    def merged_layout(
+        self, rider: nn.Linear, fold: nn.Linear
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """The weights of :meth:`forward_static_merged` (``hardware.round_products=merged``):
+        the bank's two layers laid out flat with two other maps merged into them,
+
+        * ``w1 [in, M·H + r]`` and ``b1 [M·H + r]``: :meth:`_w1_flat` and the first biases,
+          followed by ``rider``'s weight and bias as ``r`` more columns (a linear map of the
+          bank's input with a bias: the cell's gate), so one product serves both maps;
+        * ``w2 [H, M·d]`` and ``b2 [M·d]``: every unit's second layer multiplied by ``fold``
+          (a linear map of the bank's output without a bias: the cell's ``W_out``), ``w2[:,
+          j·d:(j+1)·d] = W2[j] · Wᵀ`` and ``b2[j·d:(j+1)·d] = b2[j] · Wᵀ``, so the pass returns
+          ``W(F_j(v))`` without a product of its own.
+
+        Built with autograd (the gradients reach the bank and the merged maps through the
+        layout) and outside autocast: the layout stays in the masters' dtype, so that a window
+        which casts it at every use sums its gradients there."""
+        if rider.in_features != self.in_dim or rider.bias is None:
+            raise ValueError("the rider must be a linear map of the bank's input with a bias")
+        if fold.in_features != self.d or fold.bias is not None:
+            raise ValueError(
+                "the folded map must be a linear map of the bank's output without a bias"
+            )
+        M, H = self.n_units, self.hidden
+        with torch.autocast(device_type=self.W1.device.type, enabled=False):
+            w1 = torch.cat([self._w1_flat(), rider.weight.t()], dim=1)
+            b1 = torch.cat([self.b1.reshape(M * H), rider.bias])
+            w2 = torch.matmul(self.W2, fold.weight.t()).permute(1, 0, 2).reshape(H, -1)
+            b2 = torch.matmul(self.b2, fold.weight.t()).reshape(-1)
+        return w1, b1, w2, b2
+
+    def forward_static_merged(
+        self, v: Tensor, unit_idx: Tensor, layout: tuple[Tensor, Tensor, Tensor, Tensor]
+    ) -> tuple[Tensor, Tensor]:
+        """The unit pass of ``hardware.round_products=merged``: ``(out, rider)`` with ``out[p]
+        = W(F_{unit_idx[p]}(v[p]))`` (``W``: the map folded into the ``layout``,
+        :meth:`merged_layout`) and ``rider [P, r]`` the layout's rider map of ``v``. Static
+        shapes, no host synchronisation, autograd intact.
+
+        :meth:`forward_static` runs the activation and the second layer for every unit and
+        gathers one output in ``M``. Here, as in the forward sweep's
+        :meth:`forward_static_chosen`, only the first layer runs for every unit (one ``addmm``:
+        the pairs' units differ, and one product over all of them keeps the shapes static and
+        on the fastest kernel). The chosen unit's hidden row is taken before the activation,
+        so the activation and the second layer run on ``[P, H]`` instead of ``[M, P, H]``:
+        one ``addmm`` against the folded second layers of all units and a pick of the chosen
+        unit's outputs (:func:`pick_hidden`, :func:`pick_unit`: gathers, with a backward that
+        writes each gradient once).
+
+        Each value is the dot product :meth:`forward_selected` computes; the passes agree to
+        rounding (other matmul shapes; the fold multiplies ``W2`` and ``W`` first). The
+        gradients are the same sums over a unit's pairs, with exact zeros for a unit no pair
+        chose. ``unit_idx`` must lie in ``[0, M)`` (not checked, as in
+        :meth:`forward_static`)."""
+        if v.ndim != 2 or v.shape[1] != self.in_dim:
+            raise ValueError(
+                f"forward_static_merged expects v [P, {self.in_dim}], got shape {tuple(v.shape)}"
+            )
+        if unit_idx.dtype not in _INDEX_DTYPES:
+            raise TypeError(f"unit_idx must be int64 or int32, got dtype {unit_idx.dtype}")
+        if unit_idx.ndim != 1 or unit_idx.shape[0] != v.shape[0]:
+            raise ValueError(
+                f"unit_idx must be [P] with P = {v.shape[0]} rows of v, got shape "
+                f"{tuple(unit_idx.shape)}"
+            )
+        P, M, H = int(v.shape[0]), self.n_units, self.hidden
+        w1, b1, w2, b2 = layout
+        if w1.shape[0] != self.in_dim or w1.shape[1] <= M * H or w2.shape[0] != H:
+            raise ValueError(
+                f"the layout must be w1 [{self.in_dim}, > {M * H}] and w2 [{H}, M·d], got "
+                f"{tuple(w1.shape)} and {tuple(w2.shape)}"
+            )
+        unit = unit_idx.to(torch.int64)
+        first = torch.addmm(b1, v, w1)  # [P, M·H + r]: every unit's first layer and the rider
+        chosen, rider = pick_hidden(first, unit, M, H)  # [P, H], before the activation
+        out = torch.addmm(b2, self.act(chosen), w2).view(P, M, -1)
+        return pick_unit(out, unit), rider
 
     def _w2_flat(self) -> Tensor:
         """``W2 [M, H, d]`` laid out as ``[H, M·d]`` (column ``j·d + k`` is unit ``j``'s output

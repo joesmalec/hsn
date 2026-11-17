@@ -234,8 +234,9 @@ every window. The word address makes every byte of a context that is not text an
 under `data.align_docs` the padding behind every document is `PAD` under context 0: in 400
 training windows (`B` 32, `T` 256, the spec's loader) `E` took 10 values from 64 to 256, mean
 238, and 44 % of the events were padding bytes. The two arms compiled for 20 minutes on an
-RTX 3070 without a step. The blocks now read columns of `[B, T, …]` tensors
-(`hsn.train.compile._full_width`): one graph for every `E`, the eager window unchanged. The
+RTX 3070 without a step. The blocks now read dense copies of their slots
+(`hsn.train.compile._block_columns`; until 17 Nov 2026 columns of slots padded to `[B, T, …]`,
+`docs/word_event_speed.md`): one graph for every `E`, the eager window unchanged. The
 padding events remain: they cost slots (about 3.7 times the byte address's per window) and
 are valid slots of the statistics, though no loss position reads them. With
 `model.word_contexts=[0,6]` (context 0 read as text, a configuration change and another arm

@@ -891,6 +891,66 @@ class HSN(nn.Module):
             parts.append(self._summary_read(self._fast_read(h_prev)))
         return torch.cat(parts, dim=-1)
 
+    def front_layout(self) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+        """``hardware.round_products=merged``: ``P`` and ``S`` as one two-layer map (the fused
+        sweep's merged front of P2.10, here with autograd). ``(w1, b1, w2, b2)`` in
+        ``nn.Linear``'s layout: ``w1 [H_S + H_P, in_S + d]`` and ``w2 [d_u + d, H_S + H_P]``
+        are block-diagonal, ``S``'s block first, so the map reads ``[x_S ; q]`` (``x_S``:
+        :meth:`_shared_input`, in which ``S``'s own read of ``q`` may be detached; ``P`` reads
+        the carried ``q`` itself) and returns ``[u ; ẑ]``. The zero blocks add exact zeros to
+        the products and their gradients are dropped, so the values and the gradients are
+        those of the two maps to rounding. ``None`` when the two maps do not share an
+        activation (they then keep their own products). Built with autograd, in the masters'
+        dtype."""
+        pred, shared = self.predictor, self.shared
+        if type(pred.act) is not type(shared.act) or pred.activation_name != shared.activation_name:
+            return None
+        s1, p1, s2, p2 = shared.fc1, pred.fc1, shared.fc2, pred.fc2
+        with torch.autocast(device_type=s1.weight.device.type, enabled=False):
+            w1 = torch.cat(
+                [
+                    torch.cat([s1.weight, s1.weight.new_zeros(shared.hidden, pred.in_dim)], dim=1),
+                    torch.cat([p1.weight.new_zeros(pred.hidden, shared.in_dim), p1.weight], dim=1),
+                ],
+                dim=0,
+            )
+            w2 = torch.cat(
+                [
+                    torch.cat([s2.weight, s2.weight.new_zeros(shared.out_dim, pred.hidden)], dim=1),
+                    torch.cat([p2.weight.new_zeros(pred.out_dim, shared.hidden), p2.weight], dim=1),
+                ],
+                dim=0,
+            )
+            b1 = torch.cat([s1.bias, p1.bias])
+            b2 = torch.cat([s2.bias, p2.bias])
+        return w1, b1, w2, b2
+
+    def merged_consts(self, *, units: bool = True, front: bool = True) -> WindowConsts:
+        """The window constants of ``hardware.round_products=merged``
+        (:class:`~hsn.model.cell.WindowConsts`; inside :meth:`PDGCell.window`): with ``units``
+        the unit pass on the merged layouts (the gate riding, ``W_out`` folded), with
+        ``front`` the merged ``P`` / ``S`` layout. Either one alone is for measurements."""
+        consts = self.cell.window_consts(merged=units)
+        layout = self.front_layout() if front else None
+        if layout is None:
+            return consts
+        w1, b1, w2, b2 = layout
+        return consts._replace(front_w1=w1, front_b1=b1, front_w2=w2, front_b2=b2)
+
+    def _front(
+        self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor, consts: WindowConsts
+    ) -> tuple[Tensor, Tensor]:
+        """``(ẑ, u)`` of a position from the merged front (:meth:`front_layout`): ``ẑ =
+        P(q_{t−1})`` and ``u = S(x_S)`` as one product per layer of ``[x_S ; q_{t−1}]``."""
+        assert consts.front_w1 is not None and consts.front_w2 is not None
+        x = self._shared_input(z, q_prev, ctx, h_prev)
+        first = F.linear(
+            torch.cat([x, q_prev.to(x.dtype)], dim=-1), consts.front_w1, consts.front_b1
+        )
+        out = F.linear(self.shared.act(first), consts.front_w2, consts.front_b2)
+        width = self.shared.out_dim
+        return out[:, width:], out[:, :width]
+
     def _gate_read(
         self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor, dtype: torch.dtype
     ) -> Tensor | None:
@@ -1641,7 +1701,9 @@ class HSN(nn.Module):
         bool ``[B]``, or ``None`` for a column without one), ``ẑ_t = P(q_{t−1})``, ``ε_t``,
         ``u_t = S([z_t ; q_{t−1} ; ctx_t])``, the scorer and the round (:meth:`step`'s, shared
         code). ``dense_counters`` (the P1.10b dense window) are the ``age`` / ``pos`` before and
-        after the position. ``static`` / ``consts``: P2.8's capturable round (:meth:`_update`)."""
+        after the position. ``static`` / ``consts``: P2.8's capturable round (:meth:`_update`);
+        with ``consts.front_w1`` (``hardware.round_products=merged``) ``ẑ_t`` and ``u_t`` come
+        from one product per layer (:meth:`_front`), the same values to rounding."""
         if dense_counters is not None:
             h, q = state.h, state.q
             if reset_t is not None:  # age and pos already account for the reset
@@ -1652,9 +1714,13 @@ class HSN(nn.Module):
             state = state.reset(reset_t)
         state = self._clip_state_grad(state)  # A6: what this position passes back is limited
         q_prev = state.q
-        z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
+        if consts is not None and consts.front_w1 is not None:
+            # hardware.round_products=merged: P and S in one product per layer
+            z_hat, u = self._front(z_t, q_prev, ctx_t, state.h, consts)
+        else:
+            z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
+            u = self.shared(self._shared_input(z_t, q_prev, ctx_t, state.h))
         eps = z_t - z_hat
-        u = self.shared(self._shared_input(z_t, q_prev, ctx_t, state.h))
         # P1.7: see step. A6: the reads of the cell and the scorer (the same values)
         u_s, eps_s = u.to(state.dtype), self._eps_read(z_t, z_hat, eps).to(state.dtype)
         age = None if dense_counters is not None else state.age  # dense: a column of the scalars

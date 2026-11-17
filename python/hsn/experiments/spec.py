@@ -635,6 +635,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # stored memory and step-time estimates of the eager baselines still apply); a compiled
         # baseline has a key of its own
         del dump["hardware"]["baseline_compile"]
+    if dump["hardware"]["round_products"] == "separate":
+        # likewise: the compiled round's products at their default (17 Nov 2026) stay out; with
+        # the key set the step time changes, and the arm has a memory key of its own
+        del dump["hardware"]["round_products"]
     if dump["model"]["memory"] is True:
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates
