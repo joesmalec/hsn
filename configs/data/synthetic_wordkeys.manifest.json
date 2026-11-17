@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/dev"
+    }
+  ],
+  "name": "synthetic_wordkeys",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 7,
+      "family": "kv_words",
+      "file": "kvw.in_range.train.npz",
+      "hash": "3c3c52c328a80c2fc2293bc5940a72219288d21a24835d6acbd06636a4cdc44e",
+      "n_docs": 20000,
+      "n_loss": 69290,
+      "n_tokens": 4030359,
+      "split": "train",
+      "task": "kvw",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 7,
+      "family": "kv_words",
+      "file": "kvw.in_range.dev.npz",
+      "hash": "34ce202d97c623c9c8636d1b0900900f246b2305aa2e1d91cd890adb18e9a421",
+      "n_docs": 1000,
+      "n_loss": 3447,
+      "n_tokens": 201927,
+      "split": "dev",
+      "task": "kvw",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 7,
+      "family": "kv_words",
+      "file": "kvw.in_range.test.npz",
+      "hash": "6e13aa8dffb3525069c8cd6afeed9de6e7e02d2c4367d177bd41f567191603f1",
+      "n_docs": 1000,
+      "n_loss": 3470,
+      "n_tokens": 199957,
+      "split": "test",
+      "task": "kvw",
+      "variant": "in_range"
+    }
+  ],
+  "spec_hash": "e33f30ec8dafbda331234342ae895ad4073acfcf052d1aecb92fa19e2a225d9c",
+  "split_hashes": {
+    "dev": "b1325644def914fef07d4fadb22bd9a2ecb77a31dbe22e55d4a42903a4d75928",
+    "test": "d28a6c0f20cf71db50ae11ee309ae5c0f6e814ee4a53925228d50a4779658d01",
+    "train": "9248f50f59ab88a96416185368348e86b97650838c2acb99fbf5101ec80de2c6"
+  },
+  "unroll": 256
+}
