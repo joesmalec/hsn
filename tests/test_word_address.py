@@ -576,7 +576,7 @@ def test_key_is_opt_in_and_the_default_keeps_its_hash() -> None:
     assert word.model.word_address == "none" and word.model.word_contexts == [TEXT]
     dumped = json.loads(canonical_json(word))["model"]
     assert "word_address" not in dumped and "word_contexts" not in dumped
-    assert HASH_OMIT_AT_DEFAULT[-2:] == ("model.word_address", "model.word_contexts")
+    assert {"model.word_address", "model.word_contexts"} <= set(HASH_OMIT_AT_DEFAULT)
     named = load_config(RECIPE_A6, [*HYBRID, _ev("word"), _wa("none")])
     exact = load_config(RECIPE_A6, [*HYBRID, _ev("word"), _wa("exact")])
     bag = load_config(RECIPE_A6, [*HYBRID, _ev("word"), _wa("bag")])

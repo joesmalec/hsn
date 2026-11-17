@@ -128,7 +128,10 @@ Profile = Literal["rtx3060", "a100", "dgx_spark", "m_series", "cpu", "gpu8gb"]
 Device = Literal["cuda", "mps", "cpu"]
 AutocastDtype = Literal["bf16", "fp16", "fp32"]
 MasterDtype = Literal["fp32", "fp64"]
-CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
+CompileMode = Literal["none", "default", "reduce-overhead", "max-autotune"]
+#: The values of ``hardware.compile_mode`` that replay the HSN's compiled window as CUDA graphs on
+#: CUDA (``default`` compiles without them).
+CUDA_GRAPH_COMPILE_MODES: tuple[str, ...] = ("reduce-overhead", "max-autotune")
 #: Opt-in: the ``torch.compile`` mode of a baseline's training and evaluation windows
 #: (``hardware.baseline_compile``, :mod:`hsn.train.baseline_compile`). ``none`` runs the baseline
 #: eager, as before the key; the other values are passed to ``torch.compile`` as its mode
@@ -1018,6 +1021,14 @@ class TrainConfig(_StrictModel):
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
     micro_batch: int = Field(default=4, ge=1)
     grad_accum: int = Field(default=1, ge=1)
+    # Opt-in (16 Nov 2026; docs/tbptt_windows.md): the windows one gradient segment joins. The
+    # train.grad_accum windows of an optimiser step are cut into segments of tbptt_windows
+    # consecutive windows (grad_accum must be a multiple); the carried state is detached at a
+    # segment's start only and stays attached between its windows, and the segment's loss takes
+    # one backward pass, so a later window's loss reaches what an earlier window of the segment
+    # wrote. The HSN trainer's eager or compiled window without CUDA graphs only. A trainer
+    # option: no model equation changes. 1 (default): every window starts detached (P1.7).
+    tbptt_windows: int = Field(default=1, ge=1)
     precision: Precision = "bf16"  # autocast dtype (fp64 only for gradcheck)
     grad_clip: float = Field(default=1.0, ge=0.0)  # global norm clip
     # Opt-in wide norm reduction AND scaling; native preserves historical clipping bitwise.
@@ -1265,6 +1276,13 @@ class TrainConfig(_StrictModel):
                 f"train.weight_ema={self.weight_ema} with train.rollback_every="
                 f"{self.rollback_every}: the rollback's snapshots do not hold the averaged "
                 "weights; use one of them"
+            )
+        # --- train.tbptt_windows: segments of whole optimiser steps ---
+        if self.grad_accum % self.tbptt_windows:
+            raise ValueError(
+                f"train.tbptt_windows={self.tbptt_windows} joins that many windows of one "
+                f"optimiser step, but train.grad_accum={self.grad_accum} is not a multiple of it: "
+                "a segment never spans two optimiser steps; set train.grad_accum to a multiple"
             )
         return self
 
@@ -1574,6 +1592,14 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
+        # --- train.tbptt_windows (docs/tbptt_windows.md): where a gradient segment is defined ---
+        if self.train.tbptt_windows > 1:
+            reason = tbptt_windows_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"train.tbptt_windows={self.train.tbptt_windows} is not available for this "
+                    f"configuration: {reason}"
+                )
         # --- P2.10: the split window is only defined inside its scope ---
         if self.hardware.window != "autograd":
             reason = split_window_scope_error(self)
@@ -2117,6 +2143,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.write_events",
     "model.word_address",
     "model.word_contexts",
+    "train.tbptt_windows",
 )
 
 
@@ -2143,6 +2170,7 @@ MEMORY_TRAIN_KEYS: dict[str, str] = {
     "p_dense": "the routed round's dense fallback",
     "aux_enabled": "the routing penalties",
     "address_gate_hold_step": "the address gate's weights",
+    "tbptt_windows": "the carried state's gradient across windows",
 }
 #: The loss weights of ``train.*``: the generic trainer's objective has none of their terms.
 LOSS_WEIGHT_KEYS: tuple[str, ...] = tuple(
@@ -2323,6 +2351,39 @@ def split_window_scope_error(
         return "train.precision=fp16 scales the loss (GradScaler)"
     if train.grad_accum != 1:
         return f"train.grad_accum={train.grad_accum}: one window per step only"
+    return None
+
+
+def tbptt_windows_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``train.tbptt_windows > 1`` (gradient segments of several windows,
+    ``docs/tbptt_windows.md``) cannot run with ``cfg``; ``None`` when it can. The segments are
+    the HSN trainer's (:class:`~hsn.train.tbptt.TBPTTTrainer`), over its autograd window, eager
+    or compiled without CUDA graphs."""
+    train, hardware = cfg.train, cfg.hardware
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return (
+            f"model_name={cfg.model_name!r}"
+            + ("" if cfg.model.memory else " with model.memory=false")
+            + " trains on the generic trainer, whose state (if any) is detached at every "
+            "window; the segments are the HSN trainer's (model_name hsn, or hsn_t with its memory)"
+        )
+    if hardware.window != "autograd":
+        return (
+            f"hardware.window={hardware.window!r}: the split window's forward tape and replay "
+            "end at the window (no gradient into its start state); use hardware.window=autograd"
+        )
+    if hardware.compile_mode in CUDA_GRAPH_COMPILE_MODES:
+        return (
+            f"hardware.compile_mode={hardware.compile_mode!r} replays the window as CUDA graphs, "
+            "whose next replay overwrites what a live segment's backward pass still needs; use "
+            "hardware.compile_mode=default (compiled without CUDA graphs) or none (eager)"
+        )
+    if train.lambda_u > 0.0:
+        return (
+            f"train.lambda_u={train.lambda_u} (P2.3): the scorer's EMA features are updated in "
+            "place after every window, while a segment's graph still holds them; set "
+            "train.lambda_u=0"
+        )
     return None
 
 

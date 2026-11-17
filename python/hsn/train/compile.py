@@ -4,10 +4,11 @@ step, without custom kernels.
 At the reference scale HSN is launch-bound (plan A.2): a training window is ``T`` positions of
 small kernels issued from Python, so the card waits on the host between launches. This module
 compiles the work of a window with ``torch.compile`` (``hardware.compile_mode``: ``none`` |
-``reduce-overhead`` | ``max-autotune``, passed through as the compile mode) and, on CUDA, replays
-it as CUDA Graphs. What it compiles is the same code the eager path runs
-(:meth:`hsn.model.hsn.HSN._position`), with three changes that make the shapes and the control flow
-static (plan P2.8, "static shapes are required for graph capture"):
+``default`` | ``reduce-overhead`` | ``max-autotune``, passed through as the compile mode) and, on
+CUDA, replays it as CUDA Graphs (``reduce-overhead`` and ``max-autotune``; ``default`` compiles
+without them, added 16 Nov 2026 for ``train.tbptt_windows``). What it compiles is the same code
+the eager path runs (:meth:`hsn.model.hsn.HSN._position`), with three changes that make the shapes
+and the control flow static (plan P2.8, "static shapes are required for graph capture"):
 
 * **Blocks of positions.** :func:`compile_window` compiles a block of ``block_size(T)``
   consecutive positions (at most :data:`MAX_BLOCK`, a divisor of ``T``) as one graph and calls it
@@ -64,9 +65,16 @@ CUDA Graphs and the trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`): the traine
 step per window, takes the carried state out of graph memory (a replay overwrites it), runs full
 windows (no trailing cut: one fixed ``T``), takes a statistics step's per-term gradient norms from
 one extra compiled pass per term (several retained backwards of one recorded graph are refused by
-CUDA Graph trees) and refuses ``train.grad_accum > 1`` (a gradient held in ``.grad`` from one
-window would live in graph memory the next window's replay overwrites). Compile time is reported
-apart from the steady state (the ``compile`` segment, never inside step timings).
+CUDA Graph trees) and refuses ``train.grad_accum > 1`` in the CUDA-graph modes (a gradient held
+in ``.grad`` from one window would live in graph memory the next window's replay overwrites).
+Compile time is reported apart from the steady state (the ``compile`` segment, never inside step
+timings). Without CUDA graphs (``default``) the trainer may accumulate windows and join them into
+gradient segments (``train.tbptt_windows``, ``docs/tbptt_windows.md``): a block's outputs keep
+their autograd edges to its inputs (AOTAutograd), so a window started from an attached state
+passes the gradient back into the window before; CUDA-graph replay stays refused for that
+(``tbptt_windows_scope_error``), since the next replay would overwrite what a live segment's
+backward pass still reads. Measured on the CPU only (inductor and ``aot_eager``); the CUDA step
+time of ``default`` is unmeasured.
 
 :func:`compile_step` is the serving step (P5.2's inference path in miniature): one position under
 ``no_grad`` on a preallocated state updated in place, so that its buffers keep their addresses and
@@ -93,6 +101,7 @@ from typing import Any, Literal, cast
 import torch
 from torch import Tensor, nn
 
+from hsn.config import CUDA_GRAPH_COMPILE_MODES
 from hsn.device import DeviceContext
 from hsn.kernels import window as window_kernels
 from hsn.model.cell import WindowConsts
@@ -121,8 +130,8 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
-_MODES: tuple[CompileMode, ...] = ("none", "reduce-overhead", "max-autotune")
+CompileMode = Literal["none", "default", "reduce-overhead", "max-autotune"]
+_MODES: tuple[CompileMode, ...] = ("none", "default", "reduce-overhead", "max-autotune")
 
 #: The largest block of positions compiled as one graph: 16 (module docstring: half the compile of
 #: 32 for a step about 1 % slower; larger blocks only add compile time).
@@ -156,9 +165,13 @@ def block_size(T: int) -> int:
 # --------------------------------------------------------------------------------------------------
 
 
-def check_compile_scope(model: HSN, *, grad_accum: int = 1) -> None:
+def check_compile_scope(
+    model: HSN, *, grad_accum: int = 1, mode: CompileMode = "reduce-overhead"
+) -> None:
     """Raise ``NotImplementedError`` (with the reason) unless ``model`` is in the compiled scope
-    (module docstring): routing, gate, exploration, master dtype and ``train.grad_accum``."""
+    (module docstring): routing, gate, exploration, master dtype and, for a ``mode`` that replays
+    CUDA graphs (:data:`~hsn.config.CUDA_GRAPH_COMPILE_MODES`, on every device, so that a
+    configuration means the same everywhere), ``train.grad_accum``."""
     if not isinstance(model, HSN):
         raise TypeError(f"compile needs an HSN model, got {type(model).__name__}")
     cfg = model.cfg
@@ -194,11 +207,14 @@ def check_compile_scope(model: HSN, *, grad_accum: int = 1) -> None:
             "the fp64 master dtype is not compiled: the gradchecks (configs/tiny_gradcheck.yaml) "
             "stay eager (P2.8 'Do not')"
         )
-    if isinstance(grad_accum, bool) or not isinstance(grad_accum, int) or grad_accum != 1:
+    if isinstance(grad_accum, bool) or not isinstance(grad_accum, int) or grad_accum < 1:
+        raise ValueError(f"grad_accum must be an int >= 1, got {grad_accum!r}")
+    if grad_accum != 1 and mode in CUDA_GRAPH_COMPILE_MODES:
         raise NotImplementedError(
-            f"train.grad_accum={grad_accum!r} is not compiled: a CUDA-Graph backward output "
-            "held in .grad across windows would be overwritten by the next window's replay; use "
-            "train.grad_accum=1 or hardware.compile_mode=none"
+            f"train.grad_accum={grad_accum!r} is not compiled with CUDA graphs "
+            f"(hardware.compile_mode={mode}): a CUDA-Graph backward output held in .grad across "
+            "windows would be overwritten by the next window's replay; use train.grad_accum=1, "
+            "hardware.compile_mode=default (compiled without CUDA graphs) or none"
         )
 
 
@@ -322,7 +338,7 @@ def install_graph_alias_index() -> bool:
 
 
 def _uses_cuda_graphs(ctx: DeviceContext, mode: CompileMode, backend: Backend) -> bool:
-    return ctx.device.type == "cuda" and backend == "inductor" and mode != "none"
+    return ctx.device.type == "cuda" and backend == "inductor" and mode in CUDA_GRAPH_COMPILE_MODES
 
 
 def _mps_supported(backend: Backend, device: torch.device) -> tuple[bool, str]:
@@ -1773,7 +1789,7 @@ def compile_window(
     mode = _check_mode(mode)
     if mode == "none":
         return _eager_window(model)
-    check_compile_scope(model, grad_accum=grad_accum)
+    check_compile_scope(model, grad_accum=grad_accum, mode=mode)
     if ctx.device.type == "mps":
         ok, reason = _mps_supported(backend, ctx.device)
         if not ok:
