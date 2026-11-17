@@ -466,6 +466,69 @@ def _block(
     return out
 
 
+def _event_block(
+    model: HSN,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    z_b: Tensor,
+    c_b: Tensor,
+    s_b: Tensor,
+    r_b: Tensor,
+    v_b: Tensor,
+    p_b: Tensor,
+    dense_rows: Tensor | None,
+    dense_indices: Tensor | None,
+    consts: WindowConsts,
+    mode: StepMode,
+    controls: _Controls,
+    keep_cells: bool,
+) -> dict[str, Tensor]:
+    """A block of consecutive event slots (``model.write_events``; the compile unit of the
+    event loop): :meth:`HSN._event_block` with the capturable round and the window's
+    constants. ``v_b [B, n]`` marks each row's real events; a padding slot leaves the row's
+    state unchanged."""
+    return model._event_block(
+        h,
+        q,
+        age,
+        z_b,
+        c_b,
+        s_b,
+        r_b,
+        v_b,
+        p_b,
+        mode,
+        controls,
+        dense_rows,
+        static=True,
+        consts=consts,
+        dense_indices=dense_indices,
+        keep_cells=keep_cells,
+    )
+
+
+def _full_width(x: Tensor, width: int) -> Tensor:
+    """The event slots ``x [B, E, …]`` (:meth:`HSN._event_slots`) as the first ``E`` columns of
+    a contiguous ``[B, width, …]`` tensor (zeros after them, which no block reads), so that a
+    block of its columns has the same strides whatever ``E`` is.
+
+    Dynamo guards on the strides of a compiled function's tensor inputs (static shapes), and a
+    block of ``[B, E, …]`` carries ``E`` in its first stride: every new number of event slots
+    compiled a new graph of :func:`_event_block`, and with ``fullgraph`` the ninth one raised
+    ``FailOnRecompileLimitHit``. ``model.word_address`` makes every byte of a context that is
+    not text an event (the padding behind a document under ``data.align_docs`` among them), so
+    on TinyStories ``E`` took 10 values in 400 training windows of B32 (64 to 256; the byte
+    address's events: 64 in all of them), and the runs compiled for 20 minutes on a card without
+    a step. The byte loop's blocks (:meth:`CompiledWindow._run`) are columns of ``[B, T, …]``
+    tensors already."""
+    E = int(x.shape[1])
+    if E == width:
+        return x.contiguous()
+    tail = x.new_zeros((int(x.shape[0]), width - E, *x.shape[2:]))
+    return torch.cat([x, tail], dim=1)
+
+
 #: The parameters autocast casts at every use (the linears of P, S, the scorer, V, the gate,
 #: W_out and the unit bank): the ones a :class:`SweepTwin` holds pre-cast.
 SWEEP_CAST_PREFIXES: tuple[str, ...] = (
@@ -1247,6 +1310,8 @@ class CompiledWindow:
         self._bucket_blocks: dict[int, Any] = {0: self._block}
         #: The capture variant's compiled blocks (their own code objects and recompile budgets).
         self._capture_blocks: dict[int, Any] = {}
+        #: The event loop's compiled blocks (``model.write_events``), per dense-fallback bucket.
+        self._event_blocks: dict[int, Any] = {}
         #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
         #: compiled function for the native round and one for the fused round.
         self._tape_blocks: dict[tuple[bool, bool, int, int], Any] = {}
@@ -1350,6 +1415,7 @@ class CompiledWindow:
         self._block = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
         self._bucket_blocks = {0: self._block}
         self._capture_blocks = {}
+        self._event_blocks = {}
         self._tape_blocks = {}
         self._variants.clear()
         gc.collect()
@@ -1460,6 +1526,9 @@ class CompiledWindow:
         pro = model._window_prologue(
             tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
         )
+        if pro.events is not None:  # model.write_events: the loop over event slots
+            model._refuse_event_capture(capture)
+            return self._run_events(pro, state, reset, mode, controls, dense_rows, dense_indices)
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age, pos = state.h, state.q, state.age, state.pos
@@ -1535,6 +1604,73 @@ class CompiledWindow:
             written=joined("cap_written") if capture else None,
             readouts=joined("readouts") if model.cfg.selected_readout else None,
         )
+
+    def _run_events(
+        self,
+        pro: _Prologue,
+        state: CellGraphState,
+        reset: Tensor,
+        mode: StepMode,
+        controls: _Controls,
+        dense_rows: Tensor | None,
+        dense_indices: Tensor | None,
+    ) -> WindowOut:
+        """:meth:`_run` with ``model.write_events``: the compiled :func:`_event_block` over the
+        window's event slots, a block at a time. The number of blocks follows the batch (its
+        largest event count); the loop over blocks is eager, and every block's inputs are
+        columns of ``[B, T, …]`` tensors (:func:`_full_width`), so no new graph is compiled for
+        another number of slots. The per-byte reads run after the loop
+        (:meth:`HSN._event_epilogue`)."""
+        model = self.model
+        T = int(reset.shape[1])
+        blk = block_size(T)
+        ev = model._event_slots(pro, reset, blk)
+        # the blocks read the slots as columns of [B, T, …] tensors: strides without E
+        z, context, scalars, slot_reset, valid, pos = (
+            _full_width(x, T) for x in (ev.z, ev.context, ev.scalars, ev.reset, ev.valid, ev.pos)
+        )
+        if self.cuda_graphs:
+            torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
+        h, q, age = state.h, state.q, state.age
+        if torch.is_grad_enabled() and not (h.requires_grad or q.requires_grad):
+            h = h.detach().requires_grad_(True)  # one graph for every block, as in _run
+            q = q.detach().requires_grad_(True)
+        start = CellGraphState._make(h=h, q=q, age=age, pos=state.pos)
+        bucket = 0 if dense_indices is None else int(dense_indices.numel())
+        if bucket not in self._event_blocks:
+            self._event_blocks[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(
+                _event_block
+            )
+        block = self._event_blocks[bucket]
+        keep_cells = model.cell_read is not None
+        blocks: list[dict[str, Tensor]] = []
+        with model.cell.window():
+            consts = model.cell.window_consts()
+            for first in range(0, int(ev.valid.shape[1]), blk):
+                cols = slice(first, first + blk)
+                out = block(
+                    model,
+                    h,
+                    q,
+                    age,
+                    z[:, cols],
+                    context[:, cols],
+                    scalars[:, cols],
+                    slot_reset[:, cols],
+                    valid[:, cols],
+                    pos[:, cols],
+                    dense_rows,
+                    dense_indices,
+                    consts,
+                    mode,
+                    controls,
+                    keep_cells,
+                )
+                h, q, age = out["h"], out["q"], out["age"]
+                blocks.append(out)
+        if self.cuda_graphs:  # out of graph memory: the next replay overwrites the outputs
+            h, q, age = h.clone(), q.clone(), age.clone()
+        return model._event_epilogue(pro, ev, start, blocks, h, q, age)
 
 
 def run_tape(

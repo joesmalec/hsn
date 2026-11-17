@@ -446,7 +446,7 @@ def profile_run(
         state = _detach(state)
         with train_prof.segment(first, tokens=_n_tokens(window)):
             with autocast_ctx(ctx):
-                logits, state, _ = forward(
+                logits, state, info = forward(
                     window["tokens"],
                     window["context"],
                     state,
@@ -454,7 +454,7 @@ def profile_run(
                     **({"prev_tokens": prev_tokens} if key_address else {}),
                 )
             if key_address:
-                prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens)
+                prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens, info)
             _window_loss(logits, window).backward()  # type: ignore[no-untyped-call]
         optimizer.zero_grad(set_to_none=True)
     counterfactual = isinstance(replica, HSN) and cfg.train.lambda_u > 0.0
@@ -468,7 +468,7 @@ def profile_run(
                 replica, cfg, ctx, train_ds, window, state, train_prof, index, prev_tokens
             )
         with train_prof.segment("shared_path", tokens=tokens), autocast_ctx(ctx):
-            logits, state, _ = forward(
+            logits, state, info = forward(
                 window["tokens"],
                 window["context"],
                 state,
@@ -476,7 +476,7 @@ def profile_run(
                 **({"prev_tokens": prev_tokens} if key_address else {}),
             )
             if key_address:
-                prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens)
+                prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens, info)
             loss = _window_loss(logits, window)
         with train_prof.segment("backward", tokens=tokens):
             loss.backward()  # type: ignore[no-untyped-call]
@@ -508,7 +508,7 @@ def profile_run(
                 break
             name = first if index < warm_windows else "shared_path"
             with serve_prof.segment(name, tokens=_n_tokens(window)), autocast_ctx(ctx):
-                _, state, _ = forward(
+                _, state, info = forward(
                     window["tokens"],
                     window["context"],
                     state,
@@ -516,7 +516,7 @@ def profile_run(
                     **({"prev_tokens": prev_tokens} if key_address else {}),
                 )
                 if key_address:
-                    prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens)
+                    prev_tokens = address_history(cfg.model, window["tokens"], prev_tokens, info)
     synchronize(device)
     return train_prof.report(), serve_prof.report()
 

@@ -191,6 +191,7 @@ from hsn.model.halting import HaltingHead
 from hsn.model.reader import Reader
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
+from hsn.model.word_address import state_width
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
@@ -344,6 +345,13 @@ class _Prologue(NamedTuple):
     #: HSN-T (``model.reader``): the reader's output ``c [B, T, w]``, which ``context`` also ends
     #: in and the decoder reads after the loop; ``None`` without the key.
     reader: Tensor | None = None
+    #: ``model.write_events`` (HSN-T): the event positions (bool ``[B, T]``,
+    #: :func:`event_positions`) and ``pos`` before each step (``[B, T]``); ``None`` at ``byte``.
+    events: Tensor | None = None
+    positions: Tensor | None = None
+    #: ``model.word_address``: what the next window of the same rows takes as ``prev_tokens``
+    #: (:func:`address_history`): the address bytes, then the word state; ``None`` without it.
+    address_carry: Tensor | None = None
 
     def dense_counters(self, t: int) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         """The P1.10b dense window's ``(age, pos)`` before and after position ``t`` (``None``
@@ -355,7 +363,77 @@ class _Prologue(NamedTuple):
         return age, positions[:, t], zero_age, positions_after[:, t]
 
 
-def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = None) -> Tensor:
+#: ``model.write_events``: the most event slots per block of the eager event loop, the
+#: compiled window's ``MAX_BLOCK`` (:func:`hsn.train.compile.block_size`).
+EVENT_BLOCK = 16
+
+
+def event_block(T: int) -> int:
+    """The event slots per block for a window of ``T``: the largest divisor of ``T`` that is at
+    most :data:`EVENT_BLOCK` (16 for the A.1 unroll of 256), which is the compiled window's
+    block, so that the eager and the compiled event loop lay out the same slots."""
+    return max(b for b in range(1, min(T, EVENT_BLOCK) + 1) if T % b == 0)
+
+
+def event_positions(kind: str, tokens: Tensor, previous: Tensor, reset: Tensor) -> Tensor:
+    """``model.write_events``: where the memory runs in a window, bool ``[B, T]``.
+
+    ``word``: at every word end, a byte that is not an ASCII letter or digit directly after one
+    that is (bytes >= 128 count as letters; the control and marker symbols 0..31, so the
+    newline marker 16 and the tab marker 17, are separators like every other byte), and at
+    every position where a document starts (``reset``), so that a new document's state is set
+    up there. ``previous [B, T]`` is the byte before each position: the window's own bytes and,
+    at column 0, the last byte of the window before (A5's carried ``prev_tokens``; BOS when
+    nothing is carried). ``all`` (a test value): every position."""
+    if kind == "all":
+        return torch.ones_like(reset)
+
+    def wordy(x: Tensor) -> Tensor:
+        digit = (x >= 48) & (x <= 57)
+        upper = (x >= 65) & (x <= 90)
+        lower = (x >= 97) & (x <= 122)
+        return digit | upper | lower | (x >= 128)
+
+    return (wordy(previous) & ~wordy(tokens)) | reset
+
+
+def _take_rows(x: Tensor, index: Tensor) -> Tensor:
+    """``x [B, S, …]`` at ``index [B, T]`` along dim 1, ``[B, T, …]``. Whole slices are copied
+    (``index_select`` on the flattened ``[B · S, …]``): for wide slices that, and its
+    backward, cost far less than ``gather`` with an expanded index."""
+    B, S = int(x.shape[0]), int(x.shape[1])
+    flat = (index + torch.arange(B, device=index.device)[:, None] * S).reshape(-1)
+    taken = x.reshape(B * S, *x.shape[2:]).index_select(0, flat)
+    return taken.view(*index.shape, *x.shape[2:])
+
+
+class _Events(NamedTuple):
+    """The event slots of a window (:meth:`HSN._event_slots`, ``model.write_events``): every
+    row's event positions in order in the first slots, padding behind them. ``E`` slots, a
+    multiple of the block. ``valid`` (bool ``[B, E]``) marks a row's real events, ``where``
+    (int64 ``[B, E]``) the byte column of each slot (a padding slot holds a column without an
+    event: real inputs, discarded results). ``z``, ``context``, ``scalars``, ``reset`` and
+    ``pos`` are the window's per-position inputs at those columns (``[B, E, …]``). ``at`` and
+    ``before`` (int64 ``[B, T]``) count a row's events at or before, and strictly before, each
+    byte: the index of the state a byte reads in the stack ``[start ; slot 0 ; … ; slot E−1]``."""
+
+    valid: Tensor
+    where: Tensor
+    z: Tensor
+    context: Tensor
+    scalars: Tensor
+    reset: Tensor
+    pos: Tensor
+    at: Tensor
+    before: Tensor
+
+
+def address_history(
+    cfg: ModelConfig,
+    tokens: Tensor,
+    previous: Tensor | None = None,
+    info: dict[str, Tensor] | None = None,
+) -> Tensor:
     """What a caller carries from the window ``tokens [B, T]`` to the next window of the same
     rows, as that window's ``prev_tokens`` (A5 / A9's address features).
 
@@ -363,7 +441,25 @@ def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = 
     last ``n = model.address_ngram`` bytes, newest first, ``[B, n]``; a window shorter than ``n``
     is completed from ``previous`` (what was carried into it; BOS where there is nothing). The
     receiving window masks whatever a row's document does not reach back to, so bytes of an
-    earlier document in the carry are never read."""
+    earlier document in the carry are never read.
+
+    ``model.word_address``: the carry also holds the running word code, which only the window
+    itself can compute (it reads the contexts, the resets and the fixed tables). It is
+    ``info["address_carry"]`` of that window's forward pass (int64 ``[B, n + 2d + 6]``: the
+    bytes above, then :func:`hsn.model.word_address.state_width` integers), so ``info`` is
+    required."""
+    if cfg.word_address != "none":
+        if info is None or "address_carry" not in info:
+            raise ValueError(
+                f"model.word_address={cfg.word_address}: the carried address holds the running "
+                "word code; pass the info of the window's forward pass to address_history"
+            )
+        return info["address_carry"].detach().clone()
+    return _byte_history(cfg, tokens, previous)
+
+
+def _byte_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None) -> Tensor:
+    """:func:`address_history`'s bytes: ``[B]``, or ``[B, n]`` with ``address_history=ngram``."""
     if cfg.address_history == "byte":
         return tokens[:, -1].detach().clone()
     n = cfg.address_ngram
@@ -376,6 +472,11 @@ def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = 
         fill = newest.new_full((newest.shape[0], n), BOS)
         newest = torch.cat([newest, older.to(newest.device), fill], dim=1)[:, :n]
     return newest.clone()
+
+
+def _stack_record_join(parts: Sequence[Tensor]) -> Tensor:
+    """Blocks of a :func:`_stack_record` record joined over the window."""
+    return torch.cat(list(parts), dim=1 if parts[0].ndim > 1 else 0)
 
 
 def _stack_record(values: Sequence[Tensor]) -> Tensor:
@@ -1242,6 +1343,12 @@ class HSN(nn.Module):
         B, T = self._check_window_inputs(tokens, ctx, state, reset)
         if not isinstance(capture, bool):
             raise TypeError(f"capture must be a bool, got {capture!r}")
+        if (
+            self.cfg.write_events != "byte"
+        ):  # the loop over events (docs/amendments/write_events.md)
+            if reset_columns is not None:  # validated; every slot resets as tensor ops
+                self._reset_columns(reset, reset_columns)
+            return self._forward_events(tokens, ctx, state, reset, capture, prev_tokens)
         resets_at = [False] * T
         for column in self._reset_columns(reset, reset_columns):
             resets_at[column] = True
@@ -1405,6 +1512,10 @@ class HSN(nn.Module):
                 before = torch.cat([torch.zeros_like(reader_out[:, :1]), reader_out[:, :-1]], 1)
                 context = torch.cat([context, before.masked_fill(reset[:, :, None], 0.0)], dim=-1)
         positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
+        word_state: Tensor | None = None
+        if cfg.word_address != "none":  # the carry is A5's bytes, then the word state
+            prev_tokens, word_state = self._split_address_carry(prev_tokens, B)
+        byte_carry = prev_tokens
         previous_window: Tensor | None = None
         carried: Tensor | None = None  # x_{-2} .. x_{-n} of the window before, when carried
         if cfg.key_address:
@@ -1435,6 +1546,20 @@ class HSN(nn.Module):
                 lag = lag.masked_fill(positions < back, BOS)
                 lags.append(lag)
             older_window = {"older": torch.stack(lags, dim=-1)}
+        events: Tensor | None = None
+        address_carry: Tensor | None = None
+        if cfg.word_address != "none":
+            # model.word_address: the events follow the word rule, and at an event a_cur and
+            # a_prev read the word it closes and the word of the event before; A9's features
+            # (older_window) keep reading the bytes
+            text = torch.zeros_like(reset)
+            for context_id in cfg.word_contexts:
+                text = text | (ctx == context_id)
+            words = self.scorer.word_codes(tokens, text, reset, word_state)
+            events = words.events
+            older_window["codes"] = (words.current, words.previous)
+            history = _byte_history(cfg, tokens, byte_carry).reshape(B, -1).to(torch.int64)
+            address_carry = torch.cat([history, words.state], dim=1)
         scalars = self.scorer.window_scalars(
             ctx,
             positions,
@@ -1445,8 +1570,13 @@ class HSN(nn.Module):
             prev_tokens=previous_window,
             **older_window,
         )  # [B, T, N, 7] (9 with A5; 7 + 2n with A9)
-        # P1.10b: the dense round writes every cell, so its counters are known for the window
-        dense_window = mode == "dense" and not self.cell.disabled_cells
+        if cfg.write_events != "byte" and events is None:
+            # the byte before each position is A5's (BOS at a reset, which is an event anyway)
+            assert previous_window is not None  # the configuration requires model.key_address
+            events = event_positions(cfg.write_events, tokens, previous_window, reset)
+        # P1.10b: the dense round writes every cell, so its counters are known for the window;
+        # the event loop keeps the per-position bookkeeping: a slot is not a byte
+        dense_window = mode == "dense" and not self.cell.disabled_cells and events is None
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
         if dense_window:
             start_age = state.age.masked_fill(reset[:, 0, None], 0) if reset_first else state.age
@@ -1465,7 +1595,30 @@ class HSN(nn.Module):
             scalar_steps=scalars.unbind(1),
             counters=counters,
             reader=reader_out,
+            events=events,
+            positions=positions if events is not None else None,
+            address_carry=address_carry,
         )
+
+    def _split_address_carry(
+        self, carry: Tensor | None, B: int
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """``model.word_address``: a window's ``prev_tokens`` (:func:`address_history`: int64
+        ``[B, n + 2d + 6]``) as A5 / A9's bytes (``[B]``, or ``[B, n]`` with
+        ``address_history=ngram``) and the word state; ``(None, None)`` for ``None``."""
+        if carry is None:
+            return None, None
+        cfg = self.cfg
+        n = cfg.address_ngram if cfg.address_history == "ngram" else 1
+        shape = (B, n + state_width(cfg.d))
+        if not isinstance(carry, Tensor) or carry.dtype != torch.int64 or carry.shape != shape:
+            raise ValueError(
+                f"model.word_address={cfg.word_address}: prev_tokens must be the int64 {shape} "
+                "address carry of the window before (info['address_carry'], address_history), "
+                f"got {tuple(carry.shape) if isinstance(carry, Tensor) else type(carry).__name__}"
+            )
+        history = carry[:, :n] if cfg.address_history == "ngram" else carry[:, 0]
+        return history, carry[:, n:]
 
     def _position(
         self,
@@ -1578,12 +1731,15 @@ class HSN(nn.Module):
         gates: Tensor | None,
         written: Tensor | None,
         readouts: Tensor | None = None,
+        live: Tensor | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """The work after the loop (P1.10a): the decoder over the stacked ``[q_t ; u_t]``, the
         statistics from the stacks and ``info`` (:meth:`forward`). Every argument is stacked over
         the window's positions (``[B, T, …]``; ``routed`` the stacked
         :meth:`_selection_record`). ``state_abs_max`` is already reduced to ``[T]``;
-        ``hs`` is materialized only for an explicit diagnostic capture."""
+        ``hs`` is materialized only for an explicit diagnostic capture. ``live`` (the event
+        loop, bool ``[B, E]``): the memory's stacks are per event slot and the statistics are
+        means over each slot's valid rows."""
         T = int(z_hats.shape[1])
         if pro.counters is not None:
             positions_after = pro.counters[3]
@@ -1612,9 +1768,20 @@ class HSN(nn.Module):
             probs = torch.softmax(unit_logits, dim=-1)
             log_probs = F.log_softmax(unit_logits, dim=-1)
             info["state_abs_max"] = state_abs_max
-            info["eps_abs_mean"] = epss.abs().mean(dim=(0, 2))
-            info["alpha_entropy"] = -(probs * log_probs).sum(dim=-1).mean(dim=(0, 2))
-        if routed is not None:
+            if live is None:
+                info["eps_abs_mean"] = epss.abs().mean(dim=(0, 2))
+                info["alpha_entropy"] = -(probs * log_probs).sum(dim=-1).mean(dim=(0, 2))
+            else:
+                rows = live.to(epss.dtype)
+                n_live = rows.sum(dim=0).clamp_min(1.0)
+                entropy = -(probs * log_probs).sum(dim=-1).mean(dim=2)  # [B, E]
+                info["eps_abs_mean"] = (epss.abs().mean(dim=2) * rows).sum(dim=0) / n_live
+                info["alpha_entropy"] = (entropy * rows.to(entropy.dtype)).sum(dim=0) / n_live
+        if routed is not None and live is not None:
+            cost_rows = routed["cost_per_row"] * live.to(routed["cost_per_row"].dtype)
+            cost = cost_rows.sum(dim=0) / live.sum(dim=0).clamp_min(1)
+            info["cost"] = cost.to(state.dtype).to(self.dtype)
+        elif routed is not None:
             cost_per_row = routed["cost_per_row"]
             info["cost"] = cost_per_row.mean(dim=0).to(state.dtype).to(self.dtype)
         else:
@@ -1639,6 +1806,255 @@ class HSN(nn.Module):
             info["cell_gates"] = gates
             info["cell_written"] = written
         return logits, state, info
+
+    # -- model.write_events: the loop over events (docs/amendments/write_events.md) --------------
+
+    def _event_slots(self, pro: _Prologue, reset: Tensor, block: int) -> _Events:
+        """Gather a window's per-position inputs into event slots (:class:`_Events`). The number
+        of slots is the batch's largest event count rounded up to a multiple of ``block`` (at
+        least one block, at most ``T``): one host read per window, the only data-dependent
+        shape of the event loop."""
+        events, positions = pro.events, pro.positions
+        assert events is not None and positions is not None
+        B, T = (int(n) for n in events.shape)
+        count = events.sum(dim=1)  # [B]
+        most = int(count.max())
+        E = min(T, max(block, -(-most // block) * block))
+        # a row's event columns in order, then its other columns: the padding slots run on real
+        # inputs (never a reset: a reset is an event), and their results are discarded
+        order = torch.argsort((~events).to(torch.int8), dim=1, stable=True)[:, :E]
+        valid = torch.arange(E, device=events.device)[None, :] < count[:, None]
+        at = events.cumsum(dim=1)
+        return _Events(
+            valid=valid,
+            where=order,
+            z=_take_rows(pro.z, order),
+            context=_take_rows(pro.context, order),
+            scalars=_take_rows(pro.scalars, order),
+            reset=_take_rows(reset, order),
+            pos=_take_rows(positions, order),
+            at=at,
+            before=at - events.to(at.dtype),
+        )
+
+    def _event_block(
+        self,
+        h: Tensor,
+        q: Tensor,
+        age: Tensor,
+        z_b: Tensor,
+        c_b: Tensor,
+        s_b: Tensor,
+        r_b: Tensor,
+        v_b: Tensor,
+        p_b: Tensor,
+        mode: StepMode,
+        controls: _Controls,
+        dense_rows: Tensor | None,
+        *,
+        static: bool = False,
+        consts: WindowConsts | None = None,
+        dense_indices: Tensor | None = None,
+        keep_cells: bool = False,
+    ) -> dict[str, Tensor]:
+        """A block of consecutive event slots: :meth:`_position`, unchanged, on each slot's
+        inputs (``z_b`` / ``c_b`` / ``s_b`` ``[B, n, …]``, the reset ``r_b`` and the session
+        position ``p_b``, ``[B, n]``), and a masked update: a row whose slot is padding
+        (``v_b [B, n]`` False) keeps ``h``, ``q`` and ``age`` as they were, with tensor
+        operations and no branch. Returns the state after the block and the per-slot stacks:
+        ``z_hat``, ``eps``, ``u``, the summary ``qs`` and A5's read ``readouts`` after each
+        slot (what the decoder gathers per byte, with their gradient), with ``keep_cells`` the
+        cell states ``cells [B, n, N, d]`` (for the attention read), and the records of
+        :func:`hsn.train.compile._block` with ``valid`` cleared in padding slots."""
+        n = int(z_b.shape[1])
+        z_hats: list[Tensor] = []
+        epss: list[Tensor] = []
+        us: list[Tensor] = []
+        qs: list[Tensor] = []
+        cells: list[Tensor] = []
+        state_maxima: list[Tensor] = []
+        logit_steps: list[Tensor] = []
+        records: list[dict[str, Tensor]] = []
+        readouts: list[Tensor] = []
+        for i in range(n):
+            state = CellGraphState._make(h=h, q=q, age=age, pos=p_b[:, i])
+            result = self._position(
+                state,
+                r_b[:, i],
+                z_b[:, i],
+                c_b[:, i],
+                s_b[:, i],
+                mode,
+                controls,
+                dense_rows,
+                False,
+                None,
+                static=static,
+                consts=consts,
+                dense_indices=dense_indices,
+            )
+            after = result.state
+            live = v_b[:, i]
+            # the read of the state the event left; a padding slot's is never gathered
+            readouts.append(self._selected_readout(after, result.selection, controls.gate, mode))
+            h = torch.where(live[:, None, None], after.h, h)
+            q = torch.where(live[:, None], after.q, q)
+            age = torch.where(live[:, None], after.age, age)
+            z_hats.append(result.z_hat)
+            epss.append(result.eps)
+            us.append(result.u)
+            qs.append(q)
+            if keep_cells:
+                cells.append(h)
+            state_maxima.append(h.detach().abs().amax())
+            logit_steps.append(result.unit_logits.detach())
+            if result.selection is not None:
+                record = self._selection_record(result.selection)
+                record["valid"] = record["valid"] & live[:, None]
+                records.append(record)
+        out = {
+            "h": h,
+            "q": q,
+            "age": age.contiguous(),
+            "z_hat": torch.stack(z_hats, dim=1),
+            "eps": torch.stack(epss, dim=1),
+            "u": torch.stack(us, dim=1),
+            "qs": torch.stack(qs, dim=1),
+            "state_abs_max": torch.stack(state_maxima),
+            "unit_logits_d": torch.stack(logit_steps, dim=1),
+            "readouts": torch.stack(readouts, dim=1),
+        }
+        if records:
+            for key in self.selection_record_keys:
+                out["sel_" + key] = _stack_record([r[key] for r in records])
+        if keep_cells:
+            out["cells"] = torch.stack(cells, dim=1)
+        return out
+
+    def _forward_events(
+        self,
+        tokens: Tensor,
+        ctx: Tensor,
+        state: CellGraphState,
+        reset: Tensor,
+        capture: bool,
+        prev_tokens: Tensor | None,
+    ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
+        """:meth:`forward` with ``model.write_events``: the prologue, the event slots, one
+        eager :meth:`_event_block` over all of them and :meth:`_event_epilogue`."""
+        self._refuse_event_capture(capture)
+        mode = self._window_mode()
+        dense_rows = self._draw_dense_rows(int(tokens.shape[0]), state)
+        dense_indices = self._dense_indices(dense_rows)
+        controls = self._controls()
+        pro = self._window_prologue(
+            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
+        )
+        ev = self._event_slots(pro, reset, event_block(int(tokens.shape[1])))
+        with self.cell.window():
+            out = self._event_block(
+                state.h,
+                state.q,
+                state.age,
+                ev.z,
+                ev.context,
+                ev.scalars,
+                ev.reset,
+                ev.valid,
+                ev.pos,
+                mode,
+                controls,
+                dense_rows,
+                dense_indices=dense_indices,
+                keep_cells=self.cell_read is not None,
+            )
+        return self._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
+
+    @staticmethod
+    def _refuse_event_capture(capture: bool) -> None:
+        if capture:
+            raise NotImplementedError(
+                "capture=True is not built into the event loop (model.write_events): the "
+                "diagnostics read cell states, gates and written masks per byte, and the "
+                "loop keeps them per event slot"
+            )
+
+    def _event_epilogue(
+        self,
+        pro: _Prologue,
+        ev: _Events,
+        start: CellGraphState,
+        blocks: Sequence[dict[str, Tensor]],
+        h: Tensor,
+        q: Tensor,
+        age: Tensor,
+    ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
+        """The work after the event loop: what the decoder reads at every byte, then
+        :meth:`_window_epilogue`. ``blocks`` are :meth:`_event_block`'s outputs in order,
+        ``start`` the state the window started from and ``h``, ``q``, ``age`` the state after
+        the last slot.
+
+        Every byte ``t`` reads the latest event at or before ``t`` (the event at ``t`` itself
+        is visible at ``t``, as ``r_t`` is in the loop over bytes): ``q_t`` and ``r_t`` are
+        that event's, and ``m_t`` is the attention read with ``t``'s own query ``c_t`` over the
+        cells as that event left them. Before a row's first event the state is the window's
+        starting state: its ``q`` and cells, and zeros for ``r`` (which cells the last event of
+        the window before selected is not carried). ``u_t = S([z_t ; q ; ctx_t ; c_t])`` is
+        computed once more for all bytes with the summary before ``t`` (after the latest event
+        strictly before it); at an event that is the value the event's slot computed, and the
+        slot's own tensor is taken there, so that its gradient passes the position's entry as
+        in the loop over bytes."""
+        events, positions = pro.events, pro.positions
+        assert events is not None and positions is not None
+
+        def joined(key: str) -> Tensor:
+            return blocks[0][key] if len(blocks) == 1 else torch.cat([b[key] for b in blocks], 1)
+
+        def latest(first: Tensor, slots: Tensor, index: Tensor) -> Tensor:
+            stack = torch.cat([first[:, None].to(slots.dtype), slots], dim=1)  # [B, 1 + E, …]
+            return _take_rows(stack, index)
+
+        slot_q, slot_r = joined("qs"), joined("readouts")
+        q_at = latest(start.q, slot_q, ev.at)
+        q_before = latest(start.q, slot_q, ev.before)
+        u_between = self.shared(self._shared_input(pro.z, q_before, pro.context, start.h))
+        slot_u = _take_rows(joined("u"), (ev.at - 1).clamp_min(0))  # an event's own slot
+        us = torch.where(events[:, :, None], slot_u, u_between.to(slot_u.dtype))
+        readouts = latest(torch.zeros_like(slot_r[:, 0]), slot_r, ev.at)
+        if self.cell_read is not None:
+            assert pro.reader is not None
+            stages = torch.cat([start.h[:, None], joined("cells")], dim=1)  # [B, 1 + E, N, d]
+            m = self.cell_read.read_latest(pro.reader, stages, ev.at, self.scorer.cell_addresses)
+            readouts = torch.cat([readouts, m.to(readouts.dtype)], dim=-1)
+        routed: dict[str, Tensor] | None = None
+        if "sel_cell_idx" in blocks[0]:
+            routed = {
+                key: _stack_record_join([b["sel_" + key] for b in blocks])
+                for key in self.selection_record_keys
+            }
+        final = CellGraphState._make(h=h, q=q, age=age, pos=(positions[:, -1] + 1).contiguous())
+        logits, final, info = self._window_epilogue(
+            pro,
+            final,
+            z_hats=joined("z_hat"),
+            epss=joined("eps"),
+            us=us,
+            qs=q_at,
+            hs=None,
+            state_abs_max=torch.cat([b["state_abs_max"] for b in blocks]),
+            unit_logits=joined("unit_logits_d"),
+            routed=routed,
+            gates=None,
+            written=None,
+            readouts=readouts,
+            live=ev.valid,
+        )
+        # what the per-slot stacks of info (z_hat, eps, the selections) are aligned to
+        info["event_valid"] = ev.valid
+        info["event_pos"] = ev.where
+        if pro.address_carry is not None:  # model.word_address: the next window's prev_tokens
+            info["address_carry"] = pro.address_carry
+        return logits, final, info
 
     def _previous_tokens(self, tokens: Tensor, previous: Tensor | None) -> Tensor:
         """A5's external previous byte; it never changes CellGraphState's schema."""

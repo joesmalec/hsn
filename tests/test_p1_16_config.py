@@ -115,6 +115,9 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.reader_carry",  # the reader's carried keys (opt-in, 15 Nov 2026)
         "model.reader_top_words",  # the top block's word ends (opt-in, 15 Nov 2026)
         "model.cell_attention_heads",  # HSN-T's attention read of the cells (opt-in candidate)
+        "model.write_events",  # HSN-T's loop over events (opt-in candidate)
+        "model.word_address",  # the event loop's word address (opt-in candidate)
+        "model.word_contexts",  # the text contexts of the word address
         "train.tbptt_windows",  # windows joined into one gradient segment (opt-in, 16 Nov 2026)
     )
 

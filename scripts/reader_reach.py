@@ -131,7 +131,9 @@ def _attention_weights(
     block: nn.Module, x: Tensor, mask: Tensor, cos: Tensor | None = None, sin: Tensor | None = None
 ) -> Tensor:
     """The attention weights ``[B, H, T, T]`` a block computes from its input (the Transformer
-    baseline's block takes ``(x, mask)``, the reader's ``(x, mask, cos, sin)``)."""
+    baseline's block takes ``(x, mask)``, the reader's ``(x, mask, cos, sin)``).
+    As in SDPA, a bool mask selects visible keys; a floating mask adds to the scores.
+    """
     B, T, w = x.shape
     heads = block.heads if hasattr(block, "heads") else block.n_heads
     q, k, _ = block.qkv(block.norm_attn(x)).split(w, dim=-1)
@@ -143,7 +145,8 @@ def _attention_weights(
             _rotate(k, cos.to(k.dtype), sin.to(k.dtype)),
         )
     scores = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1])
-    return scores.masked_fill(~mask, -math.inf).softmax(dim=-1)
+    scores = scores.masked_fill(~mask, -math.inf) if mask.dtype == torch.bool else scores + mask
+    return scores.softmax(dim=-1)
 
 
 def load_run(run_dir: Path) -> tuple[nn.Module, RunConfig, Path]:

@@ -382,17 +382,28 @@ def assemble_terms(
         if tuple(doc.shape) != shape:
             raise ValueError(f"assemble_loss: doc must have shape {shape}, got {tuple(doc.shape)}")
         z_hat, z_target, z = (_field(out, key, "out").float() for key in ("z_hat", "z_target", "z"))
-        terms.update(
-            prediction_terms(
-                z_hat,
-                z_target,
-                z,
-                lambda_p=train.lambda_p,
-                predictor_target=cfg.model.predictor_target,
-                variance_floor_gamma=train.variance_floor_gamma,
-                mask=doc >= 0,
+        mask = doc >= 0
+        if "event_pos" in out:
+            # model.write_events: the prediction is made at the events (z_hat is per event
+            # slot), so the term is taken there, over the valid slots of non-padding positions
+            where, live = out["event_pos"], out["event_valid"]
+            index = where[:, :, None].expand(-1, -1, z_hat.shape[-1])
+            z_target, z = z_target.gather(1, index), z.gather(1, index)
+            mask = mask.gather(1, where) & live
+        if "event_pos" in out and not bool(mask.any()):
+            terms["pred"] = z_hat.sum() * 0.0  # a window without an event: a zero term
+        else:
+            terms.update(
+                prediction_terms(
+                    z_hat,
+                    z_target,
+                    z,
+                    lambda_p=train.lambda_p,
+                    predictor_target=cfg.model.predictor_target,
+                    variance_floor_gamma=train.variance_floor_gamma,
+                    mask=mask,
+                )
             )
-        )
 
     # A10: the write cost, the mean over positions of the share of routed slots that may write
     if train.lambda_w > 0.0:
@@ -634,11 +645,13 @@ def auxiliary_terms(
             expected = _routed_field(info, "expected_cost", name)
             terms[name] = expected.float().mean() / _check_reference_cost(reference_cost)
         elif name == "balance":
-            terms[name] = balance_loss(
-                _routed_field(info, "unit_logits", name),
-                _routed_field(info, "unit_idx", name),
-                _routed_field(info, "valid", name),
-            )
+            logits = _routed_field(info, "unit_logits", name)
+            unit_idx = _routed_field(info, "unit_idx", name)
+            valid = _routed_field(info, "valid", name)
+            if "event_valid" in info:  # model.write_events: over the valid event slots only
+                live = info["event_valid"]
+                logits, unit_idx, valid = logits[live], unit_idx[live], valid[live]
+            terms[name] = balance_loss(logits, unit_idx, valid)
         else:  # graph
             if graph is None:
                 raise ValueError(
