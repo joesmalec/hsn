@@ -339,6 +339,37 @@ def test_cross_window_credit_changes_the_parameter_gradient(tmp_path: Path) -> N
         assert gaps and max(gaps) > 0.0, prefix
 
 
+@pytest.mark.parametrize("address", ["none", "exact"])
+def test_event_loop_carries_the_gradient_across_windows(address: str, tmp_path: Path) -> None:
+    """The loop over events (``model.write_events=word``, with and without the word address;
+    merged from main on 17 Nov 2026) reads the window's start state, ``h`` and ``q``: with the
+    loss in the second window only, the first window's final state receives a gradient at
+    ``K = 2`` and none at ``K = 1``, and the word address's carry (integers) is handed on per
+    window as always."""
+    for windows in (1, 2):
+        cfg = _cfg(
+            1,
+            STREAM,
+            "train.lambda_p=0",
+            "train.grad_accum=2",
+            f"train.tbptt_windows={windows}",
+            "model.write_events=word",
+            f"model.word_address={address}",
+        )
+        trainer = _trainer(cfg, tmp_path / str(windows))
+        _change_windows(trainer, _loss_in_last_window_only(2))
+        seen = _retain_outputs(trainer)
+        grads = _capture_grads(trainer)
+        trainer.fit(*_long_datasets(), 1)
+        assert len(seen) == 2 and len(grads) == 1
+        (_, first), (second, _) = seen
+        assert second.h.requires_grad == (windows == 2)
+        for x in (first.h, first.q):
+            assert (x.grad is not None and bool(x.grad.any())) == (windows == 2), windows
+        present = [g for g in grads[0] if g is not None]
+        assert present and all(bool(torch.isfinite(g).all()) for g in present)
+
+
 @pytest.mark.parametrize("column", [0, 5])
 def test_document_reset_cuts_only_its_row(column: int, tmp_path: Path) -> None:
     """A document starting in row 0 of the second window (at column 0, or at column 5 with no
@@ -680,9 +711,12 @@ def test_compiled_window_carries_the_gradient_across_windows() -> None:
 
 
 @pytest.mark.usefixtures("small_blocks")
-@pytest.mark.parametrize(("windows", "accum"), [(1, 2), (2, 2), (2, 4)])
+@pytest.mark.parametrize(
+    ("windows", "accum", "events"),
+    [(1, 2, False), (2, 2, False), (2, 4, False), (2, 2, True)],
+)
 def test_compiled_trainer_equals_eager(
-    windows: int, accum: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    windows: int, accum: int, events: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The trainer over two optimiser steps with ``hardware.compile_mode=default`` (``aot_eager``
     on the CPU: dynamo and AOTAutograd with eager kernels, as the other compiled-trainer tests)
@@ -691,7 +725,8 @@ def test_compiled_trainer_equals_eager(
     and the per-term gradient norms (the task term weighted under accumulation as eager
     weights it) agree to the compiled-vs-eager tolerance; every training window ran compiled,
     without CUDA graphs, and the second step compiled nothing new (the attached start state
-    of a segment's later windows reuses the first window's graph)."""
+    of a segment's later windows reuses the first window's graph). ``events``: the same over
+    the compiled loop over events (``model.write_events=word`` with the exact word address)."""
     from torch._dynamo.utils import counters
 
     monkeypatch.setattr(
@@ -706,6 +741,7 @@ def test_compiled_trainer_equals_eager(
             f"train.tbptt_windows={windows}",
             "train.stats_every=1",
             f"hardware.compile_mode={mode}",
+            *(("model.write_events=word", "model.word_address=exact") if events else ()),
         )
         trainer = _trainer(cfg, tmp_path / mode)
         graphs: list[int] = []
