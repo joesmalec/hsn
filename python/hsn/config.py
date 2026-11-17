@@ -433,6 +433,14 @@ class ModelConfig(_StrictModel):
     # reader_rotary_pairs 0, or 0 for all blocks). 0 (default): no word entries.
     reader_top_words: int = Field(default=0, ge=0)
     # --- end the reader's carried context ---
+    # reader_mask (docs/reader_causal_flash.md; opt-in, 17 Nov 2026): how the reader's attention
+    # is masked. "document" (default): the block-diagonal causal mask over the documents of a
+    # row, passed to SDPA as an additive bias (the memory-efficient kernel on CUDA), the reader
+    # as it was. "causal": SDPA with is_causal=True and no mask (the flash kernel on CUDA). The
+    # same mask, so the same reader, wherever no window has a reset after column 0: allowed only
+    # with reader_span null, reader_carry 0 and data.align_docs true (RunConfig), and the reader
+    # asserts on the device, without a host read, that no window has such a reset.
+    reader_mask: Literal["document", "causal"] = "document"
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
     # embeddings, E, the reader, S and D, with no cells, router, units, graph, predictor or
@@ -642,6 +650,11 @@ class ModelConfig(_StrictModel):
                     "model.reader_carry / model.reader_top_words: each carries the keys of "
                     "model.reader across windows; set model.reader=transformer or leave them at 0"
                 )
+            if self.reader_mask != "document":
+                raise ValueError(
+                    f"model.reader_mask={self.reader_mask} is the mask of model.reader's "
+                    "attention; set model.reader=transformer or leave it at document"
+                )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
                 raise ValueError(
@@ -696,6 +709,18 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     f"model.reader_top_words={self.reader_top_words} extends the carried span "
                     "of model.reader_carry, which is 0: set model.reader_carry > 0"
+                )
+            if self.reader_mask == "causal" and self.reader_span is not None:
+                raise ValueError(
+                    f"model.reader_mask=causal with model.reader_span={self.reader_span}: the "
+                    "span limits the distances a position reads, which the causal mask alone "
+                    "does not; leave model.reader_span null or the mask at document"
+                )
+            if self.reader_mask == "causal" and self.reader_carry:
+                raise ValueError(
+                    f"model.reader_mask=causal with model.reader_carry={self.reader_carry}: the "
+                    "carried positions are read through a mask of their own (reader.read); "
+                    "leave model.reader_carry at 0 or the mask at document"
                 )
             top = counts[-1] if counts else None  # None: every pair rotated (the default)
             if self.reader_top_words and top != 0:
@@ -1675,6 +1700,16 @@ class RunConfig(_StrictModel):
                 "memory HSN-T carries the cells' state across windows, and the reader's cache "
                 "has no place in that state"
             )
+        if self.model.reader_mask == "causal" and not self.data.align_docs:
+            # docs/reader_causal_flash.md: the causal mask is the document mask only where no
+            # window has a reset after column 0, which data.align_docs guarantees (StreamLoader
+            # starts a document at a window boundary only). Note for train.reach_dropout (branch
+            # claude/reach-dropout, not merged on 17 Nov 2026): it gives some rows a span mask,
+            # so it must be refused with reader_mask=causal when it lands.
+            raise ValueError(
+                "model.reader_mask=causal needs data.align_docs=true: without it a document can "
+                "start inside a window, where the reader's document mask is not the causal mask"
+            )
         if (
             self.model.reader_position == "learned"
             and self.train.unroll > self.model.reader_positions
@@ -2144,6 +2179,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.word_address",
     "model.word_contexts",
     "train.tbptt_windows",
+    "model.reader_mask",
 )
 
 
