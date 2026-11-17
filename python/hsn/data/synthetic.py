@@ -8,7 +8,8 @@ family was added on 14 Nov 2026 for the HSN-T line (``recall_sum``, ``configs/da
 synthetic_sum.yaml``): digits stated as facts and then sums whose operands are named by key, so
 that the answer has to be computed on what was recalled. A seventh, ``kv_words`` (16 Nov 2026,
 ``configs/data/synthetic_wordkeys.yaml``), is ``kv`` with keys that are words of letters, for the
-word address of the HSN-T memory (``docs/amendments/write_events.md``).
+word address of the HSN-T memory (``docs/amendments/write_events.md``); an eighth,
+``delayed_words`` (``configs/data/synthetic_wordhold.yaml``), is ``delayed`` with word keys.
 
 **Symbols.** Bytes ``0..15`` are reserved control symbols (``PAD=0, BOS=1, EOS=2, QRY=3, SEP=4,
 NONE=5``; the rest unused). Bytes ``16..31`` hold per-family *marker* symbols (``INS``, ``OVR``,
@@ -86,6 +87,7 @@ __all__ = [
     "BracketsParams",
     "DatasetSpec",
     "DelayedParams",
+    "DelayedWordsParams",
     "Example",
     "Family",
     "KVParams",
@@ -115,7 +117,16 @@ NONE = 5
 N_RESERVED = 16  # bytes 0..15: control symbols
 N_MARKERS = 32  # bytes 16..31: per-family marker symbols; data alphabets start here
 
-Family = Literal["kv", "delayed", "brackets", "arithmetic", "algorithmic", "recall_sum", "kv_words"]
+Family = Literal[
+    "kv",
+    "delayed",
+    "brackets",
+    "arithmetic",
+    "algorithmic",
+    "recall_sum",
+    "kv_words",
+    "delayed_words",
+]
 Variant = Literal["in_range", "out_of_range"]
 FAMILIES: tuple[Family, ...] = (
     "kv",
@@ -125,6 +136,7 @@ FAMILIES: tuple[Family, ...] = (
     "algorithmic",
     "recall_sum",
     "kv_words",
+    "delayed_words",
 )
 SPLITS: tuple[Split, ...] = ("train", "dev", "test")
 
@@ -281,21 +293,16 @@ _WORD_BYTES = frozenset([*range(48, 58), *range(65, 91), *range(97, 123), 39])
 _LETTERS = frozenset([*range(65, 91), *range(97, 123)])
 
 
-class KVWordsParams(_Params):
-    """``kv_words`` (16 Nov 2026, the word-key data of rung 3 of the word-addressing brief):
-    ``kv`` with keys that are words of letters. A fact is ``INS w v`` / ``OVR w v`` (the value
-    byte directly after the word), a delete ``DEL w SPACE`` and a query ``QRY w SPACE a``
-    (``configs/data/synthetic_wordkeys.yaml`` says why the value has no space before it).
+class _WordKeyParams(_Params):
+    """The key words of the word-key families (``kv_words``, ``delayed_words``): a fixed
+    vocabulary per split, a function of ``vocab_seed`` and the fields below: ``groups[split]``
+    groups of ``group_size`` words of ``word_len`` letters drawn uniformly from ``letters``, the
+    words of a group sharing a beginning or an ending (half the groups each) of ``affix_len``
+    letters. Every word is in one split only; every split draws from the same letters. Two
+    tasks with the same fields have the same vocabulary, word for word."""
 
-    The key words are a fixed vocabulary per split, a function of ``vocab_seed`` and the
-    parameters below: ``groups[split]`` groups of ``group_size`` words of ``word_len`` letters
-    drawn uniformly from ``letters``, the words of a group sharing a beginning or an ending
-    (half the groups each) of ``affix_len`` letters. Every word is in one split only; every
-    split draws from the same letters."""
-
-    markers: dict[Literal["ins", "ovr", "del"], int] = {"ins": 16, "ovr": 17, "del": 18}
     letters: ByteRange = (97, 123)  # the key words' letters: ASCII a-z
-    space: int = Field(default=32, ge=N_MARKERS, lt=256)  # ends the key word of a delete, a query
+    space: int = Field(default=32, ge=N_MARKERS, lt=256)  # ends a key word that a value does not
     word_len: tuple[int, int] = (3, 8)  # letters per key word, inclusive
     vocab_seed: int = Field(default=0, ge=0)
     groups: dict[Split, int] = {"train": 500, "dev": 125, "test": 125}
@@ -304,45 +311,26 @@ class KVWordsParams(_Params):
     # A document's keys after the first: with this probability a word of the group of a key
     # already chosen (it shares that key's beginning or ending), else a word of any group.
     p_share: float = Field(default=0.5, ge=0.0, le=1.0)
-    values: ByteRange = (144, 192)
-    distractors: ByteRange = (192, 256)
-    n_keys: int = Field(default=8, ge=2)
-    op_rate: float = Field(default=0.08, gt=0.0, le=1.0)
-    p_del: float = Field(default=0.25, ge=0.0, le=1.0)
-    anchor: dict[Literal["ins", "ovr", "del"], float] = {"ins": 0.5, "ovr": 0.3, "del": 0.2}
-    max_queries: int = Field(default=8, ge=1)
 
-    @model_validator(mode="after")
-    def _check(self) -> Self:
-        for name, mapping in (("markers", self.markers), ("anchor", self.anchor)):
-            missing = [kind for kind in ("ins", "ovr", "del") if kind not in mapping]
-            if missing:
-                raise ValueError(f"{name} must name ins, ovr and del; missing {missing}")
-        if any(weight < 0.0 for weight in self.anchor.values()) or sum(self.anchor.values()) <= 0:
-            raise ValueError(f"anchor weights must be >= 0 with a positive sum: {self.anchor}")
+    def _check_words(
+        self, alphabets: Sequence[tuple[str, ByteRange]], markers: Sequence[tuple[str, int]]
+    ) -> None:
+        """The checks of the word fields; ``alphabets`` are the family's other byte ranges (no
+        one of them may hold a word byte, so that nothing but the key letters joins a word)."""
         missing_splits = [split for split in SPLITS if split not in self.groups]
         if missing_splits:
             raise ValueError(f"groups must name every split; missing {missing_splits}")
         if any(count < 1 for count in self.groups.values()):
             raise ValueError(f"groups must be >= 1 per split: {self.groups}")
         _check_disjoint(
-            [
-                ("letters", self.letters),
-                ("space", (self.space, self.space + 1)),
-                ("values", self.values),
-                ("distractors", self.distractors),
-            ],
-            [(f"markers[{kind}]", byte) for kind, byte in self.markers.items()],
+            [("letters", self.letters), ("space", (self.space, self.space + 1)), *alphabets],
+            markers,
         )
         if not set(range(*self.letters)) <= _LETTERS:
             raise ValueError(f"letters {self.letters} must be ASCII letters")
         joins = [
             name
-            for name, lo, hi in (
-                ("space", self.space, self.space + 1),
-                ("values", *self.values),
-                ("distractors", *self.distractors),
-            )
+            for name, (lo, hi) in (("space", (self.space, self.space + 1)), *alphabets)
             if set(range(lo, hi)) & _WORD_BYTES
         ]
         if joins:
@@ -355,7 +343,6 @@ class KVWordsParams(_Params):
             raise ValueError(
                 f"affix_len={list(self.affix_len)} must satisfy 1 <= lo <= hi < word_len[1]"
             )
-        return self
 
     @functools.cached_property
     def vocabulary(self) -> dict[Split, tuple[tuple[tuple[int, ...], ...], ...]]:
@@ -395,6 +382,60 @@ class KVWordsParams(_Params):
                 )
             out[split] = tuple(groups)
         return out
+
+
+class KVWordsParams(_WordKeyParams):
+    """``kv_words`` (16 Nov 2026, the word-key data of rung 3 of the word-addressing brief):
+    ``kv`` with keys that are words of letters. A fact is ``INS w v`` / ``OVR w v`` (the value
+    byte directly after the word), a delete ``DEL w SPACE`` and a query ``QRY w SPACE a``
+    (``configs/data/synthetic_wordkeys.yaml`` says why the value has no space before it).
+
+    The key words (fields of :class:`_WordKeyParams`) are a fixed vocabulary per split, a
+    function of ``vocab_seed`` and the parameters below: ``groups[split]`` groups of
+    ``group_size`` words of ``word_len`` letters drawn uniformly from ``letters``, the words of
+    a group sharing a beginning or an ending (half the groups each) of ``affix_len`` letters.
+    Every word is in one split only; every split draws from the same letters."""
+
+    markers: dict[Literal["ins", "ovr", "del"], int] = {"ins": 16, "ovr": 17, "del": 18}
+    values: ByteRange = (144, 192)
+    distractors: ByteRange = (192, 256)
+    n_keys: int = Field(default=8, ge=2)
+    op_rate: float = Field(default=0.08, gt=0.0, le=1.0)
+    p_del: float = Field(default=0.25, ge=0.0, le=1.0)
+    anchor: dict[Literal["ins", "ovr", "del"], float] = {"ins": 0.5, "ovr": 0.3, "del": 0.2}
+    max_queries: int = Field(default=8, ge=1)
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        for name, mapping in (("markers", self.markers), ("anchor", self.anchor)):
+            missing = [kind for kind in ("ins", "ovr", "del") if kind not in mapping]
+            if missing:
+                raise ValueError(f"{name} must name ins, ovr and del; missing {missing}")
+        if any(weight < 0.0 for weight in self.anchor.values()) or sum(self.anchor.values()) <= 0:
+            raise ValueError(f"anchor weights must be >= 0 with a positive sum: {self.anchor}")
+        self._check_words(
+            [("values", self.values), ("distractors", self.distractors)],
+            [(f"markers[{kind}]", byte) for kind, byte in self.markers.items()],
+        )
+        return self
+
+
+class DelayedWordsParams(_WordKeyParams):
+    """``delayed_words`` (16 Nov 2026): ``delayed`` with keys that are words of letters, from
+    the vocabulary of :class:`_WordKeyParams` (the same fields as a ``kv_words`` task give the
+    same words). A fact is ``w v`` (the value byte directly after the word, as in ``kv_words``),
+    a query ``QRY w SPACE v`` with the answer predicted at the ``SPACE``
+    (``configs/data/synthetic_wordhold.yaml`` says why)."""
+
+    values: ByteRange = (144, 192)
+    filler: ByteRange = (192, 256)
+    max_facts: int = Field(default=6, ge=1)
+    max_queries: int = Field(default=4, ge=1)
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        self._check_words([("values", self.values), ("filler", self.filler)], [])
+        return self
 
 
 class DelayedParams(_Params):
@@ -1019,6 +1060,30 @@ class _KV(_Generator[KVParams]):
 # ---- kv_words ------------------------------------------------------------------------------------
 
 
+def _pick_words(
+    params: _WordKeyParams, split: Split, rng: np.random.Generator, n: int
+) -> list[tuple[int, ...]]:
+    """``n`` distinct words of the split: after the first, each one shares the group of a key
+    already chosen with probability ``p_share`` (if that group has a word left)."""
+    groups = params.vocabulary[split]
+    size = params.group_size
+    share = _threshold(params.p_share)
+    picked: list[tuple[int, int]] = []  # (group, word) indices
+    while len(picked) < n:
+        group = -1
+        if picked and int(rng.integers(0, _SIXTEEN)) < share:
+            group = picked[int(rng.integers(0, len(picked)))][0]
+            left = [w for w in range(size) if (group, w) not in picked]
+            if left:
+                picked.append((group, left[int(rng.integers(0, len(left)))]))
+                continue
+        group = int(rng.integers(0, len(groups)))
+        word = int(rng.integers(0, size))
+        if (group, word) not in picked:
+            picked.append((group, word))
+    return [groups[g][w] for g, w in picked]
+
+
 class _KVWords(_Generator[KVWordsParams]):
     """``BOS prefix anchor middle SEP (QRY w SPACE a)* EOS``: ``kv`` with word keys.
 
@@ -1055,29 +1120,6 @@ class _KVWords(_Generator[KVWordsParams]):
         # BOS + stale INS (L + 2) + anchor (L + 2) + middle (dep - L - 3) + SEP + the anchor
         # query (L + 3) + EOS, for the longest word L
         return dep + 2 * params.word_len[1] + 7
-
-    def _keys(
-        self, params: KVWordsParams, split: Split, rng: np.random.Generator
-    ) -> list[tuple[int, ...]]:
-        """``n_keys`` distinct words of the split: after the first, each one shares the group
-        of a key already chosen with probability ``p_share`` (if that group has a word left)."""
-        groups = params.vocabulary[split]
-        size = params.group_size
-        share = _threshold(params.p_share)
-        picked: list[tuple[int, int]] = []  # (group, word) indices
-        while len(picked) < params.n_keys:
-            group = -1
-            if picked and int(rng.integers(0, _SIXTEEN)) < share:
-                group = picked[int(rng.integers(0, len(picked)))][0]
-                left = [w for w in range(size) if (group, w) not in picked]
-                if left:
-                    picked.append((group, left[int(rng.integers(0, len(left)))]))
-                    continue
-            group = int(rng.integers(0, len(groups)))
-            word = int(rng.integers(0, size))
-            if (group, word) not in picked:
-                picked.append((group, word))
-        return [groups[g][w] for g, w in picked]
 
     def _middle(
         self,
@@ -1132,7 +1174,7 @@ class _KVWords(_Generator[KVWordsParams]):
         length: int,
         dep: int,
     ) -> Emitted:
-        keys = self._keys(params, split, rng)
+        keys = _pick_words(params, split, rng, params.n_keys)
         k_star, others = keys[0], keys[1:]
         kind = self._KINDS[_weighted(rng, [params.anchor[k] for k in self._KINDS])]
         stale = kind != "ins"
@@ -1433,6 +1475,178 @@ class _Delayed(_Generator[DelayedParams]):
             raise ValueError("delayed: truncated document") from exc
         if i != len(t) - 1:
             raise ValueError("delayed: symbols after EOS")
+        return _sorted_solution(positions, targets, deps)
+
+
+# ---- delayed_words -------------------------------------------------------------------------------
+
+
+class _DelayedWords(_Generator[DelayedWordsParams]):
+    """``BOS prefix-filler (w v)^n filler SEP QRY w_1 SPACE v_1 (QRY w SPACE v)* EOS``.
+
+    ``delayed`` with each key replaced by a key word ``w``: a fact is ``w v`` (``|w| + 1``
+    symbols, the value byte directly after the word), a query ``QRY w SPACE v`` (``|w| + 3``)
+    with its answer predicted at the ``SPACE``. The first query asks the first fact at distance
+    D from that fact's value, the document's largest; the facts after the first and the filler
+    between the facts and ``SEP`` take ``D - |w_1| - 3`` symbols, so a fact that does not fit
+    before the anchor is dropped (the first always fits: ``D >= word_len[1] + 3``). Further
+    queries ask other facts in random order, each at a distance of at most D. The document's
+    keys come from the split's vocabulary (:attr:`_WordKeyParams.vocabulary`), some of them
+    from one group (``p_share``). ``T == L`` exactly.
+    """
+
+    family: Family = "delayed_words"
+    params_model = DelayedWordsParams
+
+    def validate(self, spec: TaskSpec, params: DelayedWordsParams) -> None:
+        super().validate(spec, params)
+        for split in SPLITS:
+            words = params.groups[split] * params.group_size
+            if words < params.max_facts:
+                raise ValueError(
+                    f"{spec.key}: the {split} vocabulary has {words} words but "
+                    f"max_facts={params.max_facts}"
+                )
+
+    def min_dep(self, params: DelayedWordsParams) -> int:
+        return params.word_len[1] + 3  # one fact: its value, SEP, QRY, the word, the SPACE
+
+    def min_length(self, params: DelayedWordsParams, dep: int) -> int:
+        # BOS + the first fact's word (L) + its value .. the first query's SPACE (dep + 1) +
+        # the answer + EOS, for the longest word L
+        return dep + params.word_len[1] + 4
+
+    def emit(
+        self,
+        params: DelayedWordsParams,
+        split: Split,
+        rng: np.random.Generator,
+        length: int,
+        dep: int,
+    ) -> Emitted:
+        n = int(rng.integers(1, params.max_facts + 1))
+        keys = _pick_words(params, split, rng, n)
+        # The facts after the first and the filler before SEP fill D - |w_1| - 3 symbols; keep
+        # the facts that fit, in order.
+        budget = dep - len(keys[0]) - 3
+        kept = [keys[0]]
+        for key in keys[1:]:
+            if len(key) + 1 > budget:
+                break
+            kept.append(key)
+            budget -= len(key) + 1
+        keys, n = kept, len(kept)
+        filler_len = budget
+        values: list[int] = rng.integers(params.values[0], params.values[1], size=n).tolist()
+        # Positions relative to the first fact's value: fact i's value at at_value[i], the
+        # first query's SPACE at dep, the next query's QRY at dep + 2.
+        at_value = [0]
+        for key in keys[1:]:
+            at_value.append(at_value[-1] + len(key) + 1)
+        avail = length - dep - len(keys[0]) - 4
+        if avail < 0:
+            raise RuntimeError(f"delayed_words: length {length} below min_length for dep {dep}")
+        # Each further query sits after the ones before it, so a fact may only be asked if its
+        # value is late enough that the query's dependency is at most D. Candidates come in
+        # random order; one that does not fit the budget is passed over.
+        order: list[int] = (1 + rng.permutation(n - 1)).tolist() if n > 1 else []
+        chosen = [0]
+        spaces = [dep]
+        at = dep + 2
+        used = 0
+        for which in order:
+            if len(chosen) >= params.max_queries:
+                break
+            width = len(keys[which]) + 3
+            space = at + len(keys[which]) + 1
+            if used + width <= avail and space - at_value[which] <= dep:
+                chosen.append(which)
+                spaces.append(space)
+                at += width
+                used += width
+        prefix_len = avail - used
+        facts: list[int] = []
+        for key, value in zip(keys, values, strict=True):
+            facts += [*key, value]
+        queries: list[int] = []
+        for which in chosen:
+            queries += [QRY, *keys[which], params.space, values[which]]
+        first_value = 1 + prefix_len + len(keys[0])  # BOS, the prefix, the first word
+        positions = [first_value + space for space in spaces]
+        deps = [space - at_value[which] for space, which in zip(spaces, chosen, strict=True)]
+        tokens = _assemble(
+            [
+                [BOS],
+                _draw(rng, params.filler, prefix_len),
+                facts,
+                _draw(rng, params.filler, filler_len),
+                [SEP],
+                queries,
+                [EOS],
+            ]
+        )
+        if tokens.shape[0] != length:
+            raise RuntimeError(
+                f"delayed_words: assembled {tokens.shape[0]} symbols, wanted {length}"
+            )
+        return tokens, positions, deps
+
+    def solve(self, params: DelayedWordsParams, tokens: U8) -> Solved:
+        letter = _byte_table([params.letters])
+        is_value = _byte_table([params.values])
+        is_filler = _byte_table([params.filler])
+        len_lo, len_hi = params.word_len
+        t: list[int] = tokens.tolist()
+        _frame(t)
+
+        def word(at: int) -> tuple[tuple[int, ...], int]:
+            """The run of letters from ``at`` and the position after it."""
+            end = at
+            while letter[t[end]]:
+                end += 1
+            if not len_lo <= end - at <= len_hi:
+                raise ValueError(f"delayed_words: a key word of {end - at} letters at {at}")
+            return tuple(t[at:end]), end
+
+        value_of: dict[tuple[int, ...], int] = {}
+        value_pos: dict[tuple[int, ...], int] = {}
+        i = 1
+        try:
+            while is_filler[t[i]]:
+                i += 1
+            while letter[t[i]]:
+                key, end = word(i)
+                if not is_value[t[end]]:
+                    raise ValueError(f"delayed_words: expected a value at {end}, got {t[end]}")
+                if key in value_of:
+                    raise ValueError(f"delayed_words: key word at {i} stated twice")
+                value_of[key] = t[end]
+                value_pos[key] = end
+                i = end + 1
+            while is_filler[t[i]]:
+                i += 1
+            if t[i] != SEP:
+                raise ValueError(f"delayed_words: expected SEP at position {i}, got {t[i]}")
+            i += 1
+            positions: list[int] = []
+            targets: list[int] = []
+            deps: list[int] = []
+            while t[i] != EOS:
+                if t[i] != QRY:
+                    raise ValueError(f"delayed_words: expected QRY at position {i}, got {t[i]}")
+                key, end = word(i + 1)
+                if t[end] != params.space:
+                    raise ValueError(f"delayed_words: expected SPACE at {end}, got {t[end]}")
+                if key not in value_of:
+                    raise ValueError(f"delayed_words: query at {i} asks a key no fact states")
+                positions.append(end)
+                targets.append(value_of[key])
+                deps.append(end - value_pos[key])
+                i = end + 2
+        except IndexError as exc:
+            raise ValueError("delayed_words: truncated document") from exc
+        if i != len(t) - 1:
+            raise ValueError("delayed_words: symbols after EOS")
         return _sorted_solution(positions, targets, deps)
 
 
@@ -2143,6 +2357,7 @@ _FAMILIES: dict[str, _Generator[Any]] = {
         _Algorithmic(),
         _RecallSum(),
         _KVWords(),
+        _DelayedWords(),
     )
 }
 

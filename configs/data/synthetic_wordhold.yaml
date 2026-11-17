@@ -1,0 +1,121 @@
+# synthetic_wordhold: key-value AND delayed recall with keys that are WORDS (16 Nov 2026; the user asked for the delayed
+# task with word keys too, after synthetic_wordkeys). It is to synthetic_wordkeys what synthetic_hold is to kv alone.
+#
+# Why: on single-byte synthetic tasks HSN-T's word events (model.write_events=word) are the per-byte loop (every non-text
+# byte is its own word and event), so they need tasks whose keys are words under a text context. synthetic_wordkeys has
+# key-value only; this adds the delayed task.
+#
+# The tasks:
+#   kvw        synthetic_wordkeys' task, the same spec (seed 70001, the same parameters, context 7), so the same
+#              documents, byte for byte (its shards hash as in configs/data/synthetic_wordkeys.manifest.json); its header
+#              says how a fact binds.
+#   delayedw   the delayed task (family delayed_words, python/hsn/data/synthetic.py) with key words, context 8: facts
+#              stated early, then a filler, then queries.
+#                fact     w v               (|w| + 1 symbols: the value byte DIRECTLY after the word)
+#                query    QRY w SPACE v     (the answer v predicted at the SPACE: the loss position)
+#                distance from the fact's value to the query's SPACE
+#              BOS filler w_1 v_1 w_2 v_2 ... w_n v_n filler SEP QRY w_1 SPACE v_1 (QRY w SPACE v)* EOS
+#              n is 1 to 6 (max_facts; a fact that does not fit before the anchor is dropped), every key word of a
+#              document distinct; the first query asks the first fact at the drawn anchor distance D (16-240), the
+#              document's largest; up to 3 more queries ask later facts, each at a distance of at most D. Values are
+#              bytes 144-191, filler 192-255, SPACE 32 (no byte but the key letters is a letter, digit or apostrophe).
+#              There is no pair hold-out (delayed2h's hold_mod): the held-out keys are the dev and test WORDS, new
+#              combinations of the letters seen in training, which is what delayed2h's held pairs test for bytes.
+#
+# Key words: both tasks draw from ONE vocabulary (the same vocab_seed 7001, word_len, letters, groups, group_size,
+# affix_len): 2,000 training / 500 dev / 500 test words, disjoint, in groups of four that share a beginning or an ending of
+# 2-3 letters, every letter of a-z in every split (synthetic_wordkeys' header). A training word is in training documents of
+# both tasks; no dev or test word is in either task's training documents. A document's keys after the first share the group
+# of an earlier key with probability 0.5 (p_share), so keys sharing their last two letters (the per-byte memory's address
+# of a key) occur in both tasks.
+#
+# Binding (checked with hsn.model.word_address.word_address on main 5c54832 with context 8 read as text, exact and bag;
+# tests/test_word_hold.py::test_a_fact_binds_under_the_word_address):
+#   BOS ... l i l y v ... SEP QRY l i l y SPACE v EOS
+#   - Events: BOS, the byte after each key word, and nothing else (a value, a filler byte, SEP, QRY and EOS are one-byte
+#     words that close nothing under a text context). A delayedw document has 1 + facts + queries events (2 to 11).
+#   - WRITE: the event at v (v closes "lily"): a_cur = W(lily), a_prev = W(the fact before; BOS for the first fact).
+#   - READ: the event at the query's SPACE (it closes "lily"): a_cur = W(lily), a_prev = W(the last fact's word for the
+#     first query, the query before's word for the others). v is predicted at this SPACE from that event's q and r.
+#   - So the key's code is in a_cur at the write and at the read, as in kvw.
+#   Rejected: "w SPACE v" facts (the event is at the SPACE, before v: v reaches no write under W(w)); "QRY w v" queries (v
+#   predicted at the word's last letter, whose latest event is before the word: no read under W(w)).
+#   The per-byte memory (write_events=byte): the write at v has a_prev = C[last letter], a_prev2 = code(last two letters);
+#   the read at the SPACE the same, so keys sharing their last two letters share its address.
+#
+# Context ids: 7 (kvw) and 8 (delayedw; no other dataset uses 8). For word events select
+#   model.write_events=word model.word_address=exact|bag "model.word_contexts=[0, 6, 7, 8]"
+# (0: the PAD tail behind each document under data.align_docs, then no event; 6: TinyStories, inert here).
+#
+# Size and shape: both in_range, every document one 256-byte window; 20,000 / 1,000 / 1,000 documents per task as
+# synthetic_hold. Measured on the 20,000 training documents of delayedw: 198 symbols, 3.4 facts, 1.96 queries, 1.53 far
+# queries (distance >= 63; 78 % of the queries; 79 % of the documents have one) per document, mean distance 122; of the
+# queried keys 27 % share their last two letters with another key of the document, 27 % their first two (27 % of the far
+# queries share an ending); dev and test the same within 0.1 query (test: 31 % share an ending). Each training word is in
+# 15 to 55 delayedw training documents (mean 34) and, with kvw's, 54 to 120 (mean 84); no dev or test word is in either
+# task's training documents. delayed2h (2,000 training documents): 194 symbols, 2.15 queries, 1.67 far (77 %).
+#
+# Build (CPU, a few seconds):
+#   PYTHONPATH=python python -m hsn.data.synthetic build --spec configs/data/synthetic_wordhold.yaml \
+#       --out data/synthetic_wordhold --golden configs/data/synthetic_wordhold.manifest.json
+# Built copy: /home/joe/hsn-experiments/datasets/synthetic_wordhold (link it as data/synthetic_wordhold). Select with
+#   data.dataset=synthetic_wordhold data.manifest=data/synthetic_wordhold/manifest.json "data.tasks=[kvw, delayedw]"
+#   data.variants=[in_range]
+# Evaluation: /home/joe/hsn-handoff/word_keys/wh_score.py (far recall per task on training / dev / test key words, the 97 %
+# rule per task, the capitalised and one-letter probes). Golden manifest: configs/data/synthetic_wordhold.manifest.json.
+
+name: synthetic_wordhold
+unroll: 256
+
+tasks:
+  - name: kvw
+    variant: in_range
+    family: kv_words
+    context_id: 7
+    seed: 70001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 232]
+    params:
+      markers: { ins: 16, ovr: 17, del: 18 }
+      letters: [97, 123]
+      space: 32
+      word_len: [3, 8]
+      vocab_seed: 7001
+      groups: { train: 500, dev: 125, test: 125 }
+      group_size: 4
+      affix_len: [2, 3]
+      p_share: 0.5
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 8
+      op_rate: 0.1
+      p_del: 0.25
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 }
+      max_queries: 8
+
+  - name: delayedw
+    variant: in_range
+    family: delayed_words
+    context_id: 8
+    seed: 80001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 240]
+    params:
+      letters: [97, 123]
+      space: 32
+      word_len: [3, 8]
+      vocab_seed: 7001
+      groups: { train: 500, dev: 125, test: 125 }
+      group_size: 4
+      affix_len: [2, 3]
+      p_share: 0.5
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4

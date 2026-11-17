@@ -1,0 +1,169 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayedw/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayedw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "kvw/in_range/dev"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayedw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "kvw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayedw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayedw/in_range/dev",
+      "test_docs_with_overlap": 0,
+      "train": "delayedw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayedw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayedw/in_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "delayedw/in_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "delayedw/in_range/dev"
+    }
+  ],
+  "name": "synthetic_wordhold",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 7,
+      "family": "kv_words",
+      "file": "kvw.in_range.train.npz",
+      "hash": "3c3c52c328a80c2fc2293bc5940a72219288d21a24835d6acbd06636a4cdc44e",
+      "n_docs": 20000,
+      "n_loss": 69290,
+      "n_tokens": 4030359,
+      "split": "train",
+      "task": "kvw",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 7,
+      "family": "kv_words",
+      "file": "kvw.in_range.dev.npz",
+      "hash": "34ce202d97c623c9c8636d1b0900900f246b2305aa2e1d91cd890adb18e9a421",
+      "n_docs": 1000,
+      "n_loss": 3447,
+      "n_tokens": 201927,
+      "split": "dev",
+      "task": "kvw",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 7,
+      "family": "kv_words",
+      "file": "kvw.in_range.test.npz",
+      "hash": "6e13aa8dffb3525069c8cd6afeed9de6e7e02d2c4367d177bd41f567191603f1",
+      "n_docs": 1000,
+      "n_loss": 3470,
+      "n_tokens": 199957,
+      "split": "test",
+      "task": "kvw",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 8,
+      "family": "delayed_words",
+      "file": "delayedw.in_range.train.npz",
+      "hash": "4d663eeb6773f079636568bca93cb71ae3c3741e191c256ae015af368b0d6a3b",
+      "n_docs": 20000,
+      "n_loss": 39193,
+      "n_tokens": 3955113,
+      "split": "train",
+      "task": "delayedw",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 8,
+      "family": "delayed_words",
+      "file": "delayedw.in_range.dev.npz",
+      "hash": "f5098a803ca2c7de083ab658e38b9bf66c55427b801aefd894b17f09d40a5f0b",
+      "n_docs": 1000,
+      "n_loss": 1919,
+      "n_tokens": 197900,
+      "split": "dev",
+      "task": "delayedw",
+      "variant": "in_range"
+    },
+    {
+      "context_id": 8,
+      "family": "delayed_words",
+      "file": "delayedw.in_range.test.npz",
+      "hash": "9ee731bc554e77b79a0c30f3b2d6dd4e8f0d3c12d06a3ff77ee95ed00e55e6f1",
+      "n_docs": 1000,
+      "n_loss": 1936,
+      "n_tokens": 199446,
+      "split": "test",
+      "task": "delayedw",
+      "variant": "in_range"
+    }
+  ],
+  "spec_hash": "167b7d60927e33531cdc3f3794459dd97bc561d3f68853150e3f5d78cc1478a1",
+  "split_hashes": {
+    "dev": "8c8bf39b9f716f49c014cc71b1a4c8ce5db10b13940d47e1d9ba4d7a197643d7",
+    "test": "d9aaa9ec93517e269523248464d215d30665be3a196ded956375a6ba5d546690",
+    "train": "ee94f1333ae36dd53dc3585800a2518f5db5f3f1913cadc919575d7f427c8c2e"
+  },
+  "unroll": 256
+}
