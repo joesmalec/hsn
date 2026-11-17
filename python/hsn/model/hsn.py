@@ -151,6 +151,9 @@ graph, the gate, the router, the addresses and the state layout are unchanged. I
 compiled block and :meth:`_position` are the code they were. :meth:`step` has no window to read
 and refuses the key; the split and fused windows refuse it too. With ``model.fast_cells`` kept
 beside the reader, ``S`` reads ``[z ; q ; ctx ; c ; f]`` and ``D`` reads ``[q ; u ; r ; f ; c]``.
+``train.reach_dropout`` (``docs/reach_dropout.md``; opt-in, training only): in a training window
+the rows the trainer hands over (:meth:`HSN.set_reach_rows`) read with a short span; no equation
+changes, and evaluation reads as configured.
 
 The attention read of the cells (``model.cell_attention_heads = H > 0``, HSN-T only,
 ``docs/amendments/cell_attention_read.md``; opt-in candidate): at every position ``c_t`` queries
@@ -637,6 +640,10 @@ class HSN(nn.Module):
         self._fixed_route: Tensor | None = (
             torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
         )
+        #: ``train.reach_dropout`` (HSN-T, ``docs/reach_dropout.md``): the rows of the training
+        #: window that read with a short span, and the span (:meth:`set_reach_rows`); None: every
+        #: row reads as configured. Read in training mode only.
+        self._reach: tuple[Tensor, int] | None = None
 
     @property
     def scorer(self) -> Scorer:
@@ -669,6 +676,26 @@ class HSN(nn.Module):
         if isinstance(step, bool) or not isinstance(step, int) or step < 0:
             raise ValueError(f"step must be an int >= 0, got {step!r}")
         self.train_step = step
+
+    def set_reach_rows(self, rows: Tensor | None, span: int = 0) -> None:
+        """``train.reach_dropout`` (HSN-T, ``docs/reach_dropout.md``): the batch rows (bool
+        ``[B]`` on the model's device) whose reader reads with the per-block span ``span`` in
+        the training windows from now on, as the reader with ``model.reader_span = span``
+        would; ``None`` clears them. The trainer sets them before a training window and clears
+        them after it. A window in evaluation mode ignores them: it always reads as
+        configured."""
+        if rows is None:
+            self._reach = None
+            return
+        if self.reader is None:
+            raise ValueError("reach rows shorten HSN-T's reader; this model has none")
+        if rows.dtype is not torch.bool or rows.dim() != 1:
+            raise ValueError(
+                f"rows must be a bool [B] tensor, got {rows.dtype} {tuple(rows.shape)}"
+            )
+        if isinstance(span, bool) or not isinstance(span, int) or span < 1:
+            raise ValueError(f"span must be an int >= 1, got {span!r}")
+        self._reach = (rows, span)
 
     # -- placement --------------------------------------------------------------------------------
 
@@ -1504,7 +1531,9 @@ class HSN(nn.Module):
         if self.reader is not None:
             # HSN-T: c_t travels behind the context embedding, so S reads [z; q; ctx; c] at every
             # position with the loop, the compiled block and _position unchanged
-            reader_out = self.reader(tokens, reset)  # [B, T, w]
+            # train.reach_dropout: the training window's short rows (docs/reach_dropout.md)
+            short = self._reach if self.training else None
+            reader_out = self.reader(tokens, reset, short)  # [B, T, w]
             context = torch.cat([context, reader_out], dim=-1)
             if self._gate_rides:
                 # address_gate_input=reader_prev: c_{t−1} behind c_t, for the address gate alone;

@@ -335,6 +335,15 @@ The recipe of HSN-T with its memory, `configs/experiments/hsn_t_memory.yaml` (ma
 (kv, delayed), so text runs set `H = 4`. Results in the design note, "Results (16 Nov 2026)" and
 "Results on the recall tasks (16 Nov 2026)".
 
+## Reach dropout (`train.reach_dropout`)
+
+A training option of 17 Nov 2026 (`docs/reach_dropout.md`; opt-in, no equation change): in a
+training window each row reads, with probability `train.reach_dropout`, with the per-block span
+`train.reach_dropout_span` (16 by default), the other rows with the whole window; evaluation
+reads as configured. It leaves the names beyond the short span to the memory in those rows
+while the reader keeps the whole window (experiment E1 of the names design note). The default
+is 0, and with it nothing in this document changes.
+
 ## Tests (`tests/test_hsn_t.py`)
 
 The two families are kept apart (config, class, registry); the keys leave the HSN's hashes

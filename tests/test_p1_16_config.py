@@ -119,6 +119,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.word_address",  # the event loop's word address (opt-in candidate)
         "model.word_contexts",  # the text contexts of the word address
         "train.tbptt_windows",  # windows joined into one gradient segment (opt-in, 16 Nov 2026)
+        "train.reach_dropout",  # short-span rows of HSN-T's reader in training (opt-in, 17 Nov)
+        "train.reach_dropout_span",
     )
 
 

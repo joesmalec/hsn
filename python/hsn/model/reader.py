@@ -17,6 +17,11 @@ What ``c_t`` may depend on (tested in ``tests/test_hsn_t.py``):
   short-sighted reader, which has to leave everything further back to the memory;
 * nothing of an earlier window, no cell state, no context symbol.
 
+``train.reach_dropout`` (``docs/reach_dropout.md``; opt-in, training only): the trainer hands
+the model, per training window, the batch rows that read as with ``model.reader_span = S``
+(``short`` of :meth:`Reader.forward`); the other rows, and every call without ``short``, read
+as configured.
+
 Layout: byte embedding → ``model.reader_layers`` pre-norm blocks (LayerNorm → causal multi-head
 self-attention → residual; LayerNorm → GELU MLP of width ``4 w`` → residual) → LayerNorm. The
 position enters as a rotation of the attention's queries and keys by the position in the window
@@ -432,10 +437,15 @@ class Reader(nn.Module):
         keep = torch.arange(cos.shape[-1], device=cos.device) < pairs
         return torch.where(keep, cos, 1.0), torch.where(keep, sin, 0.0)
 
-    def attention_mask(self, reset: Tensor) -> Tensor:
+    def attention_mask(self, reset: Tensor, short: tuple[Tensor, int] | None = None) -> Tensor:
         """Bool ``[B, 1, T, T]``, True where position ``t`` (row) may read position ``s``
         (column): ``s ≤ t``, the same document of the row (``reset [B, T]`` starts a document at
-        its True columns), and with a span ``t − s < span``. Every row holds its own position."""
+        its True columns), and with a span ``t − s < span``. Every row holds its own position.
+
+        ``short = (rows, n)`` (``train.reach_dropout``, ``docs/reach_dropout.md``; a reader
+        without a span): the batch rows where ``rows`` (bool ``[B]``, on the device) is True
+        also need ``t − s < n``, the mask of ``model.reader_span = n``; the other rows keep the
+        whole window, bit for bit. Tensor operations only: no host read, one shape."""
         T = int(reset.shape[1])
         segment = reset.to(torch.int64).cumsum(dim=1)  # the document index of every position
         same = segment[:, :, None] == segment[:, None, :]
@@ -444,9 +454,17 @@ class Reader(nn.Module):
         near = distance >= 0
         if self.span is not None:
             near = near & (distance < self.span)
-        return (same & near)[:, None]
+        mask = same & near
+        if short is not None:
+            rows, n = short
+            mask = mask & ((distance < n) | ~rows[:, None, None])
+        return mask[:, None]
 
-    def forward(self, tokens: Tensor, reset: Tensor) -> Tensor:
+    def forward(
+        self, tokens: Tensor, reset: Tensor, short: tuple[Tensor, int] | None = None
+    ) -> Tensor:
+        """``c [B, T, w]``; ``short``: :meth:`attention_mask`'s, the rows that read with a
+        short span (``train.reach_dropout``; None, the default: every row as configured)."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
@@ -457,6 +475,20 @@ class Reader(nn.Module):
                 f"a reader with model.reader_carry={self.carry} reads with "
                 "read(tokens, reset, cache), the cache from init_cache"
             )
+        if short is not None:
+            rows, n = short
+            if self.span is not None:
+                raise ValueError(
+                    f"short rows (train.reach_dropout) shorten a whole-window reader; this one "
+                    f"has model.reader_span={self.span}"
+                )
+            if rows.dtype is not torch.bool or tuple(rows.shape) != (int(tokens.shape[0]),):
+                raise ValueError(
+                    f"short rows must be a bool [B] tensor (B = {int(tokens.shape[0])}), got "
+                    f"{rows.dtype} {tuple(rows.shape)}"
+                )
+            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                raise ValueError(f"the short span must be an int >= 1, got {n!r}")
         x = self.emb(tokens)
         T = int(tokens.shape[1])
         cos: Tensor | None
@@ -471,7 +503,7 @@ class Reader(nn.Module):
             cos = sin = None
         else:
             cos, sin = self._rotation(T, x)
-        mask = _attention_bias(self.attention_mask(reset), x)
+        mask = _attention_bias(self.attention_mask(reset, short), x)
         for i, block in enumerate(self.blocks):
             block_cos, block_sin = self._block_rotation(self._block_pairs[i], cos, sin)
             x = block(x, mask, block_cos, block_sin)

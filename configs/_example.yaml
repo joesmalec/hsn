@@ -173,6 +173,8 @@ train: # Appendix A.3
   micro_batch: 4
   grad_accum: 1
   tbptt_windows: 1 # opt-in: consecutive windows of a step joined into one gradient segment (docs/tbptt_windows.md)
+  reach_dropout: 0.0 # opt-in, HSN-T with its memory: probability that a row of a training window reads with the span below (docs/reach_dropout.md); 0 = off
+  reach_dropout_span: 16 # the per-block span of those rows (as model.reader_span); needs model.reader_span null
   precision: bf16 # bf16 | fp16 | fp32 | fp64 (fp64 only for gradcheck)
   grad_clip: 1.0 # global norm clip
   grad_norm_precision: native # native | float64; wide global reduction and clipping, opt-in
