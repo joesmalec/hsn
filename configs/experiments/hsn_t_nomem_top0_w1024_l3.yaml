@@ -1,0 +1,88 @@
+# hsn_t_nomem_top0_w1024_l3: HSN-T without its memory on text, the 16 Nov standard with three
+# reader blocks (docs/hsn_t_no_memory.md).
+#
+# Decision, 17 Nov 2026, the user: "I agree that 160X3 is the best middle ground". The standard of
+# 16 Nov (configs/experiments/hsn_t_nomem_top0_w1024.yaml, unchanged) with the reader 160 wide x 3
+# blocks in place of 4, the top block still unrotated (top0: rotary pairs [20, 20, 0]); the rest is
+# the standard's: the whole window (no reader_span), no carry (reader_carry 0), windows of 1024
+# bytes, batch 8 x 1024 = 8,192 positions a step, TinyStories built at 1024
+# (configs/data/tinystories_w1024.yaml). 1,578,272 parameters (HSNTNoMemory.param_report(); the
+# standard has 1,887,552, one reader block of width 160 is 309,280).
+#
+# Measured at 27,000 steps on TinyStories, 1024-byte windows x 8, dev bits per byte on all 2,000
+# dev stories (lower is better); step time alone on the RTX 3060 with CUDA graphs
+# (hardware.baseline_compile=reduce-overhead):
+#   reader                       dev bits (seeds)              ms/step
+#   160 x 4 (the standard)       0.7412 / 0.7375 (s0 / s1)     22.0
+#   160 x 3 (this recipe)        0.7798 / 0.7697 (s0 / s1)     17.6
+#   128 x 4                      0.7854 (s0)                   18.1
+#   128 x 3                      0.8240 (s0)                   14.8
+#   224 x 2                      0.8731 (s0)                   15.4
+#   GRU 2M at 256 x 32           0.8788 / 0.8794               16.0
+#   Transformer 2M at 1024 x 8   0.7366 / 0.7304               20.8
+# The 160 x 3, 128 and 224 rows trained with CUDA graphs: spec fast_readers (arm
+# ts27_nomem_w160l3_top0_w1024, seed 0 arm id cbf69170a5493817) and fast_160x3_s1 (seed 1, arm id
+# 0473099ae665f4ca), tree 5c54832; ms/step is the run's median (160 x 3: seed 0 17.6, seed 1 17.5;
+# seed 1's 50-step check at the start read 18.9 while a CPU test suite ran). The bits of the
+# 160 x 4, GRU and Transformer rows are their eager 27k runs (this recipe's parent's header); their
+# ms/step are 400-step CUDA-graph arms (spec fast_timing). The heads stay 4 (head width 40).
+#
+# With data.align_docs: true each window is padded after its story ends: about 69 % of a step's
+# 8,192 positions are real bytes at 1024-byte windows, against 86 % for the GRU at 256 x 32.
+#
+# On the synthetic tasks (in_range, windows of 256 x batch 32, 9,000 steps, lr 3e-4, eager; spec
+# tasks_160x3), 160 x 3 top0: arithmetic 100.00 %, algorithmic 99.87 % dev accuracy at 15.4 ms a
+# step (160 x 4 at the same settings, spec tasks_now: 100.00 % / 99.97 % at 19.1 ms).
+#
+# The arms on the card add: profile=rtx3060 hardware.compile_mode=none
+# hardware.baseline_compile=reduce-overhead, the steps (train.steps=27000 train.ckpt_every=27000
+# train.eval_every=1500) and protocol eval_batch: 32 in the spec. A spec with those lines on this
+# file expands to the arm ids above. In an experiment spec the family is hsn_t_nomem. A `hardware:`
+# block here would replace the whole profile, so the hardware stays with `profile=`.
+#
+# Everything else is configs/experiments/hsn_t_nomem.yaml (that recipe is unchanged): AdamW at
+# 1e-3, the next-byte loss alone, no routing terms. The loader has no "extends", so the file is
+# complete. Everything not listed keeps its Appendix A default (configs/_example.yaml).
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
+
+run_id: hsn_t_nomem_top0_w1024_l3
+seed: 0
+notes: "HSN-T without its memory, the text recipe of 17 Nov 2026: reader 160 x 3, top block unrotated, whole window, no carry; 1024-byte windows."
+profile: cpu # override with `profile=<name>`
+model_name: hsn_t
+
+model:
+  memory: false # HSN-T without its memory
+  reader: transformer
+  reader_width: 160
+  reader_layers: 3
+  reader_heads: 4
+  reader_rotary_pairs: [20, 20, 0] # top0: the top block compares queries and keys unrotated
+  reader_span: null # the whole window
+  reader_carry: 0 # no carry: every window is read on its own
+  selected_readout: true # HSN-T's decoder input [q; u; r; c]; q and r read zeros
+  routing: topk # required by selected_readout; no cell exists to route
+
+data:
+  dataset: tinystories_w1024
+  manifest: data/tinystories_w1024/manifest.json # built by `python -m hsn.data.text build`
+  tasks: [tinystories]
+  variants: [out_of_range]
+  align_docs: true # every story starts at a window boundary (as in hsn_t_nomem.yaml)
+
+train:
+  optimizer: adamw # the generic trainer's; lazy_adamw needs the unit bank
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 1024 # the window the model reads
+  batch: 8
+  micro_batch: 8
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  lambda_p: 0.0 # no predictor: the objective is the next-byte loss alone
+  search_trials: 1

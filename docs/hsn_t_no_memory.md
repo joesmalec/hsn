@@ -326,6 +326,11 @@ balance"): the shape below on 1024-byte windows without the carry is the recipe
 0.7412 / 0.7375 dev bits per byte at 27,000 steps, 26.1 ms a step eager, alone on the RTX 3060
 (Transformer at 1024: 0.7366 / 0.7304, 23.2 ms); the recipe's header has the comparison.
 
+**17 Nov 2026** (user: "I agree that 160X3 is the best middle ground"): that recipe with 3 reader
+blocks (pairs `[20, 20, 0]`) is `configs/experiments/hsn_t_nomem_top0_w1024_l3.yaml`: 0.7798 /
+0.7697 dev bits at 17.6 ms a step against 22.0 ms for 4 blocks, both with CUDA graphs alone on
+the RTX 3060; its header has the comparison.
+
 TinyStories (`tinystories_v1`), 9,000 steps, dev bits per byte (lower is better). The figures
 are the coordinating session's measurements, quoted as given; they were not re-measured for
 this document.
