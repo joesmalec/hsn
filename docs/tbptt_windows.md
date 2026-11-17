@@ -1,8 +1,9 @@
 # Gradient segments across windows: `train.tbptt_windows`
 
-16 November 2026. Branch `claude/tbptt-windows`, from main `af21ce3`. Written and tested on the
-CPU only (torch 2.15.0+cu132, the card hidden): nothing here has run on a GPU, so this document
-holds no card step time. The design follows the source audit
+16 November 2026. Branch `claude/tbptt-windows`, from main `af21ce3`, merged with main `5c54832`
+on 17 November 2026. Written and tested on the CPU (torch 2.15.0+cu132, the card hidden); the
+first experiment's card results (local RTX 3060) are under [Results](#results). The design
+follows the source audit
 `~/hsn-handoff/cross_window/TRAINER_AUDIT.md` ("Proposed option", points 1 to 6). A trainer option:
 no model equation changes (cells, graph, units, ε, the convex tanh gate, the router and `q` are
 untouched).
@@ -87,6 +88,14 @@ Refused at configuration load (`tbptt_windows_scope_error`), each with the reaso
 In scope: the HSN trainer's autograd window, eager (`hardware.compile_mode=none`) or compiled
 without CUDA graphs (`hardware.compile_mode=default`, below).
 
+Main's loop over events (`model.write_events=word`, with or without `model.word_address`; merged
+17 November 2026) is in scope too: the event loop reads the window's start `h` and `q`, so the
+gradient crosses the window boundary there as in the loop over bytes (`r` before a row's first
+event is zeros, not carried), and the word address's carry is integers, handed on window by
+window as before. The reader's carried keys (`model.reader_carry`, `model.reader_top_words`) stay
+detached at every window: inside a segment the gradient crosses windows through the memory's
+state only.
+
 ### `hardware.compile_mode=default`
 
 A new value of the HSN's compile mode: `torch.compile` with inductor's default mode, no CUDA
@@ -130,7 +139,10 @@ user's approval.
   dense HSN with the trailing-padding cut;
 * `K = 2` with two segments per step resumes from a checkpoint bit for bit (records, weights,
   optimiser moments, carried state, address bytes);
-* the compiled window without CUDA graphs against eager (above).
+* the compiled window without CUDA graphs against eager (above);
+* after the merge with main: the loop over events (`model.write_events=word`, word address
+  `none` and `exact`) passes the second window's loss into the first window's final `h` and `q`
+  at `K = 2` and not at `K = 1`, and its compiled form (`aot_eager`) equals eager at `K = 2`.
 
 `K = 1` against main: the same five tiny CPU trainings (HSN-T in the memory recipe's form with
 `grad_accum` 1, 2 and 3 with and without aligned documents, the dense HSN with the trailing cut,
@@ -140,7 +152,8 @@ tests (every window starts detached) pass unchanged.
 
 ## The first experiment
 
-`/home/joe/hsn-experiments/remote/specs/xwin_top0.yaml` (not launched): HSN-T with its memory and
+`/home/joe/hsn-experiments/remote/specs/xwin_top0.yaml` (seed 0) and `xwin_top0_s1.yaml` (seed 1,
+the same arms): HSN-T with its memory and
 the top0 reader (width 160, four blocks, the top block unrotated, the reader over the whole
 window), TinyStories in windows of 256, the memory recipe, C-read off, 9,000 steps, seed 0,
 `hardware.compile_mode=default`. The fair pair of the audit: both arms take two windows per step
@@ -149,8 +162,8 @@ detaches at every window (`tbptt_windows=1`), arm B joins the two (`tbptt_window
 
 | Arm | Run id |
 | --- | --- |
-| A, detached | `ts_memT_top0_ga2_detached-s0-11bd4dada918` |
-| B, one segment of two windows | `ts_memT_top0_ga2_xwin2-s0-28f4e144d44e` |
+| A, detached | `ts_memT_top0_ga2_detached-s0-11bd4dada918`, `ts_memT_top0_ga2_detached-s1-fe578bcc29a1` |
+| B, one segment of two windows | `ts_memT_top0_ga2_xwin2-s0-28f4e144d44e`, `ts_memT_top0_ga2_xwin2-s1-2a6e11df1376` |
 
 Each step is twice the tokens of `mem_top0` (one window per step): compare A with B, not either
 with `mem_top0` at equal steps.
@@ -162,15 +175,35 @@ threads, four steps of each arm on TinyStories. Steps 2 and 3 (two windows each)
 checkpoint) 31.6 and 27.5 s. The process's resident memory sampled at the end: 7.06 GB (A),
 10.32 GB (B), about 3.3 GB more for holding the first window's activations through the second
 (fp32 on the CPU; the card runs bf16 autocast). So on the CPU the joined segment costs memory, not
-arithmetic, as the audit expected; the card's step time under `compile_mode=default` still has to
-be measured.
+arithmetic, as the audit expected. The card's numbers are under Results.
+
+## Results
+
+17 November 2026. The pair above, seeds 0 and 1: TinyStories, 9,000 steps, HSN-T with its memory
+and the top0 reader, `train.grad_accum=2`, `hardware.compile_mode=default`, each run alone on the
+local RTX 3060. Dev is bits per byte; names is the names test, bits per letter of a name whose
+earlier mention lies in an earlier window, 64 to 255 bytes back.
+
+| Arm | Dev (s0 / s1) | Names (s0 / s1) | Step time | Peak memory |
+| --- | --- | --- | --- | --- |
+| A, `tbptt_windows=1` (cut at every window) | 0.8119 / 0.8118 | 0.75 / 0.73 | 752 ms | 2.96 GB |
+| B, `tbptt_windows=2` (gradient across 2 windows) | 0.7977 / 0.8048 | 0.71 / 0.72 | 766 ms | 5.65 GB |
+
+Step time is the s1 run's median (`step_time.run_median_s`); peak memory is
+`measured.peak_bytes`, the same in both seeds.
+
+* `K = 2` is better on dev by 0.014 (s0) and 0.007 (s1) bits per byte. Its names gain (0.04 and
+  0.01 bits per letter) is within the 95 % intervals.
+* Both arms run without CUDA graphs (`compile_mode=default`), hence about 0.75 s per step: over
+  the 0.5 s limit, under an exception the user approved for this pair (cap 4.0 s). Joining two
+  windows costs about 2 % in step time and about 1.9 times the peak memory.
+* Decision (the user, 17 November 2026): `train.tbptt_windows` stays an opt-in research option
+  and goes into no recipe.
 
 ## Open
 
-* The CUDA step time and peak memory of `compile_mode=default`, and of `K = 2` against `K = 1`
-  there. A first short run of arm A and arm B alone on the card answers both before a full run.
-* Whether the trained model uses the longer credit: score names in earlier windows (the probe
-  that gave +0.18 bits per letter) on arm B against arm A.
+* Whether the trained model uses the longer credit for names: the names score moved by less than
+  its 95 % intervals in both seeds.
 * `K > 2`, and segments longer than one optimiser step (more windows per step, or a carried graph
   across steps), are not tried; the latter is out of scope by construction.
 * The split and fused windows and CUDA-graph replay would each need their own segment support
