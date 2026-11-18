@@ -139,6 +139,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.reach_dropout",  # short-span rows of HSN-T's reader in training (opt-in, 17 Nov)
         "train.reach_dropout_span",
         "baseline.gated_deltanet",  # the Gated DeltaNet baseline's sizes (17 Nov 2026)
+        "eval",  # opt-in evaluation reports (18 Nov 2026)
+        "eval.by_distance",  # score by distance (docs/distance_eval.md)
     )
 
 

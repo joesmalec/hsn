@@ -38,7 +38,9 @@ every other configuration unchanged; such a configuration must be routed, probe 
 windows, keep the horizon inside the window and not run soft gates throughout. P1.16's rollback
 keys (``train.rollback_*``, :data:`ROLLBACK_KEYS`) are off by default and, at their defaults, left
 out of the hash (:data:`HASH_OMIT_AT_DEFAULT`), so every configuration written before them keeps its
-``config_hash``.
+``config_hash``. ``eval.*`` (18 Nov 2026) holds opt-in evaluation reports
+(``eval.by_distance``, :mod:`hsn.eval.distance`); at its default the whole block is left out of
+the hash in the same way.
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -75,7 +77,10 @@ __all__ = [
     "REPO_ROOT",
     "ROLLBACK_KEYS",
     "BaselineConfig",
+    "ByDistanceConfig",
     "DataConfig",
+    "DistanceSetConfig",
+    "EvalConfig",
     "FastConfig",
     "GRUBaselineConfig",
     "GatedDeltaNetBaselineConfig",
@@ -1583,6 +1588,73 @@ class BaselineConfig(_StrictModel):
 
 
 # --------------------------------------------------------------------------------------------------
+# eval.*  (not in Appendix A; opt-in evaluation reports)
+# --------------------------------------------------------------------------------------------------
+
+_SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]*$")
+
+
+class DistanceSetConfig(_StrictModel):
+    """One more dev set that ``eval.by_distance`` scores at the end of a run (for example
+    recall distances the run did not train on: ``data/synthetic_far/manifest.json``). Always the
+    manifest's ``dev`` split."""
+
+    name: str  # the set's key in the report; "dev" is the run's own dev set
+    manifest: Path  # split manifest (CWD-relative, as data.manifest)
+    tasks: list[str] = []  # empty = every task of the manifest
+    variants: list[Variant] = []  # empty = every variant of the manifest
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _SET_NAME_RE.match(value) or value == "dev":
+            raise ValueError(
+                f"eval.by_distance.sets: name {value!r} must be letters, digits and '_' and not "
+                "'dev' (the run's own dev set)"
+            )
+        return value
+
+
+class ByDistanceConfig(_StrictModel):
+    """``eval.by_distance`` (opt-in, 18 Nov 2026; ``docs/distance_eval.md``): score by distance.
+
+    Off (default): nothing runs, and the block is left out of the configuration hash. On: when
+    training ends, the run's dev set and every set of ``sets`` take one more evaluation pass
+    each (the cost of one of the run's evaluations per set, plus host-side tables), and the
+    bucket tables go to the run record as ``by_distance`` (:mod:`hsn.eval.distance`): accuracy
+    by recall distance, query slot, answer kind and fact position on the synthetic tasks; bits
+    per letter of repeated names and content words by the distance of the previous mention on
+    text. Evaluation only: training, the model and every existing metric are unchanged.
+    """
+
+    enabled: bool = False
+    # also at every evaluation of the run (the dev set only; each evaluation entry gains
+    # ``by_distance``): the pass is the evaluation itself, the cost its per-position copies
+    every_eval: bool = False
+    # the first max_docs documents of every task/variant group of a set (None: all of them)
+    max_docs: int | None = Field(default=None, ge=1)
+    sets: list[DistanceSetConfig] = []
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if not self.enabled and (self.every_eval or self.max_docs is not None or self.sets):
+            raise ValueError(
+                "eval.by_distance: every_eval, max_docs and sets are read only with "
+                "eval.by_distance.enabled=true"
+            )
+        names = [entry.name for entry in self.sets]
+        if len(set(names)) != len(names):
+            raise ValueError(f"eval.by_distance.sets: names must differ, got {names}")
+        return self
+
+
+class EvalConfig(_StrictModel):
+    """``eval.*``: opt-in evaluation reports. Nothing here changes training or a metric."""
+
+    by_distance: ByDistanceConfig = ByDistanceConfig()
+
+
+# --------------------------------------------------------------------------------------------------
 # Appendix A.5  hardware profile file
 # --------------------------------------------------------------------------------------------------
 
@@ -1676,6 +1748,7 @@ class RunConfig(_StrictModel):
     stream: StreamConfig = StreamConfig()
     serve: ServeConfig = ServeConfig()
     baseline: BaselineConfig = BaselineConfig()  # P0.5 baseline sizes (not in Appendix A)
+    eval: EvalConfig = EvalConfig()  # opt-in evaluation reports; hash-omitted at its default
     hardware: HardwareConfig  # resolved from `profile` by load_config, or given inline
     run_id: str = "default"
     seed: int = Field(default=0, ge=0)
@@ -2341,6 +2414,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.reach_dropout",
     "train.reach_dropout_span",
     "baseline.gated_deltanet",
+    "eval",
+    "eval.by_distance",
 )
 
 
