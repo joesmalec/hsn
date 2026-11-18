@@ -101,29 +101,36 @@ class _PickUnit(torch.autograd.Function):
     """:func:`pick_unit`."""
 
     @staticmethod
-    def forward(ctx: Any, x: Tensor, unit: Tensor) -> Tensor:
+    def forward(ctx: Any, x: Tensor, unit: Tensor, as_gather: bool = False) -> Tensor:
         ctx.save_for_backward(unit)
         ctx.n_units = int(x.shape[1])
+        ctx.as_gather = as_gather
         rows, width = int(x.shape[0]), int(x.shape[2])
         return x.gather(1, unit[:, None, None].expand(rows, 1, width)).squeeze(1)
 
     @staticmethod
-    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor, None]:
+    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor, None, None]:
         (unit,) = ctx.saved_tensors
         own = unit[:, None] == torch.arange(ctx.n_units, device=grad.device)[None, :]
         zero = torch.zeros_like(grad[:1, None, :1])
-        return torch.where(own[:, :, None], grad[:, None, :], zero), None
+        rows = grad[:, None, :]
+        if ctx.as_gather:  # gather's backward adds the row to zeros: -0.0 arrives as +0.0
+            rows = rows + 0.0
+        return torch.where(own[:, :, None], rows, zero), None, None
 
 
-def pick_unit(x: Tensor, unit: Tensor) -> Tensor:
+def pick_unit(x: Tensor, unit: Tensor, *, as_gather: bool = False) -> Tensor:
     """``x[p, unit[p]]`` for ``x [P, M, W]`` and int64 ``unit [P]`` in ``[0, M)`` (not
     checked): each pair's own unit, ``[P, W]``. The value is ``gather``'s, which reads the
     chosen rows only. The backward writes each gradient row into its unit's place and zeros
     into the others as one masked copy; ``gather``'s own backward fills a tensor of zeros and
-    scatters into it (the same values: every place is written at most once).
+    scatters into it (the same values: every place is written at most once). ``as_gather``:
+    the gradient is ``gather``'s bit for bit, a ``-0.0`` of the incoming gradient written as
+    the ``+0.0`` that adding it to a zero gives (:meth:`UnitBank.forward_static`); ``False``
+    (the pick of ``hardware.round_products=merged``, as it was) writes the row as it comes.
 
     (:func:`pick_hidden` is the pick of the first layer, whose input is not ``[P, M, W]``.)"""
-    out: Tensor = _PickUnit.apply(x, unit)
+    out: Tensor = _PickUnit.apply(x, unit, as_gather)
     return out
 
 
@@ -430,8 +437,11 @@ class UnitBank(nn.Module):
             )
         P = int(v.shape[0])
         every = self.forward_all(v.reshape(1, P, self.in_dim), w1_flat=w1_flat)[0]  # [P, M, d]
-        index = unit_idx.to(torch.int64)[:, None, None].expand(P, 1, self.d)
-        return every.gather(1, index).squeeze(1)
+        # 18 Nov 2026 (docs/perbyte_speed.md): the gather through pick_unit. The value and the
+        # gradient are the gather's bit for bit; its backward is one masked copy, where the
+        # gather's own (zeros, then a scatter-add in the autocast dtype) ran outside a
+        # compiled window's fused kernels: 9 µs at every position of the loop over bytes.
+        return pick_unit(every, unit_idx.to(torch.int64), as_gather=True)
 
     def merged_layout(
         self, rider: nn.Linear, fold: nn.Linear
