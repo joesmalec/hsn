@@ -149,6 +149,11 @@ BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "selectiv
 #: with the sweep's cell round as one fused CUDA op (:mod:`hsn.kernels.window`): experimental,
 #: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
 WindowMode = Literal["autograd", "split", "fused"]
+#: Opt-in (``hardware.round_products``, ``docs/word_event_speed.md``): how the compiled autograd
+#: window's sparse round takes its matrix products. ``separate``: one product per map and every
+#: unit on every selected pair, as since P2.8. ``merged``: the same dot products in fewer and
+#: smaller products (equal to rounding).
+RoundProducts = Literal["separate", "merged"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal[
     "hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet", "moe"
@@ -1583,6 +1588,14 @@ class HardwareConfig(_StrictModel):
     # mode. compile_mode above keeps its meaning (the HSN's window; the generic trainer ignores
     # it). none (default): the baselines train eager, as before the key.
     baseline_compile: BaselineCompileMode = "none"
+    # Opt-in (17 Nov 2026, docs/word_event_speed.md): how the compiled autograd window's sparse
+    # round takes its matrix products. separate (default): as before. merged: fewer and smaller
+    # products for the same dot products: a (cell, unit) pair is multiplied with its own unit's
+    # weights only (UnitBank.forward_static_segments; separate runs every unit on every pair
+    # and gathers one), the gate's linear rides in the unit bank's first product and W_out is
+    # folded into its second, and P and S share one product per layer. Equal to rounding (other
+    # matmul shapes), not bit for bit. Needs hardware.compile_mode and model.routing=topk.
+    round_products: RoundProducts = "separate"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1681,6 +1694,13 @@ class RunConfig(_StrictModel):
                 raise ValueError(
                     f"hardware.window={self.hardware.window!r} is not available for this "
                     f"configuration: {reason}"
+                )
+        if self.hardware.round_products != "separate":
+            reason = round_products_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.round_products={self.hardware.round_products} is not available "
+                    f"for this configuration: {reason}"
                 )
         if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
@@ -2242,6 +2262,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.reader_mask",
     "train.host_sync",
     "train.fused_adamw",
+    "hardware.round_products",
     "baseline.gated_deltanet",
 )
 
@@ -2332,6 +2353,23 @@ def write_events_refusals(cfg: RunConfig) -> list[str]:
     if train.lambda_w > 0.0:
         refused.append(f"train.lambda_w={train.lambda_w} (A10's write cost, per position)")
     return refused
+
+
+def round_products_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot run ``hardware.round_products=merged``
+    (``docs/word_event_speed.md``), or ``None`` when it can. The key changes how the compiled
+    autograd window's sparse round takes its matrix products; a configuration in which no
+    such round runs is refused instead of ignoring the key."""
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return f"model_name={cfg.model_name!r} without the memory's cells has no sparse round"
+    if cfg.hardware.compile_mode == "none":
+        return (
+            "hardware.compile_mode=none: the eager round groups the pairs by unit already "
+            "(UnitBank.forward_selected); the key is the compiled window's"
+        )
+    if cfg.model.routing != "topk":
+        return f"model.routing={cfg.model.routing!r}: only the routed sparse round selects pairs"
+    return None
 
 
 def split_window_scope_error(

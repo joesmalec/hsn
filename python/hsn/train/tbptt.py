@@ -498,7 +498,11 @@ class TBPTTTrainer(Trainer):
             if cfg.hardware.graph_alias_index:  # opt-in: PyTorch's alias check by index
                 install_graph_alias_index()
             window = compile_window(
-                model, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
+                model,
+                ctx,
+                cfg.hardware.compile_mode,
+                grad_accum=cfg.train.grad_accum,
+                merged=cfg.hardware.round_products == "merged",
             )
             if isinstance(window, CompiledWindow):  # MPS without compile support: eager
                 self._compiled = window

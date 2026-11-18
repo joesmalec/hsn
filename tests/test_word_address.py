@@ -516,7 +516,7 @@ def test_compiled_word_events_compile_once(kind: str, monkeypatch: pytest.Monkey
     window equals the eager event loop (values, integer outputs, the carried address and the
     parameter gradients). The cause it guards: the blocks read slices of ``[B, E, …]``, whose
     stride holds ``E``, and every new ``E`` compiled a new graph (FailOnRecompileLimitHit after
-    eight; ``hsn.train.compile._full_width``)."""
+    eight; ``hsn.train.compile._block_columns``)."""
     from torch._dynamo.utils import counters
 
     monkeypatch.setattr("hsn.model.hsn.EVENT_BLOCK", p28.compile_mod.MAX_BLOCK)  # small_blocks
