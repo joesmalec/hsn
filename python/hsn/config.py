@@ -2359,12 +2359,12 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.host_sync",
     "train.fused_adamw",
     "hardware.round_products",
-    "hardware.message_gradients",
     "baseline.transformer.position",
     "baseline.transformer.carry",
     "train.reach_dropout",
     "train.reach_dropout_span",
     "baseline.gated_deltanet",
+    "hardware.message_gradients",
 )
 
 
