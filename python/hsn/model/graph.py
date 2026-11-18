@@ -134,6 +134,11 @@ class CellGraph(nn.Module):
         #: The per-window cache of :meth:`window` (``None`` outside a window): name ->
         #: ((edge_logit id, its version, grad mode), tensor).
         self._window_cache: dict[str, tuple[tuple[int, int, bool], Tensor]] | None = None
+        #: ``hardware.message_gradients=state`` (opt-in, ``docs/perbyte_speed.md``; set by the
+        #: trainer, :func:`hsn.train.compile.apply_message_gradients`):
+        #: :meth:`messages_selected` accumulates the gradients of its two gathers in the
+        #: state's dtype instead of the autocast dtype. The values it returns are the same.
+        self.state_gradients = False
 
         indptr, indices, is_random = _build_topology(n_cells, in_degree, random_edges, seed)
         _check_topology(indptr, indices, is_random, n_cells, in_degree)
@@ -303,16 +308,29 @@ class CellGraph(nn.Module):
         :meth:`Router.select`) skips it and keeps the shape, dtype and device checks. ``weights``
         as in :meth:`messages_dense`. ``vh`` (P2.10, the forward sweep) is ``V(h_prev)``
         ``[B, N, d]`` already computed by the caller (in a matmul it shares with the scorer);
-        ``V`` is then not applied here."""
+        ``V`` is then not applied here.
+
+        :attr:`state_gradients` (``hardware.message_gradients=state``): the two gathers read
+        the edge weights before their cast to the message dtype and ``V h`` through the state's
+        dtype, and cast what they gathered. A cast and a gather commute, so the gathered
+        values, and with them the messages, are the same bit for bit; what changes is the
+        dtype in which autograd adds up the gradients of the rows gathered more than once:
+        the state's (fp32 under bf16 autocast) instead of the message dtype (bf16). Without
+        autocast the dtypes agree, the casts are no-ops and this is the same computation."""
         B, _, d = self._check_h(h_prev)
         K = self._check_cell_idx(cell_idx, B, check_values=validate)
         D = self._max_in_degree
         Vh: Tensor = V(h_prev) if vh is None else vh  # [B, N, d]
-        padded = self._padded_weights_as(Vh.dtype) if weights is None else weights.to(Vh.dtype)
-        weights_sel = padded[cell_idx]  # [B, K, D_max]
         source_idx = self._pad_src[cell_idx].reshape(B, K * D, 1).expand(B, K * D, d)
-        sources = Vh.gather(1, source_idx).reshape(B, K, D, d)
-        return (sources * weights_sel[..., None]).sum(dim=2)
+        if self.state_gradients:
+            own = self._padded_weights() if weights is None else weights  # [N, D_max]
+            weights_sel = own[cell_idx].to(Vh.dtype)  # [B, K, D_max]
+            sources = Vh.to(h_prev.dtype).gather(1, source_idx).to(Vh.dtype)
+        else:
+            padded = self._padded_weights_as(Vh.dtype) if weights is None else weights.to(Vh.dtype)
+            weights_sel = padded[cell_idx]  # [B, K, D_max]
+            sources = Vh.gather(1, source_idx)
+        return (sources.reshape(B, K, D, d) * weights_sel[..., None]).sum(dim=2)
 
     # -- topology ---------------------------------------------------------------------------------
 

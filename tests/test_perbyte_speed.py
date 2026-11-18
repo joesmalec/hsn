@@ -1,10 +1,9 @@
-"""The per-byte loop's block inputs (``docs/perbyte_speed.md``, 18 Nov 2026).
+"""The per-byte step-time work of 18 Nov 2026 (``docs/perbyte_speed.md``).
 
-The compiled autograd window hands every block of the loop over bytes its inputs (the encoded
-bytes, the context with the reader's output, the scorer's scalars, the resets) as dense
-tensors (:func:`hsn.train.compile._window_blocks`): one copy of the window, laid out block by
-block, instead of a slice of the window per block. It is a change of layout only. These tests
-check that nothing else changed:
+**The block inputs.** The compiled autograd window hands every block of the loop over bytes
+its inputs (the encoded bytes, the context with the reader's output, the scorer's scalars, the
+resets) as dense tensors (:func:`hsn.train.compile._window_blocks`): one copy of the window,
+laid out block by block, instead of a slice of the window per block. A change of layout only:
 
 * the blocks hold the slices' values, are dense, and one block is the tensor itself;
 * the gradient that reaches the window's tensor is the slices' bit for bit, a ``-0.0`` in a
@@ -14,6 +13,16 @@ check that nothing else changed:
   final state, the next cache, every parameter gradient (and so it equals the eager window as
   before, which the compile tests keep checking);
 * the trainer over several optimiser steps: the same records, gradients and weights.
+
+**Three per-position fallbacks, bit for bit.** The chosen unit's gather in the all-units pass
+through :func:`hsn.model.units.pick_unit` (``as_gather``), :meth:`Router._selected` and the
+one-hot of the chosen units by comparison: each against the form it replaces.
+
+**``hardware.message_gradients=state``** (opt-in): the messages of the sparse round add up the
+gradients of their two gathers in the state's dtype. The messages are the same bit for bit
+under bf16 autocast; without autocast the whole computation is; under autocast the two
+gradients are the fp32 sums of what the default adds up in bf16; the key's place in the
+configuration and its refusals.
 """
 
 from __future__ import annotations
@@ -24,13 +33,24 @@ from pathlib import Path
 import pytest
 import test_p2_8_compile as p28
 import torch
+from hsn.config import (
+    HASH_OMIT_AT_DEFAULT,
+    REPO_ROOT,
+    config_hash,
+    load_config,
+    message_gradients_scope_error,
+)
 from hsn.device import resolve, seed_everything
+from hsn.experiments.spec import memory_key
+from hsn.model.graph import CellGraph
 from hsn.model.hsn import WindowCarry, address_history
 from hsn.model.hsn_t import HSNT
+from hsn.model.router import Router
+from hsn.model.units import UnitBank, pick_unit
 from hsn.runner import build_model
 from hsn.train import compile as compile_mod
 from hsn.train import tbptt as tbptt_mod
-from hsn.train.compile import _window_blocks
+from hsn.train.compile import _window_blocks, apply_message_gradients
 from hsn.train.tbptt import TBPTTTrainer
 from p1_15_support import datasets, hsn_config
 from test_a6_feedback_detach import A5
@@ -41,6 +61,9 @@ from test_write_events import CATTN, NGRAM, STE
 from torch import Tensor
 
 CARRY = "model.reader_carry=5"
+RECIPE = REPO_ROOT / "configs" / "experiments" / "hsn_t_memory_carry.yaml"
+CARD = ("profile=rtx3060", "hardware.compile_mode=reduce-overhead")
+STATE = "hardware.message_gradients=state"
 
 
 def _slices(x: Tensor, blk: int) -> tuple[Tensor, ...]:
@@ -288,3 +311,271 @@ def test_trainer_steps_are_the_same_bit_for_bit(
             assert _same_bits(got[name], value), name
     for name, value in old[2].items():
         assert _same_bits(new[2][name], value), name
+
+
+# --------------------------------------------------------------------------------------------------
+# Three per-position fallbacks, bit for bit
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_pick_unit_as_gather_has_the_gathers_gradient_bit_for_bit(dtype: torch.dtype) -> None:
+    """The value is the gather's; the gradient is the gather's own (a zero tensor with each
+    row added at its unit) bit for bit, where the incoming gradient holds ``-0.0`` too."""
+    generator = torch.Generator().manual_seed(0)
+    P, M, W = 37, 5, 6
+    unit = torch.randint(0, M, (P,), generator=generator)
+    weights = torch.randn(P, W, generator=generator).to(dtype)
+    weights[::4, 0] = -0.0
+    index = unit[:, None, None].expand(P, 1, W)
+
+    def run(pick: object) -> tuple[Tensor, Tensor]:
+        x = torch.randn(P, M, W, generator=torch.Generator().manual_seed(1)).to(dtype)
+        x.requires_grad_(True)
+        out = pick(x)  # type: ignore[operator]
+        (grad,) = torch.autograd.grad((out * weights).sum(), x)
+        return out.detach(), grad
+
+    want, want_grad = run(lambda x: x.gather(1, index).squeeze(1))
+    got, got_grad = run(lambda x: pick_unit(x, unit, as_gather=True))
+    assert _same_bits(got, want) and _same_bits(got_grad, want_grad)
+    assert not bool(((want_grad == 0) & torch.signbit(want_grad)).any())
+    # the merged round's pick (as_gather=False, as it was) writes the row as it comes
+    plain, plain_grad = run(lambda x: pick_unit(x, unit))
+    assert _same_bits(plain, want) and torch.equal(plain_grad, want_grad)
+    assert bool(((plain_grad == 0) & torch.signbit(plain_grad)).any())
+
+
+def test_static_unit_pass_is_the_gather_of_the_all_units_pass() -> None:
+    """:meth:`UnitBank.forward_static` against every unit's output with a gather: the value
+    and every gradient (the input, the four stacked parameters) bit for bit."""
+    torch.manual_seed(0)
+    bank = UnitBank(8, 6, 10, "gelu", init="trunc_normal_0.02")
+    generator = torch.Generator().manual_seed(3)
+    P = 23
+    unit = torch.randint(0, bank.n_units, (P,), generator=generator)
+    weights = torch.randn(P, bank.d, generator=generator)
+    v0 = torch.randn(P, bank.in_dim, generator=generator)
+
+    def run(static: bool) -> list[Tensor]:
+        v = v0.clone().requires_grad_(True)
+        if static:
+            out = bank.forward_static(v, unit)
+        else:
+            every = bank.forward_all(v.reshape(1, P, bank.in_dim))[0]
+            out = every.gather(1, unit[:, None, None].expand(P, 1, bank.d)).squeeze(1)
+        grads = torch.autograd.grad((out * weights).sum(), [v, *bank.parameters()])
+        return [out.detach(), *grads]
+
+    for got, want in zip(run(True), run(False), strict=True):
+        assert _same_bits(got, want)
+
+
+def test_selected_cells_by_comparison_are_the_counted_ones() -> None:
+    """:meth:`Router._selected` against the count of the valid slots per cell it replaces
+    (a ``scatter_add``), with padded slots (index 0, not valid) and a repeated cell."""
+    generator = torch.Generator().manual_seed(0)
+    B, K, N = 7, 5, 11
+    for trial in range(20):
+        cells = torch.stack([torch.randperm(N, generator=generator)[:K] for _ in range(B)])
+        valid = torch.rand(B, K, generator=generator) < 0.7
+        cells = cells.masked_fill(~valid, 0)
+        if trial % 5 == 0:
+            cells[0, 1] = cells[0, 0]  # a repeat: the count is 2, still "selected"
+        counts = torch.zeros(B, N, dtype=torch.int64).scatter_add(1, cells, valid.to(torch.int64))
+        assert torch.equal(Router._selected(cells, valid, N), counts > 0)
+
+
+def test_one_hot_by_comparison_is_one_hot() -> None:
+    generator = torch.Generator().manual_seed(0)
+    M = 8
+    unit_full = torch.randint(0, M, (4, 9), generator=generator)
+    by_comparison = (unit_full[:, :, None] == torch.arange(M)).to(torch.float32)
+    want = torch.nn.functional.one_hot(unit_full, M).to(torch.float32)
+    assert _same_bits(by_comparison, want)
+
+
+# --------------------------------------------------------------------------------------------------
+# hardware.message_gradients=state (opt-in)
+# --------------------------------------------------------------------------------------------------
+
+
+def _graph_case(
+    dtype: torch.dtype = torch.float32,
+) -> tuple[CellGraph, torch.nn.Linear, Tensor, Tensor, Tensor]:
+    torch.manual_seed(0)
+    generator = torch.Generator().manual_seed(4)
+    N, d, B, K = 12, 8, 6, 5
+    graph = CellGraph(N, 3, 0).to(dtype)
+    with torch.no_grad():
+        graph.edge_logit.copy_(torch.randn(graph.edge_logit.shape, generator=generator))
+    V = torch.nn.Linear(d, d, bias=False).to(dtype)
+    h = (torch.rand(B, N, d, generator=generator) * 1.6 - 0.8).to(dtype)
+    cells = torch.stack([torch.randperm(N, generator=generator)[:K] for _ in range(B)])
+    weights = torch.randn(B, K, d, generator=generator).to(dtype)
+    return graph, V, h, cells, weights
+
+
+def _messages(
+    graph: CellGraph, V: torch.nn.Linear, h: Tensor, cells: Tensor, weights: Tensor, *, bf16: bool
+) -> tuple[Tensor, list[Tensor]]:
+    """The messages of the selected cells and the gradients of a fixed functional of them
+    with respect to the state, ``V`` and the edge logits."""
+    h = h.clone().requires_grad_(True)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
+        m = graph.messages_selected(h, V, cells, validate=False)
+        loss = (m.float() * weights.float()).sum()
+    grads = torch.autograd.grad(loss, [h, V.weight, graph.edge_logit])
+    return m.detach(), list(grads)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_state_gradients_without_autocast_are_the_same_computation(dtype: torch.dtype) -> None:
+    graph, V, h, cells, weights = _graph_case(dtype)
+    want, want_grads = _messages(graph, V, h, cells, weights, bf16=False)
+    graph.state_gradients = True
+    got, grads = _messages(graph, V, h, cells, weights, bf16=False)
+    assert got.dtype == dtype and _same_bits(got, want)
+    for g, w in zip(grads, want_grads, strict=True):
+        assert _same_bits(g, w)
+
+
+def test_state_gradients_under_autocast_keep_the_messages_and_sum_in_fp32() -> None:
+    """bf16 autocast: the messages are the same bits. The gradients of the state and of
+    ``V`` and the edge logits differ from the default's by its bf16 sums only: they agree
+    with it to bf16 rounding, and they are at least as close to the gradients of the same
+    messages computed in float64 (the same bf16 forward values held in float64, no rounding
+    in the backward sums) as the default's are."""
+    graph, V, h, cells, weights = _graph_case()
+    want, want_grads = _messages(graph, V, h, cells, weights, bf16=True)
+    graph.state_gradients = True
+    got, grads = _messages(graph, V, h, cells, weights, bf16=True)
+    assert got.dtype == torch.bfloat16 and _same_bits(got, want)
+    changed = 0
+    for g, w in zip(grads, want_grads, strict=True):
+        scale = float(w.abs().max())
+        assert float((g - w).abs().max()) <= 0.05 * scale  # bf16: 8 bits, a few sums deep
+        changed += int(not torch.equal(g, w))
+    assert changed > 0  # the case does hold rows gathered more than once
+    # the gradient of the edge weights: the default adds each selected row's gradient in bf16,
+    # the key in fp32. Against the exact sum of the same bf16 addends:
+    graph.state_gradients = False
+    padded = graph._padded_weights().detach()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        Vh = V(h).detach()
+    D, B, K, d = graph.max_in_degree, *cells.shape, h.shape[-1]
+    source_idx = graph._pad_src[cells].reshape(B, K * D, 1).expand(B, K * D, d)
+    sources = Vh.gather(1, source_idx).reshape(B, K, D, d)
+    # d loss / d weights_sel [B, K, D], each addend as the bf16 backward forms it
+    addends = (sources * weights.to(torch.bfloat16)[:, :, None, :]).sum(dim=3)
+    exact = torch.zeros(padded.shape, dtype=torch.float64).index_put(
+        (cells,), addends.double(), accumulate=True
+    )
+
+    def edge_weight_grad(state: bool) -> Tensor:
+        graph.state_gradients = state
+        own = graph._padded_weights().detach().requires_grad_(True)
+        hh = h.clone()
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            m = graph.messages_selected(hh, V, cells, weights=own, validate=False)
+            loss = (m.float() * weights.float()).sum()
+        (grad,) = torch.autograd.grad(loss, own)
+        return grad.double()
+
+    error_default = float((edge_weight_grad(False) - exact).abs().max())
+    error_state = float((edge_weight_grad(True) - exact).abs().max())
+    assert error_state <= error_default
+    assert error_state <= 1e-5 * float(exact.abs().max())  # fp32 sums of the same addends
+
+
+def test_message_gradients_key_is_off_by_default_and_left_out_of_the_hash() -> None:
+    base = load_config(RECIPE, list(CARD))
+    assert base.hardware.message_gradients == "autocast"
+    assert "hardware.message_gradients" in HASH_OMIT_AT_DEFAULT
+    off = load_config(RECIPE, [*CARD, "hardware.message_gradients=autocast"])
+    assert config_hash(off) == config_hash(base)
+    assert "message_gradients" not in base.hardware.model_dump(exclude_defaults=True)
+    on = load_config(RECIPE, [*CARD, STATE])
+    assert on.hardware.message_gradients == "state"
+    assert message_gradients_scope_error(on) is None
+    assert config_hash(on) != config_hash(base)
+    assert on.model == base.model and on.train == base.train
+    protocol = {"name": "train_eval", "eval_batch": 128, "probe_batch": 64, "diag_docs": 32}
+    assert memory_key(off, "pdg", protocol) == memory_key(base, "pdg", protocol)
+    assert memory_key(on, "pdg", protocol) != memory_key(base, "pdg", protocol)
+    # with the merged products, on the CPU and eager: the key is the round's, not the card's
+    both = load_config(RECIPE, [*CARD, STATE, "hardware.round_products=merged"])
+    assert both.hardware.round_products == "merged"
+    assert load_config(RECIPE, [STATE]).hardware.compile_mode == "none"
+    words = REPO_ROOT / "configs" / "experiments" / "hsn_t_memory_words_carry.yaml"
+    assert load_config(words, [*CARD, STATE]).hardware.message_gradients == "state"
+
+
+@pytest.mark.parametrize(
+    ("path", "overrides", "reason"),
+    [
+        (p28.REF_A1, (STATE,), "model.routing=dense"),
+        (RECIPE, (*CARD, "hardware.message_gradients=fp32"), "'autocast' or 'state'"),
+        (
+            REPO_ROOT / "configs" / "experiments" / "hsn_t_nomem.yaml",
+            (*CARD, STATE),
+            "has no sparse round",
+        ),
+        (
+            REPO_ROOT / "configs" / "experiments" / "hsn_recipe_a6.yaml",
+            (*CARD, "hardware.window=fused", STATE),
+            "hardware.window=fused",
+        ),
+    ],
+)
+def test_message_gradients_key_is_refused_outside_its_scope(
+    path: Path, overrides: tuple[str, ...], reason: str
+) -> None:
+    with pytest.raises(ValueError, match=reason):
+        load_config(path, list(overrides))
+
+
+def test_trainer_sets_the_graphs_gradient_dtype(tmp_path: Path) -> None:
+    def graph_flag(*extra: str) -> bool:
+        cfg = hsn_config(4, *A5, STE, "train.soft_until_step=0", *extra)
+        seed_everything(0)
+        model = build_model(cfg)
+        trainer = TBPTTTrainer(model, cfg, resolve(cfg.hardware), run_dir=tmp_path / "run")
+        return bool(trainer.hsn.cell.graph.state_gradients)
+
+    assert graph_flag() is False
+    assert graph_flag(STATE) is True
+    model = _carry_model()
+    apply_message_gradients(model, "state")
+    assert model.cell.graph.state_gradients is True
+    apply_message_gradients(model, "autocast")
+    assert model.cell.graph.state_gradients is False
+    with pytest.raises(ValueError, match="autocast or state"):
+        apply_message_gradients(model, "fp32")
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", p28.CPU_BACKEND])
+@pytest.mark.usefixtures("small_blocks")
+def test_compiled_window_with_state_gradients_without_autocast(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fp32, no autocast: the compiled window with the key is the compiled window without
+    it bit for bit (the casts are no-ops: the same graph)."""
+    old = _run_windows(backend, (), None, monkeypatch)
+    torch._dynamo.reset()
+    model = _carry_model()
+    apply_message_gradients(model, "state")
+    window = p28._window(model, p28._ctx(), backend)
+    T = 20
+    state = p28._inputs(model, b=3, t=T)[2]
+    carry: Tensor | WindowCarry | None = None
+    for i, (tokens, ctx, reset) in enumerate(_compiled_windows(T)):
+        got = p28._run(functools.partial(window, tokens, ctx, state, reset, prev_tokens=carry))
+        ref, ref_grads = old[i]
+        assert _same_bits(got[0], ref[0]) and _same_bits(got[1].h, ref[1].h)
+        for g, r in zip(p28._grads(model, got), ref_grads, strict=True):
+            assert (g is None) == (r is None)
+            if g is not None and r is not None:
+                assert _same_bits(g, r), i
+        carry = address_history(model.cfg, tokens, carry, got[2])
+        state = got[1].detach()

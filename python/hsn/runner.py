@@ -83,7 +83,7 @@ from hsn.profiler import (
 from hsn.train.amp import autocast_ctx
 from hsn.train.baseline_compile import compile_baseline
 from hsn.train.checkpoint import load_checkpoint
-from hsn.train.compile import compile_window
+from hsn.train.compile import apply_message_gradients, compile_window
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
 from hsn.train.probes import choose_probe_position, probe_window, window_split
 from hsn.train.tbptt import TBPTTTrainer
@@ -438,6 +438,7 @@ def profile_run(
     api = cast(SequenceModel, replica)
     forward: Callable[..., Any] = replica
     warm_windows = 1
+    apply_message_gradients(replica, cfg.hardware.message_gradients)  # as the trainer
     if ctx.compile_enabled and isinstance(replica, HSN):  # P2.8: the trainer's window
         forward = compile_window(
             replica,

@@ -131,6 +131,7 @@ __all__ = [
     "CompileMode",
     "CompiledWindow",
     "ServingStep",
+    "apply_message_gradients",
     "block_size",
     "check_compile_scope",
     "compile_step",
@@ -169,6 +170,19 @@ MERGE_UNITS = True
 MERGE_FRONT = True
 
 WindowOut = tuple[Tensor, CellGraphState, dict[str, Tensor]]
+
+
+def apply_message_gradients(model: nn.Module, kind: str) -> None:
+    """``hardware.message_gradients`` on ``model`` (``docs/perbyte_speed.md``): ``state``
+    makes the sparse round's messages accumulate the gradients of their two gathers in the
+    state's dtype (:attr:`hsn.model.graph.CellGraph.state_gradients`); ``autocast`` (the
+    default) leaves them in the autocast dtype, as before. The trainer and the runner's
+    profile pass call it on the model they run; a model without the memory's cells is left
+    alone (the configuration refuses the key there)."""
+    if kind not in ("autocast", "state"):
+        raise ValueError(f"hardware.message_gradients must be autocast or state, got {kind!r}")
+    if isinstance(model, HSN):
+        model.cell.graph.state_gradients = kind == "state"
 
 
 def block_size(T: int) -> int:
