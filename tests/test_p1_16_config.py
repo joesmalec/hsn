@@ -141,6 +141,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.reach_dropout",  # short-span rows of HSN-T's reader in training (opt-in, 17 Nov)
         "train.reach_dropout_span",
         "baseline.gated_deltanet",  # the Gated DeltaNet baseline's sizes (17 Nov 2026)
+        "hardware.message_gradients",  # the messages' gradient sums in fp32 (opt-in, 18 Nov)
     )
     # evaluation-only sections are never hashed, whatever they hold (eval.*, 18 Nov 2026)
     assert HASH_EXCLUDED == ("eval",)

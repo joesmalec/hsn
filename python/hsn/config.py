@@ -160,6 +160,11 @@ WindowMode = Literal["autograd", "split", "fused"]
 #: unit on every selected pair, as since P2.8. ``merged``: the same dot products in fewer and
 #: smaller products (equal to rounding).
 RoundProducts = Literal["separate", "merged"]
+#: Opt-in (``hardware.message_gradients``, ``docs/perbyte_speed.md``): the dtype in which the
+#: sparse round's messages accumulate the two gradients of their gathers (the edge weights' and
+#: ``V h``'s). ``autocast``: in the autocast dtype, as before. ``state``: in the state's dtype
+#: (fp32 under bf16 autocast). The forward values are the same bit for bit.
+MessageGradients = Literal["autocast", "state"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal[
     "hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet", "moe"
@@ -1710,6 +1715,17 @@ class HardwareConfig(_StrictModel):
     # folded into its second, and P and S share one product per layer. Equal to rounding (other
     # matmul shapes), not bit for bit. Needs hardware.compile_mode and model.routing=topk.
     round_products: RoundProducts = "separate"
+    # Opt-in (18 Nov 2026, docs/perbyte_speed.md): the dtype in which the sparse round's
+    # messages accumulate the gradients of their two gathers: the edge weights (one row per
+    # selected cell) and V h (one row per source of a selected cell). autocast (default): as
+    # before, in the autocast dtype (bf16 on the cards), where a compiled window runs both
+    # accumulations outside its fused kernels (an index_put with a sort and a scatter-add: 39 µs
+    # at every position on the RTX 3060). state: in the state's dtype (fp32 under bf16
+    # autocast), where they fuse. The forward values are the same bit for bit and without
+    # autocast the two are one computation; under autocast the two gradients are summed in
+    # fp32 instead of bf16 (equal to rounding, not bit for bit). Needs the memory's cells
+    # and a routed round on the autograd window.
+    message_gradients: MessageGradients = "autocast"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1816,6 +1832,13 @@ class RunConfig(_StrictModel):
                 raise ValueError(
                     f"hardware.round_products={self.hardware.round_products} is not available "
                     f"for this configuration: {reason}"
+                )
+        if self.hardware.message_gradients != "autocast":
+            reason = message_gradients_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.message_gradients={self.hardware.message_gradients} is not "
+                    f"available for this configuration: {reason}"
                 )
         if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
@@ -2416,6 +2439,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.reach_dropout",
     "train.reach_dropout_span",
     "baseline.gated_deltanet",
+    "hardware.message_gradients",
 )
 
 #: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
@@ -2529,6 +2553,25 @@ def round_products_scope_error(cfg: RunConfig) -> str | None:
         )
     if cfg.model.routing != "topk":
         return f"model.routing={cfg.model.routing!r}: only the routed sparse round selects pairs"
+    return None
+
+
+def message_gradients_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot run ``hardware.message_gradients=state``
+    (``docs/perbyte_speed.md``), or ``None`` when it can. The key changes the dtype in which
+    the sparse round's messages accumulate two gradients
+    (:meth:`hsn.model.graph.CellGraph.messages_selected`); a configuration in which that
+    round does not run, or runs on a window that takes the messages its own way, is refused
+    instead of ignoring the key."""
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return f"model_name={cfg.model_name!r} without the memory's cells has no sparse round"
+    if cfg.model.routing == "dense":
+        return "model.routing=dense: the dense round gathers no messages by selection"
+    if cfg.hardware.window != "autograd":
+        return (
+            f"hardware.window={cfg.hardware.window}: the split and fused windows take the "
+            "messages in their own sweep and replay (not measured with the key)"
+        )
     return None
 
 
