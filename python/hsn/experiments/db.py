@@ -531,6 +531,26 @@ def arm_row(arm: Any) -> dict[str, Any]:
     }
 
 
+def _eval_difference(conn: sqlite3.Connection, exp_id: int, arm: Any) -> dict[str, Any]:
+    """``eval.*`` (evaluation-only reports, :data:`hsn.config.HASH_EXCLUDED`) is not part of an
+    arm id, so an arm enqueued with other reports than its existing attempt is the same arm and
+    is skipped like any other. This says so: ``{"eval_differs": True, "run_dir": ...}`` when the
+    attempt ``exp_id`` holds other ``eval`` settings than ``arm`` asks for (a configuration
+    stored before the section existed holds its defaults), else nothing."""
+    row = conn.execute(
+        "SELECT e.config_json AS own, a.config_json AS arm, e.run_dir AS run_dir "
+        "FROM experiments e JOIN arms a ON a.arm_id = e.arm_id WHERE e.exp_id = ?",
+        (exp_id,),
+    ).fetchone()
+    stored = (loads(row["own"] or row["arm"]) or {}).get("eval")
+    asked = arm.config.eval.model_dump(mode="json")
+    if stored is None:
+        stored = type(arm.config.eval)().model_dump(mode="json")
+    if stored == asked:
+        return {}
+    return {"eval_differs": True, "run_dir": row["run_dir"]}
+
+
 def enqueue_arms(
     db: Database,
     *,
@@ -546,7 +566,10 @@ def enqueue_arms(
 ) -> EnqueueReport:
     """Register the sweep version and queue every arm that has no queued, running, done or
     stopped-early experiment (``force`` queues anyway; imported runs never block unless
-    ``skip_imported``). One transaction. P1.14: every arm it would add passes the step-time rule
+    ``skip_imported``). A skipped arm whose existing attempt holds other ``eval.*`` settings
+    carries ``eval_differs`` and that attempt's ``run_dir`` (:func:`_eval_difference`): the
+    reports are not part of the arm id, so asking for one later queues nothing. One
+    transaction. P1.14: every arm it would add passes the step-time rule
     (:func:`hsn.experiments.steptime.enqueue_refusal`); any refusal raises
     :class:`~hsn.experiments.steptime.StepTimeRefused` and queues nothing. Each added entry
     carries the arm's expected step time (``step_s``, None when no run of its memory key exists)."""
@@ -574,7 +597,12 @@ def enqueue_arms(
                 report.imported_matches.append({**entry, "exp_id": imported[-1]["exp_id"]})
             if own and not force:
                 report.skipped.append(
-                    {**entry, "exp_id": own[-1]["exp_id"], "status": own[-1]["status"]}
+                    {
+                        **entry,
+                        "exp_id": own[-1]["exp_id"],
+                        "status": own[-1]["status"],
+                        **_eval_difference(conn, own[-1]["exp_id"], arm),
+                    }
                 )
                 continue
             if imported and skip_imported and not force:

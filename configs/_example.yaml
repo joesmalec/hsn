@@ -286,6 +286,13 @@ serve: # Appendix A.4 (P5.3 / P5.4)
     rps_per_tenant: 10.0
   capture_policy: disabled # disabled | local_only | shared_candidates
 
+eval: # opt-in evaluation reports (not in Appendix A); nothing here changes training or a metric, and the section is never part of the config hash or an arm id
+  by_distance: # score by distance (docs/distance_eval.md); off = nothing runs
+    enabled: false # true: when training ends, one more evaluation pass per set and the bucket tables in the run record (by_distance)
+    every_eval: false # also at every evaluation of the run (dev set only; each evaluation entry gains by_distance)
+    max_docs: null # the first max_docs documents of every task/variant group of a set; null = all
+    sets: [] # more dev sets scored at the end: [{name: far, manifest: data/synthetic_far/manifest.json, tasks: [], variants: []}]
+
 baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which baseline runs
   gru: # 1,977,856 parameters measured for V=256, 16 context symbols
     d_model: 384 # embedding and hidden width

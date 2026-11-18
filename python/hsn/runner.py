@@ -17,7 +17,8 @@ the HSN, the P0.5 trainer otherwise) → evaluation → result store (P0.8) → 
 directory ``<out>/<run_id>`` holds:
 
 ``config.resolved.yaml``, ``run_manifest.json`` (P0.2 writer), ``history.json`` (every step and
-evaluation), ``metrics.json`` (the final dev evaluation, measured numbers, hashes, data provenance),
+evaluation), ``metrics.json`` (the final dev evaluation, measured numbers, hashes, data provenance;
+with ``eval.by_distance.enabled`` also ``by_distance``: the tables of :mod:`hsn.eval.distance`),
 ``profile_train.json`` / ``profile_serve.json`` (P0.6 reports of a separate profiling pass),
 ``step_*.pt`` checkpoints, ``run.log``; a rerun directory adds ``rerun.json``. Results are appended
 to ``<out>/results.jsonl`` (:class:`~hsn.eval.results.ResultStore`).
@@ -651,7 +652,19 @@ def run_one(
         if cfg.train.init_from is not None:
             logger.info("warm start: %s", warm_start(model, cfg.train.init_from))
         trainer = make_trainer(model, cfg, ctx, run_dir=run_dir)
-        history: History = trainer.fit(train_ds, dev_ds, cfg.train.steps)
+        # eval.by_distance (opt-in, docs/distance_eval.md): the sets are loaded before the fit
+        by_distance: Any = None
+        if cfg.eval.by_distance.enabled:
+            from hsn.eval.distance import RunScorer
+
+            by_distance = RunScorer(cfg, dev_ds)
+            if cfg.eval.by_distance.every_eval:
+                trainer.eval_observer = by_distance.observer()
+        try:
+            history: History = trainer.fit(train_ds, dev_ds, cfg.train.steps)
+        finally:
+            trainer.eval_observer = None
+        distance_block = by_distance.final(trainer) if by_distance is not None else None
         train_report, serve_report = profile_run(
             model,
             cfg,
@@ -712,6 +725,8 @@ def run_one(
                 if trainer.compiled_baseline is not None
                 else {}
             ),
+            # eval.by_distance: the bucket tables of the final weights (absent: the key is off)
+            **({"by_distance": distance_block} if distance_block is not None else {}),
             "data": _data_provenance(cfg, train_ds, dev_ds),
             "profile_segments": PROFILE_SEGMENTS,
             "profile_steps": profile_steps,

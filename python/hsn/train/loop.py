@@ -53,7 +53,9 @@ sets the number of parallel streams of :meth:`Trainer.evaluate` only; training i
 the per-document metrics change by rounding at most. **P1.15:** :attr:`Trainer.eval_position_groups`
 (``None`` by default) labels the evaluation's loss positions
 (:func:`hsn.eval.evaluate.evaluate_windows`, ``position_groups``); the result gains
-``per_position_group``, everything else is computed as before.
+``per_position_group``, everything else is computed as before. :attr:`Trainer.eval_observer`
+(``None`` by default; :class:`EvalObserver`) watches the windows of :meth:`Trainer.evaluate`
+and adds its own entry to the result (``eval.by_distance``, :mod:`hsn.eval.distance`).
 
 **Compiled baselines.** ``hardware.baseline_compile`` (opt-in; ``none``, the default, is the
 trainer as it was) runs a baseline's training and evaluation windows through ``torch.compile``
@@ -212,7 +214,13 @@ from hsn.device import (
     set_deterministic,
     synchronize,
 )
-from hsn.eval.evaluate import DEFAULT_METRICS, Metric, PositionGroups, evaluate_windows
+from hsn.eval.evaluate import (
+    DEFAULT_METRICS,
+    Metric,
+    PositionGroups,
+    WindowObserver,
+    evaluate_windows,
+)
 from hsn.losses import task_cross_entropy
 from hsn.train.adaptive import AdaptiveLR
 from hsn.train.amp import autocast_ctx, autocast_name, make_grad_scaler
@@ -242,6 +250,7 @@ __all__ = [
     "SPIKE_MIN_HISTORY",
     "SPIKE_WINDOW",
     "BudgetExhaustedError",
+    "EvalObserver",
     "FitCallback",
     "History",
     "SearchBudget",
@@ -353,6 +362,21 @@ def _skipped_counter(extra: Mapping[str, Any], key: str, path: str) -> int:
 # --------------------------------------------------------------------------------------------------
 # Protocol and state helpers
 # --------------------------------------------------------------------------------------------------
+
+
+class EvalObserver(Protocol):
+    """An observer of :meth:`Trainer.evaluate` (:attr:`Trainer.eval_observer`): :meth:`start`
+    is called with the evaluated dataset and gives the per-window callback of the pass
+    (:data:`hsn.eval.evaluate.WindowObserver`); :meth:`finish`, called after the pass, gives the
+    value stored in the evaluation's result under :attr:`key`. It reads the pass and changes no
+    metric."""
+
+    @property
+    def key(self) -> str: ...
+
+    def start(self, ds: ByteDataset) -> WindowObserver: ...
+
+    def finish(self) -> Any: ...
 
 
 @runtime_checkable
@@ -878,6 +902,9 @@ class Trainer:
         # P1.15: labels of evaluate()'s loss positions (the reads-state harness's query slots,
         # hsn.experiments.split); a harness setting, not config. None: today's evaluation
         self.eval_position_groups: PositionGroups | None = None
+        # an observer of evaluate()'s windows that adds an entry to its result (eval.by_distance,
+        # hsn.eval.distance); a harness setting. None: today's evaluation
+        self.eval_observer: EvalObserver | None = None
         # P1.16: an extra checkpoint every this many steps (the harness's protocol keep_every); a
         # harness setting, not config (train.ckpt_every is unchanged). None: none
         self.extra_ckpt_every: int | None = None
@@ -1868,7 +1895,9 @@ class Trainer:
         Per-task entries live under ``"per_group"`` keyed ``"<task>/<variant>"``. The test split
         raises unless ``allow_test`` (gate scripts only). With ``train.weight_ema`` the averaged
         weights are scored (A6); ``averaged=False`` scores the training weights instead (without
-        the key the two are the same model).
+        the key the two are the same model). With :attr:`eval_observer` set, the observer sees
+        every window and its entry is added to the result under its key; the metrics are the
+        same with and without it.
         """
         self._refuse_test(ds, allow_test)
         if len(ds) == 0:
@@ -1885,6 +1914,8 @@ class Trainer:
         # A6: with train.weight_ema the averaged weights are scored (the training weights are
         # back, bit for bit, when the block ends)
         weights = self._averaged_weights() if averaged else contextlib.nullcontext()
+        observer = self.eval_observer
+        watch = observer.start(ds) if observer is not None else None
         with self._segment("evaluate"), weights:
             result = evaluate_windows(
                 self._eval_model(),
@@ -1895,8 +1926,11 @@ class Trainer:
                 group_of_doc=torch.tensor(ids, dtype=torch.int64),
                 group_names=names,
                 position_groups=self.eval_position_groups,  # P1.15 (None: no extra groups)
+                observer=watch,
             )
         result["n_docs"] = len(ds)
+        if observer is not None:
+            result[observer.key] = observer.finish()
         return result
 
     def _eval_model(self) -> Any:
