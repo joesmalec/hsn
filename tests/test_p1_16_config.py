@@ -122,6 +122,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.reader_mask",  # the reader's causal mask (opt-in, 17 Nov 2026)
         "train.host_sync",  # the generic trainer's host reads (opt-in, 17 Nov 2026)
         "train.fused_adamw",  # the fused AdamW (opt-in, 17 Nov 2026)
+        "baseline.gated_deltanet",  # the Gated DeltaNet baseline's sizes (17 Nov 2026)
     )
 
 

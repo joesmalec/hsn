@@ -1,0 +1,49 @@
+# Gated DeltaNet baseline at a ≈2M-parameter setting: 1,932,584 parameters measured by
+# GatedDeltaNetBaseline.param_report() for V=256 and 16 context symbols (d_model 176, 4 blocks,
+# 3 heads of key width 44 and value width 88, d_conv 4, MLP width 512). The fast-weight
+# associative-memory control (Yang, Kautz and Hatamizadeh, 2024), python/hsn/baselines/
+# gated_deltanet.py, docs/gated_deltanet_baseline.md. Trained with the generic trainer like the
+# GRU; the state (the fast weights and the convolution inputs of every block, 52,800 numbers per
+# row) is carried between windows.
+#
+# It needs flash-linear-attention's kernels (fla-core 0.6.0), which are not in the project
+# environment: run it with the interpreter of the environment scripts/gated_deltanet_env.sh
+# builds. It runs eager with those kernels (hardware.baseline_compile is refused).
+# Everything not listed keeps its Appendix A default (configs/_example.yaml).
+
+run_id: gated_deltanet_2m
+seed: 0
+notes: "Gated DeltaNet baseline, ~2M parameters (the fast-weight associative-memory control)."
+profile: cpu # override with `profile=<name>`
+model_name: gated_deltanet
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv, delayed, brackets, arithmetic, algorithmic]
+  variants: [in_range] # as the G0 baselines
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train:
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 256 # the window synthetic_v1 defines in_range against
+  batch: 4
+  micro_batch: 4
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  search_trials: 1 # the same budget for every method in the ladder
+
+baseline:
+  gated_deltanet:
+    d_model: 176
+    n_layers: 4
+    num_heads: 3
+    head_dim: 44 # num_heads x head_dim = 3/4 of d_model, as the reference keeps it
+    expand_v: 2
+    d_conv: 4
