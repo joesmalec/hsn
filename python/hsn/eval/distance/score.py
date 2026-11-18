@@ -193,6 +193,16 @@ def _manifest_name(path: str | Path | None) -> str | None:
     return SplitManifest.load(Path(path)).name if path is not None else None
 
 
+def _compile_seconds(trainer: Any) -> float | None:
+    """The seconds ``trainer``'s compiled windows have spent compiling or recording so far
+    (the HSN's window under ``hardware.compile_mode``, a baseline's under
+    ``hardware.baseline_compile``); ``None`` for an eager trainer."""
+    compiled = getattr(trainer, "compiled_window", None)
+    if compiled is None:
+        compiled = getattr(trainer, "compiled_baseline", None)
+    return float(compiled.compile_seconds) if compiled is not None else None
+
+
 class RunScorer:
     """``eval.by_distance`` of one run (module docstring). ``dev_ds`` is the run's dev set as
     it evaluates it (``None``: only the sets of ``eval.by_distance.sets``)."""
@@ -279,14 +289,23 @@ class RunScorer:
                 observer.add(scorer)
                 trainer.eval_observer = observer
                 began = time.perf_counter()
+                compiled_before = _compile_seconds(trainer)
                 try:
                     result = trainer.evaluate(scorer.ds)
+                    compiled_after = _compile_seconds(trainer)
                     block: dict[str, Any] = {
                         "accuracy": float(result["accuracy"]),
                         "loss": float(result["loss"]),
                         "n_positions": int(result["n_positions"]),
                         "n_windows": int(result["n_windows"]),
                         "seconds": round(time.perf_counter() - began, 3),
+                        # what of the pass was compiling or recording a window: 0 when the
+                        # run's evaluation variant served it; None for an eager trainer
+                        "compile_seconds": (
+                            round(compiled_after - compiled_before, 3)
+                            if compiled_before is not None and compiled_after is not None
+                            else None
+                        ),
                     }
                     groups = result[KEY]
                     if set(groups) == {"error"}:  # the pass ran, its tables failed

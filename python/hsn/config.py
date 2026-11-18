@@ -39,8 +39,8 @@ windows, keep the horizon inside the window and not run soft gates throughout. P
 keys (``train.rollback_*``, :data:`ROLLBACK_KEYS`) are off by default and, at their defaults, left
 out of the hash (:data:`HASH_OMIT_AT_DEFAULT`), so every configuration written before them keeps its
 ``config_hash``. ``eval.*`` (18 Nov 2026) holds opt-in evaluation reports
-(``eval.by_distance``, :mod:`hsn.eval.distance`); at its default the whole block is left out of
-the hash in the same way.
+(``eval.by_distance``, :mod:`hsn.eval.distance`); the whole section is evaluation-only and never
+enters the hash or an arm id, whatever it holds (:data:`HASH_EXCLUDED`).
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -69,6 +69,7 @@ __all__ = [
     "AUX_TERMS",
     "BASELINE_COMPILE_MODEL_NAMES",
     "HARDWARE_PROFILE_DIR",
+    "HASH_EXCLUDED",
     "HASH_OMIT_AT_DEFAULT",
     "HSN_MODEL_NAMES",
     "RETIRED_KEYS",
@@ -1618,7 +1619,8 @@ class DistanceSetConfig(_StrictModel):
 class ByDistanceConfig(_StrictModel):
     """``eval.by_distance`` (opt-in, 18 Nov 2026; ``docs/distance_eval.md``): score by distance.
 
-    Off (default): nothing runs, and the block is left out of the configuration hash. On: when
+    Evaluation-only, so never part of the configuration hash or an arm id, on or off
+    (:data:`HASH_EXCLUDED`). Off (default): nothing runs. On: when
     training ends, the run's dev set and every set of ``sets`` take one more evaluation pass
     each (the cost of one of the run's evaluations per set, plus host-side tables), and the
     bucket tables go to the run record as ``by_distance`` (:mod:`hsn.eval.distance`): accuracy
@@ -1748,7 +1750,7 @@ class RunConfig(_StrictModel):
     stream: StreamConfig = StreamConfig()
     serve: ServeConfig = ServeConfig()
     baseline: BaselineConfig = BaselineConfig()  # P0.5 baseline sizes (not in Appendix A)
-    eval: EvalConfig = EvalConfig()  # opt-in evaluation reports; hash-omitted at its default
+    eval: EvalConfig = EvalConfig()  # opt-in evaluation reports; never hashed (HASH_EXCLUDED)
     hardware: HardwareConfig  # resolved from `profile` by load_config, or given inline
     run_id: str = "default"
     seed: int = Field(default=0, ge=0)
@@ -2414,9 +2416,14 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.reach_dropout",
     "train.reach_dropout_span",
     "baseline.gated_deltanet",
-    "eval",
-    "eval.by_distance",
 )
+
+#: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
+#: (:func:`hsn.experiments.spec.config_view`), whatever they hold: evaluation-only reports
+#: (``eval.*``). They read a model and change nothing a run trains, so a run with a report on is
+#: the same run (the same hash, the same arm, checkpoints that resume either way) as without
+#: it. A key that could change a trained weight does not belong in such a section.
+HASH_EXCLUDED: tuple[str, ...] = ("eval",)
 
 
 #: ``model.memory = false`` (HSN-T without its memory, ``docs/hsn_t_no_memory.md``): the
@@ -2778,8 +2785,11 @@ def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
 
 def _hash_view(cfg: RunConfig) -> dict[str, Any]:
     """The configuration dump :func:`canonical_json` hashes: :meth:`RunConfig.model_dump` without
-    the :data:`HASH_OMIT_AT_DEFAULT` keys that hold their default."""
+    the :data:`HASH_EXCLUDED` sections and without the :data:`HASH_OMIT_AT_DEFAULT` keys that
+    hold their default."""
     dump = cfg.model_dump(mode="json")
+    for section in HASH_EXCLUDED:
+        dump.pop(section, None)
     for dotted in HASH_OMIT_AT_DEFAULT:
         parts = dotted.split(".")
         node = dump

@@ -9,6 +9,7 @@ tables.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -36,11 +37,13 @@ from hsn.data.synthetic import (
     load_dataset_spec,
 )
 from hsn.data.text import SourceSpec, TextSpec, build_text
+from hsn.device import resolve, seed_everything
 from hsn.eval.distance import (
     DISTANCE_KEYS,
     ByDistance,
     Captured,
     PositionCapture,
+    RunScorer,
     SetScorer,
     TextIndex,
     fact_positions,
@@ -55,10 +58,15 @@ from hsn.eval.distance.capture import flat_documents
 from hsn.eval.distance.recall import value_range
 from hsn.eval.distance.text import BOOTSTRAP, FrequentWords, build_frequent_words
 from hsn.eval.evaluate import DEFAULT_METRICS, evaluate_windows
+from hsn.experiments import db as dbm
+from hsn.experiments.cli import main as experiments_cli
 from hsn.experiments.protocols import ArmRun, run_protocol
 from hsn.experiments.rules import parse_rules
-from hsn.experiments.spec import protocol_params
+from hsn.experiments.spec import arm_identity, config_view, protocol_params
 from hsn.runner import build_model, make_trainer, run_one
+from hsn.train import compile as compile_mod
+from hsn.train import tbptt
+from hsn.train.compile import compile_window
 from hsn.train.loop import StreamLoader
 from p1_11_support import (
     GRU_2M,
@@ -68,11 +76,17 @@ from p1_11_support import (
     TINY_HSN_OVERRIDES,
     UNROLL,
     cpu_ctx,
+    db_path,
     disk_overrides,
     docs,
+    enqueue_spec,
+    isolated,  # noqa: F401  (fixture)
     restore_determinism,  # noqa: F401  (fixture)
     tiny_gru_config,
+    tiny_hsn_config,
     tiny_manifest,  # noqa: F401  (fixture)
+    train_overrides,
+    write_yaml,
 )
 
 pytestmark = pytest.mark.usefixtures("restore_determinism")
@@ -87,17 +101,47 @@ ON = "eval.by_distance.enabled=true"
 # --------------------------------------------------------------------------------------------------
 
 
-def test_by_distance_is_off_and_out_of_the_hash_by_default() -> None:
+_FAR_SET = "eval.by_distance.sets=[{name: far, manifest: data/far/manifest.json}]"
+_ALL_ON = [ON, _FAR_SET, "eval.by_distance.every_eval=true", "eval.by_distance.max_docs=100"]
+
+
+def test_by_distance_is_off_by_default_and_never_in_the_hash() -> None:
     cfg = load_config(REF_A1)
     by = cfg.eval.by_distance
     assert (by.enabled, by.every_eval, by.max_docs, by.sets) == (False, False, None, [])
     assert config_hash(cfg) == REF_HASH
-    assert '"eval"' not in canonical_json(cfg) and "by_distance" not in canonical_json(cfg)
-    on = load_config(REF_A1, [ON])
-    assert config_hash(on) != REF_HASH
-    assert json.loads(canonical_json(on))["eval"]["by_distance"]["enabled"] is True
-    far = "eval.by_distance.sets=[{name: far, manifest: data/far/manifest.json}]"
-    assert config_hash(load_config(REF_A1, [ON, far])) != config_hash(on)
+    # evaluation-only: on, with every key set, it is the same configuration to the hash
+    on = load_config(REF_A1, _ALL_ON)
+    assert on.eval.by_distance.enabled and on.eval.by_distance.sets[0].name == "far"
+    assert on != cfg and canonical_json(on) == canonical_json(cfg)
+    assert config_hash(on) == REF_HASH
+    assert '"eval"' not in canonical_json(on) and "by_distance" not in canonical_json(on)
+    # a training key still changes it, with the report on or off
+    assert config_hash(load_config(REF_A1, [*_ALL_ON, "train.lr=0.002"])) != REF_HASH
+
+
+@pytest.mark.parametrize("protocol", ["train_eval", "reads_state"])
+def test_an_arm_keeps_its_id_with_the_report_on(protocol: str) -> None:
+    """The key enabled, with sets: the arm id and the group id of the same arm without it."""
+    params = protocol_params({"name": protocol}).model_dump(mode="json")
+
+    def identity(*overrides: str) -> tuple[str, str]:
+        return arm_identity(
+            load_config(REF_A1, [*TINY_HSN_OVERRIDES, *overrides]),
+            family="hsn",
+            variant="pdg",
+            variant_params={},
+            protocol=params,
+            early_stop=[],
+            data="0123456789abcdef",
+        )
+
+    plain = identity()
+    assert identity(*_ALL_ON) == plain and identity(ON) == plain
+    assert identity(*_ALL_ON, "seed=1")[0] != plain[0]  # another seed is another arm
+    assert identity(*_ALL_ON, "seed=1")[1] == plain[1]  # of the same group
+    assert identity(*_ALL_ON, "train.lr=0.002") != plain
+    assert "eval" not in config_view(load_config(REF_A1, _ALL_ON))
 
 
 @pytest.mark.parametrize(
@@ -116,6 +160,57 @@ def test_by_distance_is_off_and_out_of_the_hash_by_default() -> None:
 def test_by_distance_keys_are_validated(overrides: list[str]) -> None:
     with pytest.raises(ValueError):
         load_config(REF_A1, overrides)
+
+
+def test_enqueueing_an_existing_arm_with_the_report_on_says_what_to_do(
+    isolated: Path,  # noqa: F811
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The report is not part of an arm id, so an arm that exists is skipped as ever; the
+    enqueue says that its attempt holds other ``eval.*`` settings and how to score it."""
+
+    def spec(name: str, *extra: str) -> Path:
+        overrides = [*TINY_HSN_OVERRIDES, *train_overrides(steps=4, eval_every=2), *extra]
+        raw = {
+            "name": name,
+            "base": {"config": str(REF_A1), "overrides": overrides},
+            "protocol": {"name": "dry_run"},
+            "seeds": [0, 1],
+            "arms": [{"name": "a", "family": "hsn"}],
+        }
+        return write_yaml(tmp_path / f"{name}.yaml", raw)
+
+    db = dbm.Database(db_path())
+    first = enqueue_spec(db, spec("plain"))
+    arm_ids = [a["arm_id"] for a in first.added]
+    with db.write() as conn:
+        conn.execute(
+            "UPDATE experiments SET status = 'done', run_dir = '/runs/plain/a/exp1' "
+            "WHERE exp_id = ?",
+            (first.added[0]["exp_id"],),
+        )
+    same = enqueue_spec(db, spec("plain"))
+    assert not same.added and all("eval_differs" not in s for s in same.skipped)
+    with_report = spec("with_report", ON, _FAR_SET)
+    on = enqueue_spec(db, with_report)
+    assert not on.added and [s["arm_id"] for s in on.skipped] == arm_ids  # the same arms
+    assert [(s["status"], s.get("eval_differs"), s.get("run_dir")) for s in on.skipped] == [
+        ("done", True, "/runs/plain/a/exp1"),
+        ("queued", True, None),
+    ]
+    assert experiments_cli(["enqueue", str(with_report)]) == 0
+    printed = capsys.readouterr().out
+    assert "python -m hsn.eval.distance --run-dir /runs/plain/a/exp1" in printed
+    assert "a/s1: exp 2 (queued) keeps the eval.* settings it was queued with" in printed
+    assert "0 added, 2 skipped" in printed
+    # --force trains the arm again: the new attempt of the same arm holds the report
+    forced = enqueue_spec(db, with_report, force=True)
+    assert [a["arm_id"] for a in forced.added] == arm_ids
+    stored = json.loads(db.experiment(forced.added[0]["exp_id"])["config_json"])
+    assert stored["eval"]["by_distance"]["enabled"] is True
+    after = enqueue_spec(db, with_report)  # the newest attempts now hold what is asked for
+    assert not after.added and all("eval_differs" not in s for s in after.skipped)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -743,6 +838,57 @@ def test_the_observer_adds_its_block_and_changes_no_metric() -> None:
     assert capped.ds.examples[5] is ds.examples[12]
 
 
+def test_a_compiled_window_is_not_recompiled_by_the_observer_or_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compiled HSN window (aot_eager on the CPU, as the P2.8 trainer tests): with the
+    observer on every evaluation and the pass at the end, training is the same step for step,
+    the same steps compile, and the pass runs on the evaluation variant that exists."""
+    monkeypatch.setattr(compile_mod, "MAX_BLOCK", 2)
+    monkeypatch.setattr(
+        tbptt, "compile_window", functools.partial(compile_window, backend="aot_eager")
+    )
+    train = ByteDataset([*docs("kv", "train", 16), *docs("delayed", "train", 16)])
+    dev = ByteDataset([*docs("kv", "dev", 8), *docs("delayed", "dev", 8)])
+    histories = {}
+    try:
+        for name in ("plain", "observed"):
+            cfg = tiny_hsn_config(
+                "hardware.compile_mode=reduce-overhead", *([ON] * (name != "plain"))
+            )
+            seed_everything(cfg.seed)
+            trainer = make_trainer(
+                build_model(cfg), cfg, resolve(cfg.hardware), run_dir=tmp_path / name
+            )
+            assert trainer.compiled_window is not None
+            scorer = RunScorer(cfg, dev) if name == "observed" else None
+            if scorer is not None:
+                trainer.eval_observer = scorer.observer()
+            histories[name] = trainer.fit(train, dev, 6)
+            trainer.eval_observer = None
+            if scorer is None:
+                continue
+            window = trainer.compiled_window
+            calls, compiled_s = window.calls, window.compile_seconds
+            block = scorer.final(trainer)
+            entry = block["sets"]["dev"]
+            assert entry["compile_seconds"] == 0.0 and window.compile_seconds == compiled_s
+            assert window.calls == calls + entry["n_windows"]  # the pass ran compiled
+            assert list(entry["groups"]) == ["kv/in_range", "delayed/in_range"]
+            assert entry["accuracy"] == pytest.approx(histories[name].evals[-1]["accuracy"])
+    finally:
+        torch._dynamo.reset()
+    plain, observed = histories["plain"], histories["observed"]
+    assert [r.loss for r in observed.steps] == [r.loss for r in plain.steps]
+    assert [r.grad_norm for r in observed.steps] == [r.grad_norm for r in plain.steps]
+    for key in ("compile_steps", "compiled_windows"):
+        assert observed.measured[key] == plain.measured[key] > 0
+    assert [e["step"] for e in observed.evals] == [e["step"] for e in plain.evals] == [3, 6]
+    for a, b in zip(observed.evals, plain.evals, strict=True):
+        tables = a.pop("by_distance")
+        assert a == b and list(tables) == ["kv/in_range", "delayed/in_range"]
+
+
 @pytest.fixture(scope="module")
 def far_manifest(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A second tiny dataset whose distances exceed the window (the role of the far set)."""
@@ -813,6 +959,7 @@ def test_a_run_carries_the_block_and_the_cli_reproduces_it(
     dev, far = block["sets"]["dev"], block["sets"]["far"]
     assert dev["source"]["dataset"] == "tiny_p1_11" and far["source"]["dataset"] == "tiny_far"
     assert (dev["source"]["n_docs"], far["source"]["n_docs"]) == (32, 24)
+    assert dev["compile_seconds"] is None and far["seconds"] > 0  # an eager run compiles nothing
     assert dev["accuracy"] == pytest.approx(record["final"]["dev_accuracy"], abs=1e-12)
     assert dev["loss"] == pytest.approx(record["final"]["dev_loss"], abs=1e-6)
     assert list(dev["groups"]) == ["kv/in_range", "delayed/in_range"]

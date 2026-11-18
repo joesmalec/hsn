@@ -81,6 +81,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from hsn.config import (
+    HASH_EXCLUDED,
     REPO_ROOT,
     GatedDeltaNetBaselineConfig,
     RunConfig,
@@ -553,10 +554,14 @@ def data_hash(cfg: RunConfig, repo: Path, *, required: bool) -> str:
 
 
 def config_view(cfg: RunConfig) -> dict[str, Any]:
-    """The non-default values of the resolved configuration, without ``run_id`` and ``notes``."""
+    """The non-default values of the resolved configuration, without ``run_id`` and ``notes``
+    and without the evaluation-only sections (:data:`hsn.config.HASH_EXCLUDED`: ``eval.*``
+    changes nothing a run trains, so it is not part of an arm's identity)."""
     view = cfg.model_dump(mode="json", exclude_defaults=True)
     view.pop("run_id", None)
     view.pop("notes", None)
+    for section in HASH_EXCLUDED:
+        view.pop(section, None)
     return view
 
 

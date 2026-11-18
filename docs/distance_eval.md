@@ -2,8 +2,9 @@
 
 18 November 2026. Branch `claude/distance-eval`, from main `f7e39be`. Written, tested and
 cross-checked on the CPU (torch 2.15.0+cu132, the card hidden); nothing has run on the card.
-**Evaluation only**: training, the models and every existing metric are unchanged, and with the
-key off nothing runs and no configuration hash changes.
+**Evaluation only**: training, the models and every existing metric are unchanged. The `eval`
+section is therefore outside the configuration hash and the arm id, on or off (the user's
+decision of 18 Nov 2026): a run with the report is the same run as without it.
 
 ## Why
 
@@ -24,10 +25,12 @@ the run itself and into one CLI.
 | `eval.by_distance.max_docs` | `null` | the first `max_docs` documents of every task/variant group of a set; `null` = all |
 | `eval.by_distance.sets` | `[]` | more dev sets scored at the end: `{name, manifest, tasks: [], variants: []}` |
 
-- `eval` is a new top-level section. At its default the whole block is left out of the
-  configuration hash (`HASH_OMIT_AT_DEFAULT`: `eval`, `eval.by_distance`) and out of the arm id,
-  so every existing configuration, checkpoint and arm keeps its identity. Switched on it is
-  hashed like any key.
+- `eval` is a new top-level section for evaluation-only reports. It never enters the
+  configuration hash or an arm id, whatever it holds (`hsn.config.HASH_EXCLUDED`, applied in
+  `config_hash` and in `hsn.experiments.spec.config_view`): the same arm with the report on and
+  off has one hash, one arm id and checkpoints that resume either way. See "Runs that exist"
+  below for what that means in the queue. A key that could change a trained weight does not
+  belong in this section.
 - The other three keys are refused while `enabled` is false. A set's `name` is its key in the
   report (letters, digits, `_`; `dev` is the run's own dev set). A set is always its manifest's
   `dev` split, and its `unroll` must be the run's.
@@ -62,6 +65,27 @@ A set that fails to score keeps its `source` and an `error` in the block and the
 stands; with `every_eval` an evaluation whose tables fail carries `by_distance: {error: …}` and
 the run goes on. A manifest that does not load fails the run during setup, before training.
 
+## Runs that exist
+
+Because the report is not part of an arm's identity, switching it on for an arm that has a
+run does not make a new arm:
+
+- **`enqueue` skips it, as it skips any arm that is queued, running, done or stopped early,**
+  and says why the report will not appear:
+  `note: <label>: exp N (done) was run with other eval.* settings, which are not part of an arm
+  id, so nothing was queued. Score the run that exists: python -m hsn.eval.distance --run-dir
+  <run dir> (--force trains the arm again)`. For an attempt that is still queued or running
+  the note says that it keeps the settings it was queued with (cancel it and enqueue again to
+  change them).
+- **The CLI is the way to score a run that exists** ("The CLI" below): it reads the
+  checkpoint, costs one evaluation pass per set and trains nothing. Its report is a file of
+  its own (`--out`); the run's `result.json` and the database row are not rewritten.
+- **`enqueue --force` trains the arm again** as a new attempt of the same arm; that attempt
+  holds the `eval` settings it was queued with (every attempt stores its own configuration)
+  and its record carries the block.
+- A checkpoint written with the report on resumes with it off and the other way round (one
+  hash).
+
 ## Where the block is
 
 - Sweep runs (`hsn.experiments`): `result.json` → `by_distance`; with `every_eval` also
@@ -82,6 +106,8 @@ the run goes on. A manifest that does not load fails the run during setup, befor
         dev:                      # the run's dev set; then one entry per eval.by_distance.sets
           source: {manifest, tasks, variants, dataset, split: dev, n_docs, max_docs}
           accuracy, loss, n_positions, n_windows, seconds   # the pass's own overall numbers
+          compile_seconds         # of the pass, compiling or recording a window: 0 when the
+                                  # run's evaluation variant served it; null for an eager run
           groups:
             "<task>/<variant>": {...}                       # one table per group, below
 
@@ -254,13 +280,17 @@ HSN-T, `vast3/exp/gpu0g/runs/five_18k/five18_memT_top0-s0-29b9e8f56ab8/exp1`, st
 
 ## Tests
 
-`tests/test_distance_eval.py` (CPU): the key (off by default, the pinned `ref_a1` hash, the
-refusals); the capture on aligned and unaligned streams with documents that span windows,
+`tests/test_distance_eval.py` (CPU): the key (off by default; the pinned `ref_a1` hash with
+every key of the section set; the arm id and group id of an arm equal with the report on, with
+sets, and off; the refusals); the queue (an existing arm enqueued with the report on is
+skipped with the note, `--force` queues a new attempt that holds it); the capture on aligned and unaligned streams with documents that span windows,
 against a per-document reading, with the metrics equal with and without it, and its two
 guards; the recall table against a brute-force reading for `kv` and `delayed` at far-set
 distances; the fact position; the name rule; the names and words tables against brute-force
 readings; the frequent-word count across block boundaries and the committed list; the trainer's
-observer; a sweep run (HSN and GRU) with the block, the unchanged training, the extra set and
+observer; the compiled window (aot_eager on the CPU): the same training step for step, the same
+compile steps, and a pass that compiles nothing; a sweep run (HSN and GRU) with the block, the
+unchanged training, the extra set and
 `every_eval`, and the CLI reproducing the run's tables; the failure paths; a text run, its dump
 and the tables from the dump.
 
