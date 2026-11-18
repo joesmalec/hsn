@@ -440,7 +440,8 @@ class UnitBank(nn.Module):
         # 18 Nov 2026 (docs/perbyte_speed.md): the gather through pick_unit. The value and the
         # gradient are the gather's bit for bit; its backward is one masked copy, where the
         # gather's own (zeros, then a scatter-add in the autocast dtype) ran outside a
-        # compiled window's fused kernels: 9 µs at every position of the loop over bytes.
+        # compiled window's fused kernels: 9 µs at every position of the loop over bytes on
+        # the RTX 3060 (2.3 ms a step).
         return pick_unit(every, unit_idx.to(torch.int64), as_gather=True)
 
     def merged_layout(

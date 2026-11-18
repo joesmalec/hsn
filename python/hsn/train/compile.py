@@ -584,11 +584,12 @@ def _window_blocks(x: Tensor, blk: int) -> tuple[Tensor, ...]:
       encoded bytes (517 MB a step at B 32, T 256, 64 cells and the top0 reader's width:
       3.1 ms on the RTX 3060). Here the window is copied once, block by block (one copy with
       the blocks as the leading dimension), and a block's input is a dense piece of that
-      copy: 32 MB a step.
+      copy: 32 MB a step (0.7 ms, and 0.2 ms for the one copy).
     * **The backward pass between the blocks.** Each slice's backward made a zero tensor of
       the window's size, copied the block's gradient into it and added it to the other
-      blocks': 16 times for the encoded bytes and for the context (3.2 ms). ``unbind`` has
-      one backward node, which lays the 16 gradients side by side once.
+      blocks': 16 times for the encoded bytes and for the context (1.6 ms of the 3.2 ms
+      between the backward replays). ``unbind`` has one backward node, which lays the 16
+      gradients side by side once.
 
     The gradient that reaches ``x`` is bit for bit the one the slices gave: every element of
     ``x`` lies in exactly one block, so the old sum was that block's gradient plus exact

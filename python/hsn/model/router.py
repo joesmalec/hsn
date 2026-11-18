@@ -1720,13 +1720,9 @@ class Router(nn.Module):
 
     @staticmethod
     def _selected(cells: Tensor, valid: Tensor, N: int) -> Tensor:
-        """Bool ``[B, N]``: the cells of the valid slots (padded slots add nothing). A
-        comparison against ``arange(N)``, as :func:`hsn.kernels.native.selection_mask`: the
-        same booleans as counting the valid slots per cell with ``scatter_add`` (the form
-        until 18 Nov 2026), which a compiled window ran as an int64 scatter outside its fused
-        kernels at every position (``docs/perbyte_speed.md``)."""
-        hits = (cells[:, :, None] == torch.arange(N, device=cells.device)) & valid[:, :, None]
-        return hits.any(dim=1)
+        """Bool ``[B, N]``: the cells of the valid slots (padded slots add nothing)."""
+        counts = torch.zeros(cells.shape[0], N, dtype=torch.int64, device=cells.device)
+        return counts.scatter_add(1, cells, valid.to(torch.int64)) > 0
 
     @staticmethod
     def _draw(
@@ -1893,10 +1889,7 @@ class Router(nn.Module):
         unit_argmax = scores.detach().argmax(dim=-1)  # [B, N]
         delta = torch.where(valid, units - unit_argmax.gather(1, cells), torch.zeros_like(units))
         unit_full = unit_argmax.scatter_add(1, cells, delta)  # the chosen unit per cell
-        # one-hot [B, N, M] by comparison (18 Nov 2026, docs/perbyte_speed.md): F.one_hot's
-        # values (unit_full lies in [0, M): the slots' units do) without its range check,
-        # which a compiled window ran as a kernel of its own at every position
-        unit_hard = (unit_full[:, :, None] == torch.arange(M, device=device)).to(torch.float32)
+        unit_hard = F.one_hot(unit_full, M).to(torch.float32)  # [B, N, M]
         if executed_scores:  # the chosen unit's score: the executed unit on the selected cells
             cell_scores = scores.gather(2, unit_full[:, :, None]).squeeze(2)
         else:

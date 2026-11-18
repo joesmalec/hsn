@@ -17,15 +17,18 @@ laid out block by block, instead of a slice of the window per block. A change of
 **The prologue's per-position views** are not made for the compiled window, which never
 read them.
 
-**Three per-position fallbacks, bit for bit.** The chosen unit's gather in the all-units pass
-through :func:`hsn.model.units.pick_unit` (``as_gather``), :meth:`Router._selected` and the
-one-hot of the chosen units by comparison: each against the form it replaces.
+**The chosen unit's gather** in the all-units pass through
+:func:`hsn.model.units.pick_unit` (``as_gather``): the value and the gradient of the gather
+it replaces, bit for bit.
 
 **``hardware.message_gradients=state``** (opt-in): the messages of the sparse round add up the
 gradients of their two gathers in the state's dtype. The messages are the same bit for bit
-under bf16 autocast; without autocast the whole computation is; under autocast the two
-gradients are the fp32 sums of what the default adds up in bf16; the key's place in the
-configuration and its refusals.
+under bf16 autocast in the eager round; without autocast the whole computation is; under
+autocast the two gradients are the fp32 sums of what the default adds up in bf16; the key's
+place in the configuration and its refusals.
+
+The tests marked ``cuda`` repeat the eager comparisons on the card (fp32 and bf16) and train
+a few steps through the compiled window with CUDA Graphs with the key.
 """
 
 from __future__ import annotations
@@ -48,7 +51,6 @@ from hsn.experiments.spec import memory_key
 from hsn.model.graph import CellGraph
 from hsn.model.hsn import WindowCarry, address_history
 from hsn.model.hsn_t import HSNT
-from hsn.model.router import Router
 from hsn.model.units import UnitBank, pick_unit
 from hsn.runner import build_model
 from hsn.train import compile as compile_mod
@@ -339,7 +341,7 @@ def test_trainer_steps_are_the_same_bit_for_bit(
 
 
 # --------------------------------------------------------------------------------------------------
-# Three per-position fallbacks, bit for bit
+# The chosen unit's gather, bit for bit
 # --------------------------------------------------------------------------------------------------
 
 
@@ -396,30 +398,6 @@ def test_static_unit_pass_is_the_gather_of_the_all_units_pass() -> None:
         assert _same_bits(got, want)
 
 
-def test_selected_cells_by_comparison_are_the_counted_ones() -> None:
-    """:meth:`Router._selected` against the count of the valid slots per cell it replaces
-    (a ``scatter_add``), with padded slots (index 0, not valid) and a repeated cell."""
-    generator = torch.Generator().manual_seed(0)
-    B, K, N = 7, 5, 11
-    for trial in range(20):
-        cells = torch.stack([torch.randperm(N, generator=generator)[:K] for _ in range(B)])
-        valid = torch.rand(B, K, generator=generator) < 0.7
-        cells = cells.masked_fill(~valid, 0)
-        if trial % 5 == 0:
-            cells[0, 1] = cells[0, 0]  # a repeat: the count is 2, still "selected"
-        counts = torch.zeros(B, N, dtype=torch.int64).scatter_add(1, cells, valid.to(torch.int64))
-        assert torch.equal(Router._selected(cells, valid, N), counts > 0)
-
-
-def test_one_hot_by_comparison_is_one_hot() -> None:
-    generator = torch.Generator().manual_seed(0)
-    M = 8
-    unit_full = torch.randint(0, M, (4, 9), generator=generator)
-    by_comparison = (unit_full[:, :, None] == torch.arange(M)).to(torch.float32)
-    want = torch.nn.functional.one_hot(unit_full, M).to(torch.float32)
-    assert _same_bits(by_comparison, want)
-
-
 # --------------------------------------------------------------------------------------------------
 # hardware.message_gradients=state (opt-in)
 # --------------------------------------------------------------------------------------------------
@@ -447,7 +425,7 @@ def _messages(
     """The messages of the selected cells and the gradients of a fixed functional of them
     with respect to the state, ``V`` and the edge logits."""
     h = h.clone().requires_grad_(True)
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
+    with torch.autocast(h.device.type, dtype=torch.bfloat16, enabled=bf16):
         m = graph.messages_selected(h, V, cells, validate=False)
         loss = (m.float() * weights.float()).sum()
     grads = torch.autograd.grad(loss, [h, V.weight, graph.edge_logit])
@@ -604,3 +582,112 @@ def test_compiled_window_with_state_gradients_without_autocast(
                 assert _same_bits(g, r), i
         carry = address_history(model.cfg, tokens, carry, got[2])
         state = got[1].detach()
+
+
+# --------------------------------------------------------------------------------------------------
+# On the card
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_blocks_and_pick_on_the_card(dtype: torch.dtype) -> None:
+    """The CUDA kernels of the eager ops: the blocks against the slices (values, layout, the
+    gradient with a ``-0.0`` in it) and ``pick_unit(as_gather=True)`` against ``gather``
+    (value and gradient), bit for bit, in fp32 and bf16."""
+    device = p28._cuda_ctx().device
+    generator = torch.Generator().manual_seed(0)
+    T, blk = 12, 4
+    weights = torch.randn(2, T, 3, generator=generator)
+    weights[0, ::3, 0] = -0.0
+    weights = weights.to(device, dtype)
+    x0 = torch.randn(2, T, 3, generator=generator).to(device, dtype)
+    for got, want in zip(_window_blocks(x0, blk), _slices(x0, blk), strict=True):
+        assert got.is_contiguous() and _same_bits(got, want.contiguous())
+
+    def gradient(parts_of: object) -> Tensor:
+        x = x0.clone().requires_grad_(True)
+        parts = parts_of(x, blk)  # type: ignore[operator]
+        total = x.new_zeros(())
+        for index, part in enumerate(parts):
+            total = total + (part * weights[:, index * blk : (index + 1) * blk]).sum()
+        (grad,) = torch.autograd.grad(total, x)
+        return grad
+
+    assert _same_bits(gradient(_window_blocks), gradient(_slices))
+    P, M, W = 37, 5, 6
+    unit = torch.randint(0, M, (P,), generator=generator).to(device)
+    pick_weights = torch.randn(P, W, generator=generator)
+    pick_weights[::4, 0] = -0.0
+    pick_weights = pick_weights.to(device, dtype)
+    x1 = torch.randn(P, M, W, generator=generator).to(device, dtype)
+    index = unit[:, None, None].expand(P, 1, W)
+
+    def run(pick: object) -> tuple[Tensor, Tensor]:
+        x = x1.clone().requires_grad_(True)
+        out = pick(x)  # type: ignore[operator]
+        (grad,) = torch.autograd.grad((out * pick_weights).sum(), x)
+        return out.detach(), grad
+
+    want_out, want_grad = run(lambda x: x.gather(1, index).squeeze(1))
+    got_out, got_grad = run(lambda x: pick_unit(x, unit, as_gather=True))
+    assert _same_bits(got_out, want_out) and _same_bits(got_grad, want_grad)
+
+
+@pytest.mark.cuda
+def test_state_gradients_on_the_card_keep_the_eager_messages() -> None:
+    """bf16 autocast on the card, the eager round: the messages are the same bits with the
+    key; the three gradients agree with the default's to bf16 rounding."""
+    device = p28._cuda_ctx().device
+    graph, V, h, cells, weights = _graph_case()
+    graph, V = graph.to(device), V.to(device)
+    h, cells, weights = h.to(device), cells.to(device), weights.to(device)
+    want, want_grads = _messages(graph, V, h, cells, weights, bf16=True)
+    graph.state_gradients = True
+    got, grads = _messages(graph, V, h, cells, weights, bf16=True)
+    assert got.dtype == torch.bfloat16 and _same_bits(got, want)
+    for g, w in zip(grads, want_grads, strict=True):
+        assert bool(torch.isfinite(g).all())
+        assert float((g - w).abs().max()) <= 0.05 * float(w.abs().max())
+
+
+@pytest.mark.cuda
+@pytest.mark.usefixtures("small_blocks")
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize("extra", [(STATE,), (STATE, "hardware.round_products=merged")])
+def test_compiled_training_on_the_card_with_the_key(
+    extra: tuple[str, ...], precision: str, tmp_path: Path
+) -> None:
+    """Twelve steps of the small recipe (HSN-T, per-byte memory, carried reader) through
+    the compiled window with CUDA Graphs, on the dense blocks, with
+    ``hardware.message_gradients=state`` alone and beside the merged products: finite
+    losses and the graph flag set. (The step time and the losses of the full configuration
+    are in ``docs/perbyte_speed.md``.)"""
+    from cards import CUDA_PROFILE
+
+    p28._cuda_ctx()
+    steps = 12
+    cfg = hsn_config(
+        steps,
+        *A5,
+        CUT_C,
+        "model.cand_norm=rms",
+        "model.k_select=3",
+        "train.soft_until_step=0",
+        STE,
+        *READER,
+        *NGRAM,
+        CARRY,
+        f"profile={CUDA_PROFILE}",
+        "hardware.compile_mode=reduce-overhead",
+        f"hardware.autocast_dtype={precision}",
+        f"train.precision={precision}",
+        *extra,
+    )
+    seed_everything(0)
+    trainer = TBPTTTrainer(build_model(cfg), cfg, resolve(cfg.hardware), run_dir=tmp_path / "run")
+    assert trainer.hsn.cell.graph.state_gradients is True
+    history = trainer.fit(*datasets(), steps)
+    assert len(history.steps) == steps
+    assert all(torch.isfinite(torch.tensor(s.loss)) for s in history.steps)
+    assert trainer.compiled_window is not None and trainer.compiled_window.calls >= steps
