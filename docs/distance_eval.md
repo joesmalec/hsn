@@ -1,7 +1,8 @@
 # Score by distance: `eval.by_distance` and `python -m hsn.eval.distance`
 
 18 November 2026. Branch `claude/distance-eval`, from main `f7e39be`. Written, tested and
-cross-checked on the CPU (torch 2.15.0+cu132, the card hidden); nothing has run on the card.
+cross-checked on the CPU (torch 2.15.0+cu132, the card hidden); the card path was checked in
+one slot on the RTX 3060 ("On the card" below).
 **Evaluation only**: training, the models and every existing metric are unchanged. The `eval`
 section is therefore outside the configuration hash and the arm id, on or off (the user's
 decision of 18 Nov 2026): a run with the report is the same run as without it.
@@ -278,6 +279,46 @@ HSN-T, `vast3/exp/gpu0g/runs/five_18k/five18_memT_top0-s0-29b9e8f56ab8/exp1`, st
   tables of the full passes differ from the prototypes' by at most 0.0015 bits per letter in
   any cell.
 
+## On the card
+
+One slot on the local RTX 3060 (18 Nov 2026, 13:52 to 14:03, alone on the card, plain CUDA
+context, commit `ce4e0ee`; script, logs and every output in
+`evidence/distance_eval/gpu_slot/` of the worktree, git-ignored). All checks passed.
+
+**The CLI with `--device cuda`** (eager, bf16 autocast) on the span-16 27k checkpoint, against
+the CPU pass (fp32) of the same stories:
+
+| Stories | Card pass | CPU pass (4 threads) | Bits per byte, card / CPU | Names 256+ | Words 256-511 |
+| --- | --- | --- | --- | --- | --- |
+| all 2,000 | 98.7 s | 422.7 s | 0.7829 / 0.7827 | 0.152 / 0.152 | 1.334 / 1.332 |
+| the first 256 | 12.0 s | 62.0 s | 0.7831 / 0.7828 | (45 mentions) | 1.357 / 1.351 |
+
+Every count is equal. On the 2,000 stories the name rows of 100 mentions or more differ by at
+most 0.012 bits per letter (the capital 0.019) and the word rows by at most 0.004.
+
+**A compiled run** (`hardware.compile_mode=reduce-overhead`, CUDA graphs): 200 steps of
+`hsn_t_memory_carry.yaml` on TinyStories (256 dev stories, evaluations at 100 and 200) through
+the harness's own path (`run-arm`, `result.json`), once with `eval.by_distance.enabled` and
+`every_eval`, once without:
+
+- The block is in `result.json` (`weights: averaged`, the text tables with names and words);
+  its dev numbers are the last evaluation's (accuracy 0.466157, loss 1.759016 nats, both).
+- The pass compiled and recorded nothing (`compile_seconds` 0.0; 2.74 s for 13 windows, an
+  evaluation of the run takes 2.62 s). Both evaluations carry their tables; the observed
+  evaluation at step 200 took 2.63 s against 2.62 s without it.
+- Compile steps (2 / 2), compiled windows (230 / 230), the step-time exclusions and the dynamo
+  recompiles (1 / 1: the evaluation variant) are equal with the key on and off; the arm id is
+  one (`45eff1ae9ce21ee5`). Step time 0.186 s with the key on, 0.187 s off.
+- **The training losses of the two runs are not bit-equal, and the key is not the cause.** At
+  step 1, from equal weights on the same batch and before anything of this feature has run, the
+  loss is the same to the last digit (5.541770935) and the gradient norm is not (1.643994274
+  against 1.643997530): the compiled backward pass on this card is not reproducible bit for bit
+  between two processes. The difference grows from there (3.8e-6 in the loss at step 2, 0.012
+  at step 100, where the observer runs for the first time; final dev 1.7590 against 1.7555
+  nats). Earlier pairs of one compiled arm on this card diverge in the same way (exps 423 and
+  432 of one commit: first difference at step 39, 0.03 within 200 steps). On the CPU the same
+  pair is equal step for step, eager and compiled (the tests).
+
 ## Tests
 
 `tests/test_distance_eval.py` (CPU): the key (off by default; the pinned `ref_a1` hash with
@@ -304,5 +345,6 @@ and the tables from the dump.
   `report`): the tables are in the record, not in `final`.
 - Paired differences between two models (the memos' "minus memory off" columns) need two
   dumps; `--dump` writes them, a comparison command does not exist.
-- Not run on the card: the compiled evaluation window is the same `Trainer.evaluate` path the
-  run's evaluations use, but the block has only been produced on the CPU.
+- On the card one recipe was run (HSN-T with its per-byte memory and the carry, TinyStories);
+  the baselines' compiled windows (`hardware.baseline_compile`) and a set of
+  `eval.by_distance.sets` have only run on the CPU.
