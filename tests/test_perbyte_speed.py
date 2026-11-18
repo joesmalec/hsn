@@ -14,6 +14,9 @@ laid out block by block, instead of a slice of the window per block. A change of
   before, which the compile tests keep checking);
 * the trainer over several optimiser steps: the same records, gradients and weights.
 
+**The prologue's per-position views** are not made for the compiled window, which never
+read them.
+
 **Three per-position fallbacks, bit for bit.** The chosen unit's gather in the all-units pass
 through :func:`hsn.model.units.pick_unit` (``as_gather``), :meth:`Router._selected` and the
 one-hot of the chosen units by comparison: each against the form it replaces.
@@ -238,6 +241,28 @@ def test_compiled_window_on_blocks_is_the_window_on_slices(
             assert (g is None) == (r is None)
             if g is not None and r is not None:
                 assert _same_bits(g, r), i
+
+
+@pytest.mark.usefixtures("small_blocks")
+def test_compiled_window_makes_no_per_position_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The eager loop reads the prologue's per-position views; the compiled window reads
+    blocks and asks for none (they were made and dropped, 768 a window at T 256)."""
+    model = _carry_model()
+    seen: list[tuple[int, int, int]] = []
+    prologue = type(model)._window_prologue
+
+    def spy(self: HSNT, *args: object, **kwargs: object) -> object:
+        pro = prologue(self, *args, **kwargs)  # type: ignore[arg-type]
+        seen.append((len(pro.z_steps), len(pro.ctx_steps), len(pro.scalar_steps)))
+        return pro
+
+    monkeypatch.setattr(type(model), "_window_prologue", spy)
+    T = 20
+    tokens, ctx, reset = _compiled_windows(T)[0]
+    state = p28._inputs(model, b=3, t=T)[2]
+    model(tokens, ctx, state, reset)
+    p28._window(model, p28._ctx(), "aot_eager")(tokens, ctx, state, reset)
+    assert seen == [(T, T, T), (0, 0, 0)]
 
 
 # --------------------------------------------------------------------------------------------------

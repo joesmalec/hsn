@@ -1619,7 +1619,7 @@ class CompiledWindow:
         T = int(tokens.shape[1])
         blk = block_size(T)
         pro = model._window_prologue(
-            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
+            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens, steps=False
         )
         if pro.events is not None:  # model.write_events: the loop over event slots
             model._refuse_event_capture(capture)

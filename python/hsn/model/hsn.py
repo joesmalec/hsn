@@ -1700,6 +1700,7 @@ class HSN(nn.Module):
         *,
         reset_first: bool,
         prev_tokens: Tensor | WindowCarry | None = None,
+        steps: bool = True,
     ) -> _Prologue:
         """The window-invariant work of :meth:`forward` (P1.10a): the embeddings, ``E`` and the
         prediction target over ``[B, T]``, the context embeddings, the position-independent scorer
@@ -1707,7 +1708,12 @@ class HSN(nn.Module):
         counters, with the age feature in front of the scalars. ``reset_first`` says whether column
         0 resets (it decides the start age). With ``model.reader_carry`` on the memory
         ``prev_tokens`` is the :class:`WindowCarry` of the window before (None: a stream's first
-        window, nothing cached) and the reader reads the window after its cache."""
+        window, nothing cached) and the reader reads the window after its cache. ``steps``:
+        whether the per-position views of ``z``, the context and the scalars are made
+        (``z_steps`` / ``ctx_steps`` / ``scalar_steps``, which the eager loop over positions
+        reads). The compiled window reads blocks of columns and passes ``False``: 768 views a
+        window that nothing read, 0.8 ms of host time at T 256 while the card waits
+        (``docs/perbyte_speed.md``); the fields are then empty."""
         cfg = self.cfg
         B, T = (int(n) for n in tokens.shape)
         reader_cache: Cache | None = None
@@ -1826,9 +1832,9 @@ class HSN(nn.Module):
             z_target=z_target,
             context=context,
             scalars=scalars,
-            z_steps=z.unbind(1),
-            ctx_steps=context.unbind(1),
-            scalar_steps=scalars.unbind(1),
+            z_steps=z.unbind(1) if steps else (),
+            ctx_steps=context.unbind(1) if steps else (),
+            scalar_steps=scalars.unbind(1) if steps else (),
             counters=counters,
             reader=reader_out,
             events=events,
