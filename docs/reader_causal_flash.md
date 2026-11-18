@@ -34,15 +34,16 @@ kernel.
 | `model.reader_span: null` | a span limits the distances read; the causal mask alone does not |
 | `model.reader_carry: 0` (so no `reader_top_words`) | the carried keys are read through `Reader.read`'s own mask |
 | `data.align_docs: true` | the loader then starts documents at column 0 only (below) |
+| `train.reach_dropout: 0` | its short rows read with a span mask, which the causal mask does not apply (`docs/reach_dropout.md`) |
 
 It is allowed for HSN-T without its memory (`model.memory: false`, the target), for HSN-T with
 its memory (the reader runs in the eager prologue of the window, `HSN._window_prologue`, on the
 window's `tokens` and `reset`; the trailing-padding cut keeps column 0) and for the reader alone
 (`model_name: reader`). The three are tested for equality with the document mask.
 
-`train.reach_dropout` (branch `claude/reach-dropout`, not merged on 17 Nov 2026) gives some rows of
-a training window a span mask; when it lands it must be refused together with
-`reader_mask: causal` (a note sits at the `align_docs` refusal in `RunConfig`).
+`train.reach_dropout` (`docs/reach_dropout.md`) gives some rows of a training window a span mask;
+it is refused together with `reader_mask: causal` (`reach_dropout_scope_error`, and
+`Reader.forward` refuses short rows on a causal reader).
 
 ### The loader's guarantee
 

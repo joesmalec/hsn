@@ -1082,6 +1082,17 @@ class TrainConfig(_StrictModel):
     # foreach implementation; the same update to rounding. The generic trainer only.
     fused_adamw: bool = False
     # --- end the generic trainer's host reads ---
+    # Opt-in (17 Nov 2026; docs/reach_dropout.md): reach dropout of HSN-T's reader, training only.
+    # In every training window each batch row reads, with probability reach_dropout, through the
+    # reader with the per-block span reach_dropout_span (the mask model.reader_span=S gives); the
+    # other rows read the whole window. Drawn per row from a generator seeded by the run seed
+    # and the window counter (the global random stream is untouched; a resume replays it).
+    # Evaluation and every other forward pass read as configured. A trainer option: no model
+    # equation or parameter changes. Needs hsn_t with its memory and model.reader_span null.
+    # 0.0 (default): off, bit for bit. Both keys hashed when set; the span is read only when
+    # reach_dropout > 0.
+    reach_dropout: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    reach_dropout_span: int = Field(default=16, ge=1)
     precision: Precision = "bf16"  # autocast dtype (fp64 only for gradcheck)
     grad_clip: float = Field(default=1.0, ge=0.0)  # global norm clip
     # Opt-in wide norm reduction AND scaling; native preserves historical clipping bitwise.
@@ -1799,9 +1810,8 @@ class RunConfig(_StrictModel):
         if self.model.reader_mask == "causal" and not self.data.align_docs:
             # docs/reader_causal_flash.md: the causal mask is the document mask only where no
             # window has a reset after column 0, which data.align_docs guarantees (StreamLoader
-            # starts a document at a window boundary only). Note for train.reach_dropout (branch
-            # claude/reach-dropout, not merged on 17 Nov 2026): it gives some rows a span mask,
-            # so it must be refused with reader_mask=causal when it lands.
+            # starts a document at a window boundary only). train.reach_dropout gives some rows
+            # a span mask, so reach_dropout_scope_error refuses it with reader_mask=causal.
             raise ValueError(
                 "model.reader_mask=causal needs data.align_docs=true: without it a document can "
                 "start inside a window, where the reader's document mask is not the causal mask"
@@ -1841,6 +1851,10 @@ class RunConfig(_StrictModel):
                     "and the generic trainer trains it on the next-byte loss alone, so these "
                     "settings could not act: " + "; ".join(refused)
                 )
+        if self.train.reach_dropout > 0.0:  # docs/reach_dropout.md
+            reason = reach_dropout_scope_error(self)
+            if reason is not None:
+                raise ValueError(f"train.reach_dropout={self.train.reach_dropout}: {reason}")
         # --- end HSN-T ---
         if self.train.host_sync != "per_step" or self.train.fused_adamw:
             refused = host_sync_refusals(self)
@@ -2288,6 +2302,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "hardware.round_products",
     "baseline.transformer.position",
     "baseline.transformer.carry",
+    "train.reach_dropout",
+    "train.reach_dropout_span",
 )
 
 
@@ -2315,6 +2331,7 @@ MEMORY_TRAIN_KEYS: dict[str, str] = {
     "aux_enabled": "the routing penalties",
     "address_gate_hold_step": "the address gate's weights",
     "tbptt_windows": "the carried state's gradient across windows",
+    "reach_dropout": "the names the short-span rows leave to the memory",
 }
 #: The loss weights of ``train.*``: the generic trainer's objective has none of their terms.
 LOSS_WEIGHT_KEYS: tuple[str, ...] = tuple(
@@ -2597,6 +2614,52 @@ def tbptt_windows_scope_error(cfg: RunConfig) -> str | None:
             f"train.lambda_u={train.lambda_u} (P2.3): the scorer's EMA features are updated in "
             "place after every window, while a segment's graph still holds them; set "
             "train.lambda_u=0"
+        )
+    return None
+
+
+def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``train.reach_dropout > 0`` (``docs/reach_dropout.md``) cannot run with ``cfg``;
+    ``None`` when it can. It shortens, in some rows of a training window, the whole-window
+    reader of HSN-T with its memory, so that the memory has to carry what lies beyond the
+    short span. (HSN-T without its memory is refused by :func:`memory_off_refusals`.)"""
+    model, train = cfg.model, cfg.train
+    if cfg.model_name != "hsn_t":
+        return (
+            f"model_name={cfg.model_name!r} has no memory behind a reader; the key is HSN-T's "
+            "(model_name hsn_t with its memory and model.reader=transformer)"
+        )
+    if model.reader_span is not None:
+        return (
+            f"model.reader_span={model.reader_span} already limits every row; the key "
+            "shortens a whole-window reader in some rows: leave model.reader_span null (the "
+            "short reader in every row and in evaluation is model.reader_span alone)"
+        )
+    if model.reader_mask == "causal":
+        # docs/reader_causal_flash.md: the causal mask is SDPA's is_causal with no mask tensor,
+        # which a short row's span mask cannot narrow
+        return (
+            "model.reader_mask=causal reads with SDPA's causal mask and no mask tensor, so the "
+            "short rows' span mask could not act (docs/reader_causal_flash.md); leave "
+            "model.reader_mask at document"
+        )
+    if model.reader_carry:
+        # the carried reader reads through Reader.read and its own mask, which takes no short
+        # rows (HSN-T with its memory takes model.reader_carry since 17 Nov 2026,
+        # docs/amendments/reader_carry_memory.md; reach dropout leaves it out)
+        return (
+            f"model.reader_carry={model.reader_carry}: the carried reader reads through its "
+            "cache's own mask, which the short rows do not narrow; leave model.reader_carry at 0"
+        )
+    if train.reach_dropout_span >= train.unroll:
+        return (
+            f"train.reach_dropout_span={train.reach_dropout_span} is not shorter than the "
+            f"window (train.unroll={train.unroll}): a short row would read the whole window"
+        )
+    if train.lambda_u > 0.0:
+        return (
+            f"train.lambda_u={train.lambda_u} (P2.3) is untested with it: the counterfactual "
+            "probes run before the window's rows are drawn; set train.lambda_u=0"
         )
     return None
 

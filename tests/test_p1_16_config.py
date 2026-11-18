@@ -136,6 +136,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "hardware.round_products",  # the compiled round's merged products (17 Nov 2026)
         "baseline.transformer.position",  # the Transformer as Transformer-XL (opt-in, 17 Nov)
         "baseline.transformer.carry",
+        "train.reach_dropout",  # short-span rows of HSN-T's reader in training (opt-in, 17 Nov)
+        "train.reach_dropout_span",
     )
 
 
