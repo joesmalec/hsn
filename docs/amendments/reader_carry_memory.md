@@ -194,20 +194,37 @@ beyond it), which the carry does not have.
 end, carried reader or not; the note's 0.7445 and 0.8293 are readings in 1,024-byte windows.)
 
 The same checkpoints read through this branch's code on the CPU (the key set at load, the
-loop of `evaluate_windows`): `~/hsn-handoff/text_gap/score.py --job carry256_pb | carry256_wev |
-carry256_pb9k | carry256_wev9k`, results in `~/hsn-handoff/text_gap/dumps/carry256_*.json`;
-`carry_check.py` there prints them beside the note's. Measured so far (the jobs were not
-finished when this was written), with `reader_carry=255`, which is the note's span of 256:
+loop of `evaluate_windows`, fp32, all 2,000 dev stories): `~/hsn-handoff/text_gap/score.py --job
+carry256_pb | carry256_wev | carry256_pb9k | carry256_wev9k`, per-byte losses in
+`~/hsn-handoff/text_gap/dumps/carry*.npz`; `carry_check.py` there prints this table.
 
-| Checkpoint (27k) | Stories | Below byte 1,024: this code / the note | Largest difference there | From byte 1,024: this code / the note / as trained |
+| Checkpoint | `reader_carry` | Dev bits with the carry | The note's sighted reading | As trained |
 | --- | --- | --- | --- | --- |
-| Per byte, top0 | first 250 | 0.72744 / 0.72744 | 1.8e-5 nats (184,861 bytes) | 0.818 / 0.845 / 0.865 |
-| Word events, top0 | first 750 | 0.73207 / 0.73207 | 1.9e-5 nats (555,783 bytes) | 0.870 / 0.899 / 0.929 |
+| Per byte, top0, 27k (lr 2.5e-3) | 256 | 0.7297 | 0.7312 | 0.7782 |
+| Per byte, top0, 27k (lr 2.5e-3) | 255 | 0.7296 | 0.7312 | 0.7782 |
+| Word events, top0, 27k (lr 1.25e-3) | 256 | 0.7445 | 0.7462 | 0.7971 |
+| Word events, top0, 27k (lr 1.25e-3) | 255 | 0.7445 | 0.7462 | 0.7971 |
+| Per byte, top0, 9k | 256 | 0.8227 | 0.8244 | 0.8731 |
+| Word events, top0, 9k (lr 1.25e-3) | 256 | 0.8292 | 0.8312 | 0.8841 |
 
-So on trained weights the key reproduces the note's reading to rounding wherever the note's
-reading was sighted, and is better where it was not. With `reader_carry=256` the per-byte
-checkpoint reads 0.7324 on the first 250 stories (0.7326 at 255; the note 0.7341; as trained
-0.7807).
+These are the numbers a run of the same checkpoint with `model.reader_carry=256` should
+reproduce (bf16 on the card: the runs' own dev numbers were within 0.0002 of the fp32 CPU ones).
+
+The oracle on trained weights. `reader_carry=255` is the note's span of 256, so below byte
+1,024 of a story, where the note's reading was sighted, the two must agree:
+
+| Checkpoint (27k) | Below byte 1,024: this code / the note | Bytes further apart than 1e-3 nats | From byte 1,024: this code / the note / as trained |
+| --- | --- | --- | --- |
+| Per byte, top0 | 0.72141 / 0.72141 | 985 of 1,481,614, in 7 stories | 0.839 / 0.861 / 0.887 |
+| Word events, top0 | 0.73583 / 0.73583 | 336 of 1,481,614, in 1 story | 0.860 / 0.884 / 0.913 |
+
+The bytes that differ are whole tails of single stories (from one position to the story's
+end), with a signed mean difference of 0.0000 and −0.0021 nats over them: a top-K selection
+that fell the other way at one position, the batch-sensitive rounding of the routed
+computation that `~/hsn-handoff/cross_window/RESULTS.md` records (the two readings use other
+batch shapes: 128 rows of 256 bytes here, 32 rows of 1,024 there). Every other byte agrees
+within 1e-3 nats, the mean difference is 5e-5 nats and less. From byte 1,024 on the carried
+reading is better, as it must be: it has no blind start there.
 
 ## Tests
 
