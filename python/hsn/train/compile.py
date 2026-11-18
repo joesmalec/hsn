@@ -550,6 +550,47 @@ def _block_columns(x: Tensor, cols: slice) -> Tensor:
     return x[:, cols].contiguous()
 
 
+def _plus_zero(grad: Tensor) -> Tensor:
+    """``grad + 0.0``: what summing a gradient with exact zeros leaves of it (every value
+    itself, ``-0.0`` as ``+0.0``). The gradient hook of :func:`_window_blocks`."""
+    return grad + 0.0
+
+
+def _window_blocks(x: Tensor, blk: int) -> tuple[Tensor, ...]:
+    """The blocks of ``blk`` consecutive columns of ``x [B, T, …]`` (a window's per-position
+    input of the loop over bytes: the encoded bytes, the context, the scorer's scalars, the
+    resets) as ``T / blk`` dense ``[B, blk, …]`` tensors: the inputs of the compiled blocks.
+
+    18 Nov 2026 (``docs/perbyte_speed.md``): until then a block read the slice ``x[:, cols]``.
+    The values are the same; what changes is what the step pays around the blocks:
+
+    * **The graph's input copy.** A CUDA graph copies a strided input by the byte extent it
+      spans (:func:`_block_columns`), and a slice of 16 columns of ``[B, T, …]`` spans nearly
+      all of it: every one of the 16 blocks copied the whole window's scalars, context and
+      encoded bytes (517 MB a step at B 32, T 256, 64 cells and the top0 reader's width:
+      3.1 ms on the RTX 3060). Here the window is copied once, block by block (one copy with
+      the blocks as the leading dimension), and a block's input is a dense piece of that
+      copy: 32 MB a step.
+    * **The backward pass between the blocks.** Each slice's backward made a zero tensor of
+      the window's size, copied the block's gradient into it and added it to the other
+      blocks': 16 times for the encoded bytes and for the context (3.2 ms). ``unbind`` has
+      one backward node, which lays the 16 gradients side by side once.
+
+    The gradient that reaches ``x`` is bit for bit the one the slices gave: every element of
+    ``x`` lies in exactly one block, so the old sum was that block's gradient plus exact
+    zeros, which is the gradient itself except that ``-0.0`` becomes ``+0.0``;
+    :func:`_plus_zero` does the same to the gradient here (with one block there was no sum,
+    and there is no hook). One block is ``x`` itself, no copy."""
+    B, T = int(x.shape[0]), int(x.shape[1])
+    n = T // blk
+    if n == 1:
+        return (x,)
+    dense = x.reshape(B, n, blk, *x.shape[2:]).transpose(0, 1).contiguous()
+    if dense.requires_grad:
+        dense.register_hook(_plus_zero)
+    return dense.unbind(0)
+
+
 #: The parameters autocast casts at every use (the linears of P, S, the scorer, V, the gate,
 #: W_out and the unit bank): the ones a :class:`SweepTwin` holds pre-cast.
 SWEEP_CAST_PREFIXES: tuple[str, ...] = (
@@ -1588,9 +1629,14 @@ class CompiledWindow:
             # needs at most six fallback shapes, independent of which row IDs were drawn.
             table[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
         block = table[bucket]
+        # every block's inputs as dense tensors: one copy of the window, not one per block
+        z_blocks = _window_blocks(pro.z, blk)
+        context_blocks = _window_blocks(pro.context, blk)
+        scalar_blocks = _window_blocks(pro.scalars, blk)
+        reset_blocks = _window_blocks(reset, blk)
         with model.cell.window():
             consts = self._consts()
-            for start in range(0, T, blk):
+            for index, start in enumerate(range(0, T, blk)):
                 cols = slice(start, start + blk)
                 dense_in: tuple[Tensor, Tensor] | None = None
                 if pro.counters is not None:
@@ -1602,10 +1648,10 @@ class CompiledWindow:
                     q,
                     age,
                     pos,
-                    pro.z[:, cols],
-                    pro.context[:, cols],
-                    pro.scalars[:, cols],
-                    reset[:, cols],
+                    z_blocks[index],
+                    context_blocks[index],
+                    scalar_blocks[index],
+                    reset_blocks[index],
                     dense_in,
                     dense_rows,
                     dense_indices,
