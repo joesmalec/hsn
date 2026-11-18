@@ -148,6 +148,11 @@ BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "selectiv
 #: with the sweep's cell round as one fused CUDA op (:mod:`hsn.kernels.window`): experimental,
 #: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
 WindowMode = Literal["autograd", "split", "fused"]
+#: Opt-in (``hardware.round_products``, ``docs/word_event_speed.md``): how the compiled autograd
+#: window's sparse round takes its matrix products. ``separate``: one product per map and every
+#: unit on every selected pair, as since P2.8. ``merged``: the same dot products in fewer and
+#: smaller products (equal to rounding).
+RoundProducts = Literal["separate", "merged"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "moe"]
 #: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
@@ -433,6 +438,14 @@ class ModelConfig(_StrictModel):
     # reader_rotary_pairs 0, or 0 for all blocks). 0 (default): no word entries.
     reader_top_words: int = Field(default=0, ge=0)
     # --- end the reader's carried context ---
+    # reader_mask (docs/reader_causal_flash.md; opt-in, 17 Nov 2026): how the reader's attention
+    # is masked. "document" (default): the block-diagonal causal mask over the documents of a
+    # row, passed to SDPA as an additive bias (the memory-efficient kernel on CUDA), the reader
+    # as it was. "causal": SDPA with is_causal=True and no mask (the flash kernel on CUDA). The
+    # same mask, so the same reader, wherever no window has a reset after column 0: allowed only
+    # with reader_span null, reader_carry 0 and data.align_docs true (RunConfig), and the reader
+    # asserts on the device, without a host read, that no window has such a reset.
+    reader_mask: Literal["document", "causal"] = "document"
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
     # embeddings, E, the reader, S and D, with no cells, router, units, graph, predictor or
@@ -642,6 +655,11 @@ class ModelConfig(_StrictModel):
                     "model.reader_carry / model.reader_top_words: each carries the keys of "
                     "model.reader across windows; set model.reader=transformer or leave them at 0"
                 )
+            if self.reader_mask != "document":
+                raise ValueError(
+                    f"model.reader_mask={self.reader_mask} is the mask of model.reader's "
+                    "attention; set model.reader=transformer or leave it at document"
+                )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
                 raise ValueError(
@@ -696,6 +714,18 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     f"model.reader_top_words={self.reader_top_words} extends the carried span "
                     "of model.reader_carry, which is 0: set model.reader_carry > 0"
+                )
+            if self.reader_mask == "causal" and self.reader_span is not None:
+                raise ValueError(
+                    f"model.reader_mask=causal with model.reader_span={self.reader_span}: the "
+                    "span limits the distances a position reads, which the causal mask alone "
+                    "does not; leave model.reader_span null or the mask at document"
+                )
+            if self.reader_mask == "causal" and self.reader_carry:
+                raise ValueError(
+                    f"model.reader_mask=causal with model.reader_carry={self.reader_carry}: the "
+                    "carried positions are read through a mask of their own (reader.read); "
+                    "leave model.reader_carry at 0 or the mask at document"
                 )
             top = counts[-1] if counts else None  # None: every pair rotated (the default)
             if self.reader_top_words and top != 0:
@@ -1029,6 +1059,23 @@ class TrainConfig(_StrictModel):
     # wrote. The HSN trainer's eager or compiled window without CUDA graphs only. A trainer
     # option: no model equation changes. 1 (default): every window starts detached (P1.7).
     tbptt_windows: int = Field(default=1, ge=1)
+    # --- the generic trainer's host reads (docs/trainer_host_sync.md; opt-in, 17 Nov 2026) ---
+    # host_sync: when the generic trainer (HSN-T without its memory and the baselines; refused
+    # for the HSN trainer) reads a step's loss, accuracy and gradient norm on the host.
+    # "per_step" (default): within the step, as before (five synchronisations a step), bit for
+    # bit. "stats": they stay on the device; the loss is the masked mean (no boolean indexing),
+    # a non-finite step is skipped on the device by the fused optimiser (fused_adamw), and the
+    # host reads a step's values one step later without draining the card, at once at a stats,
+    # evaluation or checkpoint step, and when a step record is read; the skip count, its log and
+    # the stop rule follow then. Refuses what needs a step's value on the host before the next
+    # step (host_sync_refusals): spike_factor, rollback_every, adaptive_lr, gradient_growth,
+    # update_limit, weight_ema, divergence_dump, answer_weight != 1, grad_norm_precision
+    # float64, fp16. Both keys left out of the configuration hash at their defaults.
+    host_sync: Literal["per_step", "stats"] = "per_step"
+    # fused_adamw: torch.optim.AdamW(fused=True), one kernel for every tensor, in place of the
+    # foreach implementation; the same update to rounding. The generic trainer only.
+    fused_adamw: bool = False
+    # --- end the generic trainer's host reads ---
     # Opt-in (17 Nov 2026; docs/reach_dropout.md): reach dropout of HSN-T's reader, training only.
     # In every training window each batch row reads, with probability reach_dropout, through the
     # reader with the per-block span reach_dropout_span (the mask model.reader_span=S gives); the
@@ -1520,6 +1567,14 @@ class HardwareConfig(_StrictModel):
     # mode. compile_mode above keeps its meaning (the HSN's window; the generic trainer ignores
     # it). none (default): the baselines train eager, as before the key.
     baseline_compile: BaselineCompileMode = "none"
+    # Opt-in (17 Nov 2026, docs/word_event_speed.md): how the compiled autograd window's sparse
+    # round takes its matrix products. separate (default): as before. merged: fewer and smaller
+    # products for the same dot products: a (cell, unit) pair is multiplied with its own unit's
+    # weights only (UnitBank.forward_static_segments; separate runs every unit on every pair
+    # and gathers one), the gate's linear rides in the unit bank's first product and W_out is
+    # folded into its second, and P and S share one product per layer. Equal to rounding (other
+    # matmul shapes), not bit for bit. Needs hardware.compile_mode and model.routing=topk.
+    round_products: RoundProducts = "separate"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1619,6 +1674,13 @@ class RunConfig(_StrictModel):
                     f"hardware.window={self.hardware.window!r} is not available for this "
                     f"configuration: {reason}"
                 )
+        if self.hardware.round_products != "separate":
+            reason = round_products_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.round_products={self.hardware.round_products} is not available "
+                    f"for this configuration: {reason}"
+                )
         if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
                 "baseline.address_input is an input of the baselines; the HSN's own address "
@@ -1686,6 +1748,16 @@ class RunConfig(_StrictModel):
                 "memory HSN-T carries the cells' state across windows, and the reader's cache "
                 "has no place in that state"
             )
+        if self.model.reader_mask == "causal" and not self.data.align_docs:
+            # docs/reader_causal_flash.md: the causal mask is the document mask only where no
+            # window has a reset after column 0, which data.align_docs guarantees (StreamLoader
+            # starts a document at a window boundary only). Note for train.reach_dropout (branch
+            # claude/reach-dropout, not merged on 17 Nov 2026): it gives some rows a span mask,
+            # so it must be refused with reader_mask=causal when it lands.
+            raise ValueError(
+                "model.reader_mask=causal needs data.align_docs=true: without it a document can "
+                "start inside a window, where the reader's document mask is not the causal mask"
+            )
         if (
             self.model.reader_position == "learned"
             and self.train.unroll > self.model.reader_positions
@@ -1726,6 +1798,13 @@ class RunConfig(_StrictModel):
             if reason is not None:
                 raise ValueError(f"train.reach_dropout={self.train.reach_dropout}: {reason}")
         # --- end HSN-T ---
+        if self.train.host_sync != "per_step" or self.train.fused_adamw:
+            refused = host_sync_refusals(self)
+            if refused:
+                raise ValueError(
+                    "train.host_sync / train.fused_adamw (docs/trainer_host_sync.md): "
+                    + "; ".join(refused)
+                )
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:
             ignored = []
@@ -2159,6 +2238,10 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.word_address",
     "model.word_contexts",
     "train.tbptt_windows",
+    "model.reader_mask",
+    "train.host_sync",
+    "train.fused_adamw",
+    "hardware.round_products",
     "train.reach_dropout",
     "train.reach_dropout_span",
 )
@@ -2251,6 +2334,23 @@ def write_events_refusals(cfg: RunConfig) -> list[str]:
     if train.lambda_w > 0.0:
         refused.append(f"train.lambda_w={train.lambda_w} (A10's write cost, per position)")
     return refused
+
+
+def round_products_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot run ``hardware.round_products=merged``
+    (``docs/word_event_speed.md``), or ``None`` when it can. The key changes how the compiled
+    autograd window's sparse round takes its matrix products; a configuration in which no
+    such round runs is refused instead of ignoring the key."""
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return f"model_name={cfg.model_name!r} without the memory's cells has no sparse round"
+    if cfg.hardware.compile_mode == "none":
+        return (
+            "hardware.compile_mode=none: the eager round groups the pairs by unit already "
+            "(UnitBank.forward_selected); the key is the compiled window's"
+        )
+    if cfg.model.routing != "topk":
+        return f"model.routing={cfg.model.routing!r}: only the routed sparse round selects pairs"
+    return None
 
 
 def split_window_scope_error(
@@ -2370,6 +2470,59 @@ def split_window_scope_error(
     if train.grad_accum != 1:
         return f"train.grad_accum={train.grad_accum}: one window per step only"
     return None
+
+
+def host_sync_refusals(cfg: RunConfig) -> list[str]:
+    """``train.host_sync = stats`` and ``train.fused_adamw`` (``docs/trainer_host_sync.md``):
+    every setting of ``cfg`` they cannot run with, each with its reason; empty when they can.
+    Both are the generic trainer's (:class:`hsn.train.loop.Trainer`). With ``stats`` a step's
+    loss, accuracy and gradient norm reach the host one step later (or at a stats,
+    evaluation or checkpoint step), so a setting that needs one of them on the host before the
+    next step begins is refused rather than run late."""
+    train = cfg.train
+    refused: list[str] = []
+    if cfg.model_name in HSN_MODEL_NAMES and cfg.model.memory:
+        refused.append(
+            f"model_name={cfg.model_name} trains with the HSN trainer (TBPTTTrainer), whose step "
+            "these keys do not change; they are the generic trainer's (the baselines, HSN-T "
+            "with model.memory=false)"
+        )
+    if train.optimizer != "adamw":
+        refused.append(f"train.optimizer={train.optimizer} (they build torch.optim.AdamW)")
+    if train.host_sync != "stats":
+        return refused
+    what = "needs the step's {} on the host before the next step"
+    if not train.fused_adamw:
+        refused.append(
+            "train.fused_adamw=false: a non-finite step is skipped on the device by the fused "
+            "optimiser (its found_inf), so host_sync=stats needs train.fused_adamw=true"
+        )
+    keyed = {
+        "spike_factor": (train.spike_factor is not None, "gradient norm"),
+        "rollback_every": (train.rollback_every is not None, "gradient norm"),
+        "adaptive_lr.enabled": (train.adaptive_lr.enabled, "update and gradient norm"),
+        "gradient_growth.enabled": (train.gradient_growth.enabled, "gradient norms"),
+        "update_limit.groups": (bool(train.update_limit.groups), "update"),
+        "weight_ema": (train.weight_ema is not None, "applied update (a skip is on the device)"),
+        "divergence_dump": (
+            train.divergence_dump,
+            "skip (the dump holds the weights as the skipped step left them); set it false",
+        ),
+        "answer_weight": (train.answer_weight != 1.0, "loss positions (boolean indexing)"),
+        "grad_norm_precision": (train.grad_norm_precision != "native", "gradient norm"),
+        "precision": (train.precision == "fp16", "loss scale (GradScaler)"),
+    }
+    for key, (on, needs) in keyed.items():
+        if on:
+            refused.append(f"train.{key}={_getattr_dotted(train, key)!r} {what.format(needs)}")
+    return refused
+
+
+def _getattr_dotted(obj: object, dotted: str) -> object:
+    """``obj.a.b`` for ``dotted = "a.b"``."""
+    for part in dotted.split("."):
+        obj = getattr(obj, part)
+    return obj
 
 
 def tbptt_windows_scope_error(cfg: RunConfig) -> str | None:

@@ -624,6 +624,7 @@ _READER_POSITION_DEFAULTS: dict[str, Any] = {
     "reader_rotary_base": 10_000.0,
     "reader_carry": 0,  # the reader's carried context (15 Nov 2026), likewise
     "reader_top_words": 0,
+    "reader_mask": "document",  # the reader's attention mask (17 Nov 2026), likewise
 }
 
 
@@ -634,6 +635,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # stored memory and step-time estimates of the eager baselines still apply); a compiled
         # baseline has a key of its own
         del dump["hardware"]["baseline_compile"]
+    if dump["hardware"]["round_products"] == "separate":
+        # likewise: the compiled round's products at their default (17 Nov 2026) stay out; with
+        # the key set the step time changes, and the arm has a memory key of its own
+        del dump["hardware"]["round_products"]
     if dump["model"]["memory"] is True:
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates
@@ -670,6 +675,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
             # one per segment) they stay out, so every earlier arm keeps its memory key
             **({"grad_accum": cfg.train.grad_accum} if cfg.train.grad_accum != 1 else {}),
             **({"tbptt_windows": cfg.train.tbptt_windows} if cfg.train.tbptt_windows != 1 else {}),
+            # the generic trainer's host reads and fused optimiser (17 Nov 2026) set the step
+            # time too; at their defaults they stay out, likewise
+            **({"host_sync": cfg.train.host_sync} if cfg.train.host_sync != "per_step" else {}),
+            **({"fused_adamw": True} if cfg.train.fused_adamw else {}),
         }
     )
 

@@ -234,8 +234,9 @@ every window. The word address makes every byte of a context that is not text an
 under `data.align_docs` the padding behind every document is `PAD` under context 0: in 400
 training windows (`B` 32, `T` 256, the spec's loader) `E` took 10 values from 64 to 256, mean
 238, and 44 % of the events were padding bytes. The two arms compiled for 20 minutes on an
-RTX 3070 without a step. The blocks now read columns of `[B, T, …]` tensors
-(`hsn.train.compile._full_width`): one graph for every `E`, the eager window unchanged. The
+RTX 3070 without a step. The blocks now read dense copies of their slots
+(`hsn.train.compile._block_columns`; until 17 Nov 2026 columns of slots padded to `[B, T, …]`,
+`docs/word_event_speed.md`): one graph for every `E`, the eager window unchanged. The
 padding events remain: they cost slots (about 3.7 times the byte address's per window) and
 are valid slots of the statistics, though no loss position reads them. With
 `model.word_contexts=[0,6]` (context 0 read as text, a configuration change and another arm
@@ -319,7 +320,9 @@ forward plus backward.
 - Not measured on the card. There the loop is bound by launches, which fall with the number
   of slots, and the batched read is a few launches; so the ratio can be better than on the
   CPU, most of all with the read. Padding slots are paid: a batch runs as many slots as its
-  longest row needs.
+  longest row needs. (17 Nov 2026: measured, `docs/word_event_speed.md`. With the top0 reader
+  on TinyStories the step is 69.4 ms on the RTX 3060, the event loop 36.6 ms of device time
+  in it, and inside its CUDA graphs it is bound by the kernels' own time, not by launches.)
 - Saved for the backward pass, beyond the loop's own: the per-slot cell states `[B, E, N, d]`
   with the read, and the gathered keys and values `[B, T, N, 2d]` (134 MB in bf16 at `B` 32,
   `T` 256).

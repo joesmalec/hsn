@@ -101,6 +101,20 @@ letter (a word end may be the next window's first byte). The top block reads the
 span when the window is longer than ``C + 1``: of these two together the last ``N``. An entry
 inside the span (``t − s ≤ C``) is read by the span only, never twice; ``reset`` acts as on
 the cache. With ``N = 256`` the top block reaches about 256 words back at a fixed cost.
+
+The causal mask (``docs/reader_causal_flash.md``; opt-in, 17 Nov 2026). ``model.reader_mask =
+causal``: every block calls ``scaled_dot_product_attention(q, k, v, is_causal=True)`` with no
+mask, which the flash kernel takes on CUDA (the additive document mask of the default sends
+it to the memory-efficient kernel). In a window whose resets are at column 0 only, every
+position of a row is of one document (the one that starts at column 0, or the one going on
+from the window before), so the document mask is the causal mask and the reader is the same
+function. The configuration allows the key only where that holds: no ``reader_span``, no
+``reader_carry`` and ``data.align_docs`` (the loader starts a document at a window boundary
+only). :meth:`Reader.forward` also asserts it on every window with ``torch._assert_async``:
+on the device, with no host read (no synchronisation; under ``torch.compile`` a reduction
+fused into the graph, CUDA graphs included); a reset after column 0 stops the run (on CUDA a
+device-side assert, which ends the process). At ``document`` (the default) nothing of this
+runs and the reader is the one above, bit for bit.
 """
 
 from __future__ import annotations
@@ -227,9 +241,12 @@ class _ReaderBlock(nn.Module):
         self.fc_in = nn.Linear(width, 4 * width)
         self.fc_out = nn.Linear(4 * width, width)
 
-    def forward(self, x: Tensor, mask: Tensor, cos: Tensor | None, sin: Tensor | None) -> Tensor:
+    def forward(
+        self, x: Tensor, mask: Tensor | None, cos: Tensor | None, sin: Tensor | None
+    ) -> Tensor:
         """``cos`` / ``sin [T, half]``: the rotary angles' in the dtype of the parameters, or
-        ``None`` for no rotation (``model.reader_position = learned``)."""
+        ``None`` for no rotation (``model.reader_position = learned``). ``mask`` None: the
+        causal mask (``model.reader_mask = causal``), SDPA's ``is_causal``."""
         B, T, w = x.shape
         q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
         q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
@@ -243,7 +260,10 @@ class _ReaderBlock(nn.Module):
             else:
                 cos, sin = cos.to(q.dtype), sin.to(q.dtype)
                 q, k = _rotate(q, cos, sin), _rotate(k, cos, sin)
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        if mask is None:  # model.reader_mask = causal: no mask, the flash kernel on CUDA
+            attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         x = x + self.proj(attn.transpose(1, 2).reshape(B, T, w))
         out: Tensor = x + self.fc_out(F.gelu(self.fc_in(self.norm_mlp(x))))
         return out
@@ -338,6 +358,14 @@ class Reader(nn.Module):
         self.top_words: int = cfg.reader_top_words
         if self.top_words and not self.carry:
             raise ValueError("model.reader_top_words needs model.reader_carry > 0")
+        #: ``model.reader_mask = causal``: SDPA's causal mask in place of the document mask
+        #: (module docstring, "The causal mask"); False: the document mask (the default)
+        self.causal: bool = cfg.reader_mask == "causal"
+        if self.causal and (self.span is not None or self.carry):
+            raise ValueError(
+                "model.reader_mask=causal is the document mask only without model.reader_span "
+                "and model.reader_carry"
+            )
         half = width // heads // 2
         counts = (
             list(self.rotary_pairs)
@@ -503,7 +531,18 @@ class Reader(nn.Module):
             cos = sin = None
         else:
             cos, sin = self._rotation(T, x)
-        mask = _attention_bias(self.attention_mask(reset, short), x)
+        mask: Tensor | None
+        if self.causal:  # model.reader_mask = causal (module docstring, "The causal mask")
+            # on the device, no host read: the causal mask is the document mask only when no
+            # row starts a document after column 0
+            torch._assert_async(
+                reset[:, 1:].any().logical_not(),
+                "model.reader_mask=causal: a window has a reset after column 0, where the "
+                "causal mask is not the document mask (needs data.align_docs windows)",
+            )
+            mask = None
+        else:
+            mask = _attention_bias(self.attention_mask(reset, short), x)
         for i, block in enumerate(self.blocks):
             block_cos, block_sin = self._block_rotation(self._block_pairs[i], cos, sin)
             x = block(x, mask, block_cos, block_sin)
@@ -733,4 +772,6 @@ class Reader(nn.Module):
             text += f", carry={self.carry}"
         if self.top_words:
             text += f", top_words={self.top_words}"
+        if self.causal:
+            text += ", mask=causal"
         return text
