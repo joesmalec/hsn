@@ -1,0 +1,98 @@
+# hsn_t_nomem_top0_w1024_l3_fast: the memory-off 160 x 3 text recipe
+# (configs/experiments/hsn_t_nomem_top0_w1024_l3.yaml, unchanged) with the two speed settings of
+# PR #90 on: the reader's causal mask (docs/reader_causal_flash.md) and the generic trainer's
+# deferred host reads (docs/trainer_host_sync.md).
+#
+# Why: the user, 17 Nov 2026, asked that runs use the #90 settings. The model, the data and the
+# optimiser's update are the parent's (1,578,272 parameters); four keys change, nothing else:
+#   model.reader_mask: causal     every reader block calls scaled_dot_product_attention with
+#                                 is_causal=True (the flash kernel on CUDA) in place of the
+#                                 additive document mask; exact here, as data.align_docs is on,
+#                                 reader_span null and reader_carry 0 (every reset at column 0)
+#   train.host_sync: stats        a step's loss, accuracy and gradient norm stay on the device and
+#                                 the host reads them one step later
+#   train.fused_adamw: true       torch.optim.AdamW(fused=True), which stats needs (it skips a
+#                                 non-finite step on the device); the same update to rounding
+#   train.divergence_dump: false  stats refuses the per-step divergence dump
+#
+# Measured on the RTX 3060 alone, CUDA graphs (hardware.baseline_compile=reduce-overhead), 400-step
+# runs alternated, median of 3; ms per step:
+#   160 x 3, the parent                              17.62
+#   + causal reader                                  13.19
+#   + stats, fused AdamW, no dump                    15.30
+#   + both (this recipe)                             10.93
+#   GRU 2M at 256 x 32                               16.11
+#   GRU 2M + stats, fused AdamW, no dump             14.64
+# (docs/trainer_host_sync.md's table is an earlier session on a loaded machine: 25.73 / 21.06 /
+# 15.26 / 10.97 for the four HSN-T rows.)
+# Quality: the parent with both settings for 27,000 steps, seed 0: 0.7769 dev bits per byte on all
+# 2,000 dev stories (the parent: 0.7798 seed 0, 0.7697 seed 1; lower is better).
+#
+# What is given up (docs/trainer_host_sync.md has the table):
+# - the divergence dump: no pre-step state is written at a skipped step (nor healthy dumps);
+# - the per-step features stats refuses: spike_factor (and with it slow_burst_factor),
+#   rollback_every, adaptive_lr, gradient_growth, update_limit, weight_ema, answer_weight != 1,
+#   grad_norm_precision float64, precision fp16, and MPS; none is on in the parent;
+# - a non-finite step is skipped on the device by the fused AdamW (its found_inf: weights, moments
+#   and step count as P1.12's host guard leaves them); its count, warning and stop rule follow when
+#   the step is read;
+# - the stats arrive one step late: the host books a step's loss, accuracy and norm after queueing
+#   the next; stats, evaluation and checkpoint steps book every queued step first, so log lines,
+#   evaluations and checkpoints see what per_step would.
+#
+# The arms on the card add, as for the parent: profile=rtx3060 hardware.compile_mode=none
+# hardware.baseline_compile=reduce-overhead, the steps (train.steps=27000 train.ckpt_every=27000
+# train.eval_every=1500) and protocol eval_batch: 32 in the spec. In an experiment spec the family
+# is hsn_t_nomem. The four keys change the configuration hash and the memory key (another step
+# time).
+#
+# Everything else is the parent's, and through it configs/experiments/hsn_t_nomem.yaml: AdamW at
+# 1e-3, the next-byte loss alone, no routing terms. The loader has no "extends", so the file is
+# complete. Everything not listed keeps its Appendix A default (configs/_example.yaml).
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
+
+run_id: hsn_t_nomem_top0_w1024_l3_fast
+seed: 0
+notes: "HSN-T without its memory, the 160 x 3 text recipe of 17 Nov 2026 with PR #90's speed settings: causal reader mask, host reads one step late, fused AdamW, no divergence dump."
+profile: cpu # override with `profile=<name>`
+model_name: hsn_t
+
+model:
+  memory: false # HSN-T without its memory
+  reader: transformer
+  reader_width: 160
+  reader_layers: 3
+  reader_heads: 4
+  reader_rotary_pairs: [20, 20, 0] # top0: the top block compares queries and keys unrotated
+  reader_span: null # the whole window
+  reader_carry: 0 # no carry: every window is read on its own
+  reader_mask: causal # PR #90: is_causal=True, the flash kernel (exact with align_docs)
+  selected_readout: true # HSN-T's decoder input [q; u; r; c]; q and r read zeros
+  routing: topk # required by selected_readout; no cell exists to route
+
+data:
+  dataset: tinystories_w1024
+  manifest: data/tinystories_w1024/manifest.json # built by `python -m hsn.data.text build`
+  tasks: [tinystories]
+  variants: [out_of_range]
+  align_docs: true # every story starts at a window boundary (as in hsn_t_nomem.yaml)
+
+train:
+  optimizer: adamw # the generic trainer's; lazy_adamw needs the unit bank
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 1024 # the window the model reads
+  batch: 8
+  micro_batch: 8
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  lambda_p: 0.0 # no predictor: the objective is the next-byte loss alone
+  search_trials: 1
+  host_sync: stats # PR #90: the host reads a step's loss, accuracy and norm one step later
+  fused_adamw: true # PR #90: torch.optim.AdamW(fused=True); stats needs it
+  divergence_dump: false # stats refuses the per-step dump

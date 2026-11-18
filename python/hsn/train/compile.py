@@ -40,6 +40,15 @@ IDs within a bucket never changes the graph. At B32 there are six nonempty bucke
 pass still runs on all rows. State maxima are reduced within each position; only ``capture=True``
 on the eager path materializes the full state history.
 
+``hardware.round_products = merged`` (opt-in, 17 Nov 2026, ``docs/word_event_speed.md``): the
+blocks of the autograd window take the sparse round's matrix products merged, as the fused
+sweep of P2.10 does without autograd: only the chosen unit's activation and second layer run
+(:meth:`~hsn.model.units.UnitBank.forward_static_merged`), the gate's linear rides in the unit
+bank's first product, ``W_out`` is folded into its second, and ``P`` and ``S`` share one product
+per layer (:meth:`HSN.front_layout`). 21 matrix products per position where ``separate`` (the
+default, the round as it was) has 33, forward and backward together. The same dot products in
+other matmul shapes: equal to rounding, like the compiled window against the eager one.
+
 The compiled window matches eager ``HSN.forward`` to rounding (fused kernels round differently),
 not bit for bit; ``hardware.compile_mode = none`` leaves every path eager and unchanged.
 ``profile:rtx3060`` compiles by default (``reduce-overhead``, the user's decision of 7 Nov 2026);
@@ -149,6 +158,15 @@ MAX_BLOCK = 16
 #:   fused the backward did not compile ("number of constant buffers exceeds maximum supported
 #:   (31)"); kept as a guard, since one node (a wide ``cat``) can read many buffers.
 MPS_INDUCTOR_OPTIONS: dict[str, Any] = {"max_fusion_size": 1, "max_fusion_unique_io_buffers": 24}
+
+#: ``hardware.round_products=merged``: the unit pass runs on the merged layouts
+#: (:meth:`hsn.model.units.UnitBank.forward_static_merged`: the chosen unit's second layer only,
+#: the gate riding in the first product, ``W_out`` folded into the second). False keeps the
+#: all-units pass under the key (measurements).
+MERGE_UNITS = True
+#: ``hardware.round_products=merged``: ``P`` and ``S`` share one product per layer
+#: (:meth:`hsn.model.hsn.HSN.front_layout`). False keeps their own under the key (measurements).
+MERGE_FRONT = True
 
 WindowOut = tuple[Tensor, CellGraphState, dict[str, Tensor]]
 
@@ -509,25 +527,27 @@ def _event_block(
     )
 
 
-def _full_width(x: Tensor, width: int) -> Tensor:
-    """The event slots ``x [B, E, …]`` (:meth:`HSN._event_slots`) as the first ``E`` columns of
-    a contiguous ``[B, width, …]`` tensor (zeros after them, which no block reads), so that a
-    block of its columns has the same strides whatever ``E`` is.
+def _block_columns(x: Tensor, cols: slice) -> Tensor:
+    """The event slots ``cols`` of ``x [B, E, …]`` (:meth:`HSN._event_slots`) as a dense
+    ``[B, n, …]`` tensor of their own: the input of one compiled block.
 
     Dynamo guards on the strides of a compiled function's tensor inputs (static shapes), and a
-    block of ``[B, E, …]`` carries ``E`` in its first stride: every new number of event slots
+    slice of ``[B, E, …]`` carries ``E`` in its first stride: every new number of event slots
     compiled a new graph of :func:`_event_block`, and with ``fullgraph`` the ninth one raised
     ``FailOnRecompileLimitHit``. ``model.word_address`` makes every byte of a context that is
     not text an event (the padding behind a document under ``data.align_docs`` among them), so
     on TinyStories ``E`` took 10 values in 400 training windows of B32 (64 to 256; the byte
     address's events: 64 in all of them), and the runs compiled for 20 minutes on a card without
-    a step. The byte loop's blocks (:meth:`CompiledWindow._run`) are columns of ``[B, T, …]``
-    tensors already."""
-    E = int(x.shape[1])
-    if E == width:
-        return x.contiguous()
-    tail = x.new_zeros((int(x.shape[0]), width - E, *x.shape[2:]))
-    return torch.cat([x, tail], dim=1)
+    a step. A dense copy of the block's columns has the strides of ``[B, n, …]`` whatever ``E``
+    is: one graph.
+
+    17 Nov 2026 (``docs/word_event_speed.md``): until then the slots were padded to ``[B, T,
+    …]`` and a block read a slice of that. The strides were free of ``E`` as well, but a CUDA
+    graph copies a strided input by the byte extent it spans, which for a slice of 16 columns
+    of the padded scorer features is nearly all of it: 22 MB per block at B 32, T 256 and 64
+    cells, four times a window, after the padding itself. The dense block is a sixteenth of
+    that; the values are the same."""
+    return x[:, cols].contiguous()
 
 
 #: The parameters autocast casts at every use (the linears of P, S, the scorer, V, the gate,
@@ -1301,11 +1321,22 @@ class CompiledWindow:
     time of the calls that compiled or recorded (the first call of each new variant), ``calls``
     counts calls."""
 
-    def __init__(self, model: HSN, ctx: DeviceContext, mode: CompileMode, backend: Backend) -> None:
+    def __init__(
+        self,
+        model: HSN,
+        ctx: DeviceContext,
+        mode: CompileMode,
+        backend: Backend,
+        *,
+        merged: bool = False,
+    ) -> None:
         self.model = model
         self.ctx = ctx
         self.mode = mode
         self.backend = backend
+        #: ``hardware.round_products=merged``: the autograd window's blocks take the sparse
+        #: round's matrix products merged (:meth:`_consts`); False: one product per map.
+        self.merged = merged
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
         self._block = _compiler(mode, backend, ctx.device.type)(_block)
         self._bucket_blocks: dict[int, Any] = {0: self._block}
@@ -1323,6 +1354,14 @@ class CompiledWindow:
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
+
+    def _consts(self) -> WindowConsts:
+        """The window constants of the autograd window's blocks (inside the cell's window):
+        the cell's own, or with ``hardware.round_products=merged`` the merged layouts
+        (:meth:`HSN.merged_consts`)."""
+        if not self.merged:
+            return self.model.cell.window_consts()
+        return self.model.merged_consts(units=MERGE_UNITS, front=MERGE_FRONT)
 
     def variant(
         self, B: int, T: int, dense_bucket: int, capture: bool = False
@@ -1550,7 +1589,7 @@ class CompiledWindow:
             table[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
         block = table[bucket]
         with model.cell.window():
-            consts = model.cell.window_consts()
+            consts = self._consts()
             for start in range(0, T, blk):
                 cols = slice(start, start + blk)
                 dense_in: tuple[Tensor, Tensor] | None = None
@@ -1619,17 +1658,13 @@ class CompiledWindow:
         """:meth:`_run` with ``model.write_events``: the compiled :func:`_event_block` over the
         window's event slots, a block at a time. The number of blocks follows the batch (its
         largest event count); the loop over blocks is eager, and every block's inputs are
-        columns of ``[B, T, …]`` tensors (:func:`_full_width`), so no new graph is compiled for
-        another number of slots. The per-byte reads run after the loop
+        dense copies of its slots (:func:`_block_columns`: strides without ``E``), so no new
+        graph is compiled for another number of slots. The per-byte reads run after the loop
         (:meth:`HSN._event_epilogue`)."""
         model = self.model
         T = int(reset.shape[1])
         blk = block_size(T)
         ev = model._event_slots(pro, reset, blk)
-        # the blocks read the slots as columns of [B, T, …] tensors: strides without E
-        z, context, scalars, slot_reset, valid, pos = (
-            _full_width(x, T) for x in (ev.z, ev.context, ev.scalars, ev.reset, ev.valid, ev.pos)
-        )
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age = state.h, state.q, state.age
@@ -1646,7 +1681,7 @@ class CompiledWindow:
         keep_cells = model.cell_read is not None
         blocks: list[dict[str, Tensor]] = []
         with model.cell.window():
-            consts = model.cell.window_consts()
+            consts = self._consts()
             for first in range(0, int(ev.valid.shape[1]), blk):
                 cols = slice(first, first + blk)
                 out = block(
@@ -1654,12 +1689,12 @@ class CompiledWindow:
                     h,
                     q,
                     age,
-                    z[:, cols],
-                    context[:, cols],
-                    scalars[:, cols],
-                    slot_reset[:, cols],
-                    valid[:, cols],
-                    pos[:, cols],
+                    _block_columns(ev.z, cols),
+                    _block_columns(ev.context, cols),
+                    _block_columns(ev.scalars, cols),
+                    _block_columns(ev.reset, cols),
+                    _block_columns(ev.valid, cols),
+                    _block_columns(ev.pos, cols),
                     dense_rows,
                     dense_indices,
                     consts,
@@ -1781,12 +1816,15 @@ def compile_window(
     *,
     backend: Backend = "inductor",
     grad_accum: int = 1,
+    merged: bool = False,
 ) -> Callable[..., WindowOut]:
     """The training window of ``model`` at compile level ``mode`` (module docstring): ``none``
     returns the eager ``model.forward``; otherwise a :class:`CompiledWindow` (after
     :func:`check_compile_scope`). On MPS a backend that cannot compile falls back to eager with a
     logged notice. ``backend`` is ``inductor`` (what ``hardware.compile_mode`` means); tests pass
-    ``aot_eager`` where inductor's C++ toolchain is absent."""
+    ``aot_eager`` where inductor's C++ toolchain is absent. ``merged``
+    (``hardware.round_products=merged``): the blocks take the sparse round's matrix products
+    merged (:meth:`CompiledWindow._consts`, ``docs/word_event_speed.md``)."""
     mode = _check_mode(mode)
     if mode == "none":
         return _eager_window(model)
@@ -1803,7 +1841,7 @@ def compile_window(
                 reason,
             )
             return _eager_window(model)
-    return CompiledWindow(model, ctx, mode, backend)
+    return CompiledWindow(model, ctx, mode, backend, merged=merged)
 
 
 # --------------------------------------------------------------------------------------------------

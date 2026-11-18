@@ -429,7 +429,11 @@ def profile_run(
     warm_windows = 1
     if ctx.compile_enabled and isinstance(replica, HSN):  # P2.8: the trainer's window
         forward = compile_window(
-            replica, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
+            replica,
+            ctx,
+            cfg.hardware.compile_mode,
+            grad_accum=cfg.train.grad_accum,
+            merged=cfg.hardware.round_products == "merged",
         )
         warm_windows = 2  # compile, then (CUDA Graphs) record
     elif not isinstance(replica, HSN):  # hardware.baseline_compile: the trainer's windows
