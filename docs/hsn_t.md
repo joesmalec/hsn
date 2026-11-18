@@ -80,6 +80,14 @@ table is not in the state dict; a longer window, and MPS, still compute the angl
 So global rule 2 holds as before (`ẑ_t = P(q_{t−1})` reads the carried summary only), and
 everything further back than the reader's reach can come from the memory alone.
 
+**Opt-in since 17 Nov 2026: reading past the window** (`model.reader_carry = C > 0` with the
+memory on, `docs/amendments/reader_carry_memory.md`; default 0, in no recipe). The first and
+the last line above then read: the bytes `x_s`, `s ≤ t`, of the same document, in this window
+or before it, at most `C` positions back in every block (from the reader's cache of detached
+keys and values, the mechanism of HSN-T without its memory). Everything after `c_t` is
+unchanged, and the cache is carried beside the cells' state, with the address bytes. At the
+default the lines above hold as written.
+
 **Unchanged:** the cells and their state carried from window to window, the fixed cell
 addresses and byte codes (A5, A9), the router and its selection rule, the address gate (A12,
 A13), the unit bank, the convex tanh gate, the graph, the summary `q`, the selected-cell

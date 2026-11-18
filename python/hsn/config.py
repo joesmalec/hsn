@@ -427,8 +427,12 @@ class ModelConfig(_StrictModel):
     # the windows before, detached (no gradient across windows), as model state the trainer
     # carries; position t reads the keys at distances 0..C of its document, cached or of the
     # window: a sliding span, so no distance exceeds C at any window or document length. Needs
-    # rotary positions and no reader_span; HSN-T with its memory refuses it (memory = false
-    # and model_name = reader take it). 0 (default): no cache, every window read alone.
+    # rotary positions and no reader_span. HSN-T without its memory and model_name = reader
+    # carry the cache as their state. HSN-T with its memory takes it too (17 Nov 2026,
+    # docs/amendments/reader_carry_memory.md; opt-in): the cache is not part of the cells' state
+    # and rides with the address carry (hsn.model.hsn.WindowCarry), so it needs
+    # model.key_address, and it refuses reader_top_words, address_gate_input=reader_prev and
+    # train.lambda_u > 0. 0 (default): no cache, every window read alone.
     reader_carry: int = Field(default=0, ge=0)
     # reader_top_words = N: the top block also reads the keys and values at the last N word
     # ends of its document before the window (a byte that is not a letter or digit directly
@@ -1731,12 +1735,33 @@ class RunConfig(_StrictModel):
                 "read: leave it at 0"
             )
         if self.model_name == "hsn_t" and self.model.memory and self.model.reader_carry:
-            raise ValueError(
-                f"model.reader_carry={self.model.reader_carry} is for HSN-T without its memory "
-                "(model.memory=false) and the reader alone (model_name: reader): with its "
-                "memory HSN-T carries the cells' state across windows, and the reader's cache "
-                "has no place in that state"
-            )
+            # docs/amendments/reader_carry_memory.md (17 Nov 2026, opt-in): the reader's cache
+            # is carried beside the cells' state, with the address carry
+            carry = f"model.reader_carry={self.model.reader_carry} with the memory on"
+            if not self.model.key_address:
+                raise ValueError(
+                    f"{carry}: the reader's cache is handed from window to window with the "
+                    "address carry (prev_tokens, address_history), which only a model with "
+                    "model.key_address=true has; set it (the HSN-T memory recipes do)"
+                )
+            if self.model.reader_top_words:
+                raise ValueError(
+                    f"{carry}: model.reader_top_words={self.model.reader_top_words} (the top "
+                    "block's word slots) is built for HSN-T without its memory only; leave it "
+                    "at 0"
+                )
+            if self.model.address_gate_input == "reader_prev":
+                raise ValueError(
+                    f"{carry}: model.address_gate_input=reader_prev reads c_(t-1), which at a "
+                    "window's first column is zero, not the carried reader's output of the "
+                    "window before; that case is not built. Use address_gate_input=summary"
+                )
+            if self.train.lambda_u > 0.0:
+                raise ValueError(
+                    f"{carry}: train.lambda_u > 0 (the counterfactual probes) replays windows "
+                    "with A5's bytes alone and would read them without the reader's cache; set "
+                    "train.lambda_u=0"
+                )
         if self.model.reader_mask == "causal" and not self.data.align_docs:
             # docs/reader_causal_flash.md: the causal mask is the document mask only where no
             # window has a reset after column 0, which data.align_docs guarantees (StreamLoader

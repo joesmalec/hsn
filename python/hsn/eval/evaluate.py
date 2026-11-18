@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from hsn.model.hsn import address_history
+from hsn.model.hsn import WindowCarry, address_history
 
 __all__ = [
     "DEFAULT_METRICS",
@@ -213,7 +213,8 @@ def evaluate_windows(
     n_windows = 0
     n_tokens = 0
     state: Any = None
-    prev_tokens: Tensor | None = None
+    # A5's carried bytes; with model.reader_carry on the memory also the reader's cache
+    prev_tokens: Tensor | WindowCarry | None = None
     underlying = getattr(model, "model", model)
     key_address = bool(getattr(getattr(underlying, "cfg", None), "key_address", False))
     batch_size: int | None = None
