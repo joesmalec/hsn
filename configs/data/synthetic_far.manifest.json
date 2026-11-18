@@ -1,0 +1,88 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [],
+  "name": "synthetic_far",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.out_of_range.train.npz",
+      "hash": "d839f3561862873bd591c58901669b9f0c44c3b7c8df31d35af4b2bc59654924",
+      "n_docs": 0,
+      "n_loss": 0,
+      "n_tokens": 0,
+      "split": "train",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.out_of_range.dev.npz",
+      "hash": "edad6d61e2ffc2b57bcb1e2828fb782dda9f3f8bae858063b96727a07b3e9f38",
+      "n_docs": 1000,
+      "n_loss": 7887,
+      "n_tokens": 2445210,
+      "split": "dev",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 1,
+      "family": "kv",
+      "file": "kv.out_of_range.test.npz",
+      "hash": "80ed093434febc1f11f0ec792a6650b3aceb47912502f9861020802a7ffbf396",
+      "n_docs": 0,
+      "n_loss": 0,
+      "n_tokens": 0,
+      "split": "test",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.out_of_range.train.npz",
+      "hash": "ff11bace7cd4a64e88bf2158b8aafc33a5e644a9c89ce4a43a384adc07eda4b2",
+      "n_docs": 0,
+      "n_loss": 0,
+      "n_tokens": 0,
+      "split": "train",
+      "task": "delayed",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.out_of_range.dev.npz",
+      "hash": "8bb3d59f67c24c8d8cafc37088abe2b2746d5e195acfce67b65661773942ccdc",
+      "n_docs": 2000,
+      "n_loss": 4324,
+      "n_tokens": 4835470,
+      "split": "dev",
+      "task": "delayed",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 2,
+      "family": "delayed",
+      "file": "delayed.out_of_range.test.npz",
+      "hash": "599c455c87e0788a2e49bf425c202919a70c89caf4f68b6e8c142f865283e4dc",
+      "n_docs": 0,
+      "n_loss": 0,
+      "n_tokens": 0,
+      "split": "test",
+      "task": "delayed",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "c4b0640cb8eeaf404b7c0f82480fb0e8596ed9249671c68ba5444de8229af4c1",
+  "split_hashes": {
+    "dev": "d64a28c21a70678217bb3c9322941f06425492e106d5de30c659f7f7bc54c268",
+    "test": "9623efb214aa605105c2b1d91d636b0bb7470087fbb40923fb013881eb4be3da",
+    "train": "a1a81da21c263ae361c2053c30c2c8d9baf33e602cdbfdb975220b1906778e12"
+  },
+  "unroll": 256
+}

@@ -1,0 +1,77 @@
+# synthetic_far: the far-recall test set (18 Nov 2026). Evaluation only.
+#
+# Why: synthetic_v1's out_of_range variant asks a fact at most 768 bytes back. That is inside
+# Transformer-XL's reach through its four blocks (L * M = 1,024) and inside the reach of the
+# HSN-T reader carry, so a score on it cannot tell a memory from a carried cache. This set asks
+# from 272 to 3,072 bytes back; from 1,024 bytes on, no cache of either model reaches the fact.
+#
+# What it is: synthetic_v1's kv and delayed tasks, parameter for parameter (the same dev key
+# alphabet 112-127, values, filler, markers, context ids and task names), with fresh seeds,
+# anchor distances of 272 to 3,072 bytes and documents of up to 3,200 bytes. A model trained on
+# synthetic_v1 reads it as it reads synthetic_v1's dev split (docs/far_recall_data.md).
+#   kv       1,000 documents, 7,887 answers. Most are queries of the middle, a few bytes back;
+#            the far ones are the first query of each document (1,093 answers are 256 bytes or
+#            more back, 745 of them 1,024 or more).
+#   delayed  2,000 documents, 4,324 answers, all 269 bytes or more back, 3,193 of them 1,024 or
+#            more.
+#
+# Dev split only: n_train = n_test = 0, so there is nothing to train on and nothing to select
+# on beyond what any dev set allows. The six shard files exist, four of them empty.
+#
+# Score it by distance AND by where the fact sits. A long document asked a short way back holds
+# its fact late in the stream, so the two are mixed here: a checkpoint that had not learnt to
+# write late in a long stream lost late facts at every distance. The fact's position is not
+# stored; it is the answer's offset in its document minus its `deps` entry
+# (hsn.data.synthetic.fact_positions, hsn.data.splits.shard_fact_positions). The cells with the
+# fact in the first 256 bytes are thin at the short distances (88 delayed answers at 256-767
+# bytes back); synthetic_far_early fills that row.
+#
+# Build, from the repository root (CPU, about 5 s):
+#   PYTHONPATH=python python -m hsn.data.synthetic build --spec configs/data/synthetic_far.yaml \
+#       --out data/synthetic_far --no-leakage --golden configs/data/synthetic_far.manifest.json
+# --no-leakage: the build's leakage checks compare train splits with dev and test splits, and
+# this set has no train split. The golden manifest is the manifest of the set the analysis of
+# 18 Nov 2026 scored (hsn-handoff/OOR-RECALL-2026-11-18.md), byte for byte; with the checks on,
+# the shard and split hashes are the same and the manifest lists ten comparisons, all zero.
+
+name: synthetic_far
+unroll: 256
+
+tasks:
+  - name: kv
+    variant: out_of_range
+    family: kv
+    context_id: 1
+    seed: 1903
+    n_train: 0
+    n_dev: 1000
+    n_test: 0
+    length_range: [288, 3200]
+    dep_len_range: [272, 3072]
+    params: # synthetic_v1's kv params
+      markers: { ins: 16, ovr: 17, del: 18 }
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 8
+      op_rate: 0.15
+      p_del: 0.25
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 }
+      max_queries: 8
+
+  - name: delayed
+    variant: out_of_range
+    family: delayed
+    context_id: 2
+    seed: 2903
+    n_train: 0
+    n_dev: 2000
+    n_test: 0
+    length_range: [288, 3200]
+    dep_len_range: [272, 3072]
+    params: # synthetic_v1's delayed params
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
