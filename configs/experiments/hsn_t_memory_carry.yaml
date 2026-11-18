@@ -31,7 +31,8 @@
 #   Synthetic delayed + kv, out_of_range (18,000 steps; the delayed facts lie 267 to 768 bytes back, beyond the
 #     carry): 16.9 / 16.2 % (s0 / s1) with the carry against 16.5 / 14.6 % without. No harm, but no model learned
 #     that task, so it is not evidence of recall.
-#   Step time alone on the RTX 3060: about 0.19 s a step (word events: about 0.072 to 0.08).
+#   Step time alone on the RTX 3060: 0.187-0.194 s/step (word events: about 0.072 s/step alone on the RTX 3060,
+#     0.077-0.079 on the rented RTX 3080s).
 # Open:
 #   The attention read of the cells stays off, as in hsn_t_memory.yaml. With the carry it was measured once (word
 #     events, TinyStories 9k, s0): model.cell_attention_heads=4 0.8258 against the carry alone 0.8321. Not in the

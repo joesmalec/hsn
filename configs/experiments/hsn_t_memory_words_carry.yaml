@@ -34,7 +34,8 @@
 #     16.2 % with the carry against 16.5 / 14.6 % without. No harm, but no model learned that task, so it is not
 #     evidence of recall. The word tasks (synthetic_wordhold, synthetic_wordkeys) have in_range documents only,
 #     where the carry reads nothing: they cannot test it.
-#   Step time alone on the RTX 3060: about 0.072 to 0.08 s a step (the per-byte memory: about 0.19).
+#   Step time: about 0.072 s/step alone on the RTX 3060 (0.077-0.079 on the rented RTX 3080s); the per-byte
+#     memory 0.187-0.194 s/step alone on the RTX 3060.
 # Open:
 #   The attention read of the cells stays off, as in hsn_t_memory_words.yaml. With the carry it was measured once
 #     (TinyStories 9k, s0): model.cell_attention_heads=4 0.8258 against the carry alone 0.8321. Not in the carry

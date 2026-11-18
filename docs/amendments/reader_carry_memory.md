@@ -266,8 +266,8 @@ the last step; each reference is the same configuration without `model.reader_ca
 - **Synthetic delayed + kv, `out_of_range`** (18,000 steps, per byte; the delayed facts lie
   beyond the carry): 16.9 / 16.2 % (s0 / s1) with the carry against 16.5 / 14.6 % without. No
   harm, but no model learned that task, so it is not evidence of recall.
-- **Step time** alone on the RTX 3060: per byte about 0.19 s a step, word events about 0.072 to
-  0.08.
+- **Step time.** Per byte 0.187-0.194 s/step alone on the RTX 3060. Word events about 0.072
+  s/step alone on the RTX 3060 (0.077-0.079 on the rented RTX 3080s).
 - **Open.** The attention read of the cells with the carry was measured once (word events,
   TinyStories 9k, s0): 0.8258 against the carry alone 0.8321. It is not in these recipes. The
   top0 reader had one weak seed on word keys: 88.8 % (s1) against 99.8 % (s0).
