@@ -117,6 +117,7 @@ from hsn.model.cell import WindowConsts
 from hsn.model.hsn import (
     HSN,
     StepMode,
+    WindowCarry,
     _Controls,
     _Prologue,
     _stack_record,
@@ -1396,7 +1397,7 @@ class CompiledWindow:
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> WindowOut:
         model = self.model
         if not isinstance(capture, bool):
@@ -1554,7 +1555,7 @@ class CompiledWindow:
         mode: StepMode,
         controls: _Controls,
         dense_rows: Tensor | None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
         dense_indices: Tensor | None = None,
         *,
         capture: bool = False,
@@ -1792,7 +1793,7 @@ def _eager_window(model: HSN) -> Callable[..., WindowOut]:
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> WindowOut:
         result: WindowOut = model(
             tokens,

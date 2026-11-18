@@ -155,6 +155,8 @@ WindowMode = Literal["autograd", "split", "fused"]
 RoundProducts = Literal["separate", "merged"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "moe"]
+#: ``baseline.transformer.position``: the learned position table (default) or rotary positions.
+TransformerPosition = Literal["learned", "rotary"]
 #: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
 #: a Transformer reader in front of the HSN's memory core (``model.reader``, ``docs/hsn_t.md``).
 #: Everything "HSN-only" in this schema applies to both; ``model.reader`` separates them.
@@ -427,8 +429,12 @@ class ModelConfig(_StrictModel):
     # the windows before, detached (no gradient across windows), as model state the trainer
     # carries; position t reads the keys at distances 0..C of its document, cached or of the
     # window: a sliding span, so no distance exceeds C at any window or document length. Needs
-    # rotary positions and no reader_span; HSN-T with its memory refuses it (memory = false
-    # and model_name = reader take it). 0 (default): no cache, every window read alone.
+    # rotary positions and no reader_span. HSN-T without its memory and model_name = reader
+    # carry the cache as their state. HSN-T with its memory takes it too (17 Nov 2026,
+    # docs/amendments/reader_carry_memory.md; opt-in): the cache is not part of the cells' state
+    # and rides with the address carry (hsn.model.hsn.WindowCarry), so it needs
+    # model.key_address, and it refuses reader_top_words, address_gate_input=reader_prev and
+    # train.lambda_u > 0. 0 (default): no cache, every window read alone.
     reader_carry: int = Field(default=0, ge=0)
     # reader_top_words = N: the top block also reads the keys and values at the last N word
     # ends of its document before the window (a byte that is not a letter or digit directly
@@ -1472,6 +1478,13 @@ class TransformerBaselineConfig(_StrictModel):
 
     Defaults are the documented ≈2M-parameter setting for the reference data and ``train.unroll``
     256: 1,930,624 parameters as measured by ``TransformerBaseline.param_report``.
+
+    Two opt-in keys (17 Nov 2026, ``docs/transformer_xl_baseline.md``) make it the
+    Transformer-XL-style control: ``position: rotary`` replaces the learned position table by a
+    rotation of the queries and keys (no parameter; scores depend on distances only), and
+    ``carry: M`` keeps the keys and values of the last ``M`` positions of the windows before,
+    detached, for every block to attend (segment-level recurrence). At their defaults (``learned``,
+    0) the model is the one above, bit for bit, and the keys stay out of the configuration hash.
     """
 
     d_model: int = Field(default=192, ge=1)  # width; must be a multiple of n_heads
@@ -1479,6 +1492,11 @@ class TransformerBaselineConfig(_StrictModel):
     n_heads: int = Field(default=4, ge=1)  # attention heads
     ffn_hidden: int = Field(default=768, ge=1)  # MLP hidden width (4 × d_model)
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)  # embeddings, attention, residual branches
+    # learned: a position table over the window (the model as it was); rotary: queries and keys
+    # rotated by their position (RoPE), no parameter, needed by `carry`
+    position: TransformerPosition = "learned"
+    # Transformer-XL's memory length M: the cached positions of the windows before (0: none)
+    carry: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
@@ -1486,6 +1504,17 @@ class TransformerBaselineConfig(_StrictModel):
             raise ValueError(
                 f"baseline.transformer.d_model={self.d_model} must be a multiple of "
                 f"n_heads={self.n_heads}"
+            )
+        if self.position == "rotary" and (self.d_model // self.n_heads) % 2:
+            raise ValueError(
+                f"baseline.transformer.position=rotary rotates pairs of channels: the head width "
+                f"d_model / n_heads = {self.d_model // self.n_heads} must be even"
+            )
+        if self.carry and self.position != "rotary":
+            raise ValueError(
+                f"baseline.transformer.carry={self.carry} needs baseline.transformer.position="
+                "rotary: a learned position is the position in the window, which a cached key "
+                "would share with a key of the current window"
             )
         return self
 
@@ -1686,6 +1715,15 @@ class RunConfig(_StrictModel):
                 "baseline.address_input is an input of the baselines; the HSN's own address "
                 "features are model.key_address"
             )
+        transformer = self.baseline.transformer
+        if (transformer.position != "learned" or transformer.carry) and (
+            self.model_name != "transformer"
+        ):
+            raise ValueError(
+                "baseline.transformer.position and baseline.transformer.carry belong to the "
+                f"Transformer baseline (model_name: transformer); model_name={self.model_name!r} "
+                "does not read them: leave them at learned and 0"
+            )
         memory_off = self.model_name == "hsn_t" and not self.model.memory
         if (
             self.hardware.baseline_compile != "none"
@@ -1742,12 +1780,33 @@ class RunConfig(_StrictModel):
                 "read: leave it at 0"
             )
         if self.model_name == "hsn_t" and self.model.memory and self.model.reader_carry:
-            raise ValueError(
-                f"model.reader_carry={self.model.reader_carry} is for HSN-T without its memory "
-                "(model.memory=false) and the reader alone (model_name: reader): with its "
-                "memory HSN-T carries the cells' state across windows, and the reader's cache "
-                "has no place in that state"
-            )
+            # docs/amendments/reader_carry_memory.md (17 Nov 2026, opt-in): the reader's cache
+            # is carried beside the cells' state, with the address carry
+            carry = f"model.reader_carry={self.model.reader_carry} with the memory on"
+            if not self.model.key_address:
+                raise ValueError(
+                    f"{carry}: the reader's cache is handed from window to window with the "
+                    "address carry (prev_tokens, address_history), which only a model with "
+                    "model.key_address=true has; set it (the HSN-T memory recipes do)"
+                )
+            if self.model.reader_top_words:
+                raise ValueError(
+                    f"{carry}: model.reader_top_words={self.model.reader_top_words} (the top "
+                    "block's word slots) is built for HSN-T without its memory only; leave it "
+                    "at 0"
+                )
+            if self.model.address_gate_input == "reader_prev":
+                raise ValueError(
+                    f"{carry}: model.address_gate_input=reader_prev reads c_(t-1), which at a "
+                    "window's first column is zero, not the carried reader's output of the "
+                    "window before; that case is not built. Use address_gate_input=summary"
+                )
+            if self.train.lambda_u > 0.0:
+                raise ValueError(
+                    f"{carry}: train.lambda_u > 0 (the counterfactual probes) replays windows "
+                    "with A5's bytes alone and would read them without the reader's cache; set "
+                    "train.lambda_u=0"
+                )
         if self.model.reader_mask == "causal" and not self.data.align_docs:
             # docs/reader_causal_flash.md: the causal mask is the document mask only where no
             # window has a reset after column 0, which data.align_docs guarantees (StreamLoader
@@ -2241,6 +2300,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.host_sync",
     "train.fused_adamw",
     "hardware.round_products",
+    "baseline.transformer.position",
+    "baseline.transformer.carry",
     "train.reach_dropout",
     "train.reach_dropout_span",
 )
@@ -2584,7 +2645,8 @@ def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
         )
     if model.reader_carry:
         # the carried reader reads through Reader.read and its own mask, which takes no short
-        # rows (HSN-T with its memory refuses model.reader_carry on main of 17 Nov 2026)
+        # rows (HSN-T with its memory takes model.reader_carry since 17 Nov 2026,
+        # docs/amendments/reader_carry_memory.md; reach dropout leaves it out)
         return (
             f"model.reader_carry={model.reader_carry}: the carried reader reads through its "
             "cache's own mask, which the short rows do not narrow; leave model.reader_carry at 0"

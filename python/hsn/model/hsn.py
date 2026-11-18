@@ -155,6 +155,17 @@ beside the reader, ``S`` reads ``[z ; q ; ctx ; c ; f]`` and ``D`` reads ``[q ; 
 the rows the trainer hands over (:meth:`HSN.set_reach_rows`) read with a short span; no equation
 changes, and evaluation reads as configured.
 
+Reading past the window with the memory on (``model.reader_carry = C > 0`` with
+``model.memory``, ``docs/amendments/reader_carry_memory.md``; opt-in, 17 Nov 2026): ``c_t``
+also reads the last ``C`` positions of its document before the window, from the reader's cache
+of detached keys and values (:meth:`hsn.model.reader.Reader.read`, the mechanism of HSN-T
+without its memory), so the reader's sight does not fall to one byte at a window boundary.
+Nothing after ``c_t`` changes. The cache is not part of :class:`CellGraphState`: it rides with
+the address carry, as a :class:`WindowCarry` that :func:`address_history` builds from the
+window's ``info`` (:data:`READER_CACHE_KEYS`) and :meth:`forward` takes as ``prev_tokens``.
+The prologue is eager in the compiled window too, so no graph changes. At ``C = 0`` (default)
+every line of the reader's path is the one it was.
+
 The attention read of the cells (``model.cell_attention_heads = H > 0``, HSN-T only,
 ``docs/amendments/cell_attention_read.md``; opt-in candidate): at every position ``c_t`` queries
 all cells (:class:`~hsn.model.cell_read.CellAttentionRead`: keys from each cell's state and its
@@ -191,14 +202,26 @@ from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.gradclip import clip_row_grad
 from hsn.model.halting import HaltingHead
-from hsn.model.reader import Reader
+from hsn.model.reader import Cache, Reader
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.model.word_address import state_width
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
-__all__ = ["PARAM_REPORT_ROWS", "HSN", "StepMode", "StepOutput", "address_history"]
+__all__ = [
+    "PARAM_REPORT_ROWS",
+    "READER_CACHE_KEYS",
+    "HSN",
+    "StepMode",
+    "StepOutput",
+    "WindowCarry",
+    "address_history",
+    "clone_carry",
+    "pack_carry",
+    "reader_carried",
+    "split_packed_carry",
+]
 
 StepMode = Literal["dense", "masked", "sparse"]
 _INDEX_DTYPES = (torch.int64, torch.int32)
@@ -355,6 +378,10 @@ class _Prologue(NamedTuple):
     #: ``model.word_address``: what the next window of the same rows takes as ``prev_tokens``
     #: (:func:`address_history`): the address bytes, then the word state; ``None`` without it.
     address_carry: Tensor | None = None
+    #: ``model.reader_carry`` with the memory on: the reader's cache after the window
+    #: (:meth:`hsn.model.reader.Reader.read`, detached), which ``info`` hands to
+    #: :func:`address_history` (:data:`READER_CACHE_KEYS`); ``None`` without the key.
+    reader_cache: Cache | None = None
 
     def dense_counters(self, t: int) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         """The P1.10b dense window's ``(age, pos)`` before and after position ``t`` (``None``
@@ -431,12 +458,91 @@ class _Events(NamedTuple):
     before: Tensor
 
 
+#: ``model.reader_carry`` with the memory on: the keys under which a window's ``info`` holds the
+#: reader's next cache (``keys``, ``values``, ``valid``: :meth:`hsn.model.reader.Reader.read`).
+READER_CACHE_KEYS: tuple[str, str, str] = (
+    "reader_cache_keys",
+    "reader_cache_values",
+    "reader_cache_valid",
+)
+
+
+class WindowCarry(NamedTuple):
+    """``model.reader_carry`` with the memory on (``docs/amendments/reader_carry_memory.md``):
+    what a caller carries from a window to the next window of the same rows, in the place of
+    A5's ``prev_tokens``. ``address`` is what :func:`address_history` returns without the key
+    (the bytes, or with ``model.word_address`` the int64 address carry); ``reader`` is the
+    reader's cache after the window (``keys`` / ``values [L, B, H, C, w / H]``, ``valid
+    [B, C]``), detached. :func:`address_history` builds it from the window's ``info`` and
+    :meth:`HSN.forward` takes it as ``prev_tokens``, so a caller that carries the address
+    carries the reader's sight with it and :class:`~hsn.model.state.CellGraphState` keeps its
+    layout."""
+
+    address: Tensor
+    reader: Cache
+
+
+def reader_carried(cfg: ModelConfig) -> bool:
+    """Whether the reader's cache rides with the address carry: HSN-T with its memory and
+    ``model.reader_carry > 0`` (HSN-T without its memory carries the cache as its state)."""
+    return cfg.reader != "none" and cfg.reader_carry > 0 and cfg.memory
+
+
+def clone_carry(carry: Tensor | WindowCarry | None) -> Tensor | WindowCarry | None:
+    """A detached copy of a window's carry (``prev_tokens``), on its device."""
+    if carry is None:
+        return None
+    if isinstance(carry, WindowCarry):
+        return WindowCarry(
+            carry.address.detach().clone(), tuple(t.detach().clone() for t in carry.reader)
+        )
+    return carry.detach().clone()
+
+
+def pack_carry(carry: Tensor | WindowCarry | None) -> Any:
+    """A window's carry for a checkpoint: CPU copies in plain containers (``weights_only``
+    loads them). A tensor stays a tensor; a :class:`WindowCarry` is ``{"address": ...,
+    "reader": [keys, values, valid]}``."""
+    if carry is None:
+        return None
+    if isinstance(carry, WindowCarry):
+        return {
+            "address": carry.address.detach().to(device="cpu", copy=True),
+            "reader": [t.detach().to(device="cpu", copy=True) for t in carry.reader],
+        }
+    return carry.detach().to(device="cpu", copy=True)
+
+
+def split_packed_carry(
+    cfg: ModelConfig, packed: Any, where: str
+) -> tuple[Any, list[Tensor] | None]:
+    """:func:`pack_carry`'s value as ``(address, reader)``: the address part as a checkpoint
+    without the key holds it, and the reader's cache tensors (None without
+    ``model.reader_carry`` on the memory, or for ``None``). ``where`` names the file."""
+    if not reader_carried(cfg) or packed is None:
+        return packed, None
+    if not (isinstance(packed, dict) and set(packed) == {"address", "reader"}):
+        raise ValueError(
+            f"{where}: with model.reader_carry={cfg.reader_carry} on the memory, prev_tokens "
+            "must hold the address carry and the reader's cache ({'address', 'reader'}); the "
+            "checkpoint was written without the key"
+        )
+    reader = packed["reader"]
+    if not (
+        isinstance(reader, list | tuple)
+        and len(reader) == 3
+        and all(isinstance(t, Tensor) for t in reader)
+    ):
+        raise ValueError(f"{where}: the reader's cache must be three tensors (keys, values, valid)")
+    return packed["address"], list(reader)
+
+
 def address_history(
     cfg: ModelConfig,
     tokens: Tensor,
-    previous: Tensor | None = None,
+    previous: Tensor | WindowCarry | None = None,
     info: dict[str, Tensor] | None = None,
-) -> Tensor:
+) -> Tensor | WindowCarry:
     """What a caller carries from the window ``tokens [B, T]`` to the next window of the same
     rows, as that window's ``prev_tokens`` (A5 / A9's address features).
 
@@ -450,15 +556,34 @@ def address_history(
     itself can compute (it reads the contexts, the resets and the fixed tables). It is
     ``info["address_carry"]`` of that window's forward pass (int64 ``[B, n + 2d + 6]``: the
     bytes above, then :func:`hsn.model.word_address.state_width` integers), so ``info`` is
-    required."""
+    required.
+
+    ``model.reader_carry`` with the memory on (:func:`reader_carried`): the carry is a
+    :class:`WindowCarry`, the address carry above and the reader's cache after the window,
+    which only the window's forward pass has (``info``, :data:`READER_CACHE_KEYS`), so ``info``
+    is required; ``previous`` is then the :class:`WindowCarry` carried into the window."""
+    reader: Cache | None = None
+    if reader_carried(cfg):
+        if info is None or any(key not in info for key in READER_CACHE_KEYS):
+            raise ValueError(
+                f"model.reader_carry={cfg.reader_carry} with the memory on: the carry holds the "
+                "reader's cache after the window; pass the info of the window's forward pass "
+                "to address_history"
+            )
+        reader = tuple(info[key].detach() for key in READER_CACHE_KEYS)
+    if isinstance(previous, WindowCarry):
+        previous = previous.address
+    address: Tensor
     if cfg.word_address != "none":
         if info is None or "address_carry" not in info:
             raise ValueError(
                 f"model.word_address={cfg.word_address}: the carried address holds the running "
                 "word code; pass the info of the window's forward pass to address_history"
             )
-        return info["address_carry"].detach().clone()
-    return _byte_history(cfg, tokens, previous)
+        address = info["address_carry"].detach().clone()
+    else:
+        address = _byte_history(cfg, tokens, previous)
+    return address if reader is None else WindowCarry(address, reader)
 
 
 def _byte_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None) -> Tensor:
@@ -1358,7 +1483,7 @@ class HSN(nn.Module):
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """Run positions ``0 .. T−1`` of ``tokens [B, T]`` / ``ctx [B, T]`` from ``state``.
 
@@ -1574,15 +1699,25 @@ class HSN(nn.Module):
         mode: StepMode,
         *,
         reset_first: bool,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> _Prologue:
         """The window-invariant work of :meth:`forward` (P1.10a): the embeddings, ``E`` and the
         prediction target over ``[B, T]``, the context embeddings, the position-independent scorer
         features, and (P1.10b, dense routing without disabled cells) the window's ``age`` / ``pos``
         counters, with the age feature in front of the scalars. ``reset_first`` says whether column
-        0 resets (it decides the start age)."""
+        0 resets (it decides the start age). With ``model.reader_carry`` on the memory
+        ``prev_tokens`` is the :class:`WindowCarry` of the window before (None: a stream's first
+        window, nothing cached) and the reader reads the window after its cache."""
         cfg = self.cfg
         B, T = (int(n) for n in tokens.shape)
+        reader_cache: Cache | None = None
+        if self.reader is not None and self.reader.carry:
+            prev_tokens, reader_cache = self._split_window_carry(prev_tokens, B, tokens.device)
+        elif isinstance(prev_tokens, WindowCarry):
+            raise ValueError(
+                "prev_tokens is a WindowCarry (the carry of model.reader_carry on the memory), "
+                "but the model has no carried reader"
+            )
         emb = self.byte_emb(tokens)  # [B, T, d]
         z = self.encoder(emb)
         z_target = self._prediction_target(emb)  # detached; a function of x_t only
@@ -1591,9 +1726,21 @@ class HSN(nn.Module):
         if self.reader is not None:
             # HSN-T: c_t travels behind the context embedding, so S reads [z; q; ctx; c] at every
             # position with the loop, the compiled block and _position unchanged
-            # train.reach_dropout: the training window's short rows (docs/reach_dropout.md)
-            short = self._reach if self.training else None
-            reader_out = self.reader(tokens, reset, short)  # [B, T, w]
+            if reader_cache is not None:
+                # model.reader_carry on the memory: c_t also reads the cached keys and values of
+                # the last C positions before the window (same document); the next cache leaves
+                # in info, detached
+                reader_out, reader_cache = self.reader.read(tokens, reset, reader_cache)
+            else:
+                # train.reach_dropout: the training window's short rows (docs/reach_dropout.md);
+                # never beside a cache (reach dropout refuses model.reader_carry > 0). Without
+                # short rows the call is the two-argument one, so a stand-in for reader.forward
+                # (the sighted reading of tests/test_reader_carry_memory.py) still fits
+                short = self._reach if self.training else None
+                if short is None:
+                    reader_out = self.reader(tokens, reset)  # [B, T, w]
+                else:
+                    reader_out = self.reader(tokens, reset, short)
             context = torch.cat([context, reader_out], dim=-1)
             if self._gate_rides:
                 # address_gate_input=reader_prev: c_{t−1} behind c_t, for the address gate alone;
@@ -1687,7 +1834,29 @@ class HSN(nn.Module):
             events=events,
             positions=positions if events is not None else None,
             address_carry=address_carry,
+            reader_cache=reader_cache,
         )
+
+    def _split_window_carry(
+        self, carry: Tensor | WindowCarry | None, B: int, device: torch.device
+    ) -> tuple[Tensor | None, Cache]:
+        """``model.reader_carry`` on the memory: a window's ``prev_tokens`` as the address carry
+        and the reader's cache. ``None`` (a stream's first window) is no address carry and an
+        empty cache; anything but a :class:`WindowCarry` is refused, so a caller that carries
+        the bytes alone cannot read a later window blind without noticing."""
+        assert self.reader is not None
+        if carry is None:
+            cache = self.reader.init_cache(B, device)
+            assert cache is not None
+            return None, cache
+        if not isinstance(carry, WindowCarry):
+            raise ValueError(
+                f"model.reader_carry={self.reader.carry} with the memory on: prev_tokens must be "
+                "the WindowCarry of the window before (address_history(cfg, tokens, previous, "
+                "info), which needs the window's info), or None at a stream's first window; got "
+                f"{type(carry).__name__}"
+            )
+        return carry.address, self.reader.check_cache(carry.reader, B)
 
     def _split_address_carry(
         self, carry: Tensor | None, B: int
@@ -1900,6 +2069,8 @@ class HSN(nn.Module):
             info["cell_states"] = hs
             info["cell_gates"] = gates
             info["cell_written"] = written
+        if pro.reader_cache is not None:  # model.reader_carry on the memory: the next window's
+            info.update(zip(READER_CACHE_KEYS, pro.reader_cache, strict=True))
         return logits, state, info
 
     # -- model.write_events: the loop over events (docs/amendments/write_events.md) --------------
@@ -2033,7 +2204,7 @@ class HSN(nn.Module):
         state: CellGraphState,
         reset: Tensor,
         capture: bool,
-        prev_tokens: Tensor | None,
+        prev_tokens: Tensor | WindowCarry | None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """:meth:`forward` with ``model.write_events``: the prologue, the event slots, one
         eager :meth:`_event_block` over all of them and :meth:`_event_epilogue`."""

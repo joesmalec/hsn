@@ -71,7 +71,7 @@ model: # Appendix A.1
   reader_rotary_pairs: null # HSN-T reader (opt-in): n = only the first n pairs of each head (the highest frequencies) are rotated, the others are compared as they are at every distance; a list = n for each block (0 = that block's attention is not rotated); null = all width / heads / 2 pairs in every block
   reader_rotary_dtype: working # HSN-T reader (opt-in): working = the rotation runs in the dtype of the queries and keys (bf16 under bf16 autocast) | parameters = in the parameters' dtype (float32), cast back for the attention
   reader_rotary_base: 10000.0 # HSN-T reader (opt-in): b = the base of the rotation's frequency ladder, pair i of a head turns by t * b^(-i / half) at distance t; larger = longer wavelengths for the slower pairs; finite, above 1; not read with reader_position: learned (refused there)
-  reader_carry: 0 # HSN-T reader (opt-in, untested candidate): C = every block keeps the keys and values of the last C positions of the windows before (detached, carried as model state) and position t reads distances 0..C of its document, cached or in the window; 0 = every window read alone; needs rotary positions, no reader_span, and model.memory: false or model_name: reader
+  reader_carry: 0 # HSN-T reader (opt-in, untested candidate): C = every block keeps the keys and values of the last C positions of the windows before (detached, carried as model state) and position t reads distances 0..C of its document, cached or in the window; 0 = every window read alone; needs rotary positions and no reader_span; HSN-T without its memory and model_name: reader carry the cache as their state, HSN-T with its memory carries it with the address bytes (opt-in of 17 Nov 2026, docs/amendments/reader_carry_memory.md)
   reader_top_words: 0 # HSN-T reader (opt-in, untested candidate): N = the top block also reads the keys and values at the last N word ends of its document before the window (a byte that is not a letter or digit right after one; bytes >= 128 count as letters), carried and detached; entries inside the carried span are not read twice; needs reader_carry > 0 and the top block unrotated (last reader_rotary_pairs entry 0)
   reader_mask: document # HSN-T reader (opt-in, docs/reader_causal_flash.md): document = the block-diagonal causal mask over a row's documents (an additive bias; the memory-efficient kernel on CUDA) | causal = SDPA is_causal with no mask (the flash kernel on CUDA), the same mask when resets are at column 0 only; needs reader_span null, reader_carry 0 and data.align_docs: true, and asserts it on the device
   memory: true # HSN-T only (docs/hsn_t_no_memory.md): false = HSN-T without its memory, stateless and parallel over the window (embeddings, E, reader, S, D; zeros where q and r are read), trained by the generic trainer
@@ -297,6 +297,8 @@ baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which ba
     n_heads: 4 # attention heads
     ffn_hidden: 768 # MLP hidden width (4 x d_model)
     dropout: 0.0 # embeddings, attention, residual branches
+    position: learned # learned (a table over the window) | rotary (RoPE; Transformer-XL's positions)
+    carry: 0 # Transformer-XL's memory: cached positions of the windows before (needs rotary; 0 = none)
   selective_ssm: # Mamba-style control (model_name: selective_ssm); 1,887,744 parameters measured
     d_model: 256 # residual width
     n_layers: 4 # Mamba blocks

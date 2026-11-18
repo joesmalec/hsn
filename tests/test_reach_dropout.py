@@ -111,6 +111,8 @@ def test_keys_are_opt_in_and_keep_the_hash_and_the_memory_key() -> None:
         (RECIPE, [*TOP0, *E1, "train.lambda_u=0.1"], "lambda_u"),
         # docs/reader_causal_flash.md: the causal mask has no mask tensor for the span to narrow
         (RECIPE, [*TOP0, *E1, "model.reader_mask=causal"], "short rows' span mask could not act"),
+        # the carried reader (allowed with the memory since #94) reads through its own mask
+        (RECIPE, [*TOP0, *E1, "model.reader_carry=8"], "reader_carry=8: the carried reader"),
         (RECIPE_A6, ["train.reach_dropout=0.5"], "no memory behind a reader"),
         (NOMEM, ["train.reach_dropout=0.5"], "train.reach_dropout=0.5"),
         (RECIPE, [*TOP0, "train.reach_dropout=1.5"], "less than or equal"),
@@ -130,8 +132,10 @@ def test_causal_mask_and_carried_reader_refuse_short_rows() -> None:
     assert causal.data.align_docs and causal.train.reach_dropout == 0.0  # allowed without it
     on = load_config(RECIPE, [*TOP0, *E1])
     assert reach_dropout_scope_error(on) is None
-    # model.reader_carry with the memory is refused before this check on main (17 Nov 2026);
-    # the scope check refuses it on its own, whichever refusal a later main keeps
+    # model.reader_carry with the memory is allowed since 17 Nov 2026
+    # (docs/amendments/reader_carry_memory.md); the scope check refuses it beside reach dropout
+    alone = load_config(RECIPE, [*TOP0, "model.reader_carry=8"])
+    assert alone.model.reader_carry == 8 and alone.train.reach_dropout == 0.0
     carried = on.model_copy(update={"model": on.model.model_copy(update={"reader_carry": 8})})
     reason = reach_dropout_scope_error(carried)
     assert reason is not None and "model.reader_carry=8" in reason

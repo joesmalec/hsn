@@ -3,6 +3,8 @@ configuration written before them at its hash (old checkpoints resume, old dumps
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from hsn.config import (
     HASH_OMIT_AT_DEFAULT,
@@ -40,8 +42,17 @@ HASHES_80B893D = {
 def test_p1_16_config_hash_unchanged_at_defaults(path: str, overrides: tuple[str, ...]) -> None:
     cfg = load_config(REPO_ROOT / path, list(overrides))
     assert config_hash(cfg) == HASHES_80B893D[(path, overrides)]
+    dumped = json.loads(canonical_json(cfg))
     for dotted in HASH_OMIT_AT_DEFAULT:
-        assert f'"{dotted.split(".")[1]}"' not in canonical_json(cfg)
+        parts = dotted.split(".")
+        if len(parts) == 2:
+            assert f'"{parts[1]}"' not in canonical_json(cfg)
+            continue
+        # a key two levels down (baseline.transformer.position): absent from its own section
+        node = dumped
+        for section in parts[:-1]:
+            node = node.get(section, {})
+        assert parts[-1] not in node, dotted
 
 
 def test_p1_16_rollback_keys_defaults_off() -> None:
@@ -123,6 +134,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.host_sync",  # the generic trainer's host reads (opt-in, 17 Nov 2026)
         "train.fused_adamw",  # the fused AdamW (opt-in, 17 Nov 2026)
         "hardware.round_products",  # the compiled round's merged products (17 Nov 2026)
+        "baseline.transformer.position",  # the Transformer as Transformer-XL (opt-in, 17 Nov)
+        "baseline.transformer.carry",
         "train.reach_dropout",  # short-span rows of HSN-T's reader in training (opt-in, 17 Nov)
         "train.reach_dropout_span",
     )

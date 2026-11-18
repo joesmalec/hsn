@@ -536,7 +536,11 @@ def measure_utility_correlation(
                 **_address_kwargs(model, prev_tokens),
             )  # carry the state into the next window
             if model.cfg.key_address:
-                prev_tokens = address_history(model.cfg, window.tokens, prev_tokens)
+                # the bytes alone: a model whose carry needs the window's info (the word
+                # address, a carried reader) is refused by address_history
+                history = address_history(model.cfg, window.tokens, prev_tokens)
+                assert isinstance(history, Tensor)
+                prev_tokens = history
     return _summarise(per_window, n_windows, horizon, n_probe, seed, n_bootstrap)
 
 
