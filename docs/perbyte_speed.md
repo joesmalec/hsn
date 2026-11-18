@@ -208,7 +208,6 @@ Slot 3 (14:03 to 14:21; other jobs on the CPUs; the final commit):
   the load. Slot 2 is the comparison on a quiet host; slot 3 says that the final commit
   runs and is in the same place. A paired timing of the final commit on a quiet host, and
   the two keys on it, are not measured (`slot4.sh` beside the tools would do it).
-
 - Every run: 1 dynamo graph, 0 recompiles. Peak allocated 2.87 to 2.91 GiB (1.92 to 1.94
   with the merged products).
 - Device time by the two profiles (`prof/base_prof` on main, `prof/new_prof` on `3911d08`):
@@ -223,7 +222,8 @@ Slot 3 (14:03 to 14:21; other jobs on the CPUs; the final commit):
   optimiser steps with statistics steps): main against the branch at its defaults, eager
   (`compile_mode=none`) and compiled (`aot_eager`). The SHA-256 of every raw gradient of
   every step (83 tensors, before clipping), the losses and gradient norms, the 85 parameters
-  after the last step, the carried state and the reader's cache: identical.
+  after the last step, the carried state and the reader's cache: identical. The same with
+  `hardware.message_gradients=state` on the compiled window (fp32: the key changes nothing).
 - **The blocks** (`tests/test_perbyte_speed.py`): values, layout and the gradient against
   the slices bit for bit, a `-0.0` in a block's gradient included; the compiled window on
   the blocks against the compiled window on the slices over five consecutive windows of
@@ -341,5 +341,5 @@ are worth. None is built.
 - Measurement tools, traces and results (not in the repository):
   `~/hsn-experiments/perbyte-speed/` (`tools/prof_pb.py`, `tools/prof_pb2.py`,
   `tools/analyze_pb.py`, `tools/equiv.py`, `tools/compare_equiv.py`, `tools/micro1.py`,
-  `tools/op_census.py`, `tools/slot2_report.py`, `slot1.sh`, `slot2.sh`, `slot3.sh`,
+  `tools/op_census.py`, `tools/slot2_report.py`, `slot1.sh` to `slot4.sh`,
   `prof/`, `timing/`, `equiv/`, `logs/`).
