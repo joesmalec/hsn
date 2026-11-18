@@ -24,10 +24,18 @@ from typing import Any
 import pytest
 import test_p2_8_compile as p28
 import torch
-from hsn.config import HASH_OMIT_AT_DEFAULT, RunConfig, canonical_json, config_hash, load_config
+from hsn.config import (
+    HASH_OMIT_AT_DEFAULT,
+    RunConfig,
+    canonical_json,
+    config_hash,
+    load_config,
+    reach_dropout_scope_error,
+)
 from hsn.device import seed_everything
 from hsn.experiments.spec import memory_key
 from hsn.model.hsn_t import HSNT
+from hsn.model.reader import Reader
 from hsn.train import tbptt
 from hsn.train.compile import compile_window
 from hsn.train.tbptt import TBPTTTrainer
@@ -101,6 +109,8 @@ def test_keys_are_opt_in_and_keep_the_hash_and_the_memory_key() -> None:
         (RECIPE, ["train.reach_dropout=0.5"], "reader_span=32 already limits every row"),
         (RECIPE, [*TOP0, *E1, "train.reach_dropout_span=256"], "not shorter than the window"),
         (RECIPE, [*TOP0, *E1, "train.lambda_u=0.1"], "lambda_u"),
+        # docs/reader_causal_flash.md: the causal mask has no mask tensor for the span to narrow
+        (RECIPE, [*TOP0, *E1, "model.reader_mask=causal"], "short rows' span mask could not act"),
         (RECIPE_A6, ["train.reach_dropout=0.5"], "no memory behind a reader"),
         (NOMEM, ["train.reach_dropout=0.5"], "train.reach_dropout=0.5"),
         (RECIPE, [*TOP0, "train.reach_dropout=1.5"], "less than or equal"),
@@ -110,6 +120,30 @@ def test_keys_are_opt_in_and_keep_the_hash_and_the_memory_key() -> None:
 def test_configuration_refusals(path: Path, overrides: list[str], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         load_config(path, overrides)
+
+
+def test_causal_mask_and_carried_reader_refuse_short_rows() -> None:
+    """``model.reader_mask=causal`` (SDPA's ``is_causal``, no mask tensor) and a carried reader
+    (``Reader.read``'s own mask) take no short rows: refused at configuration load, and the
+    causal reader refuses them itself."""
+    causal = load_config(RECIPE, [*TOP0, "model.reader_mask=causal"])
+    assert causal.data.align_docs and causal.train.reach_dropout == 0.0  # allowed without it
+    on = load_config(RECIPE, [*TOP0, *E1])
+    assert reach_dropout_scope_error(on) is None
+    # model.reader_carry with the memory is refused before this check on main (17 Nov 2026);
+    # the scope check refuses it on its own, whichever refusal a later main keeps
+    carried = on.model_copy(update={"model": on.model.model_copy(update={"reader_carry": 8})})
+    reason = reach_dropout_scope_error(carried)
+    assert reason is not None and "model.reader_carry=8" in reason
+    cfg = _cfg(*A5, *READER, "model.reader_mask=causal")
+    reader = Reader(cfg.model, seed=0).double()
+    assert reader.causal
+    tokens = torch.randint(0, 256, (3, 8))
+    reset = torch.zeros(3, 8, dtype=torch.bool)
+    reset[:, 0] = True
+    reader(tokens, reset)  # no short rows: the causal reader as on main
+    with pytest.raises(ValueError, match="reader_mask=causal"):
+        reader(tokens, reset, (torch.tensor(ROWS), S))
 
 
 # --------------------------------------------------------------------------------------------------

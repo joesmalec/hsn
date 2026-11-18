@@ -68,6 +68,8 @@ Refused at configuration load (`reach_dropout_scope_error`) when `p > 0`:
 | `model_name` other than `hsn_t` | no memory behind a reader |
 | `model.memory=false` | `memory_off_refusals`: nothing to carry what the short rows miss |
 | `model.reader_span` set | the key shortens a whole-window reader; a span already limits every row |
+| `model.reader_mask=causal` | SDPA's causal mask has no mask tensor for the short rows' span to narrow (`docs/reader_causal_flash.md`); `Reader.forward` refuses short rows there too |
+| `model.reader_carry > 0` | the carried reader reads through `Reader.read`'s own mask, which takes no short rows (with the memory on, main refuses the key anyway) |
 | `train.reach_dropout_span ≥ train.unroll` | a short row would read the whole window |
 | `train.lambda_u > 0` (P2.3 probes) | untested: the probes run before the window's rows are drawn |
 

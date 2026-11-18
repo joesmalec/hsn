@@ -1751,9 +1751,8 @@ class RunConfig(_StrictModel):
         if self.model.reader_mask == "causal" and not self.data.align_docs:
             # docs/reader_causal_flash.md: the causal mask is the document mask only where no
             # window has a reset after column 0, which data.align_docs guarantees (StreamLoader
-            # starts a document at a window boundary only). Note for train.reach_dropout (branch
-            # claude/reach-dropout, not merged on 17 Nov 2026): it gives some rows a span mask,
-            # so it must be refused with reader_mask=causal when it lands.
+            # starts a document at a window boundary only). train.reach_dropout gives some rows
+            # a span mask, so reach_dropout_scope_error refuses it with reader_mask=causal.
             raise ValueError(
                 "model.reader_mask=causal needs data.align_docs=true: without it a document can "
                 "start inside a window, where the reader's document mask is not the causal mask"
@@ -2574,6 +2573,21 @@ def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
             f"model.reader_span={model.reader_span} already limits every row; the key "
             "shortens a whole-window reader in some rows: leave model.reader_span null (the "
             "short reader in every row and in evaluation is model.reader_span alone)"
+        )
+    if model.reader_mask == "causal":
+        # docs/reader_causal_flash.md: the causal mask is SDPA's is_causal with no mask tensor,
+        # which a short row's span mask cannot narrow
+        return (
+            "model.reader_mask=causal reads with SDPA's causal mask and no mask tensor, so the "
+            "short rows' span mask could not act (docs/reader_causal_flash.md); leave "
+            "model.reader_mask at document"
+        )
+    if model.reader_carry:
+        # the carried reader reads through Reader.read and its own mask, which takes no short
+        # rows (HSN-T with its memory refuses model.reader_carry on main of 17 Nov 2026)
+        return (
+            f"model.reader_carry={model.reader_carry}: the carried reader reads through its "
+            "cache's own mask, which the short rows do not narrow; leave model.reader_carry at 0"
         )
     if train.reach_dropout_span >= train.unroll:
         return (

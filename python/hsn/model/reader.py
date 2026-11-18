@@ -510,6 +510,13 @@ class Reader(nn.Module):
                     f"short rows (train.reach_dropout) shorten a whole-window reader; this one "
                     f"has model.reader_span={self.span}"
                 )
+            if self.causal:
+                # model.reader_mask=causal reads with SDPA's is_causal and no mask, so the short
+                # rows' span mask could not act (docs/reader_causal_flash.md)
+                raise ValueError(
+                    "short rows (train.reach_dropout) need the document mask they narrow; this "
+                    "reader has model.reader_mask=causal (no mask)"
+                )
             if rows.dtype is not torch.bool or tuple(rows.shape) != (int(tokens.shape[0]),):
                 raise ValueError(
                     f"short rows must be a bool [B] tensor (B = {int(tokens.shape[0])}), got "
