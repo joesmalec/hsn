@@ -330,6 +330,10 @@ balance"): the shape below on 1024-byte windows without the carry is the recipe
 blocks (pairs `[20, 20, 0]`) is `configs/experiments/hsn_t_nomem_top0_w1024_l3.yaml`: 0.7798 /
 0.7697 dev bits at 17.6 ms a step against 22.0 ms for 4 blocks, both with CUDA graphs alone on
 the RTX 3060; its header has the comparison.
+With PR #90's speed settings on (`model.reader_mask: causal`, `train.host_sync: stats`,
+`train.fused_adamw: true`, `train.divergence_dump: false`; the user asked for them on 17 Nov) it
+is `configs/experiments/hsn_t_nomem_top0_w1024_l3_fast.yaml`: 10.93 ms a step against 17.62, 0.7769
+dev bits at 27k (seed 0); its header has what `stats` gives up.
 
 TinyStories (`tinystories_v1`), 9,000 steps, dev bits per byte (lower is better). The figures
 are the coordinating session's measurements, quoted as given; they were not re-measured for
