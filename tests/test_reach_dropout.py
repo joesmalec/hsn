@@ -111,8 +111,9 @@ def test_keys_are_opt_in_and_keep_the_hash_and_the_memory_key() -> None:
         (RECIPE, [*TOP0, *E1, "train.lambda_u=0.1"], "lambda_u"),
         # docs/reader_causal_flash.md: the causal mask has no mask tensor for the span to narrow
         (RECIPE, [*TOP0, *E1, "model.reader_mask=causal"], "short rows' span mask could not act"),
-        # the carried reader (allowed with the memory since #94) reads through its own mask
-        (RECIPE, [*TOP0, *E1, "model.reader_carry=8"], "reader_carry=8: the carried reader"),
+        # the carried reader takes short rows (tests/test_reach_dropout_carry.py), with a span
+        # shorter than its own
+        (RECIPE, [*TOP0, *E1, "model.reader_carry=8"], "not shorter than the carried reader's"),
         (RECIPE_A6, ["train.reach_dropout=0.5"], "no memory behind a reader"),
         (NOMEM, ["train.reach_dropout=0.5"], "train.reach_dropout=0.5"),
         (RECIPE, [*TOP0, "train.reach_dropout=1.5"], "less than or equal"),
@@ -124,21 +125,26 @@ def test_configuration_refusals(path: Path, overrides: list[str], message: str) 
         load_config(path, overrides)
 
 
-def test_causal_mask_and_carried_reader_refuse_short_rows() -> None:
-    """``model.reader_mask=causal`` (SDPA's ``is_causal``, no mask tensor) and a carried reader
-    (``Reader.read``'s own mask) take no short rows: refused at configuration load, and the
-    causal reader refuses them itself."""
+def test_causal_mask_refuses_short_rows_and_the_carried_reader_takes_them() -> None:
+    """``model.reader_mask=causal`` (SDPA's ``is_causal``, no mask tensor) takes no short rows:
+    refused at configuration load, and the causal reader refuses them itself. A carried reader
+    (``Reader.read``'s own mask) takes them since 18 Nov 2026
+    (``tests/test_reach_dropout_carry.py``), with a span shorter than its own."""
     causal = load_config(RECIPE, [*TOP0, "model.reader_mask=causal"])
     assert causal.data.align_docs and causal.train.reach_dropout == 0.0  # allowed without it
     on = load_config(RECIPE, [*TOP0, *E1])
     assert reach_dropout_scope_error(on) is None
-    # model.reader_carry with the memory is allowed since 17 Nov 2026
-    # (docs/amendments/reader_carry_memory.md); the scope check refuses it beside reach dropout
+    # model.reader_carry with the memory (docs/amendments/reader_carry_memory.md): in scope
+    # where the short span S narrows the carry's span of C + 1 positions (S <= C)
     alone = load_config(RECIPE, [*TOP0, "model.reader_carry=8"])
     assert alone.model.reader_carry == 8 and alone.train.reach_dropout == 0.0
-    carried = on.model_copy(update={"model": on.model.model_copy(update={"reader_carry": 8})})
-    reason = reach_dropout_scope_error(carried)
-    assert reason is not None and "model.reader_carry=8" in reason
+    for carry, refused in ((8, True), (15, True), (16, False), (256, False)):
+        carried = on.model_copy(
+            update={"model": on.model.model_copy(update={"reader_carry": carry})}
+        )
+        reason = reach_dropout_scope_error(carried)
+        assert (reason is not None) is refused, carry
+        assert reason is None or f"model.reader_carry={carry}" in reason
     cfg = _cfg(*A5, *READER, "model.reader_mask=causal")
     reader = Reader(cfg.model, seed=0).double()
     assert reader.causal

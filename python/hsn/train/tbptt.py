@@ -44,7 +44,10 @@ window loop::
 * **Reach dropout** (``train.reach_dropout``, opt-in, ``docs/reach_dropout.md``): before each
   training window the trainer draws the rows that read with a short span (:meth:`_reach_rows`)
   and hands them to the model (:meth:`~hsn.model.hsn.HSN.set_reach_rows`), and clears them after
-  the window's forward pass; evaluation reads as configured.
+  the window's forward pass; evaluation reads as configured. With the carried reader
+  (``model.reader_carry`` on the memory) a row's draw is held until its next document start, so
+  no position reads a cached entry that was computed under the other span; the held draws are
+  part of every checkpoint.
 * **Periodic ``q`` resync.** Every ``train.q_resync_every`` windows the summary is replaced by the
   exact mean over cells (:meth:`~hsn.model.state.CellGraphState.recompute_q`) at the window start,
   which removes the floating-point drift incremental sparse updates accumulate (P1.3 pitfall). The
@@ -227,6 +230,7 @@ from hsn.model.hsn import (
     address_history,
     clone_carry,
     pack_carry,
+    reader_carried,
     split_packed_carry,
 )
 from hsn.model.router import SCORED_MODES
@@ -481,6 +485,12 @@ class TBPTTTrainer(Trainer):
         # model.reader_carry on the memory it is a WindowCarry: the address carry and the
         # reader's cache (docs/amendments/reader_carry_memory.md), carried and saved together.
         self._prev_tokens: Tensor | WindowCarry | None = None
+        # train.reach_dropout on the carried reader (docs/reach_dropout.md, "With the carried
+        # reader"): a row's draw is held until its next document start. The draw of the document
+        # going on in every row after the last window (bool [B], CPU; None before the first
+        # window), carried and saved like the carry itself
+        self._reach_hold = cfg.train.reach_dropout > 0.0 and reader_carried(cfg.model)
+        self._reach_held: Tensor | None = None
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
         # A6: the route-takeover guard (train.route_guard; None: off)
         self.route_guard: RouteGuard | None = (
@@ -582,17 +592,32 @@ class TBPTTTrainer(Trainer):
         seed = np.random.SeedSequence([self.cfg.seed, 0x50323033, self.windows]).generate_state(1)
         return torch.Generator(device="cpu").manual_seed(int(seed[0]))
 
-    def _reach_rows(self, B: int) -> Tensor | None:
+    def _reach_rows(self, B: int, reset: Tensor | None = None) -> Tensor | None:
         """``train.reach_dropout`` (``docs/reach_dropout.md``): the rows of this training window
         that read with the short span, bool ``[B]`` on the device, or ``None`` when the key is
         off. Drawn on the CPU from a generator seeded by ``(run.seed, window counter)``, as the
         probes' (the global random stream is untouched, a resume replays them, every backend
-        draws the same rows), and copied without waiting for the device."""
+        draws the same rows), and copied without waiting for the device.
+
+        With the carried reader (``model.reader_carry`` on the memory) a document keeps one
+        draw from its start to its end, so what the reader's cache holds of it was read under
+        the span it is read with: ``reset`` (the CPU window's, bool ``[B, T]``) is required,
+        the positions of the document going on keep the draw held for their row
+        (:attr:`_reach_held`), a document that starts in this window takes this window's draw,
+        and the draw of each row's last document is held for the next window. The result is
+        then bool ``[B, T]``, one flag per position."""
         p = self.cfg.train.reach_dropout
         if p <= 0.0:
             return None
         seed = np.random.SeedSequence([self.cfg.seed, 0x52454143, self.windows]).generate_state(1)
         rows = torch.rand(B, generator=torch.Generator().manual_seed(int(seed[0]))) < p
+        if self._reach_hold:
+            if reset is None or reset.dtype is not torch.bool or reset.dim() != 2:
+                raise ValueError("reach dropout on the carried reader needs the window's reset")
+            held = rows if self._reach_held is None else self._reach_held
+            going_on = reset.to("cpu").cumsum(dim=1) == 0  # before the row's first document start
+            rows = torch.where(going_on, held[:, None], rows[:, None])  # [B, T]
+            self._reach_held = rows[:, -1].clone()
         cuda = self.ctx.device.type == "cuda"
         if cuda and self.cfg.hardware.pinned_memory:
             rows = rows.pin_memory()
@@ -1048,9 +1073,12 @@ class TBPTTTrainer(Trainer):
         if train.reach_dropout > 0.0:
             logger.info(
                 "reach dropout (docs/reach_dropout.md): each row of a training window reads "
-                "with the span %d with probability %g; evaluation reads as configured",
+                "with the span %d with probability %g; evaluation reads as configured%s",
                 train.reach_dropout_span,
                 train.reach_dropout,
+                "; with the carried reader a row's draw is held until its next document start"
+                if self._reach_hold
+                else "",
             )
         if self._cut_enabled:
             logger.info("trailing-padding cut (P1.10d): on (dense routing, data.align_docs)")
@@ -1161,7 +1189,7 @@ class TBPTTTrainer(Trainer):
                 )  # P2.3: before the forward pass, from the window-start state
                 # train.reach_dropout: the window's short rows, for its forward pass and a
                 # statistics step's term passes; cleared after the window
-                reach = self._reach_rows(int(fwd["tokens"].shape[0]))
+                reach = self._reach_rows(int(fwd["tokens"].shape[0]), window["reset"][:, :cut])
                 if reach is not None:
                     self.hsn.set_reach_rows(reach, train.reach_dropout_span)
                 # P1.10b: the columns where some row resets, so that HSN.forward needs no
@@ -1560,6 +1588,8 @@ class TBPTTTrainer(Trainer):
             "reinforce_baseline": c["reinforce_baseline"],  # P2.2 (None unless reinforce ran)
             "cut_pending": c["cut_pending"],  # P1.10d: the next window must reset every row
             **({"prev_tokens": pack_carry(c["prev_tokens"])} if self.cfg.model.key_address else {}),
+            # train.reach_dropout on the carried reader: the rows' held draws
+            **({"reach_held": c["reach_held"]} if self._reach_hold else {}),
             **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
             **self._ema_extra(),  # A6: the averaged weights (train.weight_ema)
             **(
@@ -1582,6 +1612,11 @@ class TBPTTTrainer(Trainer):
             **(
                 {"prev_tokens": clone_carry(self._prev_tokens)}
                 if self.cfg.model.key_address
+                else {}
+            ),
+            **(
+                {"reach_held": None if self._reach_held is None else self._reach_held.clone()}
+                if self._reach_hold
                 else {}
             ),
         }
@@ -1659,6 +1694,20 @@ class TBPTTTrainer(Trainer):
                     raise ValueError(f"{path}: {error}") from error
                 previous = WindowCarry(previous, cache)
             self._prev_tokens = previous
+        if self._reach_hold:  # train.reach_dropout on the carried reader: the held draws
+            if "reach_held" not in extra:
+                raise ValueError(
+                    f"{path}: train.reach_dropout with model.reader_carry needs the rows' held "
+                    "draws (reach_held); the checkpoint was written without them"
+                )
+            held = extra["reach_held"]
+            if held is not None and not (
+                isinstance(held, Tensor)
+                and held.dtype is torch.bool
+                and tuple(held.shape) == (self.cfg.train.batch,)
+            ):
+                raise ValueError(f"{path}: reach_held must be a bool [train.batch] tensor or None")
+            self._reach_held = None if held is None else held.to("cpu").clone()
         if "q_resync" not in extra:
             raise ValueError(f"{path} has no q_resync counters (not a TBPTT checkpoint)")
         counters = check_q_resync(extra["q_resync"], str(path))

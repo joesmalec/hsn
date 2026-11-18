@@ -153,7 +153,8 @@ and refuses the key; the split and fused windows refuse it too. With ``model.fas
 beside the reader, ``S`` reads ``[z ; q ; ctx ; c ; f]`` and ``D`` reads ``[q ; u ; r ; f ; c]``.
 ``train.reach_dropout`` (``docs/reach_dropout.md``; opt-in, training only): in a training window
 the rows the trainer hands over (:meth:`HSN.set_reach_rows`) read with a short span; no equation
-changes, and evaluation reads as configured.
+changes, and evaluation reads as configured. With the carried reader below the short span also
+narrows what a row reads of the reader's cache.
 
 Reading past the window with the memory on (``model.reader_carry = C > 0`` with
 ``model.memory``, ``docs/amendments/reader_carry_memory.md``; opt-in, 17 Nov 2026): ``c_t``
@@ -766,8 +767,9 @@ class HSN(nn.Module):
             torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
         )
         #: ``train.reach_dropout`` (HSN-T, ``docs/reach_dropout.md``): the rows of the training
-        #: window that read with a short span, and the span (:meth:`set_reach_rows`); None: every
-        #: row reads as configured. Read in training mode only.
+        #: window that read with a short span (with ``model.reader_carry`` its positions), and
+        #: the span (:meth:`set_reach_rows`); None: every row reads as configured. Read in
+        #: training mode only.
         self._reach: tuple[Tensor, int] | None = None
 
     @property
@@ -808,15 +810,27 @@ class HSN(nn.Module):
         the training windows from now on, as the reader with ``model.reader_span = span``
         would; ``None`` clears them. The trainer sets them before a training window and clears
         them after it. A window in evaluation mode ignores them: it always reads as
-        configured."""
+        configured.
+
+        With ``model.reader_carry`` the rows narrow the cached positions as well
+        (:meth:`hsn.model.reader.Reader.read`: a short row reads as with ``model.reader_carry =
+        span − 1``), and ``rows`` may be bool ``[B, T]``, one flag per window position: the
+        trainer keeps a document short or whole from its start to its end, also where it
+        starts inside a window (``docs/reach_dropout.md``, "With the carried reader")."""
         if rows is None:
             self._reach = None
             return
         if self.reader is None:
             raise ValueError("reach rows shorten HSN-T's reader; this model has none")
-        if rows.dtype is not torch.bool or rows.dim() != 1:
+        if rows.dtype is not torch.bool or rows.dim() not in (1, 2):
             raise ValueError(
-                f"rows must be a bool [B] tensor, got {rows.dtype} {tuple(rows.shape)}"
+                f"rows must be a bool [B] tensor (with model.reader_carry also [B, T]), got "
+                f"{rows.dtype} {tuple(rows.shape)}"
+            )
+        if rows.dim() == 2 and not self.reader.carry:
+            raise ValueError(
+                f"rows per position ([B, T], got {tuple(rows.shape)}) are the carried reader's "
+                "(model.reader_carry > 0); this reader takes a bool [B] tensor"
             )
         if isinstance(span, bool) or not isinstance(span, int) or span < 1:
             raise ValueError(f"span must be an int >= 1, got {span!r}")
@@ -1726,21 +1740,23 @@ class HSN(nn.Module):
         if self.reader is not None:
             # HSN-T: c_t travels behind the context embedding, so S reads [z; q; ctx; c] at every
             # position with the loop, the compiled block and _position unchanged
+            # train.reach_dropout: the training window's short rows (docs/reach_dropout.md).
+            # Without them the reader is called as before, so the default is the code it was
+            # and a stand-in for reader.forward (the sighted reading of
+            # tests/test_reader_carry_memory.py) still fits
+            short = self._reach if self.training else None
             if reader_cache is not None:
                 # model.reader_carry on the memory: c_t also reads the cached keys and values of
                 # the last C positions before the window (same document); the next cache leaves
-                # in info, detached
-                reader_out, reader_cache = self.reader.read(tokens, reset, reader_cache)
-            else:
-                # train.reach_dropout: the training window's short rows (docs/reach_dropout.md);
-                # never beside a cache (reach dropout refuses model.reader_carry > 0). Without
-                # short rows the call is the two-argument one, so a stand-in for reader.forward
-                # (the sighted reading of tests/test_reader_carry_memory.py) still fits
-                short = self._reach if self.training else None
+                # in info, detached. Short rows narrow the cached positions with the window's
                 if short is None:
-                    reader_out = self.reader(tokens, reset)  # [B, T, w]
+                    reader_out, reader_cache = self.reader.read(tokens, reset, reader_cache)
                 else:
-                    reader_out = self.reader(tokens, reset, short)
+                    reader_out, reader_cache = self.reader.read(tokens, reset, reader_cache, short)
+            elif short is None:
+                reader_out = self.reader(tokens, reset)  # [B, T, w]
+            else:
+                reader_out = self.reader(tokens, reset, short)
             context = torch.cat([context, reader_out], dim=-1)
             if self._gate_rides:
                 # address_gate_input=reader_prev: c_{t−1} behind c_t, for the address gate alone;
