@@ -1,0 +1,58 @@
+# Transformer-XL-style baseline at the transformer_2m size (17 Nov 2026,
+# docs/transformer_xl_baseline.md): the Transformer baseline of transformer_2m.yaml with its two
+# opt-in Transformer-XL keys. 1,881,472 parameters as measured by
+# TransformerBaseline.param_report() for V=256 and 16 context symbols: transformer_2m's 1,930,624
+# less its 256 x 192 learned position table (49,152), which rotary positions replace; the blocks,
+# embeddings, norm and head are the same (d_model 192, 4 pre-norm blocks, 4 heads, MLP 768).
+#
+#   baseline.transformer.position: rotary   queries and keys rotated by their position (RoPE,
+#                                           base 10000, all 24 pairs of each 48-wide head): scores
+#                                           depend on distances only, consistent across windows
+#   baseline.transformer.carry: 256         Transformer-XL's memory length M: every block keeps the
+#                                           keys and values of the last 256 positions before the
+#                                           window, detached, and every window position attends
+#                                           them and the window causally (a document's own only)
+#
+# The state carried from window to window is (keys, values, valid): 2 x 4 blocks x 256 positions
+# x 192 channels = 393,216 floats per row (1.5 MiB in float32) and 256 flags. Its twin without the
+# cache is the same model with baseline.transformer.carry=0 (the same parameters from the same
+# seed; every window read alone). Everything not listed keeps its Appendix A default
+# (configs/_example.yaml); the data and training settings are transformer_2m.yaml's.
+
+run_id: transformer_xl_2m
+seed: 0
+notes: "Transformer-XL-style baseline: transformer_2m with rotary positions and a 256-position key/value cache across windows."
+profile: cpu # override with `profile=<name>`
+model_name: transformer
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [kv, delayed, brackets, arithmetic, algorithmic]
+  variants: [in_range]
+  align_docs: true # every document starts at a window boundary
+
+train:
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: cosine # constant | cosine | linear
+  unroll: 256 # the window; the cache adds up to 256 positions before it
+  batch: 4
+  micro_batch: 4
+  grad_clip: 1.0
+  steps: 2000
+  eval_every: 1000
+  ckpt_every: 1000
+  stats_every: 50
+  search_trials: 1
+
+baseline:
+  transformer:
+    d_model: 192
+    n_layers: 4
+    n_heads: 4
+    ffn_hidden: 768
+    dropout: 0.0
+    position: rotary
+    carry: 256
