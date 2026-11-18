@@ -41,6 +41,10 @@ window loop::
   model itself, position by position, before the position is processed (P1.5). The trainer
   passes the columns that hold a reset, read from the CPU window, as ``reset_columns`` (P1.10b),
   so the model resets only there without a device-to-host copy.
+* **Reach dropout** (``train.reach_dropout``, opt-in, ``docs/reach_dropout.md``): before each
+  training window the trainer draws the rows that read with a short span (:meth:`_reach_rows`)
+  and hands them to the model (:meth:`~hsn.model.hsn.HSN.set_reach_rows`), and clears them after
+  the window's forward pass; evaluation reads as configured.
 * **Periodic ``q`` resync.** Every ``train.q_resync_every`` windows the summary is replaced by the
   exact mean over cells (:meth:`~hsn.model.state.CellGraphState.recompute_q`) at the window start,
   which removes the floating-point drift incremental sparse updates accumulate (P1.3 pitfall). The
@@ -217,7 +221,14 @@ from hsn.losses import (
     terms_total,
     utility_loss,
 )
-from hsn.model.hsn import HSN, address_history
+from hsn.model.hsn import (
+    HSN,
+    WindowCarry,
+    address_history,
+    clone_carry,
+    pack_carry,
+    split_packed_carry,
+)
 from hsn.model.router import SCORED_MODES
 from hsn.model.state import CellGraphState
 from hsn.train.amp import autocast_ctx, autocast_name
@@ -386,7 +397,7 @@ class _CompiledEval:
         state: CellGraphState,
         reset: Tensor,
         *,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         if self.cfg.key_address:
             return self.window(tokens, ctx, state, reset, prev_tokens=prev_tokens)
@@ -466,8 +477,10 @@ class TBPTTTrainer(Trainer):
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0
-        # A5's previous byte belongs to the stream, not CellGraphState's versioned layout.
-        self._prev_tokens: Tensor | None = None
+        # A5's previous byte belongs to the stream, not CellGraphState's versioned layout. With
+        # model.reader_carry on the memory it is a WindowCarry: the address carry and the
+        # reader's cache (docs/amendments/reader_carry_memory.md), carried and saved together.
+        self._prev_tokens: Tensor | WindowCarry | None = None
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
         # A6: the route-takeover guard (train.route_guard; None: off)
         self.route_guard: RouteGuard | None = (
@@ -568,6 +581,22 @@ class TBPTTTrainer(Trainer):
         never touch the global RNG and a resumed run replays them (the counter is checkpointed)."""
         seed = np.random.SeedSequence([self.cfg.seed, 0x50323033, self.windows]).generate_state(1)
         return torch.Generator(device="cpu").manual_seed(int(seed[0]))
+
+    def _reach_rows(self, B: int) -> Tensor | None:
+        """``train.reach_dropout`` (``docs/reach_dropout.md``): the rows of this training window
+        that read with the short span, bool ``[B]`` on the device, or ``None`` when the key is
+        off. Drawn on the CPU from a generator seeded by ``(run.seed, window counter)``, as the
+        probes' (the global random stream is untouched, a resume replays them, every backend
+        draws the same rows), and copied without waiting for the device."""
+        p = self.cfg.train.reach_dropout
+        if p <= 0.0:
+            return None
+        seed = np.random.SeedSequence([self.cfg.seed, 0x52454143, self.windows]).generate_state(1)
+        rows = torch.rand(B, generator=torch.Generator().manual_seed(int(seed[0]))) < p
+        cuda = self.ctx.device.type == "cuda"
+        if cuda and self.cfg.hardware.pinned_memory:
+            rows = rows.pin_memory()
+        return rows.to(self.ctx.device, non_blocking=cuda)
 
     def _counterfactual_probe(
         self, train_ds: ByteDataset, window: Batch, batch: Batch, state: CellGraphState
@@ -700,7 +729,7 @@ class TBPTTTrainer(Trainer):
 
     # window helpers --------------------------------------------------------------------------
 
-    def _address_kwargs(self) -> dict[str, Tensor | None]:
+    def _address_kwargs(self) -> dict[str, Tensor | WindowCarry | None]:
         """Only A5 forwards receive a previous byte; legacy call signatures stay unchanged."""
         return {"prev_tokens": self._prev_tokens} if self.cfg.model.key_address else {}
 
@@ -1016,6 +1045,13 @@ class TBPTTTrainer(Trainer):
             history.autocast,
             json.dumps(report, sort_keys=True),
         )
+        if train.reach_dropout > 0.0:
+            logger.info(
+                "reach dropout (docs/reach_dropout.md): each row of a training window reads "
+                "with the span %d with probability %g; evaluation reads as configured",
+                train.reach_dropout_span,
+                train.reach_dropout,
+            )
         if self._cut_enabled:
             logger.info("trailing-padding cut (P1.10d): on (dense routing, data.align_docs)")
         else:
@@ -1123,6 +1159,11 @@ class TBPTTTrainer(Trainer):
                     if self.counterfactual
                     else None
                 )  # P2.3: before the forward pass, from the window-start state
+                # train.reach_dropout: the window's short rows, for its forward pass and a
+                # statistics step's term passes; cleared after the window
+                reach = self._reach_rows(int(fwd["tokens"].shape[0]))
+                if reach is not None:
+                    self.hsn.set_reach_rows(reach, train.reach_dropout_span)
                 # P1.10b: the columns where some row resets, so that HSN.forward needs no
                 # device-to-host copy to find them. Correct by construction: they are read from the
                 # CPU reset of this very window, cut exactly like the device views it hands over
@@ -1153,6 +1194,8 @@ class TBPTTTrainer(Trainer):
                     reset_columns=reset_columns,
                     **self._address_kwargs(),
                 )
+                if reach is not None:
+                    self.hsn.set_reach_rows(None)
                 if self.cfg.model.key_address:
                     self._prev_tokens = address_history(
                         self.cfg.model, fwd["tokens"], self._prev_tokens, info
@@ -1516,17 +1559,7 @@ class TBPTTTrainer(Trainer):
             "q_resync": q_resync_counter(c["windows"], c["windows_since_resync"], c["resyncs"]),
             "reinforce_baseline": c["reinforce_baseline"],  # P2.2 (None unless reinforce ran)
             "cut_pending": c["cut_pending"],  # P1.10d: the next window must reset every row
-            **(
-                {
-                    "prev_tokens": (
-                        None
-                        if c["prev_tokens"] is None
-                        else c["prev_tokens"].detach().to(device="cpu", copy=True)
-                    )
-                }
-                if self.cfg.model.key_address
-                else {}
-            ),
+            **({"prev_tokens": pack_carry(c["prev_tokens"])} if self.cfg.model.key_address else {}),
             **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
             **self._ema_extra(),  # A6: the averaged weights (train.weight_ema)
             **(
@@ -1547,11 +1580,7 @@ class TBPTTTrainer(Trainer):
             "cut_pending": self._cut_pending,
             "reinforce_baseline": self.reinforce_baseline,
             **(
-                {
-                    "prev_tokens": (
-                        None if self._prev_tokens is None else self._prev_tokens.detach().clone()
-                    )
-                }
+                {"prev_tokens": clone_carry(self._prev_tokens)}
                 if self.cfg.model.key_address
                 else {}
             ),
@@ -1595,7 +1624,10 @@ class TBPTTTrainer(Trainer):
         if self.cfg.model.key_address:
             if "prev_tokens" not in extra:
                 raise ValueError(f"{path}: an A5 checkpoint must hold prev_tokens")
-            previous = extra["prev_tokens"]
+            # model.reader_carry on the memory: the address carry and the reader's cache
+            previous, reader_cache = split_packed_carry(
+                self.cfg.model, extra["prev_tokens"], str(path)
+            )
             if previous is not None:
                 if self.cfg.model.word_address != "none":
                     # model.word_address: the bytes, then the word state (checked by the window)
@@ -1616,6 +1648,16 @@ class TBPTTTrainer(Trainer):
                         "[train.batch, model.address_ngram]"
                     )
                 previous = previous.to(self.ctx.device).clone()
+            if reader_cache is not None:
+                reader = self.hsn.reader
+                if reader is None or not isinstance(previous, Tensor):
+                    raise ValueError(f"{path}: a reader's cache without a reader or an address")
+                cache = tuple(t.to(self.ctx.device).clone() for t in reader_cache)
+                try:
+                    cache = reader.check_cache(cache, int(previous.shape[0]))
+                except ValueError as error:
+                    raise ValueError(f"{path}: {error}") from error
+                previous = WindowCarry(previous, cache)
             self._prev_tokens = previous
         if "q_resync" not in extra:
             raise ValueError(f"{path} has no q_resync counters (not a TBPTT checkpoint)")

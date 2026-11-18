@@ -643,6 +643,9 @@ _READER_POSITION_DEFAULTS: dict[str, Any] = {
     "reader_top_words": 0,
     "reader_mask": "document",  # the reader's attention mask (17 Nov 2026), likewise
 }
+#: The Transformer baseline's Transformer-XL keys (``baseline.transformer.*``, 17 Nov 2026) and
+#: their defaults: :func:`memory_key` leaves them out at these.
+_TRANSFORMER_XL_DEFAULTS: dict[str, Any] = {"position": "learned", "carry": 0}
 
 
 def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str:
@@ -674,6 +677,11 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # likewise: without the word address (and its contexts, read only with it)
         del dump["model"]["word_address"]
         del dump["model"]["word_contexts"]
+    for key, default in _TRANSFORMER_XL_DEFAULTS.items():
+        # the Transformer baseline's positions and cache (17 Nov 2026) at their defaults stay
+        # out: every arm, of every family, keeps its memory key
+        if dump["baseline"]["transformer"][key] == default:
+            del dump["baseline"]["transformer"][key]
     if cfg.baseline.gated_deltanet == GatedDeltaNetBaselineConfig():
         # likewise: the Gated DeltaNet baseline's sizes (17 Nov 2026) at their defaults stay
         # out, so the arms from before the family keep their memory key (a gated_deltanet arm

@@ -67,6 +67,17 @@ TINY: dict[str, tuple[Path, list[str], int]] = {
     # evaluation's two
     "gru": (GRU_2M, TINY_GRU_OVERRIDES, 5),
     "transformer": (TRANSFORMER_2M, TINY_TRANSFORMER_OVERRIDES, 2),  # training, evaluation
+    # the Transformer as Transformer-XL (docs/transformer_xl_baseline.md): its cache of keys and
+    # values in and out of the one graph
+    "transformer_xl": (
+        TRANSFORMER_2M,
+        [
+            *TINY_TRANSFORMER_OVERRIDES,
+            "baseline.transformer.position=rotary",
+            "baseline.transformer.carry=12",
+        ],
+        2,
+    ),
     "reader": (
         READER,
         ["model.reader_width=16", "model.reader_layers=1", "model.reader_heads=2"],
@@ -126,8 +137,9 @@ def _tensors(state: Any) -> list[Tensor]:
 
 
 def _inputs(model: nn.Module, *, mid_reset: bool, batch: int = B, seed: int = 1) -> Inputs:
-    """Tokens, contexts, a random incoming state and resets at ``t = 0`` (not in every row) and,
-    with ``mid_reset``, inside the window; on the model's device."""
+    """Tokens, contexts, a random incoming state (random flags for a boolean part) and resets
+    at ``t = 0`` (not in every row) and, with ``mid_reset``, inside the window; on the model's
+    device."""
     device = next(model.parameters()).device
     g = torch.Generator().manual_seed(seed)
     tokens = torch.randint(0, 256, (batch, T), generator=g)
@@ -137,7 +149,14 @@ def _inputs(model: nn.Module, *, mid_reset: bool, batch: int = B, seed: int = 1)
     if mid_reset:
         reset[1, 5] = True
     state = model.init_state(batch, "cpu")  # type: ignore[operator]
-    parts = [(torch.randn(s.shape, generator=g) * 0.1).to(device) for s in _tensors(state)]
+    parts = [
+        (
+            torch.rand(s.shape, generator=g) < 0.7  # a cache's valid slots
+            if s.dtype is torch.bool
+            else torch.randn(s.shape, generator=g) * 0.1
+        ).to(device)
+        for s in _tensors(state)
+    ]
     state = None if state is None else parts[0] if isinstance(state, Tensor) else tuple(parts)
     return tokens.to(device), context.to(device), state, reset.to(device)
 
@@ -321,7 +340,7 @@ def test_compiled_equals_eager(family: str) -> None:
     pairs = zip([logits, *_tensors(state)], [ref_logits, *_tensors(ref_state)], strict=True)
     tol = _tol(family)
     bound = min(tol["values"], tol["relative"] * float(ref_logits.abs().max()))
-    assert max(float((a - b).abs().max()) for a, b in pairs) <= bound
+    assert max(float((a.float() - b.float()).abs().max()) for a, b in pairs) <= bound
 
     report = compiled.report()
     assert report["functions"] == report["graphs"] == TINY[family][2], report  # one graph each

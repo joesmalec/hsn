@@ -39,7 +39,7 @@ break raises) and static shapes. Nothing of a baseline's architecture changes.
 
 | Family | Compiled | Stays eager |
 | --- | --- | --- |
-| `transformer`, `reader`, `hsn_t_nomem` | The whole forward of a window, as one graph, and its backward. | |
+| `transformer`, `reader`, `hsn_t_nomem` | The whole forward of a window, as one graph, and its backward; with a carried cache (`model.reader_carry`, or `baseline.transformer.carry`: Transformer-XL, `docs/transformer_xl_baseline.md`) the cache goes in and out of that graph. | |
 | `gru` | The embeddings before the recurrence and the read-out after it (LayerNorm and head), as two graphs, and their backward. | The recurrence, `torch.nn.GRU`: cuDNN on CUDA, called between the two graphs as before. |
 | `selective_ssm` | The whole forward of a window, as one graph, and its backward, with every block's scan run as `_plain_scan` (below). | |
 | `gated_deltanet` (17 November 2026) | Nothing: the key is refused for this family when the configuration is loaded. | Everything. The delta rule runs as flash-linear-attention's own Triton kernels, which `torch.compile` does not take into a graph (`docs/gated_deltanet_baseline.md`, "Compiled or eager"). |

@@ -80,6 +80,14 @@ table is not in the state dict; a longer window, and MPS, still compute the angl
 So global rule 2 holds as before (`ẑ_t = P(q_{t−1})` reads the carried summary only), and
 everything further back than the reader's reach can come from the memory alone.
 
+**Opt-in since 17 Nov 2026: reading past the window** (`model.reader_carry = C > 0` with the
+memory on, `docs/amendments/reader_carry_memory.md`; default 0, in no recipe). The first and
+the last line above then read: the bytes `x_s`, `s ≤ t`, of the same document, in this window
+or before it, at most `C` positions back in every block (from the reader's cache of detached
+keys and values, the mechanism of HSN-T without its memory). Everything after `c_t` is
+unchanged, and the cache is carried beside the cells' state, with the address bytes. At the
+default the lines above hold as written.
+
 **Unchanged:** the cells and their state carried from window to window, the fixed cell
 addresses and byte codes (A5, A9), the router and its selection rule, the address gate (A12,
 A13), the unit bank, the convex tanh gate, the graph, the summary `q`, the selected-cell
@@ -345,6 +353,15 @@ The recipe of HSN-T with its memory, `configs/experiments/hsn_t_memory.yaml` (ma
 2026), leaves it off (`H = 0`): it helps on TinyStories (the names) but costs the recall tasks
 (kv, delayed), so text runs set `H = 4`. Results in the design note, "Results (16 Nov 2026)" and
 "Results on the recall tasks (16 Nov 2026)".
+
+## Reach dropout (`train.reach_dropout`)
+
+A training option of 17 Nov 2026 (`docs/reach_dropout.md`; opt-in, no equation change): in a
+training window each row reads, with probability `train.reach_dropout`, with the per-block span
+`train.reach_dropout_span` (16 by default), the other rows with the whole window; evaluation
+reads as configured. It leaves the names beyond the short span to the memory in those rows
+while the reader keeps the whole window (experiment E1 of the names design note). The default
+is 0, and with it nothing in this document changes.
 
 ## Tests (`tests/test_hsn_t.py`)
 
