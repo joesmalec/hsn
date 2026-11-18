@@ -1,11 +1,17 @@
 # Word-event step time on the RTX 3060: where it goes, and three changes
 
-17 November 2026. Branch `claude/word-event-speed`, from `b32f663`. Measured on the RTX 3060
+17 November 2026. Branch `claude/word-event-speed`. Measured on the RTX 3060
 (`profile:rtx3060`), alone on the card in a plain CUDA context, torch 2.15.0+cu132. The
 configuration is the target of the job: `configs/experiments/hsn_t_memory_words.yaml` with the
 top0 reader on TinyStories (word events, exact word address, B 32, T 256, bf16,
 `hardware.compile_mode=reduce-overhead`, `hardware.graph_alias_index=true`; arm
 `1888ced675259be1`).
+
+The profile, the timings and the 9k run were taken with the changes on main at `b32f663`
+(the branch then: `ce918cf`). The branch was rebased onto main at `5941d13` afterwards (PRs
+#90 and #91: the reader's causal mask, the generic trainer's host reads, the fast recipe); the
+tests were run again there ("Tests", "With the reader's causal mask"), the timings and the 9k
+run were not.
 
 ## What this is
 
@@ -36,9 +42,10 @@ be needed ("What is left").
 
 ## Where the step goes
 
-`torch.profiler` (CPU and CUDA activities) over 5 steps of the training loop on main's code,
-trainer kernels absent. The device times are sums of kernel durations, which do not depend on
-the host; the wall time of a profiled step does and is not a step time.
+`torch.profiler` (CPU and CUDA activities) over 5 steps of the training loop on main's code
+path (the branch before the changes below, trainer kernels switched off). The device times
+are sums of kernel durations, which do not depend on the host; the wall time of a profiled
+step does and is not a step time.
 
 | Part of a step | Device time, ms | Kernels |
 | --- | ---: | ---: |
@@ -171,9 +178,12 @@ configurations were alternated over three card windows between 16:09 and 17:00.
 | branch, `merged`, trainer kernels on | 61.12, 60.99, 61.31 | 61.12 | about 0.9 |
 
 - Every run: 1 dynamo graph, 0 recompiles, 64 event slots in all 408 windows.
+- The load average at the start of a run was below 5, except for main's first run (14.7) and
+  the merged round's first (23.0), which started while other jobs were winding down. Their
+  medians (70.05, the largest of main's five, and 61.12) are in line with the others.
 - The 75.6 ms on record for this arm is the experiment harness's number of 16 Nov on
-  `5c54832`. Main measures 69.4 ms with this tool today; the harness number of the merged
-  round is under "Quality".
+  `5c54832`. Main measures 69.4 ms with this tool today; main was not run through the
+  harness again. The harness's median of the 9k run with the key is 62.4 ms ("Quality").
 - The parts of `merged`, one run each on an earlier form of the picks: the unit pass alone
   63.5 ms, the front alone 65.3 ms (64.99 without either), both 62.2 to 62.9 ms.
 
@@ -192,16 +202,80 @@ configurations were alternated over three card windows between 16:09 and 17:00.
 - **Compiled against eager** (CPU inductor, fp32, the tolerances of the compile tests):
   values 8e-6, gradients 1.2e-4, selections exact; the recipe's window in small over
   windows of 2 to `T` event slots on one graph.
-- **On the card**: see "Tests".
+- **On the card** (`tests/test_round_products.py`, CUDA graphs: warm-up, recording, replay):
+  the compiled window with the key against the eager window in fp32 at the compile tests'
+  CUDA tolerance (values 1.5e-5, gradients 2e-4, selections exact), loop over bytes and loop
+  over events, training and evaluation; and the merged unit pass against the all-units pass
+  with the gate's and `W_out`'s own products under bf16 at the recipe's sizes, outputs within
+  2 % and gradients within 3 % of their largest value (both round to bf16).
 
 ## Tests
 
-- CPU suite: see the commit message.
-- Card: see the commit message.
+- **Card** (17:03 to 17:14 on 17 Nov, the files of the compiled window, the event loop,
+  HSN-T, the merged round and the trainer kernels: `test_round_products`,
+  `test_write_events`, `test_word_address`, `test_p2_8_compile`, `test_hsn_t`,
+  `test_cell_attention_read`, `test_p2_10b_trainer_kernels`, `test_p2_10_trainer_speed`,
+  `test_graph_alias_index`): 317 passed, 2 skipped (no MPS device).
+- **Compile check** (`scripts/word_address_gpu_compile_check.py`, the target arm with the
+  key, 120 steps): 1 dynamo graph, 0 recompiles (bound 0), 64 event slots in every window,
+  peak 0.77 GiB allocated.
+- **CPU suite** (the whole suite, GPU hidden, at `ce918cf`): 2,359 passed, 490 skipped
+  (CUDA, MPS and kernel-build tests), 118 subtests passed.
+- **After the rebase onto `5941d13`** (17:55 to 18:11 on 17 Nov): the full CPU suite 2,438
+  passed, 494 skipped, 118 subtests passed; on the card the files above and main's
+  `test_reader_causal_flash` and `test_trainer_host_sync` 395 passed, 2 skipped (no MPS
+  device); the compile check of the target arm with the key again 1 dynamo graph, 0
+  recompiles; `ruff check`, `ruff format --check` and `mypy --strict python/hsn` clean.
+
+## With the reader's causal mask (`model.reader_mask=causal`, PR #90)
+
+The two keys do not meet: the reader runs in the window's prologue, the merged round and the
+dense block inputs after it. `model.reader_mask=causal` is allowed on a memory run with a
+whole-window reader (`reader_span` null, no carry, `data.align_docs`), with
+`hardware.round_products=merged` as without it. The generic trainer's `train.host_sync` and
+`train.fused_adamw` stay refused for a memory run (`host_sync_refusals`), with the key as
+without it.
+
+- **Tests** (`tests/test_round_products.py`): the compiled event window with both keys
+  against the eager window, and that against the eager window with the document mask, on a
+  window without a reset after column 0; the recipe with the top0 reader and both keys
+  loads; the refusals.
+- **On the card**, the target arm for 120 steps
+  (`scripts/word_address_gpu_compile_check.py`, bound 0 recompiles):
+
+  | | Graphs | Recompiles | Event slots | Peak allocated |
+  | --- | ---: | ---: | ---: | ---: |
+  | `merged` | 1 | 0 | 64 | 0.77 GiB |
+  | `merged`, `reader_mask=causal` | 1 | 0 | 64 | 0.78 GiB |
+  | `separate` (dense block inputs), `reader_mask=causal` | 1 | 0 | 64 | 1.01 GiB |
+
+- **Not timed.** The step time with both keys was not measured: these checks ran beside
+  other work on the CPUs, and their step rates are not timings. The causal mask replaces
+  the reader's masked attention kernels, which are 2.4 ms of device time per step here.
 
 ## Quality
 
-See the commit message for the 9k TinyStories run of the target arm with the key.
+The 9k TinyStories run of the target arm with the key: arm `bfc3db8c061187ae` (the recorded
+arm's configuration plus `hardware.round_products=merged`), seed 0, the experiment harness's
+`train_eval` protocol, commit `ce918cf` (the branch before its rebase) with a clean tree,
+trainer kernels built, alone on the 3060, 17:30 to 17:43 on 17 Nov
+(`~/hsn-experiments/wev-speed/runs/wev_speed/ts_memT_top0_wev_wexact_lr125_merged-s0-bfc3db8c0611/exp1`).
+
+| | Recorded arm `1888ced675259be1` (16 Nov, `5c54832`, RTX A4000) | With the key (this run, RTX 3060) |
+| --- | ---: | ---: |
+| Dev bits per byte at 9k | 0.8842 | 0.8855 |
+| Dev accuracy at 9k | 80.42 % | 80.39 % |
+| Dev bits at 1.5k / 3k / 4.5k / 6k / 7.5k | 1.2288 / 1.0531 / 0.9768 / 0.9389 / 0.9121 | 1.2302 / 1.0556 / 0.9805 / 0.9417 / 0.9133 |
+| Train loss of the last step | 0.5799 | 0.5850 |
+| Skipped steps, route-guard events | 0, 0 | 0, 0 |
+| Harness median step (8,885 steps) | 71.5 ms; 75.6 ms on record for the 3060 | 62.4 ms |
+| Peak allocated | 1.11 GB | 0.83 GB |
+
+- **+0.0013 bits at 9k**: inside the seed noise of about ±0.004 (seed 1 of the recorded arm:
+  0.8808).
+- Every evaluation of this run is 0.001 to 0.004 above the recorded run's. It is one run
+  against one run, and two runs of the same code on the card already differ from the second
+  step on, so this is one more draw and not a paired comparison. A second seed was not run.
 
 ## What did not pay
 
@@ -219,7 +293,7 @@ See the commit message for the 9k TinyStories run of the target arm with the key
   | Adding the weight gradients back per unit | | 120 / 74 / 56 µs |
 
   Batched products of small matrices run at 2 to 4 thousand million multiply-accumulates per
-  second on this card against 7 to 10 for one large product, and the weights have to be
+  second on this card against 7 to 11 for one large product, and the weights have to be
   copied. This is the lesson of P2.10's fused cell round again: keep the products large and
   on tensor cores. (Component measurements; no end-to-end run.)
 - **Other forms of the picks.** The chosen unit's hidden row as a masked sum over the units
@@ -235,9 +309,9 @@ See the commit message for the 9k TinyStories run of the target arm with the key
 In device time per step, with the three changes: event loop 32.5 ms (forward 11.6, backward
 20.8), reader 13.6 ms, the rest 8.2 ms; the card is idle for about 7 ms.
 
-- **The reader, 13.6 ms.** Its attention kernels are 2.4 ms of that (job F3's causal kernel
-  addresses them; not measured here). Compiling the prologue would be a second graph, which
-  this job was told not to add; estimated 3 to 5 ms (not measured).
+- **The reader, 13.6 ms.** Its attention kernels are 2.4 ms of that; `model.reader_mask=causal`
+  (PR #90) replaces them ("With the reader's causal mask"). Compiling the prologue would be a
+  second graph, which this job was told not to add; estimated 3 to 5 ms (not measured).
 - **The unit bank's first-layer backward, 6.3 ms.** The weight gradient (38 µs per slot)
   does not feed the recurrence. It could be taken once per window, grouped by unit, outside
   the graphs: about 2 ms (estimate). So could the other 9 weight-gradient products of a slot.
@@ -245,7 +319,7 @@ In device time per step, with the three changes: event loop 32.5 ms (forward 11.
 - **The scorer features for all 256 positions** are built in the prologue and 64 slots of
   them are read: about 0.6 ms of copies.
 - **The host**: the float64 gradient norm (84 tensors, two kernels each), the per-step
-  snapshot of the divergence dump, the word address (about 150 small kernels).
+  snapshot of the divergence dump, the word address (about 150 small operations).
 - A step under 50 ms needs the loop's backward restructured (the split window's design for
   HSN-T and events) or the reader's cost out of the step. Neither is a result-preserving
   change of the kind made here.

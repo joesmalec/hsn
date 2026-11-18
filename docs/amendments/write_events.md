@@ -320,7 +320,9 @@ forward plus backward.
 - Not measured on the card. There the loop is bound by launches, which fall with the number
   of slots, and the batched read is a few launches; so the ratio can be better than on the
   CPU, most of all with the read. Padding slots are paid: a batch runs as many slots as its
-  longest row needs.
+  longest row needs. (17 Nov 2026: measured, `docs/word_event_speed.md`. With the top0 reader
+  on TinyStories the step is 69.4 ms on the RTX 3060, the event loop 36.6 ms of device time
+  in it, and inside its CUDA graphs it is bound by the kernels' own time, not by launches.)
 - Saved for the backward pass, beyond the loop's own: the per-slot cell states `[B, E, N, d]`
   with the read, and the gathered keys and values `[B, T, N, 2d]` (134 MB in bf16 at `B` 32,
   `T` 256).
