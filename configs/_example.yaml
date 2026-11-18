@@ -10,7 +10,7 @@ run_id: example
 seed: 0
 notes: "Appendix A example: every key at its default."
 profile: cpu # hardware profile: configs/hardware/<profile>.yaml (Appendix A.5) unless `hardware:` is inline
-model_name: hsn # hsn | gru | transformer | selective_ssm | moe
+model_name: hsn # hsn | gru | transformer | selective_ssm | gated_deltanet | moe
 
 model: # Appendix A.1
   vocab_size: 256 # byte vocabulary V
@@ -306,5 +306,14 @@ baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which ba
     d_conv: 4 # taps of the causal depthwise convolution
     expand: 2 # inner width = expand x d_model
     dt_rank: null # rank of the step-size path; null = d_model / 16
+  gated_deltanet: # Gated DeltaNet control (model_name: gated_deltanet); 1,932,584 parameters measured
+    d_model: 176 # residual width
+    n_layers: 4 # blocks of [Gated DeltaNet mixer, gated MLP]
+    num_heads: 3 # heads, each with a fast-weight memory of its own
+    head_dim: 44 # key and query width of a head
+    expand_v: 2 # value width of a head = expand_v x head_dim
+    d_conv: 4 # taps of the causal depthwise convolution on q, k, v
+    mlp_hidden: null # gated MLP width; null = the reference's rule (512 at d_model 176)
+    norm_eps: 1.0e-6 # every RMS norm of the model
   address_input: false # the HSN's fixed byte codes (A5) as an input of the baselines (a control)
   address_dim: 64 # width of those codes; 64 = the recipe's model.d, the router's own table

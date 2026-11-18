@@ -1,0 +1,10 @@
+# The kernels of the Gated DeltaNet baseline (python/hsn/baselines/gated_deltanet.py,
+# docs/gated_deltanet_baseline.md): the core operations of flash-linear-attention
+# (https://github.com/fla-org/flash-linear-attention, MIT licence), release 0.6.0 as published
+# on PyPI on 23 October 2026, and its one dependency (einops, MIT licence). Not a dependency of
+# hsn and not in uv.lock: scripts/gated_deltanet_env.sh installs the two wheels below, checked
+# against these hashes, on top of the project's locked environment and changes no other package.
+fla-core==0.6.0 \
+    --hash=sha256:b0708b70e0b119cd58a0a5146ea56cb175cef6ed969d8ac60267e3e077ce3ebd
+einops==0.8.2 \
+    --hash=sha256:54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193

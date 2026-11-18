@@ -125,10 +125,21 @@ def _hsn_t(cfg: RunConfig) -> nn.Module:
     return HSNT.from_config(cfg) if cfg.model.memory else HSNTNoMemory.from_config(cfg)
 
 
+def _gated_deltanet(cfg: RunConfig) -> nn.Module:
+    """The Gated DeltaNet baseline (``docs/gated_deltanet_baseline.md``). Its module is imported
+    here, when one is built, and not with this module: it needs flash-linear-attention's
+    kernels, which are not a dependency of this package, and raises ``ImportError`` with what to
+    do when the environment does not have them."""
+    from hsn.baselines.gated_deltanet import GatedDeltaNetBaseline
+
+    return GatedDeltaNetBaseline(cfg)
+
+
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "gru": GRUBaseline,
     "transformer": TransformerBaseline,
     "selective_ssm": MambaBaseline,  # the paper's selective-memory control (plan P2.13)
+    "gated_deltanet": _gated_deltanet,  # the fast-weight associative-memory control (17 Nov 2026)
     "hsn": HSN.from_config,  # P1.9: the dense predictive cell (P1.5) trained by TBPTTTrainer (P1.7)
     "hsn_t": _hsn_t,  # HSN-T (docs/hsn_t.md); without its memory when model.memory=false
     "reader": ReaderLM,  # the HSN-T reader alone with a next-byte head (the exact-reader check)

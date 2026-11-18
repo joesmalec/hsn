@@ -78,6 +78,7 @@ __all__ = [
     "DataConfig",
     "FastConfig",
     "GRUBaselineConfig",
+    "GatedDeltaNetBaselineConfig",
     "GrowthConfig",
     "HardwareConfig",
     "ModelConfig",
@@ -154,7 +155,9 @@ WindowMode = Literal["autograd", "split", "fused"]
 #: smaller products (equal to rounding).
 RoundProducts = Literal["separate", "merged"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
-ModelName = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "moe"]
+ModelName = Literal[
+    "hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet", "moe"
+]
 #: ``baseline.transformer.position``: the learned position table (default) or rotary positions.
 TransformerPosition = Literal["learned", "rotary"]
 #: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
@@ -1535,12 +1538,41 @@ class SelectiveSSMBaselineConfig(_StrictModel):
     dt_rank: int | None = Field(default=None, ge=1)  # rank of the step-size path; None = d_model/16
 
 
+class GatedDeltaNetBaselineConfig(_StrictModel):
+    """``baseline.gated_deltanet.*``: Gated DeltaNet (Yang, Kautz and Hatamizadeh, 2024), the
+    fast-weight associative-memory control (:mod:`hsn.baselines.gated_deltanet`,
+    ``docs/gated_deltanet_baseline.md``). Its module needs the kernels of flash-linear-attention
+    (``fla-core``), which are not a dependency of this package.
+
+    Defaults are a ≈2M-parameter setting for the reference data: 1,932,584 parameters as measured
+    by ``GatedDeltaNetBaseline.param_report``. The reference keeps ``num_heads × head_dim`` at
+    three quarters of ``d_model`` and ``expand_v`` at 2.
+    """
+
+    d_model: int = Field(default=176, ge=1)  # residual width
+    n_layers: int = Field(default=4, ge=1)  # blocks of [Gated DeltaNet mixer, gated MLP]
+    num_heads: int = Field(default=3, ge=1)  # heads, each with a memory of its own
+    head_dim: int = Field(default=44, ge=1)  # key and query width of a head
+    expand_v: int = Field(default=2, ge=1)  # value width of a head = expand_v × head_dim
+    d_conv: int = Field(default=4, ge=1)  # taps of the causal depthwise convolution on q, k, v
+    mlp_hidden: int | None = Field(default=None, ge=1)  # None = the reference's rule (below)
+    norm_eps: float = Field(default=1e-6, gt=0.0)  # every RMS norm of the model
+
+    def mlp_width(self) -> int:
+        """The gated MLP's hidden width: ``mlp_hidden``, or the reference's rule for a hidden
+        ratio of 4 (two thirds of ``4 × d_model``, rounded up to a multiple of 256)."""
+        if self.mlp_hidden is not None:
+            return self.mlp_hidden
+        return 256 * ((int(self.d_model * 4 * 2 / 3) + 255) // 256)
+
+
 class BaselineConfig(_StrictModel):
     """``baseline.*``: sizes of the P0.5 baselines (``model_name`` selects which one runs)."""
 
     gru: GRUBaselineConfig = GRUBaselineConfig()
     transformer: TransformerBaselineConfig = TransformerBaselineConfig()
     selective_ssm: SelectiveSSMBaselineConfig = SelectiveSSMBaselineConfig()
+    gated_deltanet: GatedDeltaNetBaselineConfig = GatedDeltaNetBaselineConfig()
     # The HSN's fixed byte codes (amendment A5, ``model.key_address``) as a baseline input: the
     # codes of the current and of the previous byte, frozen, through one learned projection
     # (:mod:`hsn.baselines.address`). Opt-in; a control for how much of the HSN's score on keys it
@@ -1737,6 +1769,10 @@ class RunConfig(_StrictModel):
                 + (
                     "the HSN's own compiled window is hardware.compile_mode"
                     if self.model_name in HSN_MODEL_NAMES
+                    else "its delta-rule kernels are flash-linear-attention's own (Triton), "
+                    "which torch.compile does not trace: it runs eager with them "
+                    "(docs/gated_deltanet_baseline.md)"
+                    if self.model_name == "gated_deltanet"
                     else "it is outside the compiled scope (hsn.train.baseline_compile)"
                 )
             )
@@ -2304,6 +2340,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "baseline.transformer.carry",
     "train.reach_dropout",
     "train.reach_dropout_span",
+    "baseline.gated_deltanet",
 )
 
 
