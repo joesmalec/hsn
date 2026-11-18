@@ -653,20 +653,19 @@ def test_state_gradients_on_the_card_keep_the_eager_messages() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.usefixtures("small_blocks")
-@pytest.mark.parametrize("precision", ["fp32", "bf16"])
 @pytest.mark.parametrize("extra", [(STATE,), (STATE, "hardware.round_products=merged")])
-def test_compiled_training_on_the_card_with_the_key(
-    extra: tuple[str, ...], precision: str, tmp_path: Path
-) -> None:
-    """Twelve steps of the small recipe (HSN-T, per-byte memory, carried reader) through
-    the compiled window with CUDA Graphs, on the dense blocks, with
+def test_compiled_training_on_the_card_with_the_key(extra: tuple[str, ...], tmp_path: Path) -> None:
+    """Twelve steps of the small recipe (HSN-T, per-byte memory, carried reader) under bf16
+    autocast through the compiled window with CUDA Graphs, on the dense blocks, with
     ``hardware.message_gradients=state`` alone and beside the merged products: finite
-    losses and the graph flag set. (The step time and the losses of the full configuration
-    are in ``docs/perbyte_speed.md``.)"""
+    losses and the graph flag set. (Without autocast the key changes nothing: the CPU tests.
+    The step time and the losses of the full configuration are in
+    ``docs/perbyte_speed.md``.)"""
     from cards import CUDA_PROFILE
 
     p28._cuda_ctx()
     steps = 12
+    precision = "bf16"
     cfg = hsn_config(
         steps,
         *A5,
