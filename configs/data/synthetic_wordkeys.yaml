@@ -1,0 +1,106 @@
+# synthetic_wordkeys: key-value with keys that are WORDS (16 Nov 2026; rung 3 of
+# /home/joe/hsn-handoff/WORD-ADDRESSING-BRIEF-2026-11-15.md, approved by the user: "go ahead with both").
+#
+# Why: HSN-T's word events (model.write_events=word with model.word_address=exact|bag; PR #86,
+# docs/amendments/write_events.md, "The word address") run the memory at word ends only and give an
+# event the code of the whole word. On the synthetic recall tasks that cannot be tested: there every
+# context is non-text, so every byte is its own word and event (the model is the loop over bytes),
+# and the keys are single bytes, many of them not letters (test keys 128-143). This task's keys are
+# words of letters under a context id (7) that runs list as text.
+#
+# The task (family kv_words, python/hsn/data/synthetic.py): synthetic_hold's kv with each key byte
+# replaced by a key word: INS / OVR / DEL operations, distractors, then the queries after SEP.
+#   key word   3 to 8 ASCII letters a-z, lower case only (the word address folds case anyway; a
+#              changed case is an evaluation probe, wk_score.py, not training data)
+#   INS, OVR   MARK w v          (|w| + 2 symbols: the value byte DIRECTLY after the word)
+#   DEL        DEL w SPACE       (the answer to a later query is NONE)
+#   query      QRY w SPACE a     (the answer a is predicted at the SPACE: the loss position)
+#   distance   from the defining operation's last symbol (v, or a DEL's SPACE) to the query's SPACE
+# Values are single bytes 144-191 and distractors 192-255 as in kv, markers 16-18, SPACE 32: no byte
+# but the key letters is a letter, digit or apostrophe, so a value or distractor never joins a word.
+#
+# The layout is the one under which a fact binds with the word events (checked with
+# hsn.model.word_address.word_address on main 5c54832, exact code, context 7 read as text):
+#   BOS ... INS l i l y v ... SEP ... QRY l i l y SPACE v ...
+#   - Events: BOS (a document start), and the byte after each key word. Nothing else: a value or a
+#     distractor is a one-byte word that closes nothing, so it is no event under a text context.
+#     A document has 1 + (operations) + (queries) events.
+#   - WRITE: the event at v (v closes "lily"): a_cur = W(lily), a_prev = W(the key of the event
+#     before: the operation before, or BOS). The slot runs on v's own inputs: z of v, and the
+#     reader's c_t at v, which has read "INS lily v".
+#   - READ: the event at the query's SPACE (it closes "lily"): a_cur = W(lily), a_prev = W(the key
+#     of the event before). v is predicted at this SPACE from q and r of this event (r: the mean of
+#     the cells it selects, after its own write), so the read is addressed by W(lily).
+#   - So the key's code is in a_cur at both the write and the read. This is not A5's cross binding
+#     (k in a_prev at the write, in a_cur at the read): a value byte is not a word and has no event
+#     of its own, so the value is written at the event that closes the key.
+#   Rejected layouts: "INS lily SPACE v": the event is at the SPACE, before v; v gets into no write
+#   under W(lily) (the next event is the next key word's, a_cur = that word, a_prev = W(lily), and
+#   v reaches it only through a 32-byte reader). "QRY lily v": v would be predicted at the y, whose
+#   latest event is before the word, so the read could not be addressed by W(lily).
+#   The per-byte memory (write_events=byte) on the same layout: the write at v has a_prev = C[y] and
+#   A9's a_prev2 = code(l, y); the read at SPACE has a_prev = C[y], a_prev2 = code(l, y). Its address
+#   of a key is the key's last two letters, so keys that share an ending share an address.
+#
+# Key words: a fixed vocabulary per split drawn from vocab_seed (KVWordsParams.vocabulary): groups of
+# four words of 3-8 letters that share a beginning or an ending (half the groups each) of 2-3 letters,
+# 500 groups (2,000 words) for train and 125 (500 words) each for dev and test. Every word is in one
+# split only; all three draw every letter uniformly from a-z, so a dev or test word is a new
+# combination of letters seen in training (all 26 occur in every split, first and last letters too).
+# A document's 8 keys: after the first, each one comes with probability 0.5 from the group of a key
+# already chosen. Measured on the 20,000 training documents: of the queried keys 27 % share their last
+# two letters with another key of the document, 26 % their first two, 48 % neither; 31 % of the far
+# queries (distance >= 63) share an ending. Each training word occurs in 29 to 75 training documents
+# (mean 50); no dev or test word occurs in training.
+#
+# Size and shape: in_range, every document fits one 256-byte window (length 32-256, anchor distance
+# 16-232; the longest anchor needs 23 symbols beside it). Measured on the 20,000 training documents:
+# 202 symbols, 8.1 operations, 3.5 queries, 2.0 far queries (57 % of the queries; 13 % of the answers
+# are NONE) per document; dev and test the same within 0.2. synthetic_hold's kv (2,000 training
+# documents): 196 symbols, 16.1 operations, 5.6 queries, 2.1 far queries (37 %).
+#
+# Build (CPU, a few seconds):
+#   PYTHONPATH=python python -m hsn.data.synthetic build --spec configs/data/synthetic_wordkeys.yaml \
+#       --out data/synthetic_wordkeys --golden configs/data/synthetic_wordkeys.manifest.json
+# Built copy: /home/joe/hsn-experiments/datasets/synthetic_wordkeys (link it as data/synthetic_wordkeys).
+# Select with
+#   data.dataset=synthetic_wordkeys data.manifest=data/synthetic_wordkeys/manifest.json data.tasks=[kvw]
+#   data.variants=[in_range]
+# and, for word events, model.write_events=word model.word_address=exact|bag "model.word_contexts=[0, 6, 7]"
+# (7: this task; 0: the PAD tail behind each document under data.align_docs, no event; 6: TinyStories).
+# Not for write_events=word with word_address=none: that first build counts bytes >= 128 as letters, so
+# a value would join its key word.
+# Evaluation: /home/joe/hsn-handoff/word_keys/wk_score.py (far recall on training / dev / test key
+# words). Golden manifest: configs/data/synthetic_wordkeys.manifest.json.
+
+name: synthetic_wordkeys
+unroll: 256
+
+tasks:
+  - name: kvw
+    variant: in_range
+    family: kv_words
+    context_id: 7
+    seed: 70001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [32, 256]
+    dep_len_range: [16, 232]
+    params:
+      markers: { ins: 16, ovr: 17, del: 18 }
+      letters: [97, 123]
+      space: 32
+      word_len: [3, 8]
+      vocab_seed: 7001
+      groups: { train: 500, dev: 125, test: 125 }
+      group_size: 4
+      affix_len: [2, 3]
+      p_share: 0.5
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 8
+      op_rate: 0.1
+      p_del: 0.25
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 }
+      max_queries: 8

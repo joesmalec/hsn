@@ -20,7 +20,7 @@ writes stubbed out and nothing written to the run database, and prints:
   and the steps during which the compiled window compiled or recorded.
 
 Exit status 1 when the recompiles exceed ``--max-recompiles`` (default 1), 2 without CUDA.
-Before the fix of ``hsn.train.compile._full_width`` every new ``E`` was a new graph, and the
+Before the fix of ``hsn.train.compile._block_columns`` every new ``E`` was a new graph, and the
 mem_events2 arms compiled for 20 minutes on an RTX 3070 without a step (the CPU reproduction:
 eight graphs in six steps, then ``FailOnRecompileLimitHit``). Run it alone on the card: the
 step rate is a timing.
