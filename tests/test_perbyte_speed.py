@@ -637,7 +637,9 @@ def test_blocks_and_pick_on_the_card(dtype: torch.dtype) -> None:
 @pytest.mark.cuda
 def test_state_gradients_on_the_card_keep_the_eager_messages() -> None:
     """bf16 autocast on the card, the eager round: the messages are the same bits with the
-    key; the three gradients agree with the default's to bf16 rounding."""
+    key; the three gradients agree with the default's to bf16 rounding. (CUDA autocast takes
+    the messages' sum over the sources in fp32, so the messages are fp32 there; the products
+    under the sum are bf16.)"""
     device = p28._cuda_ctx().device
     graph, V, h, cells, weights = _graph_case()
     graph, V = graph.to(device), V.to(device)
@@ -645,7 +647,7 @@ def test_state_gradients_on_the_card_keep_the_eager_messages() -> None:
     want, want_grads = _messages(graph, V, h, cells, weights, bf16=True)
     graph.state_gradients = True
     got, grads = _messages(graph, V, h, cells, weights, bf16=True)
-    assert got.dtype == torch.bfloat16 and _same_bits(got, want)
+    assert got.dtype == want.dtype and _same_bits(got, want)
     for g, w in zip(grads, want_grads, strict=True):
         assert bool(torch.isfinite(g).all())
         assert float((g - w).abs().max()) <= 0.05 * float(w.abs().max())
