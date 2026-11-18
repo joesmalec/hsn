@@ -13,6 +13,8 @@ within a task.
 (int64, the example index of each document) and the scalars ``task``, ``variant``, ``split``,
 ``family``, ``context_id``, ``unroll`` and ``format``. ``targets`` (next symbol, PAD last),
 ``context`` (constant ``context_id``) and ``dep_len`` (largest ``deps`` entry) are derived on load.
+So is the fact position of every answer, its offset in its document minus its ``deps`` entry
+(:func:`shard_fact_positions`): no shard stores it and every shard has it.
 
 **Hashes.** A shard's hash is blake2b-256 over a header naming the shard and the arrays' bytes in a
 fixed order with explicit little-endian dtypes, so it depends only on the generated data, never
@@ -28,7 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Self
 
@@ -59,6 +61,7 @@ __all__ = [
     "load_shard",
     "pack_examples",
     "read_shard",
+    "shard_fact_positions",
     "shard_file_name",
     "shard_hash",
     "unpack_examples",
@@ -176,6 +179,29 @@ def pack_examples(examples: Sequence[Example]) -> dict[str, npt.NDArray[Any]]:
         "index": np.asarray([int(e.meta["index"]) for e in examples], dtype=np.int64),
     }
     return arrays
+
+
+def shard_fact_positions(arrays: Mapping[str, npt.NDArray[Any]]) -> npt.NDArray[np.int32]:
+    """``fact_pos`` of a whole shard: for every scored answer, the byte offset in its document of
+    the fact it asks for (:func:`hsn.data.synthetic.fact_positions`, which says what the fact
+    is for each family).
+
+    ``arrays`` holds a shard's ``loss_mask``, ``offsets`` and ``deps``: the result of
+    :func:`read_shard` or :func:`pack_examples`, or an opened ``.npz`` shard file. The result is
+    int32 with one entry per True ``loss_mask`` position in shard order, so it is aligned with
+    ``deps``: ``fact_pos[j] = (p_j - offsets[doc_j]) - deps[j]``, where ``p_j`` is the ``j``-th
+    True position of the flat ``loss_mask`` and ``doc_j`` the document that holds it. It is
+    derived, never stored, so shards built before 18 Nov 2026 have it too and no shard hash or
+    file changes.
+    """
+    positions = np.flatnonzero(np.asarray(arrays["loss_mask"], dtype=np.bool_))
+    offsets = np.asarray(arrays["offsets"], dtype=np.int64)
+    deps = np.asarray(arrays["deps"], dtype=np.int64)
+    if positions.shape[0] != deps.shape[0]:
+        raise ValueError("shard arrays disagree on the number of loss positions")
+    doc = np.searchsorted(offsets, positions, side="right") - 1
+    fact_pos: npt.NDArray[np.int32] = (positions - offsets[doc] - deps).astype(np.int32)
+    return fact_pos
 
 
 def shard_hash(arrays: dict[str, npt.NDArray[Any]], scalars: dict[str, Any]) -> str:
