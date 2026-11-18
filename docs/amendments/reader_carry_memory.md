@@ -1,6 +1,10 @@
-# Reading past the window with the memory on (HSN-T; opt-in, in no recipe)
+# Reading past the window with the memory on (HSN-T; opt-in key, in two recipes since 18 Nov 2026)
 
-Status: **built on 17 Nov 2026, opt-in, in no recipe, not run on the card.** Branch
+Status: **built on 17 Nov 2026 as an opt-in key; since 18 Nov 2026 on in two recipes of their
+own** (`configs/experiments/hsn_t_memory_carry.yaml` and `hsn_t_memory_words_carry.yaml`, the
+user's decision after the runs in "The recipes" below). The code default stays 0, and
+`hsn_t_memory.yaml` and `hsn_t_memory_words.yaml` are unchanged. The rest of this document is
+as written on 17 Nov 2026, before any run on the card. Branch
 `claude/reader-carry-memory` (on main ed9487b). The user's decision of 17 Nov 2026, relayed by
 the campaign session: "lets add that fix as an opt in and test it". No amendment number.
 
@@ -226,6 +230,48 @@ batch shapes: 128 rows of 256 bytes here, 32 rows of 1,024 there). Every other b
 within 1e-3 nats, the mean difference is 5e-5 nats and less. From byte 1,024 on the carried
 reading is better, as it must be: it has no blind start there.
 
+## The recipes (18 Nov 2026)
+
+The user's decision of 18 Nov 2026, after the runs below: the carry is adopted for HSN-T with
+its memory, as two recipes of their own. The existing recipes are unchanged (past runs and
+specs use them).
+
+| Recipe | Is |
+| --- | --- |
+| `configs/experiments/hsn_t_memory_carry.yaml` | `hsn_t_memory.yaml` (per-byte memory, lr 2.5e-3) with the five keys below |
+| `configs/experiments/hsn_t_memory_words_carry.yaml` | `hsn_t_memory_words.yaml` (word events, exact word address, contexts [0, 6], lr 1.25e-3) with the same five keys |
+
+The five keys: the top0 reader of the text runs (`model.reader_width=160`,
+`model.reader_layers=4`, `model.reader_rotary_pairs=[20,20,20,0]`, `model.reader_span=null`) and
+`model.reader_carry=256`. 3,298,025 trainable parameters each (the base recipes: 2,037,801; the
+difference is the top0 reader and the columns that read its wider output, the carry adds none).
+`tests/test_hsn_t_memory_carry_recipes.py`: each recipe is its base with those five keys and
+nothing else, and a spec on it with the TinyStories data lines expands to the arm ids of the
+runs below.
+
+Evidence (the carry runs: tree 6d2bb88, the local RTX 3060 and a rented RTX 3080; dev numbers at
+the last step; each reference is the same configuration without `model.reader_carry`):
+
+| TinyStories, dev bits per byte | Steps | With the carry | Without | Arm ids with the carry |
+| --- | --- | --- | --- | --- |
+| Per byte, s0 | 27,000 | 0.7337 | 0.7783 | `2c02ed8cd1677e50` |
+| Word events, s0 / s1 | 27,000 | 0.7413 / 0.7381 | 0.7972 (s0) | `ba51973f9d0e9c09` / `b446636ec6a18a95` |
+| Per byte, s0 | 9,000 | 0.8272 | 0.8665 | `4815baad3d694a25` |
+| Word events, s0 / s1 | 9,000 | 0.8321 / 0.8338 | 0.8842 / 0.8845 | `d0a23b9c39b08f8e` / `fd12960892ab00a6` |
+
+- **Names**, the "which name" test (bits per letter of a repeated name): where the name's last
+  mention lies 64 to 255 bytes back in an earlier window, 0.04-0.07 with the carry against 0.67
+  without. Beyond 256 bytes the carry does not help: 0.58-0.65 (Mamba 0.19). What is older than
+  the carry is still the memory's ("Reach, not span" above).
+- **Synthetic delayed + kv, `out_of_range`** (18,000 steps, per byte; the delayed facts lie
+  beyond the carry): 16.9 / 16.2 % (s0 / s1) with the carry against 16.5 / 14.6 % without. No
+  harm, but no model learned that task, so it is not evidence of recall.
+- **Step time** alone on the RTX 3060: per byte about 0.19 s a step, word events about 0.072 to
+  0.08.
+- **Open.** The attention read of the cells with the carry was measured once (word events,
+  TinyStories 9k, s0): 0.8258 against the carry alone 0.8321. It is not in these recipes. The
+  top0 reader had one weak seed on word keys: 88.8 % (s1) against 99.8 % (s0).
+
 ## Tests
 
 `tests/test_reader_carry_memory.py`:
@@ -243,6 +289,9 @@ reading is better, as it must be: it has no blind start there.
 - a run resumed from a checkpoint continues bit for bit (also with `train.tbptt_windows=2`).
 
 ## Not run, open
+
+As written on 17 Nov 2026. The arms of `text_carry_e1.yaml` have run on the card since (results
+and step times in "The recipes" above).
 
 - **The card.** No step time, no CUDA-graph run, no bf16 run. The reader's extra work is the
   memory-off form's (19.0 to 24.4 ms per step there at 256 × 32, the whole model); the estimate
