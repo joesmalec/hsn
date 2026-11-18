@@ -601,7 +601,7 @@ def _window_blocks(x: Tensor, blk: int) -> tuple[Tensor, ...]:
         return (x,)
     dense = x.reshape(B, n, blk, *x.shape[2:]).transpose(0, 1).contiguous()
     if dense.requires_grad:
-        dense.register_hook(_plus_zero)
+        dense.register_hook(_plus_zero)  # type: ignore[no-untyped-call]
     return dense.unbind(0)
 
 
