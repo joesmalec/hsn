@@ -15,25 +15,26 @@ bits operation by operation; what is equal to rounding only is an opt-in key.
 
 | | Median step, ms | Against main |
 | --- | ---: | ---: |
-| main (`f7e39be`) | 185.5 | |
-| the branch at its defaults | 178.3 | −7.2 (−3.9 %) |
-| + `hardware.message_gradients=state` (new, opt-in; equal to rounding) | 171.1 | −14.3 (−7.7 %) |
-| + `hardware.round_products=merged` as well (the opt-in of 17 Nov) | 152.6 | −32.9 (−17.7 %) |
+| main (`f7e39be`) | 185.9 | |
+| the branch at its defaults | 180.1 | −5.8 (−3.1 %) |
+| + `hardware.message_gradients=state` (new, opt-in; equal to rounding) | about 173 | about −13 (−7 %) |
+| + `hardware.round_products=merged` as well (the opt-in of 17 Nov) | 154.3 | −31.7 (−17.0 %) |
 
-Medians of the steady steps of runs of 200 steps in one card slot on a quiet host (slot 2,
-"Timings"). The three branch rows were measured at `3911d08`, one change before the final
-commit: it still had the router comparisons that the profile then showed to cost 0.5 ms
-("What did not pay"). The final commit (`bf96b0d`) measured 180.2 ms in slot 3 on a busier
-host, where main measured 189.3 ms. The step moves by 4 to 6 ms with the host's load, so
-the device times of the profiles are the firmer figure: 179.7 → 173.1 ms busy at `3911d08`.
+Rows 1, 2 and 4 are the final code in one card slot on a quiet host (slot 4, "Timings"):
+main before and after the branch (185.1 and 186.7 ms), the branch between them, then the
+branch with both keys. Row 3 was measured one change earlier (`3911d08`, slot 2): 7.2 ms
+under the branch's defaults in that slot (171.1 against 178.3 ms). The step moves by 1.5
+to 6 ms with the host's load (main alone: 185.1 to 191.4 ms over four slots), so
+differences of a millisecond between slots mean nothing; by the profiles' device time,
+which does not depend on the host, the default changes are 6.5 ms (179.7 → 173.1 ms busy).
 
 What was found: **the step is the card's own work in the 256 positions.** Of a step the card
 is busy for about 180 ms; 149 ms of that are the 16 forward and 16 backward replays of the
 compiled block, 17.6 ms the reader (eager), and about 13 ms everything else. Inside a
 position the unit bank is half (it runs all eight units on every selected pair and reads
 one), and the rest is about a hundred small kernels. There is no large waste: what could be
-removed without changing an operation's result is 4 %; with the two opt-in keys the step is
-18 % shorter.
+removed without changing an operation's result is 3 %; with the two opt-in keys the step is
+17 % shorter.
 
 ## Where the step goes
 
@@ -99,7 +100,9 @@ Inside a position (µs per position, 256 positions per step):
 
 Each is the same computation operation by operation (tested bit for bit: "Equality"). On
 the card a compiled block whose graph changed is another compile, and its results differ in
-the last bits, as between any two compiles ("On the card").
+the last bits, as between any two compiles ("On the card"). The times with each change are
+from the two profiles (device time, and host time for the third); they add up to 7.2 ms,
+and the step measured 5.8 ms shorter in the paired runs.
 
 **1. Dense block inputs** (`hsn.train.compile._window_blocks`). −4.2 ms of device time.
 
@@ -140,7 +143,8 @@ Default `autocast`: as it was. Left out of the configuration hash and of the exp
 database's memory key at its default. Refused without the memory's cells, with
 `model.routing=dense` and with `hardware.window=split|fused`. It applies to the sparse
 round's messages wherever they run: eager or compiled, the loop over bytes and the loop over
-events, training and evaluation. −7.2 ms (178.3 → 171.1) on the per-byte recipe.
+events, training and evaluation. −7.2 ms (178.3 → 171.1, at `3911d08`) on the per-byte
+recipe.
 
 - **What it changes.** `CellGraph.messages_selected` gathers a row of edge weights per
   selected cell and a row of `V h` per source of a selected cell. Under bf16 autocast both
@@ -149,8 +153,8 @@ events, training and evaluation. −7.2 ms (178.3 → 171.1) on the per-byte rec
   through the state's dtype (fp32), and cast what they gathered. The two gradients (of the
   edge weights, and of `V h` into `V` and the state) are then summed in fp32.
 - **The forward pass.** A cast and a gather commute, so in the eager round the messages are
-  the same bit for bit (tested under CPU autocast; the card test of it has not passed yet,
-  "On the card"). A compiled block with the key is another compile, and like any two
+  the same bit for bit (tested under CPU autocast and, in bf16, on the card). A compiled
+  block with the key is another compile, and like any two
   compiles the two agree to rounding, not to the bit (first-step loss 5.5417647 with the
   key, 5.5417786 without). One place where they can differ: the key's cast of the gathered
   edge weights sits inside a fused kernel, and a fused kernel may hold a bf16 value in fp32
@@ -170,9 +174,10 @@ events, training and evaluation. −7.2 ms (178.3 → 171.1) on the per-byte rec
 
 The opt-in of 17 Nov (`docs/word_event_speed.md`) had been timed on word events only. On the
 per-byte recipe: 170.4 ms against 191.4 ms on main in slot 1 (−21.0 ms, −11 %), and with
-`message_gradients=state` 152.6 ms against 185.5 ms in slot 2. It is the larger of the two
-keys because it takes the activation and the second layer of seven of the eight units out
-of every position (the first layer stays).
+`message_gradients=state` on the branch 154.3 ms against 185.9 ms in slot 4 (152.6 against
+185.5 ms in slot 2). It is the larger of the two keys because it takes the activation and
+the second layer of seven of the eight units out of every position (the first layer
+stays).
 
 ## Timings
 
@@ -180,8 +185,22 @@ Runs through the real `TBPTTTrainer` (evaluation and checkpoints stubbed), one p
 run, alone on the card. The number of a run is the median step time of its steady steps:
 without the compile steps and the first 20, and without statistics steps.
 
+Slot 4 (15:01 to 15:14; quiet CPUs; the final code, in this order; `train.stats_every`
+beyond the run):
+
+| Configuration | Tree | Median, ms | p10 to p90 | Steps in the median | Load at start, at end |
+| --- | --- | ---: | --- | ---: | --- |
+| main | `f7e39be` | 185.12 | 184.46 to 188.18 | 127 | 2.1, 4.6 |
+| branch, defaults | `86b270f` | 180.14 | 177.96 to 183.30 | 127 | 4.7, 4.8 |
+| main | `f7e39be` | 186.74 | 185.13 to 190.23 | 127 | 4.8, 4.9 |
+| branch, `message_gradients=state`, `round_products=merged` | `86b270f` | 154.25 | 152.87 to 157.27 | 177 | 4.9, 4.6 |
+
+- Main is 185.93 ms as the mean of its two medians; the branch is 5.79 ms under it (3.1 %),
+  6.6 ms under the run of main that had its load. With both keys: 31.7 ms (17.0 %).
+- (`86b270f` and the tip differ from `bf96b0d` in tests and this write-up only.)
+
 Slot 2 (13:36 to 13:53, 200 steps a run, `train.stats_every` beyond the run, 177 steps in
-the median):
+the median; `3911d08` is the final code with the router comparisons of "What did not pay"):
 
 | Configuration | Tree | Median, ms | p10 to p90 | Load at start |
 | --- | --- | ---: | --- | ---: |
@@ -205,9 +224,13 @@ Slot 3 (14:03 to 14:21; other jobs on the CPUs; the final commit):
 | main | `f7e39be` | 189.34 | 188.31 to 196.54 | 37 | 24.3, 11.9 |
 
 - The two slot 3 runs are not a pair: main ran behind the card tests' compiles, under twice
-  the load. Slot 2 is the comparison on a quiet host; slot 3 says that the final commit
-  runs and is in the same place. A paired timing of the final commit on a quiet host, and
-  the two keys on it, are not measured (`slot4.sh` beside the tools would do it).
+  the load.
+- Across the slots: main 185.1 to 186.7 ms on a quiet host (three runs), 189.3 and 191.4
+  under load; the branch's final code 180.1 and 180.2 ms; `3911d08` 178.3 ms, in the
+  quietest run of all (load 3 falling to 2, where main's quietest run is also its
+  fastest). The 1.8 ms between `3911d08` and the final code is inside what the host does
+  to one configuration, so the timings do not say whether the router comparisons cost or
+  saved anything; the profile's device time says they cost 0.5 ms.
 - Every run: 1 dynamo graph, 0 recompiles. Peak allocated 2.87 to 2.91 GiB (1.92 to 1.94
   with the merged products).
 - Device time by the two profiles (`prof/base_prof` on main, `prof/new_prof` on `3911d08`):
@@ -251,6 +274,9 @@ sizes, CUDA graphs; the first 40 losses and gradient norms of every run):
 | Runs compared | First-step loss | Largest relative loss difference, steps 1 to 8 | Steps 1 to 40 | Gradient norm, relative: step 1; largest of steps 1 to 40 |
 | --- | --- | ---: | ---: | --- |
 | main against main (one compile; slots 2 and 3) | equal (5.541769981) | 4.1e-5 | 2.1e-4 | 5.9e-6; 1.0e-2 |
+| main against main (the two runs of slot 4) | equal | 4.5e-5 | 4.6e-4 | 7.1e-6; 3.8e-2 |
+| main against the final branch, slot 4 (either run of main) | 5.541769981 / 5.541777134 | 2.5e-5 | 1.3e-4; 4.8e-4 | 6.1e-5; 3.3e-2 |
+| main against the final branch with both keys, slot 4 | 5.541769981 / 5.541805744 | 3.4e-5 | 4.1e-4 | 7.1e-4; 3.5e-2 |
 | main against the final branch (`bf96b0d`), slot 2's main | 5.541769981 / 5.541777134 | 3.2e-5 | 3.4e-4 | 6.8e-5; 2.3e-2 |
 | main against the final branch, slot 3's main | 5.541769981 / 5.541777134 | 1.6e-5 | 2.3e-4 | 7.4e-5; 1.3e-2 |
 | main against the branch at `3911d08` | 5.541769981 / 5.541778564 | 4.4e-5 | 1.2e-3 | 9.7e-5; 9.3e-2 |
@@ -261,26 +287,32 @@ sizes, CUDA graphs; the first 40 losses and gradient norms of every run):
   first-step gradient tensors are the same bits (the bf16 scatter-adds of the default take
   their additions in no fixed order), and they are 4e-5 apart by step 8 and 2e-4 by step
   40.
-- The final branch differs from main in the first step by 1.3e-6 of the loss and 7e-5 of
-  the gradient norm (another compile), and then stays as close to main as main stays to
-  itself (2.3e-4 and 3.4e-4 over 40 steps against 2.1e-4).
-- The runs at `3911d08` (with the router comparisons, and with the keys) drift further
-  from main by step 40 (1.2e-3 to 1.4e-3 of the loss). All are between 2.913 and 2.916
-  after 40 steps (main 2.9135 and 2.9138, the final branch 2.9143).
-- **Card tests** (slot 3, `pytest -n 0 -m cuda` on the final commit, 24 of the 32 selected
-  tests ran before the slot's time limit): 23 passed, 1 failed, 8 did not run.
+- The final branch differs from main in the first step by 1.3e-6 of the loss and 6e-5 to
+  7e-5 of the gradient norm (another compile), and then stays as close to main as main
+  stays to itself: 1.3e-4 to 4.8e-4 of the loss over 40 steps in four comparisons, against
+  2.1e-4 and 4.6e-4 for main against main. With both keys on the final code: 4.1e-4.
+- The slot 2 runs at `3911d08` (with the router comparisons, and with the keys) are 1.2e-3
+  to 1.4e-3 from that slot's main by step 40. Every run is between 2.913 and 2.916 after
+  40 steps (main 2.9135 to 2.9154, the final branch 2.9143, with both keys 2.9153).
+- **Card tests** (`pytest -n 0 -m cuda`, the final code): all 32 selected tests have
+  passed, 23 in slot 3 and the other 9 in slot 4 (which also ran the branch's own five
+  again). Slot 3 reached 24 tests before its time limit: 23 passed, 1 failed, 8 did not
+  run.
   - Passed: all 12 of `test_p2_8_compile.py` (the compiled window with CUDA Graphs against
     the eager one in fp32 with exact selections, dense in bf16, the launch counts, the dense
     symmetry, a statistics step), the blocks and the pick against the slices and the gather
     in fp32 and bf16, twelve compiled training steps under bf16 with
     `message_gradients=state` alone and beside the merged products, the four compiled
     training runs with the carried reader, three of the four merged-round comparisons.
-  - Failed: `test_state_gradients_on_the_card_keep_the_eager_messages`, a test of this
-    branch. The run was cut before pytest printed the failure. The test asserted that the
-    messages are bf16; CUDA autocast takes their sum in fp32
-    (`hsn.kernels.native.csr_messages`), so that assertion was wrong for the card. It now
-    compares the dtypes of the two forms. **Not rerun on the card.**
-  - Did not run: `test_merged_products_equal_eager_cuda[events_eval]`,
+  - Failed in slot 3: `test_state_gradients_on_the_card_keep_the_eager_messages`, a test
+    of this branch, on an assertion of mine that was wrong for the card: it required the
+    messages to be bf16, and CUDA autocast takes their sum in fp32
+    (`hsn.kernels.native.csr_messages`; the code compiled on the card shows the bf16
+    product and the fp32 sum). The test now compares the dtypes of the two forms, and
+    passed in slot 4: on the card, in the eager round, the messages are the same bits
+    with the key, and the gradients agree to bf16 rounding.
+  - Passed in slot 4, not reached in slot 3:
+    `test_merged_products_equal_eager_cuda[events_eval]`,
     `test_merged_pass_under_bf16_on_the_card`, the four card tests of
     `test_p2_5_sparse_path.py`, and the device tests of `test_p2_1_router.py` and
     `test_p2_2_selection_grads.py`.
@@ -289,9 +321,11 @@ sizes, CUDA graphs; the first 40 losses and gradient norms of every run):
 
 - **CPU suite** (the whole suite, GPU hidden, at the final code): 2,612 passed, 519 skipped
   (CUDA, MPS and kernel-build tests), 118 subtests passed.
-- **Card** (slot 3): 23 of the 24 CUDA tests that ran passed; one test of this branch failed
-  on an assertion that was wrong for the card and is corrected but not rerun; 8 selected
-  tests did not run ("On the card").
+- **Card** (slots 3 and 4): the 32 CUDA tests of the seven files of the changed code
+  (`test_p2_8_compile`, `test_perbyte_speed`, `test_reader_carry_memory`,
+  `test_round_products`, `test_p2_5_sparse_path`, `test_p2_1_router`,
+  `test_p2_2_selection_grads`) all passed, one of them after a correction of the test
+  ("On the card").
 - `ruff check`, `ruff format --check` and `mypy --strict python/hsn`: clean.
 - Not run: the rest of the CUDA suite (the split and fused windows, the four-op kernels).
   The code they run is touched in one place, `UnitBank.forward_static`, whose value is the
@@ -341,5 +375,6 @@ are worth. None is built.
 - Measurement tools, traces and results (not in the repository):
   `~/hsn-experiments/perbyte-speed/` (`tools/prof_pb.py`, `tools/prof_pb2.py`,
   `tools/analyze_pb.py`, `tools/equiv.py`, `tools/compare_equiv.py`, `tools/micro1.py`,
-  `tools/op_census.py`, `tools/slot2_report.py`, `slot1.sh` to `slot4.sh`,
+  `tools/op_census.py`, `tools/slot2_report.py`, `tools/slot4_report.py`, `slot1.sh` to
+  `slot4.sh`,
   `prof/`, `timing/`, `equiv/`, `logs/`).
