@@ -150,6 +150,8 @@ BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "selectiv
 WindowMode = Literal["autograd", "split", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "moe"]
+#: ``baseline.transformer.position``: the learned position table (default) or rotary positions.
+TransformerPosition = Literal["learned", "rotary"]
 #: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
 #: a Transformer reader in front of the HSN's memory core (``model.reader``, ``docs/hsn_t.md``).
 #: Everything "HSN-only" in this schema applies to both; ``model.reader`` separates them.
@@ -1456,6 +1458,13 @@ class TransformerBaselineConfig(_StrictModel):
 
     Defaults are the documented ≈2M-parameter setting for the reference data and ``train.unroll``
     256: 1,930,624 parameters as measured by ``TransformerBaseline.param_report``.
+
+    Two opt-in keys (17 Nov 2026, ``docs/transformer_xl_baseline.md``) make it the
+    Transformer-XL-style control: ``position: rotary`` replaces the learned position table by a
+    rotation of the queries and keys (no parameter; scores depend on distances only), and
+    ``carry: M`` keeps the keys and values of the last ``M`` positions of the windows before,
+    detached, for every block to attend (segment-level recurrence). At their defaults (``learned``,
+    0) the model is the one above, bit for bit, and the keys stay out of the configuration hash.
     """
 
     d_model: int = Field(default=192, ge=1)  # width; must be a multiple of n_heads
@@ -1463,6 +1472,11 @@ class TransformerBaselineConfig(_StrictModel):
     n_heads: int = Field(default=4, ge=1)  # attention heads
     ffn_hidden: int = Field(default=768, ge=1)  # MLP hidden width (4 × d_model)
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)  # embeddings, attention, residual branches
+    # learned: a position table over the window (the model as it was); rotary: queries and keys
+    # rotated by their position (RoPE), no parameter, needed by `carry`
+    position: TransformerPosition = "learned"
+    # Transformer-XL's memory length M: the cached positions of the windows before (0: none)
+    carry: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
@@ -1470,6 +1484,17 @@ class TransformerBaselineConfig(_StrictModel):
             raise ValueError(
                 f"baseline.transformer.d_model={self.d_model} must be a multiple of "
                 f"n_heads={self.n_heads}"
+            )
+        if self.position == "rotary" and (self.d_model // self.n_heads) % 2:
+            raise ValueError(
+                f"baseline.transformer.position=rotary rotates pairs of channels: the head width "
+                f"d_model / n_heads = {self.d_model // self.n_heads} must be even"
+            )
+        if self.carry and self.position != "rotary":
+            raise ValueError(
+                f"baseline.transformer.carry={self.carry} needs baseline.transformer.position="
+                "rotary: a learned position is the position in the window, which a cached key "
+                "would share with a key of the current window"
             )
         return self
 
@@ -1654,6 +1679,15 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 "baseline.address_input is an input of the baselines; the HSN's own address "
                 "features are model.key_address"
+            )
+        transformer = self.baseline.transformer
+        if (transformer.position != "learned" or transformer.carry) and (
+            self.model_name != "transformer"
+        ):
+            raise ValueError(
+                "baseline.transformer.position and baseline.transformer.carry belong to the "
+                f"Transformer baseline (model_name: transformer); model_name={self.model_name!r} "
+                "does not read them: leave them at learned and 0"
             )
         memory_off = self.model_name == "hsn_t" and not self.model.memory
         if (
@@ -2206,6 +2240,8 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.reader_mask",
     "train.host_sync",
     "train.fused_adamw",
+    "baseline.transformer.position",
+    "baseline.transformer.carry",
 )
 
 

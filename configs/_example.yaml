@@ -295,6 +295,8 @@ baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which ba
     n_heads: 4 # attention heads
     ffn_hidden: 768 # MLP hidden width (4 x d_model)
     dropout: 0.0 # embeddings, attention, residual branches
+    position: learned # learned (a table over the window) | rotary (RoPE; Transformer-XL's positions)
+    carry: 0 # Transformer-XL's memory: cached positions of the windows before (needs rotary; 0 = none)
   selective_ssm: # Mamba-style control (model_name: selective_ssm); 1,887,744 parameters measured
     d_model: 256 # residual width
     n_layers: 4 # Mamba blocks
