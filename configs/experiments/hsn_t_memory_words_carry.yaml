@@ -1,6 +1,12 @@
 # hsn_t_memory_words_carry: the recipe for HSN-T with its memory writing at word ends and its reader carried
 # across windows (the user's decision of 18 Nov 2026).
 #
+# 19 Nov 2026, at the user's request: the two speed keys of PR #101 that the user asked to keep on join the CUDA
+# arm line below: hardware.message_gradients=state and hardware.round_products=merged (docs/perbyte_speed.md,
+# docs/word_event_speed.md; both equal to rounding, not bit for bit; the code defaults stay autocast and
+# separate; both are accepted on word events). The file's values are unchanged: a spec on it keeps its arm ids
+# unless it adds the two keys. The attention read of the cells stays off here (hsn_t_memory_carry.yaml has it since
+# 19 Nov; with word events and the carry it was measured once, "Open" below).
 # The user's decision of 18 Nov 2026: the reader carry (model.reader_carry with the memory on,
 # docs/amendments/reader_carry_memory.md; an opt-in key since 17 Nov 2026) is adopted for the HSN-T memory, as
 # recipes of their own: this file for word events, hsn_t_memory_carry.yaml for the per-byte memory.
@@ -26,7 +32,8 @@
 #   TinyStories, 27,000 steps, dev bits per byte (lower is better): 0.7413 / 0.7381 with the carry against 0.7972
 #     (s0) without.
 #   TinyStories, 9,000 steps: 0.8321 / 0.8338 against 0.8842 / 0.8845.
-#   (The per-byte memory, hsn_t_memory_carry.yaml, s0: 27k 0.7337 against 0.7783; 9k 0.8272 against 0.8665.)
+#   (The per-byte memory with the carry, s0: 27k 0.7337 against 0.7783; 9k 0.8272 against 0.8665.
+#   hsn_t_memory_carry.yaml has the attention read since 19 Nov 2026: 27k 0.7263 with the two speed keys.)
 #   Names, the "which name" test (bits per letter of a repeated name): where the name's last mention lies 64 to
 #     255 bytes back in an earlier window, 0.04-0.07 with the carry against 0.67 without. Beyond 256 bytes the
 #     carry does not help: 0.58-0.65 (Mamba 0.19). What is older than the carry is still the memory's.
@@ -34,25 +41,34 @@
 #     16.2 % with the carry against 16.5 / 14.6 % without. No harm, but no model learned that task, so it is not
 #     evidence of recall. The word tasks (synthetic_wordhold, synthetic_wordkeys) have in_range documents only,
 #     where the carry reads nothing: they cannot test it.
-#   Step time: about 0.072 s/step alone on the RTX 3060 (0.077-0.079 on the rented RTX 3080s); the per-byte
-#     memory 0.187-0.194 s/step alone on the RTX 3060.
+#   Step time without the speed keys: about 0.072 s/step alone on the RTX 3060 (0.077-0.079 on the rented RTX
+#     3080s); the per-byte memory 0.187-0.194 s/step alone on the RTX 3060.
+#   The speed keys on word events (docs/word_event_speed.md; hsn_t_memory_words.yaml with the top0 reader, no
+#     carry): hardware.round_products=merged 65.0 -> 61.1 ms/step alone on the RTX 3060, 9k TinyStories 0.8855
+#     against 0.8842 (one run each, inside the seed noise). hardware.message_gradients=state was timed on the
+#     per-byte recipe only (docs/perbyte_speed.md). Neither key has been timed or trained with the carry on word
+#     events.
 # Open:
 #   The attention read of the cells stays off, as in hsn_t_memory_words.yaml. With the carry it was measured once
-#     (TinyStories 9k, s0): model.cell_attention_heads=4 0.8258 against the carry alone 0.8321. Not in the carry
-#     recipes; a text arm may set it (+59,648 parameters with this reader).
+#     (TinyStories 9k, s0): model.cell_attention_heads=4 0.8258 against the carry alone 0.8321. Not in this
+#     recipe (in hsn_t_memory_carry.yaml since 19 Nov 2026); a text arm may set it (+59,648 parameters with this
+#     reader).
 #   The top0 reader had one weak seed on word keys (synthetic_wordkeys, word events, lr 1.25e-3, 18,000 steps):
 #     88.8 % (s1) against 99.8 % (s0).
 #
 # model.word_contexts stays [0, 6] (TinyStories' text and its padding); a spec adds its task's contexts on top
-# (hsn_t_memory_words.yaml's header). With the carry on, the configuration refuses model.reader_span,
-# model.reader_mask=causal and train.reach_dropout > 0 (docs/amendments/reader_carry_memory.md, "Scope and
-# refusals"; docs/reader_causal_flash.md; docs/reach_dropout.md).
-# hardware.graph_alias_index=true stays an override (a `hardware` block in a configuration replaces the whole
-# profile), and a spec sets its own data (TinyStories: data.dataset, data.manifest, data.tasks, data.variants).
-# In an experiment spec the family is hsn_t. A CUDA arm:
+# (hsn_t_memory_words.yaml's header). With the carry on, the configuration refuses model.reader_span and
+# model.reader_mask=causal (docs/amendments/reader_carry_memory.md, "Scope and refusals";
+# docs/reader_causal_flash.md); train.reach_dropout is accepted beside the carry since 18 Nov 2026 (PR #102,
+# docs/reach_dropout.md; off here).
+# hardware.graph_alias_index=true and the two speed keys stay overrides of the CUDA arm (a `hardware` block in a
+# configuration replaces the whole profile, and hardware.round_products=merged is refused with
+# hardware.compile_mode=none, the CPU profile of this file), and a spec sets its own data (TinyStories:
+# data.dataset, data.manifest, data.tasks, data.variants). In an experiment spec the family is hsn_t. A CUDA arm:
 #
 #   base: {config: configs/experiments/hsn_t_memory_words_carry.yaml,
-#          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead, hardware.graph_alias_index=true]}
+#          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead, hardware.graph_alias_index=true,
+#                      hardware.message_gradients=state, hardware.round_products=merged]}
 #
 # Everything not listed keeps its Appendix A default (configs/_example.yaml).
 # Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
