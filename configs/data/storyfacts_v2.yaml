@@ -1,0 +1,166 @@
+# storyfacts_v2 (19 Nov 2026): storyfacts_v1 with two data fixes from the storyfacts memory probe
+# (~/hsn-handoff/STORYFACTS-MEMORY-PROBE-2026-11-19.md, section 5, item 3; the user approved queuing the probe's fixes):
+#   numbers   five of v1's six number relations removed (costs, weighs, counted, collected, owns); "holds" stays. Relations are
+#             drawn uniformly, so numbers go from 6/11 = 55 % of the asked facts to 1/6 = 17 %. No model, Transformer-XL included,
+#             copies a number at 18k steps (their input embeddings collapse), so in v1 they pinned every band near the floor.
+#             kv.facts goes from [2, 8] to [2, 6] (a sheet holds distinct relations).
+#   called    the "called" question answers "It is called {value}." (v1: "{value}."), so the two bytes before the value are "d " at
+#             the statement and at the answer, like the other name relations: a per-byte memory (address_ngram 2) gets a key.
+# Everything else is v1's, the seed included. Not in v2 (builder code, held): two to three questions per fact, a same-window band.
+# Build (CPU, about a minute):
+#   PYTHONPATH=python python -m hsn.data.storyfacts build --spec configs/data/storyfacts_v2.yaml \
+#       --raw /home/joe/hsn-experiments/datasets/tinystories/raw --out data/storyfacts_v2
+# Built copy: /home/joe/hsn-experiments/datasets/storyfacts_v2 (link it as data/storyfacts_v2); select as v1 with storyfacts_v2.
+#
+# v1's header follows.
+#
+# storyfacts_v1: stories with stated facts, the corpus of the recall router (18 Nov 2026; docs/recall_router.md).
+#
+# Why: HSN-T with its memory wins keyed recall, a fast model is as good or better on plain story text. To train a router that
+# sends a document to the memory model only where recall is needed, both models must be trained and scored on ONE corpus that
+# holds both kinds of document; with a model per domain a router only recognises the domain (the analysis of 18 Nov 2026,
+# ~/hsn-handoff/ROUTER-ANALYSIS-2026-11-18.md: AUC 1.000 across domains, nothing to find inside TinyStories alone).
+#
+# What the build makes (python/hsn/data/storyfacts.py; its header has the rules):
+#   plain    one to four consecutive TinyStories stories, unchanged, joined by a blank line (family text)
+#   stated   the same with one to three facts inserted as sentences, never asked
+#   facts    the same, and later one or more questions with their answers, at a recall distance of one of three bands:
+#              near 64-255     inside one reader block's carry and Transformer-XL's cache
+#              mid  256-1,023  inside the reach of the stacked caches (4 x 256)
+#              far  1,024-3,000 beyond every cache: the memory's alone
+#   kv       fact sheets: two to eight facts and their questions, no story
+# One context (6, TinyStories' text) and plain ASCII sentences everywhere: nothing but the text tells a document's kind, and a
+# story document's kind is drawn independently of its stories (one length distribution; the kinds read alike up to the first
+# fact). Facts are stated in the first 320 bytes (15 % of the time: later, up to the middle), so a router that reads a prefix
+# sees most of them and not all.
+#   bytes      as tinystories_v1: newline -> 16, tab -> 17, everything from 32 up as it is
+#   targets    every next byte (dev loss / ln 2 = bits per byte); deps is 1 at text positions and the recall distance at the
+#              answer positions (the positions whose target is a byte of an asked value), so answers = loss positions with a
+#              dependency above 1 (train.answer_weight, eval.by_distance)
+#   names      value names are invented two-syllable words (Zukan, Tamor), 1,500 / 300 / 300 for train / dev / test, disjoint;
+#              a fact's owner is a character of the document's first story where one occurs twice (75 %), else a name of the
+#              split's own list. Numbers (2-99), relation words and slot words are shared
+#   key words  in every relation the word before the value is the same in the statement and in the question (checked at
+#              load); a document uses a relation at most once. Under HSN-T's word address (docs/amendments/write_events.md)
+#              the value is then written under that word's code (a_prev at the value's event) and read where the word closes
+#              again in the question (a_cur); tests/test_storyfacts_data.py checks it against hsn.model.word_address
+#   sources    tinystories_v1's two files (its header has the fetch commands): train documents from the training file, test
+#              and dev documents from the validation file: test from its first story, dev behind test, so the stories of
+#              tinystories_v1's dev and test splits (the file's first 4,000) are in this set's test split, not in its dev split
+#
+# Build (CPU, about a minute):
+#   PYTHONPATH=python python -I -m hsn.data.storyfacts build --spec configs/data/storyfacts_v1.yaml \
+#       --raw <folder with the source files> --out data/storyfacts_v1 --golden configs/data/storyfacts_v1.manifest.json
+# Built copy: /home/joe/hsn-experiments/datasets/storyfacts_v1 (link it as data/storyfacts_v1). Select with
+#   data.dataset=storyfacts_v1 data.manifest=data/storyfacts_v1/manifest.json "data.tasks=[plain, stated, facts, kv]"
+#   data.variants=[out_of_range]
+# HSN-T word events: model.word_contexts stays [0, 6]. Golden manifest: configs/data/storyfacts_v1.manifest.json.
+
+name: storyfacts_v2
+unroll: 256
+variant: out_of_range # documents are longer than a window
+context_id: 6 # TinyStories' text context: one context for every document
+seed: 91001
+separator: "<|endoftext|>"
+min_story_bytes: 200
+newline: 16
+tab: 17
+
+stories:
+  n: {train: 36000, dev: 4000, test: 4000}
+  count_weights: [10, 5, 3, 2] # a document has 1 / 2 / 3 / 4 stories
+  max_bytes: 4096 # of a document's stories; a longer story is left out
+  gap: 2 # newline markers between two stories
+  kinds: {plain: 52, stated: 8, facts: 40}
+  fact_weights: [8, 7, 5] # 1 / 2 / 3 facts
+  ask_percent: 70 # every fact after the one that is always asked
+  zone: 320 # facts are stated at a sentence boundary of the first 320 bytes ...
+  late_percent: 15 # ... or between byte 320 and the middle of the document
+  story_owner_percent: 75
+  bands:
+    - {name: near, lo: 64, hi: 255, weight: 20}
+    - {name: mid, lo: 256, hi: 1023, weight: 30}
+    - {name: far, lo: 1024, hi: 3000, weight: 50}
+
+kv:
+  n: {train: 18000, dev: 2000, test: 2000}
+  facts: [2, 6]
+  ask_percent: 75
+  newline_percent: 25 # a sentence starts a new line instead of following a space
+
+names:
+  seed: 7101
+  onsets: [b, d, f, g, j, k, l, m, n, p, r, s, t, v, z]
+  vowels: [a, e, i, o, u]
+  finals: ["", n, r, s, l, k, m, x]
+  syllables: 2
+  n: {train: 1500, dev: 300, test: 300}
+  exclude: [baker, color, dolor, favor, honor, labor, lemon, melon, never, paper, river, robin, seven, sugar, tiger, water,
+            lily, lola, lulu, mama, mimi, nana, papa, sara, tina, toby, bobo, coco, dodo, fifi, gigi, kiki, lala, momo, nemo]
+
+owners:
+  train: [Lily, Tom, Tim, Sam, Ben, Mia, Anna, Lucy, Sue, Bob, Jack, Jill, Amy, Emma, Leo, Joe, Kim, Dan, Jen, Zoe, Mark,
+          Jane, John, Mary, Sally, Billy, Jimmy, Molly, Daisy, Rosie]
+  dev: [Ella, Nina, Pete, Fred, Ted, Roy, Kate, Luke, Paul, Ruth, Beth, Greg]
+  test: [Hank, Ivy, Jade, Kyle, Lara, Nick, Olga, Owen, Rita, Seth, Tara, Vera]
+
+number_range: [2, 99]
+
+words:
+  pets: [dog, cat, rabbit, bird, puppy, kitten, pony, turtle, hamster, parrot, duck, goat]
+  colors: [red, blue, green, yellow, pink, purple, orange, brown, white, black, gray]
+  containers: [box, jar, basket, bag, bucket, drawer, crate, tin]
+  items: [apples, pears, plums, nuts, eggs, marbles, buttons, shells, stones, beads, pens, keys]
+  adjectives: [small, big, old, new, shiny, wooden, soft, funny, little, round]
+  toys: [robot, kite, drum, doll, truck, train, boat, ball, puzzle, whistle]
+  animals: [pig, cow, sheep, goat, horse, donkey, goose, calf, lamb, hen]
+  sights: [birds, stars, boats, flowers, ducks, frogs, cars, trees, kites, clouds]
+  places: [park, garden, yard, field, pond, forest, street, barn]
+  keepsakes: [stamps, stickers, rocks, shells, cards, coins, feathers, leaves, badges, magnets]
+  goods: [hats, books, bikes, balls, dolls, kites, pens, cups, socks, shirts]
+  belongings: [kite, bike, hat, wagon, door, boat, ball, cup, coat, bag]
+  seasons: [summer, winter, spring, autumn]
+  titles: [Mr., Mrs.]
+
+# The word before {value} is each relation's key word: called, visited, invited, the title, holds, colored (v2; v1 also had costs, weighs, counted,
+# collected, owns; all rare in TinyStories but "called": 0.07 uses per story).
+relations:
+  - name: called
+    value: name
+    slots: {pet: pets}
+    statements: ["{owner}'s {pet} is called {value}.", "{owner} has a {pet} called {value}."]
+    questions: ["What is {owner}'s {pet} called? It is called {value}."]
+  - name: visited
+    value: name
+    slots: {season: seasons}
+    statements: ["{owner} visited {value} last {season}.", "Last {season}, {owner} visited {value}."]
+    questions: ["Which town did {owner} visit last {season}? {owner} visited {value}."]
+  - name: invited
+    value: name
+    statements: ["{owner} invited {value} to the party.", "For the party, {owner} invited {value}."]
+    questions: ["Who did {owner} invite to the party? {owner} invited {value}."]
+  - name: teacher
+    value: name
+    slots: {title: titles}
+    statements: ["{owner}'s teacher is {title} {value}.", "{title} {value} is {owner}'s teacher."]
+    questions: ["Who is {owner}'s teacher? {title} {value}."]
+  - name: holds
+    value: number
+    slots: {color: colors, box: containers, items: items}
+    statements: ["The {color} {box} holds {value} {items}.", "{owner}'s {box} holds {value} {items}."]
+    questions: ["How many {items} does the {box} hold? It holds {value}."]
+  - name: colored
+    value: colors
+    slots: {thing: belongings}
+    statements: ["{owner}'s {thing} is colored {value}."]
+    questions: ["What color is {owner}'s {thing}? It is colored {value}."]
+
+train:
+  file: TinyStoriesV2-GPT4-train.first256MiB.txt
+  sha256: cce19c15f7326df79083b0bdb868bc9f596d73c2e98f71bb44dad12e05992c2a
+  drop_last: true # a byte-range download ends inside a story
+
+heldout:
+  file: TinyStoriesV2-GPT4-valid.txt
+  sha256: 6874bae9a4c1a4e7edcf0e53b86c17817e9cf881fc75ff2368da457b80c0585d
+  drop_first: true # the file starts inside a story
