@@ -7,6 +7,14 @@ kernels built. The configuration is the merged recipe
 the top0 reader (160 wide, 4 blocks), `model.reader_carry=256`, B 32, T 256, bf16,
 `hardware.compile_mode=reduce-overhead`, `hardware.graph_alias_index=true`.
 
+Since 19 Nov 2026 both opt-in keys below (`hardware.message_gradients=state`,
+`hardware.round_products=merged`) are in the CUDA arm lines of the two carry recipes
+(`hsn_t_memory_carry.yaml`, `hsn_t_memory_words_carry.yaml`; not in the files themselves: a
+`hardware` block would replace the whole profile), and the per-byte recipe also has the attention
+read of the cells (`model.cell_attention_heads=4`). That recipe with both keys: 0.173 s/step alone
+on the RTX 3060, TinyStories 27k 0.7263 dev bits per byte (seed 0). The code defaults are
+unchanged. The timings below are of the recipe as it was on 18 Nov, without the attention read.
+
 ## What this is
 
 The job: find where the per-byte step spends its time and remove what can be removed without

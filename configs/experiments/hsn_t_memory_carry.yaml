@@ -1,62 +1,84 @@
-# hsn_t_memory_carry: the recipe for HSN-T with its per-byte memory and its reader carried across windows
-# (the user's decision of 18 Nov 2026).
+# hsn_t_memory_carry: the recipe for HSN-T with its per-byte memory, its reader carried across windows and the
+# attention read of the cells: the best measured text setup of HSN-T (the user's decisions of 18 and 19 Nov 2026).
 #
+# 19 Nov 2026, at the user's request: this recipe is made the best measured text setup. The attention read of the
+# cells is on (model.cell_attention_heads 4, "C-read"; it was 0 here until then), and the two speed keys of PR #101
+# that the user asked to keep on join the CUDA arm line below: hardware.message_gradients=state and
+# hardware.round_products=merged (docs/perbyte_speed.md; both equal to rounding, not bit for bit; the code
+# defaults stay autocast and separate). This file was edited in place (against the rule at the end of this
+# header): a spec on it from before 19 Nov now expands to other arm ids; the form of 18 Nov is this file with
+# model.cell_attention_heads=0.
 # The user's decision of 18 Nov 2026: the reader carry (model.reader_carry with the memory on,
 # docs/amendments/reader_carry_memory.md; an opt-in key since 17 Nov 2026) is adopted for the HSN-T memory, as
 # recipes of their own: this file for the per-byte memory, hsn_t_memory_words_carry.yaml for word events.
 # hsn_t_memory.yaml and hsn_t_memory_words.yaml are unchanged (past runs and specs use them).
-# This file is hsn_t_memory.yaml (main's HSN-T memory form, per-byte writes, lr 2.5e-3) with five keys changed,
+# This file is hsn_t_memory.yaml (main's HSN-T memory form, per-byte writes, lr 2.5e-3) with six keys changed,
 # written out:
 #   the top0 reader of the text runs: model.reader_width 160, model.reader_layers 4, model.reader_rotary_pairs
 #   [20, 20, 20, 0] (the top block compares queries and keys unrotated) and model.reader_span null
 #   (hsn_t_memory.yaml: 32; the carry refuses a span, it is a sliding span itself);
 #   model.reader_carry 256: every reader block reads up to 256 positions back in its document, in this window or
 #   the windows before (a cache of detached keys and values handed on with the address bytes, beside the cells'
-#   state; no gradient crosses a window through the reader). Everything after the reader's output is unchanged.
+#   state; no gradient crosses a window through the reader). Everything after the reader's output is unchanged;
+#   model.cell_attention_heads 4 (19 Nov 2026; hsn_t_memory.yaml: 0): the decoder also reads the cells by
+#   attention, four heads (docs/hsn_t.md, "The attention read of the cells").
 # It resolves to hsn_t_memory.yaml with those overrides exactly (the same arm ids, and the same configuration hash
-# once run_id and notes are aligned: tests/test_hsn_t_memory_carry_recipes.py; with the TinyStories data lines on
-# top, a spec on it expands to the arm ids of the runs below, 4815baad3d694a25 at 9k and 2c02ed8cd1677e50 at 27k).
-# 3,298,025 trainable parameters (hsn_t_memory.yaml: 2,037,801; the difference is the top0 reader and the columns
-# that read its wider output; the carry adds none). The cache is 327,680 numbers per row, 42 MB at batch 32.
+# once run_id and notes are aligned: tests/test_hsn_t_memory_carry_recipes.py). With the card's lines, the two
+# speed keys and the TinyStories data lines on top, a spec on it expands to the arm id of the run below,
+# a5dfad52065bb096 at 27k; without the speed keys, to 82f1a81132c925a3 at 9k; with model.cell_attention_heads=0
+# and no speed keys, to the carry runs of 17 Nov (4815baad3d694a25 at 9k and 2c02ed8cd1677e50 at 27k).
+# 3,357,673 trainable parameters (hsn_t_memory.yaml: 2,037,801; the difference is the top0 reader, the columns
+# that read its wider output and the attention read, 59,648; the carry adds none). The cache is 327,680 numbers
+# per row, 42 MB at batch 32.
 #
-# Evidence (the carry runs of 17-18 Nov 2026: tree 6d2bb88, the local RTX 3060 and a rented RTX 3080; dev numbers
-# at the last step, seed 0 unless noted; each reference is the same configuration without model.reader_carry):
-#   TinyStories, 27,000 steps, dev bits per byte (lower is better): 0.7337 with the carry against 0.7783 without.
-#   TinyStories, 9,000 steps: 0.8272 against 0.8665.
-#   (Word events, hsn_t_memory_words_carry.yaml: 27k 0.7413 / 0.7381, s0 / s1, against 0.7972; 9k 0.8321 / 0.8338
-#   against 0.8842 / 0.8845.)
+# Evidence (TinyStories, dev bits per byte at the last step, lower is better; seed 0; alone on the RTX 3060):
+#   27,000 steps, this recipe with both speed keys: 0.7263 at 0.173 s/step (run names256_c256_27k, arm
+#     a5dfad52065bb096, tree 3718a7b, 19 Nov 2026). The same without the attention read and without the speed
+#     keys (this file of 18 Nov): 0.7337 (17 Nov); without the carry as well: 0.7783.
+#   9,000 steps, this recipe without the speed keys: 0.8225 at 0.205 s/step (arm 82f1a81132c925a3, tree aa652fd,
+#     18 Nov) against 0.8272 without the attention read and 0.8665 without the carry.
+#   The baselines at 27,000 steps: the Transformer with a 256-position cache 0.720, Mamba 0.718, the Transformer
+#     at 1024 0.714, Gated DeltaNet 0.713. They are still ahead, by 0.006 to 0.013.
+#   The speed keys alone (PR #101, docs/perbyte_speed.md, this file of 18 Nov): 185.9 -> 154.3 ms/step.
+#   (Word events, hsn_t_memory_words_carry.yaml, carry without the attention read: 27k 0.7413 / 0.7381, s0 / s1,
+#   against 0.7972; 9k 0.8321 / 0.8338 against 0.8842 / 0.8845.)
+#   The carry (the runs of 17-18 Nov 2026 without the attention read: tree 6d2bb88, the local RTX 3060 and a
+#   rented RTX 3080; each reference is the same configuration without model.reader_carry):
 #   Names, the "which name" test (bits per letter of a repeated name): where the name's last mention lies 64 to
 #     255 bytes back in an earlier window, 0.04-0.07 with the carry against 0.67 without. Beyond 256 bytes the
 #     carry does not help: 0.58-0.65 (Mamba 0.19). What is older than the carry is still the memory's.
 #   Synthetic delayed + kv, out_of_range (18,000 steps; the delayed facts lie 267 to 768 bytes back, beyond the
 #     carry): 16.9 / 16.2 % (s0 / s1) with the carry against 16.5 / 14.6 % without. No harm, but no model learned
 #     that task, so it is not evidence of recall.
-#   Step time alone on the RTX 3060: 0.187-0.194 s/step (word events: about 0.072 s/step alone on the RTX 3060,
-#     0.077-0.079 on the rented RTX 3080s).
+#   Step time alone on the RTX 3060 without the attention read and the speed keys: 0.187-0.194 s/step (word
+#     events: about 0.072 s/step alone on the RTX 3060, 0.077-0.079 on the rented RTX 3080s).
 # Open:
-#   The attention read of the cells stays off, as in hsn_t_memory.yaml. With the carry it was measured once (word
-#     events, TinyStories 9k, s0): model.cell_attention_heads=4 0.8258 against the carry alone 0.8321. Not in the
-#     carry recipes; a text arm may set it (+59,648 parameters with this reader).
+#   One seed of the recipe as it is (s0, 27k). The attention read costs the recall tasks (kv, delayed) in the runs
+#     of 16 Nov without the carry (docs/hsn_t.md): this is a text recipe; a recall arm may set
+#     model.cell_attention_heads=0. The recall tasks were not run with the attention read and the carry.
 #   The top0 reader had one weak seed on word keys (synthetic_wordkeys, word events, lr 1.25e-3, 18,000 steps):
 #     88.8 % (s1) against 99.8 % (s0).
 #
-# With the carry on, the configuration refuses model.reader_span, model.reader_mask=causal and
-# train.reach_dropout > 0 (docs/amendments/reader_carry_memory.md, "Scope and refusals";
-# docs/reader_causal_flash.md; docs/reach_dropout.md).
-# hardware.graph_alias_index=true stays an override (a `hardware` block in a configuration replaces the whole
-# profile). The data block is hsn_recipe_a6's (the delayed task, in_range: its documents fit a window and start
-# with one, where the carry reads nothing); a spec sets its own data (TinyStories: data.dataset, data.manifest,
-# data.tasks, data.variants). In an experiment spec the family is hsn_t. A CUDA arm:
+# With the carry on, the configuration refuses model.reader_span and model.reader_mask=causal
+# (docs/amendments/reader_carry_memory.md, "Scope and refusals"; docs/reader_causal_flash.md); train.reach_dropout
+# is accepted beside the carry since 18 Nov 2026 (PR #102, docs/reach_dropout.md; off here).
+# hardware.graph_alias_index=true and the two speed keys stay overrides of the CUDA arm (a `hardware` block in a
+# configuration replaces the whole profile, and hardware.round_products=merged is refused with
+# hardware.compile_mode=none, the CPU profile of this file). The data block is hsn_recipe_a6's (the delayed task,
+# in_range: its documents fit a window and start with one, where the carry reads nothing); a spec sets its own
+# data (TinyStories: data.dataset, data.manifest, data.tasks, data.variants). In an experiment spec the family is
+# hsn_t. A CUDA arm:
 #
 #   base: {config: configs/experiments/hsn_t_memory_carry.yaml,
-#          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead, hardware.graph_alias_index=true]}
+#          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead, hardware.graph_alias_index=true,
+#                      hardware.message_gradients=state, hardware.round_products=merged]}
 #
 # Everything not listed keeps its Appendix A default (configs/_example.yaml).
 # Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
 
 run_id: hsn_t_memory_carry
 seed: 0
-notes: "HSN-T with its per-byte memory and the reader carried across windows: hsn_t_memory (main's form) + the top0 reader (160 x 4, top block unrotated, no span) and model.reader_carry 256."
+notes: "HSN-T with its per-byte memory, the reader carried across windows and the attention read of the cells: hsn_t_memory (main's form) + the top0 reader (160 x 4, top block unrotated, no span), model.reader_carry 256 and model.cell_attention_heads 4; a CUDA arm adds hardware.message_gradients=state and hardware.round_products=merged."
 profile: cpu # hardware profile: configs/hardware/<profile>.yaml; override with `profile=<name>`
 model_name: hsn_t
 
@@ -109,7 +131,7 @@ model: # Appendix A.1
   reader_rotary_pairs: [20, 20, 20, 0] # top0: the top block's queries and keys unrotated (hsn_t_memory.yaml: all rotated)
   reader_span: null # no span (the carry refuses one: it is the reader's span) (hsn_t_memory.yaml: 32)
   reader_carry: 256 # every block reads up to 256 positions back in its document, across windows (hsn_t_memory.yaml: 0)
-  cell_attention_heads: 0 # C-read off (as hsn_t_memory.yaml); with the carry it was measured once (header)
+  cell_attention_heads: 4 # C-read on since 19 Nov 2026: four heads (hsn_t_memory.yaml: 0)
   state_schema_version: 1 # bumped on any state layout change
 
 data:

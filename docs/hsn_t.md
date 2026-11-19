@@ -361,8 +361,11 @@ The recipes of HSN-T with its memory are four: `hsn_t_memory.yaml` (per-byte wri
 `hsn_t_memory_carry.yaml` and `hsn_t_memory_words_carry.yaml`. Their evidence (TinyStories 27k,
 dev bits per byte: the per-byte memory 0.7337 against 0.7783 without the carry, word events
 0.7413 / 0.7381 against 0.7972) and what is open are in
-`docs/amendments/reader_carry_memory.md`, "The recipes". The carry recipes leave the attention
-read off as well: with the carry it was measured once.
+`docs/amendments/reader_carry_memory.md`, "The recipes". Since 19 Nov 2026 the per-byte carry
+recipe has the attention read on (`H = 4`), the best measured text setup of HSN-T: 0.7263 at 27k
+(seed 0, with the two speed keys of `docs/perbyte_speed.md` in its CUDA arm's lines) against
+0.7337 without either. The word-event carry recipe leaves it off: with word events and the carry
+it was measured once.
 
 ## Reach dropout (`train.reach_dropout`)
 

@@ -2,7 +2,8 @@
 
 Status: **built on 17 Nov 2026 as an opt-in key; since 18 Nov 2026 on in two recipes of their
 own** (`configs/experiments/hsn_t_memory_carry.yaml` and `hsn_t_memory_words_carry.yaml`, the
-user's decision after the runs in "The recipes" below). The code default stays 0, and
+user's decision after the runs in "The recipes" below; since 19 Nov 2026 the per-byte one also
+has the attention read of the cells). The code default stays 0, and
 `hsn_t_memory.yaml` and `hsn_t_memory_words.yaml` are unchanged. The rest of this document is
 as written on 17 Nov 2026, before any run on the card. Branch
 `claude/reader-carry-memory` (on main ed9487b). The user's decision of 17 Nov 2026, relayed by
@@ -244,16 +245,37 @@ specs use them).
 
 | Recipe | Is |
 | --- | --- |
-| `configs/experiments/hsn_t_memory_carry.yaml` | `hsn_t_memory.yaml` (per-byte memory, lr 2.5e-3) with the five keys below |
+| `configs/experiments/hsn_t_memory_carry.yaml` | `hsn_t_memory.yaml` (per-byte memory, lr 2.5e-3) with the five keys below and, since 19 Nov 2026, `model.cell_attention_heads=4` |
 | `configs/experiments/hsn_t_memory_words_carry.yaml` | `hsn_t_memory_words.yaml` (word events, exact word address, contexts [0, 6], lr 1.25e-3) with the same five keys |
 
 The five keys: the top0 reader of the text runs (`model.reader_width=160`,
 `model.reader_layers=4`, `model.reader_rotary_pairs=[20,20,20,0]`, `model.reader_span=null`) and
 `model.reader_carry=256`. 3,298,025 trainable parameters each (the base recipes: 2,037,801; the
-difference is the top0 reader and the columns that read its wider output, the carry adds none).
-`tests/test_hsn_t_memory_carry_recipes.py`: each recipe is its base with those five keys and
-nothing else, and a spec on it with the TinyStories data lines expands to the arm ids of the
-runs below.
+difference is the top0 reader and the columns that read its wider output, the carry adds none);
+the per-byte recipe with the attention read 3,357,673.
+`tests/test_hsn_t_memory_carry_recipes.py`: each recipe is its base with those keys and nothing
+else, and a spec on it with the TinyStories data lines expands to the arm ids of the runs below.
+
+**19 Nov 2026: the best measured text setup.** At the user's request the per-byte recipe turns
+on the attention read of the cells (`model.cell_attention_heads=4`, `docs/hsn_t.md`), and both
+recipes' CUDA arm lines take the two speed keys of PR #101 that the user asked to keep on,
+`hardware.message_gradients=state` and `hardware.round_products=merged`
+(`docs/perbyte_speed.md`; equal to rounding; the code defaults are unchanged). The keys stay
+out of the files: a `hardware` block in a configuration replaces the whole profile, and the
+merged products are refused on the files' CPU profile. A spec on the per-byte recipe from before
+19 Nov expands to other arm ids now (its form of 18 Nov is the recipe with
+`model.cell_attention_heads=0`); the word-event recipe's values are unchanged.
+
+| Per byte, TinyStories, s0, alone on the RTX 3060 | Steps | Dev bits per byte | s/step | Arm id |
+| --- | --- | --- | --- | --- |
+| The recipe with both speed keys (tree 3718a7b, 19 Nov) | 27,000 | 0.7263 | 0.173 | `a5dfad52065bb096` |
+| Without the attention read and the speed keys (the carry run below) | 27,000 | 0.7337 | 0.187 | `2c02ed8cd1677e50` |
+| The recipe without the speed keys (tree aa652fd, 18 Nov) | 9,000 | 0.8225 | 0.205 | `82f1a81132c925a3` |
+| Without the attention read and the speed keys (the carry run below) | 9,000 | 0.8272 | 0.194 | `4815baad3d694a25` |
+
+The baselines at 27,000 steps are still ahead: the Transformer with a 256-position cache 0.720,
+Mamba 0.718, the Transformer at 1024 0.714, Gated DeltaNet 0.713. The speed keys alone took the
+per-byte recipe of 18 Nov from 185.9 to 154.3 ms/step (`docs/perbyte_speed.md`).
 
 Evidence (the carry runs: tree 6d2bb88, the local RTX 3060 and a rented RTX 3080; dev numbers at
 the last step; each reference is the same configuration without `model.reader_carry`):
@@ -274,9 +296,11 @@ the last step; each reference is the same configuration without `model.reader_ca
   harm, but no model learned that task, so it is not evidence of recall.
 - **Step time.** Per byte 0.187-0.194 s/step alone on the RTX 3060. Word events about 0.072
   s/step alone on the RTX 3060 (0.077-0.079 on the rented RTX 3080s).
-- **Open.** The attention read of the cells with the carry was measured once (word events,
-  TinyStories 9k, s0): 0.8258 against the carry alone 0.8321. It is not in these recipes. The
-  top0 reader had one weak seed on word keys: 88.8 % (s1) against 99.8 % (s0).
+- **Open.** The attention read of the cells with the carry and word events was measured once
+  (TinyStories 9k, s0): 0.8258 against the carry alone 0.8321. It is not in the word-event
+  recipe (in the per-byte one since 19 Nov 2026, above: one seed at 27k; it costs the recall
+  tasks in the runs of 16 Nov without the carry, `docs/hsn_t.md`). The top0 reader had one weak
+  seed on word keys: 88.8 % (s1) against 99.8 % (s0).
 
 ## Tests
 
