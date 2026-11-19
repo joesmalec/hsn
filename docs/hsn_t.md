@@ -370,8 +370,10 @@ A training option of 17 Nov 2026 (`docs/reach_dropout.md`; opt-in, no equation c
 training window each row reads, with probability `train.reach_dropout`, with the per-block span
 `train.reach_dropout_span` (16 by default), the other rows with the whole window; evaluation
 reads as configured. It leaves the names beyond the short span to the memory in those rows
-while the reader keeps the whole window (experiment E1 of the names design note). The default
-is 0, and with it nothing in this document changes.
+while the reader keeps the whole window (experiment E1 of the names design note). Beside the
+carried reader (`model.reader_carry`, since 18 Nov 2026) the short rows read as with
+`model.reader_carry = S − 1`, cached positions included, and a row's draw is held until its
+next document start. The default is 0, and with it nothing in this document changes.
 
 ## Tests (`tests/test_hsn_t.py`)
 

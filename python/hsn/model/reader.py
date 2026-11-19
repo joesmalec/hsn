@@ -20,7 +20,8 @@ What ``c_t`` may depend on (tested in ``tests/test_hsn_t.py``):
 ``train.reach_dropout`` (``docs/reach_dropout.md``; opt-in, training only): the trainer hands
 the model, per training window, the batch rows that read as with ``model.reader_span = S``
 (``short`` of :meth:`Reader.forward`); the other rows, and every call without ``short``, read
-as configured.
+as configured. With ``model.reader_carry`` (:meth:`Reader.read`, below) ``short`` narrows the
+cached positions too, so a short row reads as the reader with ``model.reader_carry = S − 1``.
 
 Layout: byte embedding → ``model.reader_layers`` pre-norm blocks (LayerNorm → causal multi-head
 self-attention → residual; LayerNorm → GELU MLP of width ``4 w`` → residual) → LayerNorm. The
@@ -222,6 +223,21 @@ def _keep_tail(old: Tensor, new: Tensor, count: int, dim: int) -> Tensor:
     if length >= count:
         return new.narrow(dim, length - count, count).to(old.dtype)
     return torch.cat([old.detach().narrow(dim, length, count - length), new.to(old.dtype)], dim)
+
+
+def _check_short(short: tuple[Tensor, int], B: int, T: int | None = None) -> None:
+    """``short = (rows, n)`` of ``train.reach_dropout``: ``rows`` a bool ``[B]`` tensor, or
+    with ``T`` (:meth:`Reader.read`) a bool ``[B, T]`` one, and ``n`` an int of 1 or more."""
+    rows, n = short
+    shapes = [(B,)] if T is None else [(B,), (B, T)]
+    if rows.dtype is not torch.bool or tuple(rows.shape) not in shapes:
+        names = "[B]" if T is None else f"[B] or [B, T] (T = {T})"
+        raise ValueError(
+            f"short rows must be a bool {names} tensor (B = {B}), got "
+            f"{rows.dtype} {tuple(rows.shape)}"
+        )
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"the short span must be an int >= 1, got {n!r}")
 
 
 class _ReaderBlock(nn.Module):
@@ -504,7 +520,6 @@ class Reader(nn.Module):
                 "read(tokens, reset, cache), the cache from init_cache"
             )
         if short is not None:
-            rows, n = short
             if self.span is not None:
                 raise ValueError(
                     f"short rows (train.reach_dropout) shorten a whole-window reader; this one "
@@ -517,13 +532,7 @@ class Reader(nn.Module):
                     "short rows (train.reach_dropout) need the document mask they narrow; this "
                     "reader has model.reader_mask=causal (no mask)"
                 )
-            if rows.dtype is not torch.bool or tuple(rows.shape) != (int(tokens.shape[0]),):
-                raise ValueError(
-                    f"short rows must be a bool [B] tensor (B = {int(tokens.shape[0])}), got "
-                    f"{rows.dtype} {tuple(rows.shape)}"
-                )
-            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-                raise ValueError(f"the short span must be an int >= 1, got {n!r}")
+            _check_short(short, int(tokens.shape[0]))
         x = self.emb(tokens)
         T = int(tokens.shape[1])
         cos: Tensor | None
@@ -627,13 +636,21 @@ class Reader(nn.Module):
             parts[7] = parts[7] & ~rows
         return tuple(parts)
 
-    def carry_mask(self, reset: Tensor, valid: Tensor) -> Tensor:
+    def carry_mask(
+        self, reset: Tensor, valid: Tensor, short: tuple[Tensor, int] | None = None
+    ) -> Tensor:
         """Bool ``[B, 1, T, C + T]``: True where window position ``t`` (row) may read a
         cached position (the first ``C`` columns, slot ``j`` at the position ``j − C``) or a
         window position ``s`` (the last ``T``). ``t − s ≤ C`` and ``s ≤ t`` for both; a cached
         position needs ``valid`` (``[B, C]``, its document is the one going on) and no reset at
         or before ``t``; a window position needs the document of ``t``. Every row holds its own
-        position."""
+        position.
+
+        ``short = (rows, n)`` (``train.reach_dropout`` on the carried reader,
+        ``docs/reach_dropout.md``): where ``rows`` is True, a batch row (bool ``[B]``) or a
+        position of one (bool ``[B, T]``, by ``t``) also needs ``t − s < n``, over the cached
+        and the window positions alike: the mask of ``model.reader_carry = n − 1``. The others
+        keep the carry's span, bit for bit. Tensor operations only: no host read, one shape."""
         T = int(reset.shape[1])
         C = self.carry
         segment = reset.to(torch.int64).cumsum(dim=1)  # the document index of every position
@@ -645,7 +662,14 @@ class Reader(nn.Module):
         slot = torch.arange(C, device=reset.device)
         reach = slot[None, :] >= index[:, None]  # [T, C]: t − (j − C) ≤ C
         cached = valid[:, None, :] & going_on[:, :, None] & reach
-        return torch.cat([cached, same & near], dim=-1)[:, None]
+        mask = torch.cat([cached, same & near], dim=-1)
+        if short is not None:
+            rows, n = short
+            # t − s of every column: the cached slot j stands at the position j − C
+            apart = torch.cat([index[:, None] + (C - slot)[None, :], distance], dim=-1)
+            whole = ~rows[:, None, None] if rows.dim() == 1 else ~rows[:, :, None]
+            mask = mask & ((apart < n) | whole)
+        return mask[:, None]
 
     def word_masks(
         self, reset: Tensor, ends: Tensor, word_valid: Tensor, word_pos: Tensor
@@ -681,12 +705,25 @@ class Reader(nn.Module):
         )
         return window, cached
 
-    def read(self, tokens: Tensor, reset: Tensor, cache: Cache) -> tuple[Tensor, Cache]:
+    def read(
+        self,
+        tokens: Tensor,
+        reset: Tensor,
+        cache: Cache,
+        short: tuple[Tensor, int] | None = None,
+    ) -> tuple[Tensor, Cache]:
         """``model.reader_carry``: ``(c, cache)`` for the window ``tokens`` after the windows
         ``cache`` holds (module docstring, "Reading past the window"). ``c [B, T, w]`` is the
         reader's output, as :meth:`forward`'s; the cache returned holds the last ``C``
         positions of the stream after this window, and with ``model.reader_top_words`` its
-        last ``N`` word ends, detached."""
+        last ``N`` word ends, detached.
+
+        ``short``: :meth:`carry_mask`'s, the rows or positions that read with a short span
+        (``train.reach_dropout``; None, the default: every row as configured). What they leave
+        in the cache was computed under the short span, so the caller keeps a document short
+        or whole from its start to its end (the trainer holds a row's draw until its next
+        document start, ``docs/reach_dropout.md``): such a document is read, cached positions
+        included, exactly as the reader with ``model.reader_carry = n − 1`` reads it."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
@@ -698,13 +735,20 @@ class Reader(nn.Module):
         cache = self.check_cache(cache, B)
         keys, values, valid = cache[:3]
         C, N = self.carry, self.top_words
+        if short is not None:
+            if N:
+                raise ValueError(
+                    "short rows (train.reach_dropout) narrow the carried span; the top block's "
+                    f"word slots (model.reader_top_words={N}) reach beyond any span"
+                )
+            _check_short(short, B, T)
         x = self.emb(tokens)
         # the angles of the positions −C … T − 1: the window's as forward's, the cached ones
         # those of 1 … C with the sine's sign turned (cos is even, sin odd)
         cos_all, sin_all = self._rotation(max(T, C + 1), x)
         cos = torch.cat([cos_all[1 : C + 1].flip(0), cos_all[:T]])
         sin = torch.cat([-sin_all[1 : C + 1].flip(0), sin_all[:T]])
-        mask = self.carry_mask(reset, valid)
+        mask = self.carry_mask(reset, valid, short)
         word_keys = word_values = None
         top_mask = mask
         if N:  # the top block also reads word ends beyond the span: the window's and the slots

@@ -166,6 +166,12 @@ Refused at configuration load, each with the reason:
 | `train.lambda_u > 0` | the counterfactual probes replay windows with A5's bytes alone |
 | `model.reader_span` set, `model.reader_position=learned` | as without the memory: the carry is itself a sliding span and needs rotary positions |
 
+`train.reach_dropout` (`docs/reach_dropout.md`) is accepted beside the key since 18 Nov 2026:
+its short rows narrow the carried span, over the cached and the window positions, to that of
+`model.reader_carry = S − 1`, and a row's draw is held until its next document start, so no
+position reads a cached entry that was computed under the other span. At
+`train.reach_dropout = 0` nothing here changes.
+
 Not available, as for every HSN-T: `HSN.step`, `hardware.window = split | fused`. The
 counterfactual probes and `hsn.experiments.stability` call `address_history` without `info` and
 raise with the key, as they do with `model.word_address`.

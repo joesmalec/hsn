@@ -1103,6 +1103,9 @@ class TrainConfig(_StrictModel):
     # and the window counter (the global random stream is untouched; a resume replays it).
     # Evaluation and every other forward pass read as configured. A trainer option: no model
     # equation or parameter changes. Needs hsn_t with its memory and model.reader_span null.
+    # With model.reader_carry = C > 0 (allowed since 18 Nov 2026) the short rows also read the
+    # reader's cache with the span, as model.reader_carry = S - 1 would (S <= C), and a row's
+    # draw is held until its next document start (docs/reach_dropout.md).
     # 0.0 (default): off, bit for bit. Both keys hashed when set; the span is read only when
     # reach_dropout > 0.
     reach_dropout: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
@@ -2783,8 +2786,9 @@ def tbptt_windows_scope_error(cfg: RunConfig) -> str | None:
 def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
     """Why ``train.reach_dropout > 0`` (``docs/reach_dropout.md``) cannot run with ``cfg``;
     ``None`` when it can. It shortens, in some rows of a training window, the whole-window
-    reader of HSN-T with its memory, so that the memory has to carry what lies beyond the
-    short span. (HSN-T without its memory is refused by :func:`memory_off_refusals`.)"""
+    reader of HSN-T with its memory (or the span of its carried reader, ``model.reader_carry``),
+    so that the memory has to carry what lies beyond the short span. (HSN-T without its memory
+    is refused by :func:`memory_off_refusals`.)"""
     model, train = cfg.model, cfg.train
     if cfg.model_name != "hsn_t":
         return (
@@ -2805,13 +2809,14 @@ def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
             "short rows' span mask could not act (docs/reader_causal_flash.md); leave "
             "model.reader_mask at document"
         )
-    if model.reader_carry:
-        # the carried reader reads through Reader.read and its own mask, which takes no short
-        # rows (HSN-T with its memory takes model.reader_carry since 17 Nov 2026,
-        # docs/amendments/reader_carry_memory.md; reach dropout leaves it out)
+    if model.reader_carry and train.reach_dropout_span > model.reader_carry:
+        # the carried reader (docs/amendments/reader_carry_memory.md) is itself a sliding span
+        # of reader_carry + 1 positions; since 18 Nov 2026 the short rows narrow it, over the
+        # cached and the window positions (Reader.read), to the span of reader_carry = S - 1
         return (
-            f"model.reader_carry={model.reader_carry}: the carried reader reads through its "
-            "cache's own mask, which the short rows do not narrow; leave model.reader_carry at 0"
+            f"train.reach_dropout_span={train.reach_dropout_span} is not shorter than the "
+            f"carried reader's own span (model.reader_carry={model.reader_carry}, "
+            f"{model.reader_carry + 1} positions): a short row would read as every other row"
         )
     if train.reach_dropout_span >= train.unroll:
         return (
