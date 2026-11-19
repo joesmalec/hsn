@@ -247,7 +247,12 @@ from hsn.train.checkpoint import (
     save_checkpoint,
     unpack_cell_state,
 )
-from hsn.train.compile import CompiledWindow, compile_window, install_graph_alias_index
+from hsn.train.compile import (
+    CompiledWindow,
+    apply_message_gradients,
+    compile_window,
+    install_graph_alias_index,
+)
 from hsn.train.grad_norm import clip_grad_norm_, norm_float64
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices, active_units_packed
 from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
@@ -517,6 +522,8 @@ class TBPTTTrainer(Trainer):
         # P2.8: the compiled training window (None: eager windows), built before the cut decision
         # (a compiled window keeps one fixed T)
         self._compiled: CompiledWindow | None = None
+        # opt-in (hardware.message_gradients): the dtype of the messages' gradient sums
+        apply_message_gradients(model, cfg.hardware.message_gradients)
         if ctx.compile_enabled:
             if cfg.hardware.graph_alias_index:  # opt-in: PyTorch's alias check by index
                 install_graph_alias_index()

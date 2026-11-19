@@ -1,0 +1,123 @@
+# synthetic_far_early: the far-recall test set with every fact early (18 Nov 2026). Evaluation
+# only. Read configs/data/synthetic_far.yaml first.
+#
+# Why: synthetic_far draws a document's length and its recall distance apart, so a fact asked a
+# short way back in a long document sits late in the stream, and the cells "fact in the first
+# 256 bytes" are thin where the distance is short (delayed: 88 answers at 256-767 bytes back,
+# 136 at 768-1,535; kv: 21 and 37). That row is the one that isolates distance: in-range
+# training shows a fact in the first 256 bytes of a document and nowhere else, so a miss there
+# is a miss of the memory, not of a write position that training never showed.
+#
+# What it is: eleven tasks per family, one per k = 1 .. 11. Task <family>_back<k> is
+# synthetic_v1's in_range task with 256 * k added to both of its ranges:
+#     dep_len_range = [16 + 256 k, 240 + 256 k]      length_range = [32 + 256 k, 256 + 256 k]
+# so a document is an in_range document with 256 * k more bytes between the fact and the first
+# query (delayed: filler; kv: the middle, with its operations on the other keys).
+#   - A document is 256 k + 32 to 256 (k + 1) bytes long: k + 1 windows of 256 exactly.
+#   - delayed: every fact lies in the first 256 bytes (the first window) and every answer in the
+#     last window, k windows after it. 200 documents and about 410 answers per task.
+#   - kv: the fact of the first query (the anchor) lies in the first 256 bytes and its answer in
+#     the last window; 200 documents per task, so 200 such answers. The other queries ask keys
+#     of the middle, most of them a few bytes back, as in synthetic_far.
+#   - The first query is 272 to 3,056 bytes back; 497-527, 753-783 and so on (31 distances in
+#     every 256) do not occur. Later delayed queries are up to 7 bytes nearer.
+#   - Parameters, key alphabets, context ids: synthetic_v1's, as in synthetic_far. Fresh seeds
+#     (kv 1911-1921, delayed 2911-2921). Dev split only.
+# Answers with the fact in the first 256 bytes, at 256-767 / 768-1,535 / 1,536-3,072 bytes back:
+# delayed 830 / 1,272 / 2,412 (all of its 4,514 answers); kv 420 / 600 / 1,200.
+#
+# Reading it: a task's plain dev accuracy is already one cell, "fact early, asked k windows
+# later" (for kv, restrict to the first query of each document or to distances of 256 and
+# more). A scorer that pools by family or context id gets the early row of the grid fact
+# position x distance; the late rows are synthetic_far's.
+#
+# Build, from the repository root (CPU, about 5 s; --no-leakage as for synthetic_far):
+#   PYTHONPATH=python python -m hsn.data.synthetic build \
+#       --spec configs/data/synthetic_far_early.yaml --out data/synthetic_far_early \
+#       --no-leakage --golden configs/data/synthetic_far_early.manifest.json
+# The rows below use YAML merge keys: each takes every field of the family's first task and
+# replaces the four it names.
+
+name: synthetic_far_early
+unroll: 256
+
+tasks:
+  - &kv
+    name: kv_back01
+    variant: out_of_range
+    family: kv
+    context_id: 1
+    seed: 1911
+    n_train: 0
+    n_dev: 200
+    n_test: 0
+    dep_len_range: [272, 496]
+    length_range: [288, 512]
+    params: # synthetic_v1's kv params
+      markers: { ins: 16, ovr: 17, del: 18 }
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      values: [144, 192]
+      distractors: [192, 256]
+      n_keys: 8
+      op_rate: 0.15
+      p_del: 0.25
+      anchor: { ins: 0.5, ovr: 0.3, del: 0.2 }
+      max_queries: 8
+  - { <<: *kv, name: kv_back02, seed: 1912,
+      dep_len_range: [528, 752], length_range: [544, 768] }
+  - { <<: *kv, name: kv_back03, seed: 1913,
+      dep_len_range: [784, 1008], length_range: [800, 1024] }
+  - { <<: *kv, name: kv_back04, seed: 1914,
+      dep_len_range: [1040, 1264], length_range: [1056, 1280] }
+  - { <<: *kv, name: kv_back05, seed: 1915,
+      dep_len_range: [1296, 1520], length_range: [1312, 1536] }
+  - { <<: *kv, name: kv_back06, seed: 1916,
+      dep_len_range: [1552, 1776], length_range: [1568, 1792] }
+  - { <<: *kv, name: kv_back07, seed: 1917,
+      dep_len_range: [1808, 2032], length_range: [1824, 2048] }
+  - { <<: *kv, name: kv_back08, seed: 1918,
+      dep_len_range: [2064, 2288], length_range: [2080, 2304] }
+  - { <<: *kv, name: kv_back09, seed: 1919,
+      dep_len_range: [2320, 2544], length_range: [2336, 2560] }
+  - { <<: *kv, name: kv_back10, seed: 1920,
+      dep_len_range: [2576, 2800], length_range: [2592, 2816] }
+  - { <<: *kv, name: kv_back11, seed: 1921,
+      dep_len_range: [2832, 3056], length_range: [2848, 3072] }
+
+  - &delayed
+    name: delayed_back01
+    variant: out_of_range
+    family: delayed
+    context_id: 2
+    seed: 2911
+    n_train: 0
+    n_dev: 200
+    n_test: 0
+    dep_len_range: [272, 496]
+    length_range: [288, 512]
+    params: # synthetic_v1's delayed params
+      keys: { train: [64, 112], dev: [112, 128], test: [128, 144] }
+      values: [144, 192]
+      filler: [192, 256]
+      max_facts: 6
+      max_queries: 4
+  - { <<: *delayed, name: delayed_back02, seed: 2912,
+      dep_len_range: [528, 752], length_range: [544, 768] }
+  - { <<: *delayed, name: delayed_back03, seed: 2913,
+      dep_len_range: [784, 1008], length_range: [800, 1024] }
+  - { <<: *delayed, name: delayed_back04, seed: 2914,
+      dep_len_range: [1040, 1264], length_range: [1056, 1280] }
+  - { <<: *delayed, name: delayed_back05, seed: 2915,
+      dep_len_range: [1296, 1520], length_range: [1312, 1536] }
+  - { <<: *delayed, name: delayed_back06, seed: 2916,
+      dep_len_range: [1552, 1776], length_range: [1568, 1792] }
+  - { <<: *delayed, name: delayed_back07, seed: 2917,
+      dep_len_range: [1808, 2032], length_range: [1824, 2048] }
+  - { <<: *delayed, name: delayed_back08, seed: 2918,
+      dep_len_range: [2064, 2288], length_range: [2080, 2304] }
+  - { <<: *delayed, name: delayed_back09, seed: 2919,
+      dep_len_range: [2320, 2544], length_range: [2336, 2560] }
+  - { <<: *delayed, name: delayed_back10, seed: 2920,
+      dep_len_range: [2576, 2800], length_range: [2592, 2816] }
+  - { <<: *delayed, name: delayed_back11, seed: 2921,
+      dep_len_range: [2832, 3056], length_range: [2848, 3072] }

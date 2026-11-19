@@ -80,7 +80,14 @@ from typing import Annotated, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from hsn.config import REPO_ROOT, RunConfig, config_hash, load_config
+from hsn.config import (
+    HASH_EXCLUDED,
+    REPO_ROOT,
+    GatedDeltaNetBaselineConfig,
+    RunConfig,
+    config_hash,
+    load_config,
+)
 from hsn.experiments.rules import (
     Cadence,
     RuleSet,
@@ -109,8 +116,19 @@ __all__ = [
     "slug",
 ]
 
-FAMILIES = ("hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm")
-Family = Literal["hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm"]
+FAMILIES = (
+    "hsn",
+    "hsn_t",
+    "hsn_t_nomem",
+    "reader",
+    "gru",
+    "transformer",
+    "selective_ssm",
+    "gated_deltanet",
+)
+Family = Literal[
+    "hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet"
+]
 #: The families trained by the HSN's window trainer: the HSN and HSN-T (``docs/hsn_t.md``).
 #: ``hsn_t_nomem`` (HSN-T without its memory) is not one: the generic trainer trains it.
 HSN_FAMILIES = ("hsn", "hsn_t")
@@ -536,10 +554,14 @@ def data_hash(cfg: RunConfig, repo: Path, *, required: bool) -> str:
 
 
 def config_view(cfg: RunConfig) -> dict[str, Any]:
-    """The non-default values of the resolved configuration, without ``run_id`` and ``notes``."""
+    """The non-default values of the resolved configuration, without ``run_id`` and ``notes``
+    and without the evaluation-only sections (:data:`hsn.config.HASH_EXCLUDED`: ``eval.*``
+    changes nothing a run trains, so it is not part of an arm's identity)."""
     view = cfg.model_dump(mode="json", exclude_defaults=True)
     view.pop("run_id", None)
     view.pop("notes", None)
+    for section in HASH_EXCLUDED:
+        view.pop(section, None)
     return view
 
 
@@ -642,6 +664,9 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # likewise: the compiled round's products at their default (17 Nov 2026) stay out; with
         # the key set the step time changes, and the arm has a memory key of its own
         del dump["hardware"]["round_products"]
+    if dump["hardware"]["message_gradients"] == "autocast":
+        # likewise (18 Nov 2026): the messages' gradient dtype at its default stays out
+        del dump["hardware"]["message_gradients"]
     if dump["model"]["memory"] is True:
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates
@@ -665,6 +690,11 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # out: every arm, of every family, keeps its memory key
         if dump["baseline"]["transformer"][key] == default:
             del dump["baseline"]["transformer"][key]
+    if cfg.baseline.gated_deltanet == GatedDeltaNetBaselineConfig():
+        # likewise: the Gated DeltaNet baseline's sizes (17 Nov 2026) at their defaults stay
+        # out, so the arms from before the family keep their memory key (a gated_deltanet arm
+        # of the default size is told apart by its model_name)
+        del dump["baseline"]["gated_deltanet"]
     return digest(
         {
             "model_name": cfg.model_name,

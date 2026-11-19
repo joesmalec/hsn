@@ -379,7 +379,8 @@ about 720 bytes. Untested on long text.
 
 **Scope:** HSN-T without its memory (`model.memory: false`). HSN-T with its memory takes
 `model.reader_carry` since 17 Nov 2026 as an opt-in of its own
-(`docs/amendments/reader_carry_memory.md`; in no recipe), and still refuses
+(`docs/amendments/reader_carry_memory.md`; since 18 Nov 2026 on in the carry recipes
+`hsn_t_memory_carry.yaml` and `hsn_t_memory_words_carry.yaml`), and still refuses
 `model.reader_top_words`. The HSN has no reader.
 
 ## How to time it

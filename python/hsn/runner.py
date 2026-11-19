@@ -17,7 +17,8 @@ the HSN, the P0.5 trainer otherwise) → evaluation → result store (P0.8) → 
 directory ``<out>/<run_id>`` holds:
 
 ``config.resolved.yaml``, ``run_manifest.json`` (P0.2 writer), ``history.json`` (every step and
-evaluation), ``metrics.json`` (the final dev evaluation, measured numbers, hashes, data provenance),
+evaluation), ``metrics.json`` (the final dev evaluation, measured numbers, hashes, data provenance;
+with ``eval.by_distance.enabled`` also ``by_distance``: the tables of :mod:`hsn.eval.distance`),
 ``profile_train.json`` / ``profile_serve.json`` (P0.6 reports of a separate profiling pass),
 ``step_*.pt`` checkpoints, ``run.log``; a rerun directory adds ``rerun.json``. Results are appended
 to ``<out>/results.jsonl`` (:class:`~hsn.eval.results.ResultStore`).
@@ -83,7 +84,7 @@ from hsn.profiler import (
 from hsn.train.amp import autocast_ctx
 from hsn.train.baseline_compile import compile_baseline
 from hsn.train.checkpoint import load_checkpoint
-from hsn.train.compile import compile_window
+from hsn.train.compile import apply_message_gradients, compile_window
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
 from hsn.train.probes import choose_probe_position, probe_window, window_split
 from hsn.train.tbptt import TBPTTTrainer
@@ -125,10 +126,21 @@ def _hsn_t(cfg: RunConfig) -> nn.Module:
     return HSNT.from_config(cfg) if cfg.model.memory else HSNTNoMemory.from_config(cfg)
 
 
+def _gated_deltanet(cfg: RunConfig) -> nn.Module:
+    """The Gated DeltaNet baseline (``docs/gated_deltanet_baseline.md``). Its module is imported
+    here, when one is built, and not with this module: it needs flash-linear-attention's
+    kernels, which are not a dependency of this package, and raises ``ImportError`` with what to
+    do when the environment does not have them."""
+    from hsn.baselines.gated_deltanet import GatedDeltaNetBaseline
+
+    return GatedDeltaNetBaseline(cfg)
+
+
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "gru": GRUBaseline,
     "transformer": TransformerBaseline,
     "selective_ssm": MambaBaseline,  # the paper's selective-memory control (plan P2.13)
+    "gated_deltanet": _gated_deltanet,  # the fast-weight associative-memory control (17 Nov 2026)
     "hsn": HSN.from_config,  # P1.9: the dense predictive cell (P1.5) trained by TBPTTTrainer (P1.7)
     "hsn_t": _hsn_t,  # HSN-T (docs/hsn_t.md); without its memory when model.memory=false
     "reader": ReaderLM,  # the HSN-T reader alone with a next-byte head (the exact-reader check)
@@ -427,6 +439,7 @@ def profile_run(
     api = cast(SequenceModel, replica)
     forward: Callable[..., Any] = replica
     warm_windows = 1
+    apply_message_gradients(replica, cfg.hardware.message_gradients)  # as the trainer
     if ctx.compile_enabled and isinstance(replica, HSN):  # P2.8: the trainer's window
         forward = compile_window(
             replica,
@@ -640,7 +653,19 @@ def run_one(
         if cfg.train.init_from is not None:
             logger.info("warm start: %s", warm_start(model, cfg.train.init_from))
         trainer = make_trainer(model, cfg, ctx, run_dir=run_dir)
-        history: History = trainer.fit(train_ds, dev_ds, cfg.train.steps)
+        # eval.by_distance (opt-in, docs/distance_eval.md): the sets are loaded before the fit
+        by_distance: Any = None
+        if cfg.eval.by_distance.enabled:
+            from hsn.eval.distance import RunScorer
+
+            by_distance = RunScorer(cfg, dev_ds)
+            if cfg.eval.by_distance.every_eval:
+                trainer.eval_observer = by_distance.observer()
+        try:
+            history: History = trainer.fit(train_ds, dev_ds, cfg.train.steps)
+        finally:
+            trainer.eval_observer = None
+        distance_block = by_distance.final(trainer) if by_distance is not None else None
         train_report, serve_report = profile_run(
             model,
             cfg,
@@ -701,6 +726,8 @@ def run_one(
                 if trainer.compiled_baseline is not None
                 else {}
             ),
+            # eval.by_distance: the bucket tables of the final weights (absent: the key is off)
+            **({"by_distance": distance_block} if distance_block is not None else {}),
             "data": _data_provenance(cfg, train_ds, dev_ds),
             "profile_segments": PROFILE_SEGMENTS,
             "profile_steps": profile_steps,

@@ -7,6 +7,7 @@ import json
 
 import pytest
 from hsn.config import (
+    HASH_EXCLUDED,
     HASH_OMIT_AT_DEFAULT,
     REPO_ROOT,
     ROLLBACK_KEYS,
@@ -43,6 +44,7 @@ def test_p1_16_config_hash_unchanged_at_defaults(path: str, overrides: tuple[str
     cfg = load_config(REPO_ROOT / path, list(overrides))
     assert config_hash(cfg) == HASHES_80B893D[(path, overrides)]
     dumped = json.loads(canonical_json(cfg))
+    assert not set(HASH_EXCLUDED) & set(dumped)
     for dotted in HASH_OMIT_AT_DEFAULT:
         parts = dotted.split(".")
         if len(parts) == 2:
@@ -138,7 +140,11 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "baseline.transformer.carry",
         "train.reach_dropout",  # short-span rows of HSN-T's reader in training (opt-in, 17 Nov)
         "train.reach_dropout_span",
+        "baseline.gated_deltanet",  # the Gated DeltaNet baseline's sizes (17 Nov 2026)
+        "hardware.message_gradients",  # the messages' gradient sums in fp32 (opt-in, 18 Nov)
     )
+    # evaluation-only sections are never hashed, whatever they hold (eval.*, 18 Nov 2026)
+    assert HASH_EXCLUDED == ("eval",)
 
 
 def test_p1_16_rollback_key_set_changes_hash() -> None:

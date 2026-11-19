@@ -32,7 +32,8 @@ order and ``meta["dep_len"]`` is their maximum. Each emitter builds its document
 *anchor* dependency of exactly ``D`` positions, drawn from ``dep_len_range``, and keeps every other
 dependency at most ``D``, so ``dep_len == D`` and ``in_range = D <= unroll``: the dependency fits
 one TBPTT window of ``unroll`` positions (in range) or exceeds it (out of range, for length
-extrapolation).
+extrapolation). The position ``s`` itself, the *fact position* of an answer, is not stored: it is
+the loss position minus its ``deps`` entry (:func:`fact_positions`).
 
 **Determinism.** ``generate(spec, split, index)`` is a pure function. Its random stream is
 ``numpy.random.default_rng`` seeded from ``blake2b(spec.seed, split, index)`` (never Python's salted
@@ -97,6 +98,7 @@ __all__ = [
     "Variant",
     "check_example",
     "example_seed",
+    "fact_positions",
     "generate",
     "load_dataset_spec",
     "main",
@@ -2407,6 +2409,40 @@ def reference_targets(spec: TaskSpec, tokens: U8) -> Solved:
     """
     generator = _FAMILIES[spec.family]
     return generator.solve(generator.params(spec), np.ascontiguousarray(tokens, dtype=np.uint8))
+
+
+def fact_positions(example: Example) -> I64:
+    """``fact_pos``: for every scored answer of a document, the byte offset in that document of
+    the fact it asks for.
+
+    One entry per True position of ``example.loss_mask``, in position order, so it is aligned
+    with ``meta["deps"]``, with :func:`reference_targets` and with the shard array ``deps``:
+    ``fact_pos[j] = t_j - deps[j]``, where ``t_j`` is the ``j``-th loss position. Offsets count
+    from the document's first symbol (``BOS`` is 0), whatever window or stream position the
+    document is later given. By the definition of the dependency distance (module docstring)
+    this is the position ``s`` of the input symbol the answer depends on:
+
+    * ``delayed``, ``delayed_words``: the value byte of the queried fact;
+    * ``kv``, ``kv_words``: the last symbol of the last operation on the queried key, that is
+      the value of an ``INS`` or ``OVR`` or, for an answer ``NONE``, the last symbol of the
+      ``DEL`` (``kv``: its key byte; ``kv_words``: the ``SPACE`` after its word). A stale
+      earlier value of the key is never it;
+    * the other synthetic families: the earliest input symbol the answer directly depends on,
+      as the family's generator defines it (the matching open bracket, an input digit or list
+      element, the earlier of a sum's operand sources).
+
+    Nothing is stored for it: ``loss_mask`` and ``deps`` determine it, so it is the same for a
+    generated document and for one loaded from any shard, old or new
+    (:func:`hsn.data.splits.shard_fact_positions` gives it for a whole shard). It lets a
+    long-distance score be read on the grid fact position x distance: in a long document a
+    short distance means a fact written late in the stream, and the two can fail apart
+    (``docs/far_recall_data.md``). Text shards carry ``deps = 1`` at every position
+    (:mod:`hsn.data.text`: no annotated dependency); there this is the previous position and
+    says nothing.
+    """
+    positions: I64 = np.flatnonzero(example.loss_mask).astype(np.int64)
+    fact_pos: I64 = positions - np.asarray(example.meta["deps"], dtype=np.int64)
+    return fact_pos
 
 
 def recall_sum_kinds(spec: TaskSpec, tokens: U8) -> I64:

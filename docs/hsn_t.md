@@ -81,7 +81,8 @@ So global rule 2 holds as before (`ẑ_t = P(q_{t−1})` reads the carried summa
 everything further back than the reader's reach can come from the memory alone.
 
 **Opt-in since 17 Nov 2026: reading past the window** (`model.reader_carry = C > 0` with the
-memory on, `docs/amendments/reader_carry_memory.md`; default 0, in no recipe). The first and
+memory on, `docs/amendments/reader_carry_memory.md`; default 0; on in the carry recipes
+`hsn_t_memory_carry.yaml` and `hsn_t_memory_words_carry.yaml` since 18 Nov 2026). The first and
 the last line above then read: the bytes `x_s`, `s ≤ t`, of the same document, in this window
 or before it, at most `C` positions back in every block (from the reader's cache of detached
 keys and values, the mechanism of HSN-T without its memory). Everything after `c_t` is
@@ -353,6 +354,15 @@ The recipe of HSN-T with its memory, `configs/experiments/hsn_t_memory.yaml` (ma
 2026), leaves it off (`H = 0`): it helps on TinyStories (the names) but costs the recall tasks
 (kv, delayed), so text runs set `H = 4`. Results in the design note, "Results (16 Nov 2026)" and
 "Results on the recall tasks (16 Nov 2026)".
+
+The recipes of HSN-T with its memory are four: `hsn_t_memory.yaml` (per-byte writes),
+`hsn_t_memory_words.yaml` (word events, `docs/amendments/write_events.md`), and since 18 Nov
+2026 each of them with the top0 reader carried across windows (`model.reader_carry=256`):
+`hsn_t_memory_carry.yaml` and `hsn_t_memory_words_carry.yaml`. Their evidence (TinyStories 27k,
+dev bits per byte: the per-byte memory 0.7337 against 0.7783 without the carry, word events
+0.7413 / 0.7381 against 0.7972) and what is open are in
+`docs/amendments/reader_carry_memory.md`, "The recipes". The carry recipes leave the attention
+read off as well: with the carry it was measured once.
 
 ## Reach dropout (`train.reach_dropout`)
 

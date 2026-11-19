@@ -38,7 +38,9 @@ every other configuration unchanged; such a configuration must be routed, probe 
 windows, keep the horizon inside the window and not run soft gates throughout. P1.16's rollback
 keys (``train.rollback_*``, :data:`ROLLBACK_KEYS`) are off by default and, at their defaults, left
 out of the hash (:data:`HASH_OMIT_AT_DEFAULT`), so every configuration written before them keeps its
-``config_hash``.
+``config_hash``. ``eval.*`` (18 Nov 2026) holds opt-in evaluation reports
+(``eval.by_distance``, :mod:`hsn.eval.distance`); the whole section is evaluation-only and never
+enters the hash or an arm id, whatever it holds (:data:`HASH_EXCLUDED`).
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -67,6 +69,7 @@ __all__ = [
     "AUX_TERMS",
     "BASELINE_COMPILE_MODEL_NAMES",
     "HARDWARE_PROFILE_DIR",
+    "HASH_EXCLUDED",
     "HASH_OMIT_AT_DEFAULT",
     "HSN_MODEL_NAMES",
     "RETIRED_KEYS",
@@ -75,9 +78,13 @@ __all__ = [
     "REPO_ROOT",
     "ROLLBACK_KEYS",
     "BaselineConfig",
+    "ByDistanceConfig",
     "DataConfig",
+    "DistanceSetConfig",
+    "EvalConfig",
     "FastConfig",
     "GRUBaselineConfig",
+    "GatedDeltaNetBaselineConfig",
     "GrowthConfig",
     "HardwareConfig",
     "ModelConfig",
@@ -153,8 +160,15 @@ WindowMode = Literal["autograd", "split", "fused"]
 #: unit on every selected pair, as since P2.8. ``merged``: the same dot products in fewer and
 #: smaller products (equal to rounding).
 RoundProducts = Literal["separate", "merged"]
+#: Opt-in (``hardware.message_gradients``, ``docs/perbyte_speed.md``): the dtype in which the
+#: sparse round's messages accumulate the two gradients of their gathers (the edge weights' and
+#: ``V h``'s). ``autocast``: in the autocast dtype, as before. ``state``: in the state's dtype
+#: (fp32 under bf16 autocast). The forward values are the same bit for bit.
+MessageGradients = Literal["autocast", "state"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
-ModelName = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "moe"]
+ModelName = Literal[
+    "hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet", "moe"
+]
 #: ``baseline.transformer.position``: the learned position table (default) or rotary positions.
 TransformerPosition = Literal["learned", "rotary"]
 #: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
@@ -1538,12 +1552,41 @@ class SelectiveSSMBaselineConfig(_StrictModel):
     dt_rank: int | None = Field(default=None, ge=1)  # rank of the step-size path; None = d_model/16
 
 
+class GatedDeltaNetBaselineConfig(_StrictModel):
+    """``baseline.gated_deltanet.*``: Gated DeltaNet (Yang, Kautz and Hatamizadeh, 2024), the
+    fast-weight associative-memory control (:mod:`hsn.baselines.gated_deltanet`,
+    ``docs/gated_deltanet_baseline.md``). Its module needs the kernels of flash-linear-attention
+    (``fla-core``), which are not a dependency of this package.
+
+    Defaults are a ≈2M-parameter setting for the reference data: 1,932,584 parameters as measured
+    by ``GatedDeltaNetBaseline.param_report``. The reference keeps ``num_heads × head_dim`` at
+    three quarters of ``d_model`` and ``expand_v`` at 2.
+    """
+
+    d_model: int = Field(default=176, ge=1)  # residual width
+    n_layers: int = Field(default=4, ge=1)  # blocks of [Gated DeltaNet mixer, gated MLP]
+    num_heads: int = Field(default=3, ge=1)  # heads, each with a memory of its own
+    head_dim: int = Field(default=44, ge=1)  # key and query width of a head
+    expand_v: int = Field(default=2, ge=1)  # value width of a head = expand_v × head_dim
+    d_conv: int = Field(default=4, ge=1)  # taps of the causal depthwise convolution on q, k, v
+    mlp_hidden: int | None = Field(default=None, ge=1)  # None = the reference's rule (below)
+    norm_eps: float = Field(default=1e-6, gt=0.0)  # every RMS norm of the model
+
+    def mlp_width(self) -> int:
+        """The gated MLP's hidden width: ``mlp_hidden``, or the reference's rule for a hidden
+        ratio of 4 (two thirds of ``4 × d_model``, rounded up to a multiple of 256)."""
+        if self.mlp_hidden is not None:
+            return self.mlp_hidden
+        return 256 * ((int(self.d_model * 4 * 2 / 3) + 255) // 256)
+
+
 class BaselineConfig(_StrictModel):
     """``baseline.*``: sizes of the P0.5 baselines (``model_name`` selects which one runs)."""
 
     gru: GRUBaselineConfig = GRUBaselineConfig()
     transformer: TransformerBaselineConfig = TransformerBaselineConfig()
     selective_ssm: SelectiveSSMBaselineConfig = SelectiveSSMBaselineConfig()
+    gated_deltanet: GatedDeltaNetBaselineConfig = GatedDeltaNetBaselineConfig()
     # The HSN's fixed byte codes (amendment A5, ``model.key_address``) as a baseline input: the
     # codes of the current and of the previous byte, frozen, through one learned projection
     # (:mod:`hsn.baselines.address`). Opt-in; a control for how much of the HSN's score on keys it
@@ -1551,6 +1594,74 @@ class BaselineConfig(_StrictModel):
     # which with the same seed gives the HSN's own code table.
     address_input: bool = False
     address_dim: int = Field(default=64, ge=1)
+
+
+# --------------------------------------------------------------------------------------------------
+# eval.*  (not in Appendix A; opt-in evaluation reports)
+# --------------------------------------------------------------------------------------------------
+
+_SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]*$")
+
+
+class DistanceSetConfig(_StrictModel):
+    """One more dev set that ``eval.by_distance`` scores at the end of a run (for example
+    recall distances the run did not train on: ``data/synthetic_far/manifest.json``). Always the
+    manifest's ``dev`` split."""
+
+    name: str  # the set's key in the report; "dev" is the run's own dev set
+    manifest: Path  # split manifest (CWD-relative, as data.manifest)
+    tasks: list[str] = []  # empty = every task of the manifest
+    variants: list[Variant] = []  # empty = every variant of the manifest
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _SET_NAME_RE.match(value) or value == "dev":
+            raise ValueError(
+                f"eval.by_distance.sets: name {value!r} must be letters, digits and '_' and not "
+                "'dev' (the run's own dev set)"
+            )
+        return value
+
+
+class ByDistanceConfig(_StrictModel):
+    """``eval.by_distance`` (opt-in, 18 Nov 2026; ``docs/distance_eval.md``): score by distance.
+
+    Evaluation-only, so never part of the configuration hash or an arm id, on or off
+    (:data:`HASH_EXCLUDED`). Off (default): nothing runs. On: when
+    training ends, the run's dev set and every set of ``sets`` take one more evaluation pass
+    each (the cost of one of the run's evaluations per set, plus host-side tables), and the
+    bucket tables go to the run record as ``by_distance`` (:mod:`hsn.eval.distance`): accuracy
+    by recall distance, query slot, answer kind and fact position on the synthetic tasks; bits
+    per letter of repeated names and content words by the distance of the previous mention on
+    text. Evaluation only: training, the model and every existing metric are unchanged.
+    """
+
+    enabled: bool = False
+    # also at every evaluation of the run (the dev set only; each evaluation entry gains
+    # ``by_distance``): the pass is the evaluation itself, the cost its per-position copies
+    every_eval: bool = False
+    # the first max_docs documents of every task/variant group of a set (None: all of them)
+    max_docs: int | None = Field(default=None, ge=1)
+    sets: list[DistanceSetConfig] = []
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if not self.enabled and (self.every_eval or self.max_docs is not None or self.sets):
+            raise ValueError(
+                "eval.by_distance: every_eval, max_docs and sets are read only with "
+                "eval.by_distance.enabled=true"
+            )
+        names = [entry.name for entry in self.sets]
+        if len(set(names)) != len(names):
+            raise ValueError(f"eval.by_distance.sets: names must differ, got {names}")
+        return self
+
+
+class EvalConfig(_StrictModel):
+    """``eval.*``: opt-in evaluation reports. Nothing here changes training or a metric."""
+
+    by_distance: ByDistanceConfig = ByDistanceConfig()
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1607,6 +1718,17 @@ class HardwareConfig(_StrictModel):
     # folded into its second, and P and S share one product per layer. Equal to rounding (other
     # matmul shapes), not bit for bit. Needs hardware.compile_mode and model.routing=topk.
     round_products: RoundProducts = "separate"
+    # Opt-in (18 Nov 2026, docs/perbyte_speed.md): the dtype in which the sparse round's
+    # messages accumulate the gradients of their two gathers: the edge weights (one row per
+    # selected cell) and V h (one row per source of a selected cell). autocast (default): as
+    # before, in the autocast dtype (bf16 on the cards), where a compiled window runs both
+    # accumulations outside its fused kernels (an index_put with a sort and a scatter-add: 39 µs
+    # at every position on the RTX 3060). state: in the state's dtype (fp32 under bf16
+    # autocast), where they fuse. The forward values are the same bit for bit and without
+    # autocast the two are one computation; under autocast the two gradients are summed in
+    # fp32 instead of bf16 (equal to rounding, not bit for bit). Needs the memory's cells
+    # and a routed round on the autograd window.
+    message_gradients: MessageGradients = "autocast"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1647,6 +1769,7 @@ class RunConfig(_StrictModel):
     stream: StreamConfig = StreamConfig()
     serve: ServeConfig = ServeConfig()
     baseline: BaselineConfig = BaselineConfig()  # P0.5 baseline sizes (not in Appendix A)
+    eval: EvalConfig = EvalConfig()  # opt-in evaluation reports; never hashed (HASH_EXCLUDED)
     hardware: HardwareConfig  # resolved from `profile` by load_config, or given inline
     run_id: str = "default"
     seed: int = Field(default=0, ge=0)
@@ -1713,6 +1836,13 @@ class RunConfig(_StrictModel):
                     f"hardware.round_products={self.hardware.round_products} is not available "
                     f"for this configuration: {reason}"
                 )
+        if self.hardware.message_gradients != "autocast":
+            reason = message_gradients_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.message_gradients={self.hardware.message_gradients} is not "
+                    f"available for this configuration: {reason}"
+                )
         if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
                 "baseline.address_input is an input of the baselines; the HSN's own address "
@@ -1740,6 +1870,10 @@ class RunConfig(_StrictModel):
                 + (
                     "the HSN's own compiled window is hardware.compile_mode"
                     if self.model_name in HSN_MODEL_NAMES
+                    else "its delta-rule kernels are flash-linear-attention's own (Triton), "
+                    "which torch.compile does not trace: it runs eager with them "
+                    "(docs/gated_deltanet_baseline.md)"
+                    if self.model_name == "gated_deltanet"
                     else "it is outside the compiled scope (hsn.train.baseline_compile)"
                 )
             )
@@ -2307,7 +2441,16 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "baseline.transformer.carry",
     "train.reach_dropout",
     "train.reach_dropout_span",
+    "baseline.gated_deltanet",
+    "hardware.message_gradients",
 )
+
+#: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
+#: (:func:`hsn.experiments.spec.config_view`), whatever they hold: evaluation-only reports
+#: (``eval.*``). They read a model and change nothing a run trains, so a run with a report on is
+#: the same run (the same hash, the same arm, checkpoints that resume either way) as without
+#: it. A key that could change a trained weight does not belong in such a section.
+HASH_EXCLUDED: tuple[str, ...] = ("eval",)
 
 
 #: ``model.memory = false`` (HSN-T without its memory, ``docs/hsn_t_no_memory.md``): the
@@ -2413,6 +2556,25 @@ def round_products_scope_error(cfg: RunConfig) -> str | None:
         )
     if cfg.model.routing != "topk":
         return f"model.routing={cfg.model.routing!r}: only the routed sparse round selects pairs"
+    return None
+
+
+def message_gradients_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot run ``hardware.message_gradients=state``
+    (``docs/perbyte_speed.md``), or ``None`` when it can. The key changes the dtype in which
+    the sparse round's messages accumulate two gradients
+    (:meth:`hsn.model.graph.CellGraph.messages_selected`); a configuration in which that
+    round does not run, or runs on a window that takes the messages its own way, is refused
+    instead of ignoring the key."""
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return f"model_name={cfg.model_name!r} without the memory's cells has no sparse round"
+    if cfg.model.routing == "dense":
+        return "model.routing=dense: the dense round gathers no messages by selection"
+    if cfg.hardware.window != "autograd":
+        return (
+            f"hardware.window={cfg.hardware.window}: the split and fused windows take the "
+            "messages in their own sweep and replay (not measured with the key)"
+        )
     return None
 
 
@@ -2671,8 +2833,11 @@ def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
 
 def _hash_view(cfg: RunConfig) -> dict[str, Any]:
     """The configuration dump :func:`canonical_json` hashes: :meth:`RunConfig.model_dump` without
-    the :data:`HASH_OMIT_AT_DEFAULT` keys that hold their default."""
+    the :data:`HASH_EXCLUDED` sections and without the :data:`HASH_OMIT_AT_DEFAULT` keys that
+    hold their default."""
     dump = cfg.model_dump(mode="json")
+    for section in HASH_EXCLUDED:
+        dump.pop(section, None)
     for dotted in HASH_OMIT_AT_DEFAULT:
         parts = dotted.split(".")
         node = dump
