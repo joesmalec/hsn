@@ -678,7 +678,7 @@ def _pubmed_units(download: Path, counts: Counter[str], wanted: Wanted) -> Itera
                     continue
                 title = " ".join(str(record.get("title") or "").split())
                 abstract = "\n".join(
-                    " ".join(line.split()) for line in str(record["abstract"]).split("\n")
+                    " ".join(part.split()) for part in str(record["abstract"]).split("\n")
                 )
                 yield Unit(key, key, (f"{title}\n\n{abstract}" if title else abstract,))
 
