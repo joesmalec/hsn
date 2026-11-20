@@ -1,0 +1,46 @@
+# fields_phys_prose: physics prose of the field datasets (19-20 Nov 2026; docs/field_datasets.md).
+#
+# Source: arXiv metadata snapshot (the Kaggle snapshot, mirrored weekly),
+#   https://huggingface.co/datasets/librarian-bots/arxiv-metadata-snapshot at commit c428226b689a0e17db2cd55265133b9eca15d97f
+#   Licence: CC0-1.0 (arXiv metadata, abstracts included).
+#
+# Document: title and abstract of an arXiv paper with a physics primary category; capped at 16384
+# bytes, at least 64. Split by blake2b('fields_phys_prose/<key>') mod 10000: below 100 held out,
+# below 2000 used (python/hsn/data/fields.py).
+#
+# The raw files (not in the repository) come from the pinned sources (the build checks their
+# SHA-256):
+#
+#   python -m hsn.data.fields fetch fields_phys_prose --root <dir>
+#   python -m hsn.data.fields convert fields_phys_prose --root <dir>     # <dir>/raw/fields_phys_prose/
+#   python -m hsn.data.text build --spec configs/data/fields_phys_prose.yaml \
+#       --raw <dir>/raw/fields_phys_prose --out data/fields_phys_prose \
+#       --golden configs/data/fields_phys_prose.manifest.json
+#
+# Select it with
+#   data.dataset=fields_phys_prose data.manifest=data/fields_phys_prose/manifest.json
+#   data.tasks=[fields_phys_prose] data.variants=[out_of_range]
+# Golden manifest: configs/data/fields_phys_prose.manifest.json.
+
+name: fields_phys_prose
+unroll: 256
+task: fields_phys_prose
+variant: out_of_range # documents are longer than a window
+family: text
+context_id: 10 # the three abstract and paper-prose sets share 10 (ids 0-15; 0 is padding, 1-9 taken)
+separator: "<|endoftext|>"
+min_bytes: 64
+newline: 16
+tab: 17
+max_train_tokens: 200000000
+n_dev: 2000
+n_test: 2000
+n_gram: 32
+
+train:
+  file: train.txt
+  sha256: 98a3c61964592b17221ec6b0088a00f85b40dedeae4444076637936afd1f613b
+
+heldout:
+  file: heldout.txt
+  sha256: f79325df7f90f14cccc432134e264852de2227c07b54568d18c4adeb45c183b4

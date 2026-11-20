@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 287074,
+      "test": "fields_code_prose/out_of_range/dev",
+      "test_docs_with_overlap": 1928,
+      "train": "fields_code_prose/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 280896,
+      "test": "fields_code_prose/out_of_range/test",
+      "test_docs_with_overlap": 1925,
+      "train": "fields_code_prose/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 41697,
+      "test": "fields_code_prose/out_of_range/test",
+      "test_docs_with_overlap": 1471,
+      "train": "fields_code_prose/out_of_range/dev"
+    }
+  ],
+  "name": "fields_code_prose",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 11,
+      "family": "text",
+      "file": "fields_code_prose.out_of_range.train.npz",
+      "hash": "695d74eaac8ca9614d8b810da30ddf80220837cb323e4c22316ea94e9a6c6866",
+      "n_docs": 78837,
+      "n_loss": 199917622,
+      "n_tokens": 199996459,
+      "split": "train",
+      "task": "fields_code_prose",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 11,
+      "family": "text",
+      "file": "fields_code_prose.out_of_range.dev.npz",
+      "hash": "82d05664f09e02ad2eb6ec2935be3000cfca0fb3f208e7d45d327d5ae769a14e",
+      "n_docs": 2000,
+      "n_loss": 5144007,
+      "n_tokens": 5146007,
+      "split": "dev",
+      "task": "fields_code_prose",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 11,
+      "family": "text",
+      "file": "fields_code_prose.out_of_range.test.npz",
+      "hash": "70189376317430f627a9ad8fcaa139a027348bfe58ec33d62f91f961a6e058d9",
+      "n_docs": 2000,
+      "n_loss": 5034256,
+      "n_tokens": 5036256,
+      "split": "test",
+      "task": "fields_code_prose",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "e565983eec59760b89b576ca980385448a3ce010596d24e089455eb531af08d0",
+  "split_hashes": {
+    "dev": "bdf09e47b3fe575a6b9ae5ba299e5dd3650d23523690e22d5c618922b5666caa",
+    "test": "dec98f341eb55ed203a40116cc312cd28c9eacff7bead94cad9c22ed47bab77d",
+    "train": "d43bc96a555f9e027b01f363e9f329b06ef65065e47987cf03fb42bd7fdbfc41"
+  },
+  "unroll": 256
+}

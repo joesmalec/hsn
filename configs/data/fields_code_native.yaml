@@ -1,0 +1,46 @@
+# fields_code_native: coding native of the field datasets (19-20 Nov 2026; docs/field_datasets.md).
+#
+# Source: CodeParrot-clean: Python files from GitHub, exact duplicates removed,
+#   https://huggingface.co/datasets/codeparrot/codeparrot-clean at commit 35a59fb025bc0a102f7d96eac09d145b896d487b
+#   Licence: per file; only MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unlicense and CC0
+#   files are kept.
+#
+# Document: one permissively licensed Python source file; capped at 16384 bytes, at least 64. Split
+# by blake2b('fields_code_native/<key>') mod 10000: below 1000 held out (python/hsn/data/fields.py).
+#
+# The raw files (not in the repository) come from the pinned sources (the build checks their
+# SHA-256):
+#
+#   python -m hsn.data.fields fetch fields_code_native --root <dir>
+#   python -m hsn.data.fields convert fields_code_native --root <dir>     # <dir>/raw/fields_code_native/
+#   python -m hsn.data.text build --spec configs/data/fields_code_native.yaml \
+#       --raw <dir>/raw/fields_code_native --out data/fields_code_native \
+#       --golden configs/data/fields_code_native.manifest.json
+#
+# Select it with
+#   data.dataset=fields_code_native data.manifest=data/fields_code_native/manifest.json
+#   data.tasks=[fields_code_native] data.variants=[out_of_range]
+# Golden manifest: configs/data/fields_code_native.manifest.json.
+
+name: fields_code_native
+unroll: 256
+task: fields_code_native
+variant: out_of_range # documents are longer than a window
+family: text
+context_id: 15 # Python
+separator: "<|endoftext|>"
+min_bytes: 64
+newline: 16
+tab: 17
+max_train_tokens: 200000000
+n_dev: 2000
+n_test: 2000
+n_gram: 32
+
+train:
+  file: train.txt
+  sha256: af00176ed1784c4707d2f0582e0afa19316a6469feb32d5dbb1ace40f56c090e
+
+heldout:
+  file: heldout.txt
+  sha256: 400eed16c4ef6ed8d79306ec9125720d1b4013b6495d095971a9120f73b6fed8

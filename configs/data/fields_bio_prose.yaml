@@ -1,0 +1,46 @@
+# fields_bio_prose: biology prose of the field datasets (19-20 Nov 2026; docs/field_datasets.md).
+#
+# Source: PubMed titles and abstracts, a random subset (2.39M) of the NLM records; 3 of 24 files,
+#   https://huggingface.co/datasets/slinusc/PubMedAbstractsSubset at commit 111f2d4a15b4335a4ddf6844264e6caf2d0a614a
+#   Licence: CC0-1.0 (card); PubMed records of the NLM (abstract copyright with the publishers, open
+#   to text mining under the NLM terms).
+#
+# Document: title and abstract of a PubMed record; capped at 16384 bytes, at least 64. Split by
+# blake2b('fields_bio_prose/<key>') mod 10000: below 300 held out (python/hsn/data/fields.py).
+#
+# The raw files (not in the repository) come from the pinned sources (the build checks their
+# SHA-256):
+#
+#   python -m hsn.data.fields fetch fields_bio_prose --root <dir>
+#   python -m hsn.data.fields convert fields_bio_prose --root <dir>     # <dir>/raw/fields_bio_prose/
+#   python -m hsn.data.text build --spec configs/data/fields_bio_prose.yaml \
+#       --raw <dir>/raw/fields_bio_prose --out data/fields_bio_prose \
+#       --golden configs/data/fields_bio_prose.manifest.json
+#
+# Select it with
+#   data.dataset=fields_bio_prose data.manifest=data/fields_bio_prose/manifest.json
+#   data.tasks=[fields_bio_prose] data.variants=[out_of_range]
+# Golden manifest: configs/data/fields_bio_prose.manifest.json.
+
+name: fields_bio_prose
+unroll: 256
+task: fields_bio_prose
+variant: out_of_range # documents are longer than a window
+family: text
+context_id: 10 # the three abstract and paper-prose sets share 10 (ids 0-15; 0 is padding, 1-9 taken)
+separator: "<|endoftext|>"
+min_bytes: 64
+newline: 16
+tab: 17
+max_train_tokens: 200000000
+n_dev: 2000
+n_test: 2000
+n_gram: 32
+
+train:
+  file: train.txt
+  sha256: 329b7bdf5a8465d19faf1d4d7dcd10fadf7cdd6472ad486147bd73b3bfea5138
+
+heldout:
+  file: heldout.txt
+  sha256: e9492100c090f755f77451a650868c61854efb210dfaf66c59bfa619498018ac

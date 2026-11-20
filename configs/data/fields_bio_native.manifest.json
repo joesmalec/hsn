@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 11564,
+      "test": "fields_bio_native/out_of_range/dev",
+      "test_docs_with_overlap": 29,
+      "train": "fields_bio_native/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 3104,
+      "test": "fields_bio_native/out_of_range/test",
+      "test_docs_with_overlap": 26,
+      "train": "fields_bio_native/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 0,
+      "test": "fields_bio_native/out_of_range/test",
+      "test_docs_with_overlap": 0,
+      "train": "fields_bio_native/out_of_range/dev"
+    }
+  ],
+  "name": "fields_bio_native",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 12,
+      "family": "text",
+      "file": "fields_bio_native.out_of_range.train.npz",
+      "hash": "4db66b121582b90fb7ad3e878ac112430a83d0f1181c78150e50b17172d81197",
+      "n_docs": 645492,
+      "n_loss": 199350967,
+      "n_tokens": 199996459,
+      "split": "train",
+      "task": "fields_bio_native",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 12,
+      "family": "text",
+      "file": "fields_bio_native.out_of_range.dev.npz",
+      "hash": "6466eb66a0f567a849be651d1c30a7ba40a1e7e592a1b5ef17186ca71ebe2b59",
+      "n_docs": 2000,
+      "n_loss": 588357,
+      "n_tokens": 590357,
+      "split": "dev",
+      "task": "fields_bio_native",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 12,
+      "family": "text",
+      "file": "fields_bio_native.out_of_range.test.npz",
+      "hash": "4a03e65eaef53b4aa3283af90d8ed9d430a6f0dedf1c0eaf85703a0b7be06291",
+      "n_docs": 2000,
+      "n_loss": 616330,
+      "n_tokens": 618330,
+      "split": "test",
+      "task": "fields_bio_native",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "d64ab20f124e8114396fd4e9b751062f4bad3dd7192f903edd8897bde8949547",
+  "split_hashes": {
+    "dev": "6c1c35ad8427c3bbe07f02d71347f42357120aec6f3332232e8ad9b6f9488b6b",
+    "test": "0302b483df59044d81c477f0e8661e93941176b431d0d3a140b92fc68258e986",
+    "train": "1b1745deb974035e477484f9f4913e912c5bf4ab5d2a1cd6616419b0d6f9f624"
+  },
+  "unroll": 256
+}

@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 463966,
+      "test": "fields_phys_native/out_of_range/dev",
+      "test_docs_with_overlap": 1998,
+      "train": "fields_phys_native/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 578311,
+      "test": "fields_phys_native/out_of_range/test",
+      "test_docs_with_overlap": 1999,
+      "train": "fields_phys_native/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 141780,
+      "test": "fields_phys_native/out_of_range/test",
+      "test_docs_with_overlap": 1987,
+      "train": "fields_phys_native/out_of_range/dev"
+    }
+  ],
+  "name": "fields_phys_native",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 14,
+      "family": "text",
+      "file": "fields_phys_native.out_of_range.train.npz",
+      "hash": "2d68b29656a5a3a4da03758cf67c2ad8e34ab7ba39c8591266c74c349b5c1f9b",
+      "n_docs": 14540,
+      "n_loss": 199979549,
+      "n_tokens": 199994089,
+      "split": "train",
+      "task": "fields_phys_native",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 14,
+      "family": "text",
+      "file": "fields_phys_native.out_of_range.dev.npz",
+      "hash": "1de9f2266a7d678266495fc553f5e44fb21739c36f18dc4ae71f297e99fe4c23",
+      "n_docs": 2000,
+      "n_loss": 27272474,
+      "n_tokens": 27274474,
+      "split": "dev",
+      "task": "fields_phys_native",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 14,
+      "family": "text",
+      "file": "fields_phys_native.out_of_range.test.npz",
+      "hash": "69ab7c4f840ee8efb1da1ecd745f382010df54d73977cded928cdb45b99c1c26",
+      "n_docs": 2000,
+      "n_loss": 27462113,
+      "n_tokens": 27464113,
+      "split": "test",
+      "task": "fields_phys_native",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "39a23ae96176862e02a6731428fb5c888c7c645b9b48c63fea519e5358041722",
+  "split_hashes": {
+    "dev": "c504be0442e05c50c4abcf64bce732df6fa25062490b29c6243359974fd94dfb",
+    "test": "828b54bb11802bb8f035ec8a662370b88b8e4e0c3c50ddddac459ebcdce49c07",
+    "train": "9a8ed516f274dd83b9ee26845703ac1ba01a2a18b1e4e45df4e501f618b9c3de"
+  },
+  "unroll": 256
+}

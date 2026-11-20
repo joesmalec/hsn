@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 2540661,
+      "test": "fields_code_native/out_of_range/dev",
+      "test_docs_with_overlap": 1990,
+      "train": "fields_code_native/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 2569933,
+      "test": "fields_code_native/out_of_range/test",
+      "test_docs_with_overlap": 1984,
+      "train": "fields_code_native/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 510834,
+      "test": "fields_code_native/out_of_range/test",
+      "test_docs_with_overlap": 1962,
+      "train": "fields_code_native/out_of_range/dev"
+    }
+  ],
+  "name": "fields_code_native",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 15,
+      "family": "text",
+      "file": "fields_code_native.out_of_range.train.npz",
+      "hash": "c7eb37c42e66439f8706beb2e306e519e9d48e1c63cd6a6aacdfac222d620358",
+      "n_docs": 30315,
+      "n_loss": 199966800,
+      "n_tokens": 199997115,
+      "split": "train",
+      "task": "fields_code_native",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 15,
+      "family": "text",
+      "file": "fields_code_native.out_of_range.dev.npz",
+      "hash": "f9f0dd5e1a5dc8d31f0f7d0ab482fef011dc3e5888e62d45bb10705daed9d64f",
+      "n_docs": 2000,
+      "n_loss": 12910713,
+      "n_tokens": 12912713,
+      "split": "dev",
+      "task": "fields_code_native",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 15,
+      "family": "text",
+      "file": "fields_code_native.out_of_range.test.npz",
+      "hash": "1fdf8caf9132367686b6ed1b6b815e24477d7e644b3e5fd7f1c611fe8a8a42f7",
+      "n_docs": 2000,
+      "n_loss": 12980886,
+      "n_tokens": 12982886,
+      "split": "test",
+      "task": "fields_code_native",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "32c0212fa06d344e09a1f3afde105f3228928142583d7de91bfad7a779ffe6a6",
+  "split_hashes": {
+    "dev": "5ac5a439b702bb41d05e90d170fffe74fcb95536c5f95929c49a75a64d108746",
+    "test": "45d4f526eae8cbae4bcc4c3bc1de0bdd9a4d1d231c444903feed30a40f82b373",
+    "train": "64180100d22f3a0e7a8184777fa561006eb4d8f99c5fe708b343a8c7770848c8"
+  },
+  "unroll": 256
+}
