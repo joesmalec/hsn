@@ -152,6 +152,24 @@ one. Exact duplicates are zero everywhere by construction.
 | `fields_phys_native` | 463,966 in 1,998 | 578,311 in 1,999 | 141,780 in 1,987 |
 | `fields_code_native` | 1,050,024 in 1,989 | 1,003,821 in 1,984 | 510,834 in 1,962 |
 
+Per document (a diagnostic on the dev shard, hashed 32-byte windows, not in the manifests): the
+share of all dev windows that occur in train, and how many of the 2,000 dev documents have more
+than half or more than 90 % of their windows in train.
+
+| Dataset | Dev windows in train | Dev documents > 50 % | > 90 % | Median share |
+| --- | --- | --- | --- | --- |
+| `fields_bio_prose` | 3.7 % | 0 | 0 | 0.027 |
+| `fields_chem_prose` | 5.5 % | 20 | 8 | 0.026 |
+| `fields_phys_prose` | 4.5 % | 7 | 0 | 0.036 |
+| `fields_code_prose` | 8.6 % | 8 | 0 | 0.043 |
+| `fields_bio_native` | 2.2 % | 3 | 1 | 0.000 |
+| `fields_chem_native` | 16.5 % | 0 | 0 | 0.158 |
+| `fields_phys_native` | 3.1 % | 14 | 8 | 0.022 |
+| `fields_code_native` | 18.3 % | 225 | 6 | 0.155 |
+
+So only the Python set had near copies in numbers (before its filter: 32.5 %, 519 and 207);
+the few elsewhere (8 ChemRxiv and 8 LaTeX pieces above 90 %) are left as they are.
+
 Natural text shares phrases, so none of these is "clean" in the synthetic sense (TinyStories:
 298,688 dev 32-grams in 1,997 dev documents). The large counts have known causes:
 
