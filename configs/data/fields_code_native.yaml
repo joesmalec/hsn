@@ -39,7 +39,7 @@ n_gram: 32
 
 train:
   file: train.txt
-  sha256: af00176ed1784c4707d2f0582e0afa19316a6469feb32d5dbb1ace40f56c090e
+  sha256: 436e1712019ee72f8a11c04a4aba727903f147f1a17d19c7bd2ca557f66e23b7
 
 heldout:
   file: heldout.txt

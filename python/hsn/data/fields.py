@@ -34,11 +34,13 @@ Every document is cleaned as the importer would read it (carriage returns remove
 below 32 but newline and tab made spaces, stripped), capped at :data:`MAX_BYTES` (cut at a line
 end, else a space; a LaTeX or ChemRxiv paper is cut into pieces at paragraph ends instead), and
 kept from :data:`MIN_BYTES`. Exact duplicates are dropped (the first in order kept), every train
-document equal to a held-out one is dropped, and so is a document holding the separator. Train
-documents are written up to :data:`TRAIN_BYTES` plus a margin (the importer's ``max_train_tokens``
-makes the cut), the held-out pool whole (the importer takes its first ``n_dev`` and next ``n_test``
-documents). ``SOURCE.json`` beside the raw files records the sources, revisions, licences, counts
-and the raw files' SHA-256 (the spec's pins).
+document equal to a held-out one is dropped (with ``near``, also one that has more than that share
+of its 32-byte windows in the held-out documents: a copy of a held-out file under another name),
+and so is a document holding the separator. Train documents are written up to :data:`TRAIN_BYTES`
+plus a margin (the importer's ``max_train_tokens`` makes the cut), the held-out pool whole (the
+importer takes its first ``n_dev`` and next ``n_test`` documents). ``SOURCE.json`` beside the raw
+files records the sources, revisions, licences, counts and the raw files' SHA-256 (the spec's
+pins).
 
 **Word ends** (``stats``): the bytes per word end of a built dataset by the rule of
 :func:`hsn.model.reader.word_ends` (a byte that is not an ASCII letter or digit, right after one
@@ -90,7 +92,9 @@ __all__ = [
     "cap",
     "chunks",
     "clean",
+    "gram_hashes",
     "html_text",
+    "near_share",
     "unwrap",
     "word_end_stats",
     "write_raw",
@@ -812,6 +816,8 @@ class FieldDataset:
     heldout: int  # held-out units per BUCKETS
     keep: int = BUCKETS  # units used per BUCKETS (heldout included)
     group: int = 1  # documents joined, one per line, into one (SMILES)
+    near: float | None = None  # drop a train document with more than this share of its
+    # NEAR_GRAM-byte windows in the held-out documents (copies of a held-out file)
 
 
 DATASETS: dict[str, FieldDataset] = {
@@ -902,9 +908,35 @@ DATASETS: dict[str, FieldDataset] = {
             _codeparrot_units,
             "one permissively licensed Python source file",
             heldout=1000,
+            near=0.5,
         ),
     )
 }
+
+
+NEAR_GRAM = 32  # the n-gram of the specs' leakage count
+_NEAR_BASE = np.uint64(0x9E3779B97F4A7C15)
+
+
+def gram_hashes(doc: bytes, n: int = NEAR_GRAM) -> npt.NDArray[np.uint64]:
+    """64-bit polynomial hashes (wrapping) of every ``n``-byte window of ``doc``."""
+    x = np.frombuffer(doc, dtype=np.uint8).astype(np.uint64)
+    m = int(x.shape[0]) - n + 1
+    if m <= 0:
+        return np.zeros(0, dtype=np.uint64)
+    h = np.zeros(m, dtype=np.uint64)
+    for k in range(n):
+        h = h * _NEAR_BASE + x[k : k + m]
+    return h
+
+
+def near_share(doc: bytes, index: npt.NDArray[np.uint64]) -> float:
+    """The share of ``doc``'s windows whose hash is in ``index`` (sorted, unique)."""
+    h = gram_hashes(doc)
+    if not h.size or not index.size:
+        return 0.0
+    found = index[np.minimum(np.searchsorted(index, h), index.size - 1)] == h
+    return float(found.mean())
 
 
 def _bucket(digest: bytes) -> int:
@@ -952,6 +984,7 @@ def write_raw(
         pools[split].append((_digest(ds.name, unit.order_key), unit.docs))
     raw.mkdir(parents=True, exist_ok=True)
     held_out: set[bytes] = set()
+    near_index: npt.NDArray[np.uint64] | None = None
     files: dict[str, Any] = {}
     for split in ("heldout", "train"):
         pool = sorted(pools.pop(split), key=lambda item: item[0])
@@ -966,6 +999,10 @@ def write_raw(
                 if split == "train" and key in held_out:
                     counts["train_equal_to_heldout"] += 1
                     continue
+                if near_index is not None and ds.near is not None:
+                    if near_share(doc, near_index) > ds.near:
+                        counts["train_near_heldout"] += 1
+                        continue
                 seen.add(key)
                 docs.append(doc)
         del pool
@@ -973,6 +1010,10 @@ def write_raw(
             docs = _documents(_grouped(docs, ds.group), counts)
         if split == "heldout":
             held_out = seen
+            if ds.near is not None:
+                hashes = [gram_hashes(doc) for doc in docs]
+                near_index = np.unique(np.concatenate(hashes)) if hashes else None
+                del hashes
         written = 0
         total = 0
         path = raw / f"{split}.txt"
@@ -1022,6 +1063,7 @@ def convert(ds: FieldDataset, root: Path, *, log: Callable[[str], None] = print)
             "heldout": ds.heldout,
             "keep": ds.keep,
             "group": ds.group,
+            "near": ds.near,
         },
         "sources": [
             {

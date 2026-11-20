@@ -3,6 +3,7 @@ their raw files build through the unchanged text importer."""
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import hashlib
 import json
@@ -459,3 +460,36 @@ def test_word_end_stats_follow_the_reader_rule() -> None:
     assert stats["events_per_window"] == pytest.approx((int(ends.sum()) + 20) * 256 / tokens.size)
     proteins = np.frombuffer(b"\x01MKVLAAG\x02\x01MSTR\x02", dtype=np.uint8)
     assert word_end_stats(proteins, 2)["word_ends"] == 2  # one word a document, ended by EOS
+
+
+def test_near_copies_of_heldout_documents_leave_train(tmp_path: Path) -> None:
+    ds = _dataset(lambda download, counts, wanted: iter(()))
+    units = _units(100)
+    held = next(u for u in units if fields._bucket(fields._digest(ds.name, u.split_key)) < 3000)
+    copy = next(
+        f"fork{i}"
+        for i in range(1000)
+        if fields._bucket(fields._digest(ds.name, f"fork{i}")) >= ds.heldout
+    )
+    text = str(held.docs[0])
+    units.append(Unit(copy, copy, (text.replace("end", "fin"),)))  # one word changed
+    _, counts = _run(ds, units, tmp_path / "plain")
+    assert counts["train_near_heldout"] == 0
+    assert clean(text.replace("end", "fin")) in _docs(tmp_path / "plain" / "train.txt")
+    near = dataclasses.replace(ds, near=0.5)
+    _, counts = _run(near, units, tmp_path / "near")
+    assert counts["train_near_heldout"] == 1
+    train = _docs(tmp_path / "near" / "train.txt")
+    assert clean(text.replace("end", "fin")) not in train
+    assert len(train) == len(_docs(tmp_path / "plain" / "train.txt")) - 1
+
+
+def test_gram_hashes_and_near_share() -> None:
+    doc = bytes(range(32, 120))
+    hashes = fields.gram_hashes(doc, 8)
+    assert hashes.shape == (len(doc) - 7,) and len(set(hashes.tolist())) == hashes.size
+    assert fields.gram_hashes(b"short", 8).size == 0
+    index = np.unique(fields.gram_hashes(doc[:50]))
+    share = fields.near_share(doc, index)  # windows of 32 bytes: 19 of 57 inside the first 50
+    assert share == pytest.approx(19 / 57)
+    assert fields.near_share(b"x" * 10, index) == 0.0

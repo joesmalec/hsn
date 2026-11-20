@@ -5,8 +5,8 @@
 #   Licence: CC0-1.0 (arXiv metadata, abstracts included).
 # Source: arXiv LaTeX bodies of proof-pile-2 (the RedPajama arXiv set), every tenth train file,
 #   https://huggingface.co/datasets/EleutherAI/proof-pile-2 at commit 901a9273a770e9d4138c5ddd91802f9c5c6cdc4b
-#   Licence: per paper; only papers whose arXiv licence is Creative Commons (BY, BY-SA, BY-NC, BY-
-#   NC-SA, BY-NC-ND) or public domain (CC0) are kept.
+#   Licence: per paper; only papers whose arXiv licence is Creative Commons (BY, BY-SA, BY-NC,
+#   BY-NC-SA, BY-NC-ND) or public domain (CC0) are kept.
 #
 # Document: a piece (<= 16 KiB, cut at paragraph ends) of an openly licensed physics paper's LaTeX
 # body; capped at 16384 bytes, at least 64. Split by blake2b('fields_phys_native/<key>') mod 10000:

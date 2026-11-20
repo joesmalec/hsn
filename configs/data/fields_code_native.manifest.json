@@ -5,15 +5,15 @@
     {
       "exact_duplicates": 0,
       "n_gram": 32,
-      "overlapping_ngrams": 2540661,
+      "overlapping_ngrams": 1050024,
       "test": "fields_code_native/out_of_range/dev",
-      "test_docs_with_overlap": 1990,
+      "test_docs_with_overlap": 1989,
       "train": "fields_code_native/out_of_range/train"
     },
     {
       "exact_duplicates": 0,
       "n_gram": 32,
-      "overlapping_ngrams": 2569933,
+      "overlapping_ngrams": 1003821,
       "test": "fields_code_native/out_of_range/test",
       "test_docs_with_overlap": 1984,
       "train": "fields_code_native/out_of_range/train"
@@ -34,10 +34,10 @@
       "context_id": 15,
       "family": "text",
       "file": "fields_code_native.out_of_range.train.npz",
-      "hash": "c7eb37c42e66439f8706beb2e306e519e9d48e1c63cd6a6aacdfac222d620358",
-      "n_docs": 30315,
-      "n_loss": 199966800,
-      "n_tokens": 199997115,
+      "hash": "20c322e0389537841a5422fb1b654da985d4c0dbeb6bdf5e95b0c5bbf58cd980",
+      "n_docs": 29736,
+      "n_loss": 199964975,
+      "n_tokens": 199994711,
       "split": "train",
       "task": "fields_code_native",
       "variant": "out_of_range"
@@ -67,11 +67,11 @@
       "variant": "out_of_range"
     }
   ],
-  "spec_hash": "32c0212fa06d344e09a1f3afde105f3228928142583d7de91bfad7a779ffe6a6",
+  "spec_hash": "190ea3ba06a1bbc8c081a63a5cc2a5a24b683f852a89c35be129bea43f10bbde",
   "split_hashes": {
     "dev": "5ac5a439b702bb41d05e90d170fffe74fcb95536c5f95929c49a75a64d108746",
     "test": "45d4f526eae8cbae4bcc4c3bc1de0bdd9a4d1d231c444903feed30a40f82b373",
-    "train": "64180100d22f3a0e7a8184777fa561006eb4d8f99c5fe708b343a8c7770848c8"
+    "train": "c36b2270e3b3cc0dc4f62e80a949c77d46b181ca29e4396e6e84dbcaf7407e99"
   },
   "unroll": 256
 }
