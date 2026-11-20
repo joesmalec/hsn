@@ -9,7 +9,9 @@ synthetic_sum.yaml``): digits stated as facts and then sums whose operands are n
 that the answer has to be computed on what was recalled. A seventh, ``kv_words`` (16 Nov 2026,
 ``configs/data/synthetic_wordkeys.yaml``), is ``kv`` with keys that are words of letters, for the
 word address of the HSN-T memory (``docs/amendments/write_events.md``); an eighth,
-``delayed_words`` (``configs/data/synthetic_wordhold.yaml``), is ``delayed`` with word keys.
+``delayed_words`` (``configs/data/synthetic_wordhold.yaml``), is ``delayed`` with word keys; a
+ninth, ``recall_sum_words`` (19 Nov 2026, ``configs/data/synthetic_sumwords.yaml``), is
+``recall_sum`` with word keys.
 
 **Symbols.** Bytes ``0..15`` are reserved control symbols (``PAD=0, BOS=1, EOS=2, QRY=3, SEP=4,
 NONE=5``; the rest unused). Bytes ``16..31`` hold per-family *marker* symbols (``INS``, ``OVR``,
@@ -94,6 +96,7 @@ __all__ = [
     "KVParams",
     "KVWordsParams",
     "RecallSumParams",
+    "RecallSumWordsParams",
     "TaskSpec",
     "Variant",
     "check_example",
@@ -128,6 +131,7 @@ Family = Literal[
     "recall_sum",
     "kv_words",
     "delayed_words",
+    "recall_sum_words",
 ]
 Variant = Literal["in_range", "out_of_range"]
 FAMILIES: tuple[Family, ...] = (
@@ -139,6 +143,7 @@ FAMILIES: tuple[Family, ...] = (
     "recall_sum",
     "kv_words",
     "delayed_words",
+    "recall_sum_words",
 )
 SPLITS: tuple[Split, ...] = ("train", "dev", "test")
 
@@ -588,6 +593,81 @@ class RecallSumParams(_Params):
         """The filler between the facts and the first item that ``min_gap`` needs at least: the
         last fact's value lies ``filler + 6`` positions before the first item's ``EQ``."""
         return max(0, self.min_gap - 6)
+
+
+#: ``recall_sum_words``' filler: the printable ASCII bytes that are no word byte under any word
+#: rule of the model: no letter, digit, apostrophe or space, and none of 128 and above (letters
+#: for ``hsn.model.reader.word_bytes`` and the first event rule), so a filler byte never joins a
+#: word, ends one, or is an event under a text context.
+_PUNCTUATION: tuple[ByteRange, ...] = ((33, 39), (40, 48), (58, 65), (91, 97), (123, 127))
+
+
+class RecallSumWordsParams(_WordKeyParams):
+    """``recall_sum_words`` (19 Nov 2026): ``recall_sum`` with keys that are words of letters, for
+    the word events of HSN-T. A fact is ``w SPACE d SPACE`` (a digit is a word byte, so a
+    ``SPACE`` keeps it out of its key word and ends it), an item ``QRY x PLUS y EQ s SEP`` with
+    each operand a key word or a written digit (``configs/data/synthetic_sumwords.yaml`` says
+    where the events fall). The key words are those of :class:`_WordKeyParams` (the same fields
+    as a ``kv_words`` task give the same words); the filler is punctuation (``_PUNCTUATION``)."""
+
+    digits: ByteRange = (48, 58)  # the ASCII digits '0'..'9'; a fact's value is one digit
+    markers: dict[Literal["plus", "eq"], int] = {"plus": 19, "eq": 20}
+    filler: tuple[ByteRange, ...] = _PUNCTUATION
+    max_facts: int = Field(default=6, ge=1)
+    max_items: int = Field(default=4, ge=1)
+    recall_weights: tuple[int, int, int] = (2, 1, 1)  # as recall_sum: two, one, none recalled
+    # Every recalled operand's digit lies at least this many positions before its item's EQ
+    # (the position that predicts the first sum digit), as in recall_sum.
+    min_gap: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        missing = [kind for kind in ("plus", "eq") if kind not in self.markers]
+        if missing:
+            raise ValueError(f"markers must name plus and eq; missing {missing}")
+        if not self.filler:
+            raise ValueError("filler must name at least one byte range")
+        fillers = [(f"filler[{i}]", byte_range) for i, byte_range in enumerate(self.filler)]
+        markers = [(f"markers[{kind}]", byte) for kind, byte in self.markers.items()]
+        self._check_words(fillers, markers)
+        _check_disjoint(
+            [
+                ("letters", self.letters),
+                ("space", (self.space, self.space + 1)),
+                ("digits", self.digits),
+                *fillers,
+            ],
+            markers,
+        )
+        if tuple(self.digits) != (48, 58):
+            raise ValueError(f"digits {list(self.digits)} must be the ASCII digits [48, 58)")
+        if any(hi > 128 for _, hi in self.filler):
+            raise ValueError(
+                f"filler {[list(r) for r in self.filler]} must lie below 128 (bytes >= 128 are "
+                "letters for the reader's word ends)"
+            )
+        if min(self.recall_weights) < 0 or self.recall_weights[0] + self.recall_weights[1] <= 0:
+            raise ValueError(
+                f"recall_weights={list(self.recall_weights)} must be non-negative with a "
+                "positive weight for two or one recalled operand"
+            )
+        return self
+
+    @property
+    def gap_filler(self) -> int:
+        """The filler between the facts and the first item that ``min_gap`` needs at least: the
+        last fact's digit lies ``filler + 7`` or more positions before the first item's ``EQ``
+        (its ``SPACE``, the filler, ``SEP``, ``QRY``, an operand of one symbol or more, ``PLUS``,
+        another, ``EQ``)."""
+        return max(0, self.min_gap - 7)
+
+    @functools.cached_property
+    def filler_bytes(self) -> npt.NDArray[np.uint8]:
+        """The filler's bytes in ascending order (a filler symbol is drawn uniformly from them)."""
+        table: npt.NDArray[np.uint8] = np.asarray(
+            sorted(b for lo, hi in self.filler for b in range(lo, hi)), dtype=np.uint8
+        )
+        return table
 
 
 class AlgorithmicParams(_Params):
@@ -2349,6 +2429,258 @@ class _RecallSum(_Generator[RecallSumParams]):
         return positions, targets, deps, kinds
 
 
+# ---- recall_sum_words ----------------------------------------------------------------------------
+
+#: An item of ``recall_sum_words`` as it is drawn: its two operands' symbols (a key word, or one
+#: written digit), their values, and the facts they recall (``None``: a written digit).
+_SumItem = tuple[list[list[int]], list[int], list[int | None]]
+
+
+class _RecallSumWords(_Generator[RecallSumWordsParams]):
+    """``BOS filler (w SPACE d SPACE)^n filler SEP (QRY x PLUS y EQ s SEP)+ EOS``.
+
+    ``recall_sum`` with each key replaced by a key word ``w`` from the split's vocabulary
+    (:attr:`_WordKeyParams.vocabulary`, some keys of a document from one group: ``p_share``).
+    A fact is ``w SPACE d SPACE`` (``|w| + 3`` symbols): its digit stands apart from its word,
+    since a digit is a word byte. An operand ``x`` / ``y`` is a stated key word (its digit is
+    recalled) or one written digit; ``s`` is the sum's one or two digits, least significant
+    first, predicted from ``EQ`` on, and the terminating ``SEP`` at the last sum digit. Every loss
+    position of an item depends on the earlier of its two operands' sources (a recalled
+    operand's fact digit, a written operand's own position).
+
+    The last item recalls the first fact, and the position that predicts its ``SEP``, the
+    document's longest dependency, lies exactly ``D`` after that fact's digit; the items before
+    it are nearer to every fact and recall any of them. The facts after the first that fit
+    beside the gap's filler and the longest last item (two of the longest words) are kept, in
+    order; the items share what is left; the filler between facts and items takes the rest, at
+    least ``min_gap - 7``. ``T == L`` exactly (the filler after ``BOS`` takes the slack).
+    """
+
+    family: Family = "recall_sum_words"
+    params_model = RecallSumWordsParams
+
+    def validate(self, spec: TaskSpec, params: RecallSumWordsParams) -> None:
+        super().validate(spec, params)
+        for split in SPLITS:
+            words = params.groups[split] * params.group_size
+            if words < params.max_facts:
+                raise ValueError(
+                    f"{spec.key}: the {split} vocabulary has {words} words but "
+                    f"max_facts={params.max_facts}"
+                )
+
+    def min_dep(self, params: RecallSumWordsParams) -> int:
+        # the first fact's digit to the last item's last sum digit with a second fact and a
+        # last item of the longest words L and a two-digit sum: the first fact's SPACE, the
+        # second fact (L + 3), the gap's filler, then SEP .. the last sum digit (2L + 6)
+        return 3 * params.word_len[1] + 10 + params.gap_filler
+
+    def min_length(self, params: RecallSumWordsParams, dep: int) -> int:
+        # BOS + the first word (L) + SPACE; the first fact's digit up to the last item's last
+        # sum digit (dep + 1); SEP + EOS
+        return dep + params.word_len[1] + 5
+
+    def emit(
+        self,
+        params: RecallSumWordsParams,
+        split: Split,
+        rng: np.random.Generator,
+        length: int,
+        dep: int,
+    ) -> Emitted:
+        d0 = params.digits[0]
+        plus, eq = params.markers["plus"], params.markers["eq"]
+        longest = params.word_len[1]
+        n = int(rng.integers(min(2, params.max_facts), params.max_facts + 1))
+        keys = _pick_words(params, split, rng, n)
+        values: list[int] = rng.integers(0, 10, size=n).tolist()
+        # D = 1 + (the facts after the first) + (the gap's filler) + (the items): keep the facts
+        # that fit beside the gap and the longest last item, in order (the second always fits:
+        # D >= min_dep)
+        room = dep - 1 - params.gap_filler - (len(keys[0]) + longest + 6)
+        kept = 1
+        for key in keys[1:]:
+            if len(key) + 3 > room:
+                break
+            room -= len(key) + 3
+            kept += 1
+        n, keys, values = kept, keys[:kept], values[:kept]
+        facts_after = sum(len(key) + 3 for key in keys[1:])
+        weights = params.recall_weights
+
+        def operands(recalled: list[int]) -> _SumItem:
+            """The symbols, values and facts (``None``: a written digit) of an item's two
+            operands, the recalled facts first and the two in random order."""
+            syms = [list(keys[i]) for i in recalled]
+            vals = [values[i] for i in recalled]
+            facts: list[int | None] = list(recalled)
+            while len(syms) < 2:
+                digit = int(rng.integers(0, 10))
+                syms.append([d0 + digit])
+                vals.append(digit)
+                facts.append(None)
+            if int(rng.integers(0, 2)):
+                syms.reverse()
+                vals.reverse()
+                facts.reverse()
+            return syms, vals, facts
+
+        def width(item: _SumItem) -> int:
+            syms, vals, _ = item
+            return len(syms[0]) + len(syms[1]) + len(_RecallSum._sum(vals[0], vals[1])) + 4
+
+        # The last item recalls the first fact and holds the anchor dependency; the items before
+        # it lie nearer to every fact, so they may recall any of them. The items share what the
+        # anchor leaves after the facts, less the gap's filler.
+        budget = dep - 1 - facts_after - params.gap_filler
+        two = n >= 2 and _weighted(rng, [weights[0], weights[1]]) == 0
+        last = operands([0, int(rng.integers(1, n))] if two else [0])
+        used = width(last)
+        want = int(rng.integers(1, params.max_items + 1))
+        free: list[_SumItem] = []
+        while 1 + len(free) < want:
+            count = min(2 - _weighted(rng, list(weights)), n)
+            picked: list[int] = rng.choice(n, size=count, replace=False).tolist() if count else []
+            item = operands(picked)
+            if used + width(item) > budget:
+                break
+            free.append(item)
+            used += width(item)
+        filler_len = dep - 1 - facts_after - used
+        prefix_len = length - len(keys[0]) - dep - 5
+        if filler_len < params.gap_filler or prefix_len < 0:
+            raise RuntimeError(f"recall_sum_words: length {length} or dep {dep} below the minimum")
+        digit_at: list[int] = []  # each fact's digit position
+        fact_symbols: list[int] = []
+        for key, value in zip(keys, values, strict=True):
+            digit_at.append(1 + prefix_len + len(fact_symbols) + len(key) + 1)
+            fact_symbols += [*key, params.space, d0 + value, params.space]
+        at = 1 + prefix_len + len(fact_symbols) + filler_len + 1  # the first item's QRY
+        body: list[int] = []
+        positions: list[int] = []
+        deps: list[int] = []
+        for syms, vals, facts in [*free, last]:
+            digits = _RecallSum._sum(vals[0], vals[1])
+            body += [QRY, *syms[0], plus, *syms[1], eq, *(d0 + x for x in digits), SEP]
+            written = (at + 1, at + 2 + len(syms[0]))  # where a written digit operand stands
+            sources = [
+                written[slot] if fact is None else digit_at[fact] for slot, fact in enumerate(facts)
+            ]
+            eq_at = at + 2 + len(syms[0]) + len(syms[1])
+            for j in range(len(digits) + 1):
+                positions.append(eq_at + j)
+                deps.append(eq_at + j - min(sources))
+            at = eq_at + len(digits) + 2
+        table = params.filler_bytes
+        tokens = _assemble(
+            [
+                [BOS],
+                table[rng.integers(0, table.shape[0], size=prefix_len)],
+                fact_symbols,
+                table[rng.integers(0, table.shape[0], size=filler_len)],
+                [SEP],
+                body,
+                [EOS],
+            ]
+        )
+        if tokens.shape[0] != length:
+            raise RuntimeError(
+                f"recall_sum_words: assembled {tokens.shape[0]} symbols, wanted {length}"
+            )
+        return tokens, positions, deps
+
+    def solve(self, params: RecallSumWordsParams, tokens: U8) -> Solved:
+        positions, targets, deps, _ = self.read(params, tokens)
+        return _sorted_solution(positions, targets, deps)
+
+    def read(
+        self, params: RecallSumWordsParams, tokens: U8
+    ) -> tuple[list[int], list[int], list[int], list[int]]:
+        """The document as its symbols give it, item by item: the loss positions (ascending),
+        their targets and dependency distances, and for each of them how many of its item's
+        two operands are recalled (0, 1 or 2)."""
+        letter = _byte_table([params.letters])
+        is_filler = _byte_table(list(params.filler))
+        d_lo, d_hi = params.digits
+        plus, eq, space = params.markers["plus"], params.markers["eq"], params.space
+        len_lo, len_hi = params.word_len
+        t: list[int] = tokens.tolist()
+        _frame(t)
+
+        def word(at: int) -> tuple[tuple[int, ...], int]:
+            """The run of letters from ``at`` and the position after it."""
+            end = at
+            while letter[t[end]]:
+                end += 1
+            if not len_lo <= end - at <= len_hi:
+                raise ValueError(f"recall_sum_words: a key word of {end - at} letters at {at}")
+            return tuple(t[at:end]), end
+
+        value_of: dict[tuple[int, ...], int] = {}
+        value_pos: dict[tuple[int, ...], int] = {}
+        i = 1
+        try:
+            while is_filler[t[i]]:
+                i += 1
+            while letter[t[i]]:
+                key, end = word(i)
+                if key in value_of:
+                    raise ValueError(f"recall_sum_words: key word at {i} stated twice")
+                if t[end] != space or not d_lo <= t[end + 1] < d_hi or t[end + 2] != space:
+                    raise ValueError(f"recall_sum_words: malformed fact at position {i}")
+                value_of[key] = t[end + 1] - d_lo
+                value_pos[key] = end + 1
+                i = end + 3
+            while is_filler[t[i]]:
+                i += 1
+            if t[i] != SEP:
+                raise ValueError(f"recall_sum_words: expected SEP at position {i}, got {t[i]}")
+            i += 1
+            positions: list[int] = []
+            targets: list[int] = []
+            deps: list[int] = []
+            kinds: list[int] = []
+            while t[i] != EOS:
+                if t[i] != QRY:
+                    raise ValueError(f"recall_sum_words: malformed item at position {i}")
+                total, source, recalled = 0, len(t), 0
+                at = i + 1
+                for closer in (plus, eq):
+                    if d_lo <= t[at] < d_hi:  # a written digit
+                        total += t[at] - d_lo
+                        source = min(source, at)
+                        end = at + 1
+                    elif letter[t[at]]:  # a key word: its fact's digit is recalled
+                        key, end = word(at)
+                        if key not in value_of:
+                            raise ValueError(
+                                f"recall_sum_words: operand at {at} names a key no fact states"
+                            )
+                        total += value_of[key]
+                        source = min(source, value_pos[key])
+                        recalled += 1
+                    else:
+                        raise ValueError(
+                            f"recall_sum_words: operand at {at} is no digit or key word"
+                        )
+                    if t[end] != closer:
+                        raise ValueError(f"recall_sum_words: malformed item at position {i}")
+                    at = end + 1
+                eq_at = at - 1
+                answer = [d_lo + x for x in _RecallSum._sum(total, 0)] + [SEP]
+                for j, target in enumerate(answer):
+                    positions.append(eq_at + j)
+                    targets.append(target)
+                    deps.append(eq_at + j - source)
+                    kinds.append(recalled)
+                i = eq_at + len(answer) + 1
+        except IndexError as exc:
+            raise ValueError("recall_sum_words: truncated document") from exc
+        if i != len(t) - 1:
+            raise ValueError("recall_sum_words: symbols after EOS")
+        return positions, targets, deps, kinds
+
+
 _FAMILIES: dict[str, _Generator[Any]] = {
     generator.family: generator
     for generator in (
@@ -2360,6 +2692,7 @@ _FAMILIES: dict[str, _Generator[Any]] = {
         _RecallSum(),
         _KVWords(),
         _DelayedWords(),
+        _RecallSumWords(),
     )
 }
 
@@ -2446,15 +2779,22 @@ def fact_positions(example: Example) -> I64:
 
 
 def recall_sum_kinds(spec: TaskSpec, tokens: U8) -> I64:
-    """For a ``recall_sum`` document, how many of its item's two operands each loss position
-    recalls (0, 1 or 2), in position order: aligned with ``loss_mask``'s True entries, with
-    :func:`reference_targets` and with ``meta["deps"]``. The three kinds are scored apart: 0
-    needs no memory, 1 and 2 compute on recalled digits."""
+    """For a ``recall_sum`` or ``recall_sum_words`` document, how many of its item's two operands
+    each loss position recalls (0, 1 or 2), in position order: aligned with ``loss_mask``'s True
+    entries, with :func:`reference_targets` and with ``meta["deps"]``. The three kinds are scored
+    apart: 0 needs no memory, 1 and 2 compute on recalled digits."""
     generator = _FAMILIES[spec.family]
-    if not isinstance(generator, _RecallSum):
-        raise ValueError(f"{spec.key}: family {spec.family} has no item kinds (recall_sum only)")
-    read = generator.read(generator.params(spec), np.ascontiguousarray(tokens, dtype=np.uint8))
-    return np.asarray(read[3], dtype=np.int64)
+    tokens = np.ascontiguousarray(tokens, dtype=np.uint8)
+    if isinstance(generator, _RecallSum):
+        kinds = generator.read(generator.params(spec), tokens)[3]
+    elif isinstance(generator, _RecallSumWords):
+        kinds = generator.read(generator.params(spec), tokens)[3]
+    else:
+        raise ValueError(
+            f"{spec.key}: family {spec.family} has no item kinds (recall_sum only, or its "
+            "word-key form recall_sum_words)"
+        )
+    return np.asarray(kinds, dtype=np.int64)
 
 
 def check_example(spec: TaskSpec, example: Example) -> None:
