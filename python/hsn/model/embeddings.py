@@ -31,7 +31,7 @@ from torch import Tensor, nn
 
 from hsn.config import ModelConfig
 
-__all__ = ["ByteEmbedding", "ContextEmbedding", "init_weight_", "parse_init"]
+__all__ = ["ByteEmbedding", "ContextEmbedding", "init_weight_", "parse_init", "replace_content"]
 
 _TRUNC_NORMAL_RE = re.compile(r"^trunc_normal_(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$")
 _INDEX_DTYPES = (torch.int64, torch.int32)
@@ -56,7 +56,13 @@ def parse_init(init: str) -> float:
     return std
 
 
-def init_weight_(weight: Tensor, init: str, *, fan_in: int | None = None) -> Tensor:
+def init_weight_(
+    weight: Tensor,
+    init: str,
+    *,
+    fan_in: int | None = None,
+    generator: torch.Generator | None = None,
+) -> Tensor:
     """Initialise ``weight`` in place as ``model.init`` / ``model.state_init`` asks and return it.
 
     ``trunc_normal_<std>``: N(0, std²) truncated to ``[-2·std, 2·std]`` (see the module docstring
@@ -64,6 +70,8 @@ def init_weight_(weight: Tensor, init: str, *, fan_in: int | None = None) -> Ten
     with std ``1/sqrt(fan_in)``, the fan-in being ``weight.shape[1]`` unless given: the input width
     of an ``nn.Linear`` weight ``[out, in]`` and of a stacked unit weight ``[M, in, out]``. Biases
     are not initialised here: every P1.2 module zeroes them (the cell sets its gate's bias).
+    ``generator``: draw from it instead of the global random stream (``None``, the default: the
+    global stream, as every caller before 15 Nov 2026).
     """
     if init == "fan_in":
         fan = int(weight.shape[1]) if fan_in is None else int(fan_in)
@@ -72,7 +80,11 @@ def init_weight_(weight: Tensor, init: str, *, fan_in: int | None = None) -> Ten
         std = 1.0 / math.sqrt(fan)
     else:
         std = parse_init(init)
-    return nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
+    if generator is None:
+        return nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
+    return nn.init.trunc_normal_(
+        weight, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std, generator=generator
+    )
 
 
 def _check_index_tensor(name: str, ids: Tensor) -> None:
@@ -126,6 +138,42 @@ class ByteEmbedding(_IdEmbedding):
     @classmethod
     def from_config(cls, cfg: ModelConfig) -> Self:
         return cls(cfg.vocab_size, cfg.d, init=cfg.state_init)
+
+    def add_unknown_row(self, generator: torch.Generator) -> nn.Parameter:
+        """``train.content_dropout_target = unknown`` (``docs/key_content.md``): register and
+        return the learned "unknown" row ``unknown`` ``[1, d]``, drawn as the table's rows are
+        (:func:`init_weight_` with the table's ``init``) from ``generator``, so the global
+        random stream is not read and no other parameter's start value changes. It is shaped
+        as one row of the table: a ``fan_in`` init reads the table's fan-in ``d``, and the
+        optimiser's weight decay (on tensors with two dimensions) treats it as it treats the
+        table. :meth:`forward` does not read it: the HSN puts it in place of a byte's row
+        (:func:`replace_content`). Without this call the module has no such parameter."""
+        if "unknown" in self._parameters:
+            raise ValueError("this byte embedding already has its unknown row")
+        row = torch.empty(1, self.width, dtype=self.weight.dtype, device=self.weight.device)
+        init_weight_(row, self.init, generator=generator)
+        self.unknown = nn.Parameter(row)
+        return self.unknown
+
+
+def replace_content(
+    rows: Tensor,
+    zero: Tensor | None = None,
+    unknown: Tensor | None = None,
+    unknown_row: Tensor | None = None,
+) -> Tensor:
+    """The byte-content options (``docs/key_content.md``): ``rows [..., w]`` (a content
+    table's lookup) with a zero row at the positions where ``zero`` (bool ``[...]``) is True
+    and ``unknown_row [1, w]`` (the table's learned unknown row) where ``unknown`` is True.
+    The two masks never overlap (``HSN._content_masks``). With both ``None`` this is ``rows``
+    itself, the lookup unchanged."""
+    if zero is not None:
+        rows = rows.masked_fill(zero[..., None], 0.0)
+    if unknown is not None:
+        if unknown_row is None:
+            raise ValueError("positions read the unknown row, but none was given")
+        rows = torch.where(unknown[..., None], unknown_row, rows)
+    return rows
 
 
 class ContextEmbedding(_IdEmbedding):
