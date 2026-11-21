@@ -142,6 +142,10 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.reach_dropout_span",
         "baseline.gated_deltanet",  # the Gated DeltaNet baseline's sizes (17 Nov 2026)
         "hardware.message_gradients",  # the messages' gradient sums in fp32 (opt-in, 18 Nov)
+        "train.content_dropout",  # the byte-content options (opt-in, docs/key_content.md)
+        "model.zero_unseen_bytes",
+        "train.content_dropout_target",  # the learned unknown rows (opt-in)
+        "model.unseen_bytes_as",
     )
     # evaluation-only sections are never hashed, whatever they hold (eval.*, 18 Nov 2026)
     assert HASH_EXCLUDED == ("eval",)
