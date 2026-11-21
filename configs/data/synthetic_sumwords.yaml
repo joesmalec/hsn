@@ -1,0 +1,127 @@
+# synthetic_sumwords: recall, then compute, with keys that are WORDS (19 Nov 2026).
+#
+# Why: "mixed documents", recall and arithmetic in one document. synthetic_sum (recall_sum) states digits as
+# facts and asks sums whose operands are named by key; HSN-T with its per-byte memory solves it, but its keys are
+# single symbols under a context no run reads as text, so the word-event memory (model.write_events=word,
+# model.word_address=exact; configs/experiments/hsn_t_memory_words.yaml and hsn_t_memory_words_carry.yaml) would
+# make every byte an event there and cannot be tested on it. This is recall_sum with word keys, as kv_words
+# (synthetic_wordkeys) is kv with word keys, under a context of its own (9) that runs list in model.word_contexts.
+#
+# A document (family recall_sum_words, python/hsn/data/synthetic.py):
+#   BOS filler (w SPACE d SPACE)^n filler SEP (QRY x PLUS y EQ s SEP)+ EOS
+#   w       a key word: 3 to 8 ASCII letters a-z, from synthetic_wordkeys' vocabulary (the same fields and
+#           vocab_seed, so the same words: 2,000 training, 500 dev, 500 test words, disjoint; groups of four
+#           that share a beginning or an ending, p_share 0.5)
+#   d       the fact's digit, '0'..'9' (48-57)
+#   x, y    an operand: a stated key word (its digit is recalled) or one written digit
+#   s       the sum, one or two digits, least significant first; the answer positions are EQ (it predicts the
+#           first sum digit), the sum digits but the last, and the last sum digit (it predicts the closing SEP)
+#   filler  printable ASCII punctuation, 31 bytes: 33-38, 40-47, 58-64, 91-96, 123-126 (no letter, digit,
+#           apostrophe or space, nothing >= 128)
+#   markers PLUS 19, EQ 20 (as recall_sum); SPACE 32
+# Example (training document 0, markers in brackets, the filler shortened to ...):
+#   [BOS]@,,=;}...;,pfkod 0 pfkn 9 dcbdltkf 5 @_+[\\=)"...)>)*[SEP][QRY]pfkn[PLUS]dcbdltkf[EQ]41[SEP]
+#   [QRY]pfkn[PLUS]pfkod[EQ]9[SEP][EOS]
+# Items are of three kinds, drawn by recall_weights (two, one, none of the operands recalled; weights as
+# recall_sum): two "QRY pfkn PLUS dcbdltkf EQ ..", one "QRY pfkn PLUS 7 EQ ..", none "QRY 3 PLUS 7 EQ .."
+# (the control inside the same documents). Score the kinds apart: hsn.data.synthetic.recall_sum_kinds.
+#
+# Why the layout (checked with hsn.model.word_address.word_address, exact and bag, context 9 read as text;
+# tests/test_sum_words.py): under a text context a word byte is an ASCII letter or digit (an apostrophe between
+# letters), every other byte a word of one byte, and an event is a byte that closes a word of letters or digits,
+# or a document start. A digit is a word byte, so "w d" would be one word; the SPACE keeps the fact's digit out
+# of its key word and the second SPACE ends the digit (else the next key would join it). Events of a document:
+#   BOS; per fact the SPACE after w (key w) and the SPACE after d (key d); per item PLUS (it closes x), EQ (it
+#   closes y) and the SEP after the sum (it closes the sum's digits, one word). Nothing else: the filler, SEP
+#   after the facts, QRY and EOS close nothing. So a document has 1 + 2 n + 3 m events (m items).
+#   WRITE of a fact: at the SPACE after d, a_cur = C[d] (a word of one byte keeps A5's byte code) and
+#   a_prev = W(w): the key's code in a_prev, A5's cross binding ("a fact k v is written at v's event under k's
+#   code in a_prev", config.py on model.word_address). Unlike kv_words, whose value byte is no word byte and so
+#   closes the key itself (the key in a_cur at the write); a digit cannot close a word.
+#   READ of a key operand: at the byte that closes it (PLUS for x, EQ for y), a_cur = W(w). EQ, where the first
+#   sum digit is predicted, is y's own event; x was read one event before (at PLUS).
+#   A written digit operand is a one-byte word too ("QRY 3 PLUS ..": PLUS closes "3", a_cur = C[3]).
+#   With the per-byte memory (write_events=byte, no text context) every byte is an event, as in recall_sum.
+#
+# min_gap: 64, as recall_sum: every recalled operand's fact digit lies at least 64 positions before its item's
+# EQ, beyond the complete receptive field of the HSN-T reader with span 32 (two blocks: 63 bytes). The gap's
+# filler is at least min_gap - 7 = 57 (recall_sum: 58), the shortest item head being QRY d PLUS d EQ. A reader
+# without a span (the carry recipe's top0 reader) sees every operand of an in-range document; for it the
+# out-of-range variant is the test.
+#
+# Anchor: the last item recalls the first fact, and the position that predicts its SEP lies exactly D after that
+# fact's digit (D drawn from dep_len_range; the document's dep_len). The facts after the first that fit beside the
+# gap and the longest last item are kept, in order.
+#   dep_len_range in_range starts at 91 (recall_sum: 80): the smallest D at which a second fact and a last item
+#   of two 8-letter words always fit (3 x 8 + 10 + 57). length_range and every other range and count are
+#   recall_sum's; each document needs D + 13 symbols (recall_sum: D + 5), so in range the longest anchor (240)
+#   still fits one 256-byte window.
+#
+# Build (CPU, about a minute):
+#   PYTHONPATH=python python -m hsn.data.synthetic build --spec configs/data/synthetic_sumwords.yaml \
+#       --out data/synthetic_sumwords --golden configs/data/synthetic_sumwords.manifest.json
+# Built copy: /home/joe/hsn-experiments/datasets/synthetic_sumwords (link it as data/synthetic_sumwords).
+# Select with
+#   data.dataset=synthetic_sumwords data.manifest=data/synthetic_sumwords/manifest.json data.tasks=[recall_sumw]
+#   data.variants=[in_range]
+# and, for word events, "model.word_contexts=[0, 6, 9]" on hsn_t_memory_words.yaml or hsn_t_memory_words_carry.yaml
+# (9: this task; 0: the PAD tail behind each document under data.align_docs, no event; 6: TinyStories, inert).
+# Context 9 is used by no other dataset. Golden manifest: configs/data/synthetic_sumwords.manifest.json.
+
+name: synthetic_sumwords
+unroll: 256
+
+tasks:
+  - name: recall_sumw
+    variant: in_range
+    family: recall_sum_words
+    context_id: 9
+    seed: 91001
+    n_train: 20000
+    n_dev: 1000
+    n_test: 1000
+    length_range: [96, 256]
+    dep_len_range: [91, 240]
+    params:
+      letters: [97, 123]
+      space: 32
+      word_len: [3, 8]
+      vocab_seed: 7001
+      groups: { train: 500, dev: 125, test: 125 }
+      group_size: 4
+      affix_len: [2, 3]
+      p_share: 0.5
+      digits: [48, 58]
+      markers: { plus: 19, eq: 20 }
+      filler: [[33, 39], [40, 48], [58, 65], [91, 97], [123, 127]]
+      max_facts: 6
+      max_items: 4
+      recall_weights: [2, 1, 1]
+      min_gap: 64
+
+  - name: recall_sumw
+    variant: out_of_range
+    family: recall_sum_words
+    context_id: 9
+    seed: 91002
+    n_train: 0
+    n_dev: 1000
+    n_test: 1000
+    length_range: [288, 1024]
+    dep_len_range: [272, 768]
+    params:
+      letters: [97, 123]
+      space: 32
+      word_len: [3, 8]
+      vocab_seed: 7001
+      groups: { train: 500, dev: 125, test: 125 }
+      group_size: 4
+      affix_len: [2, 3]
+      p_share: 0.5
+      digits: [48, 58]
+      markers: { plus: 19, eq: 20 }
+      filler: [[33, 39], [40, 48], [58, 65], [91, 97], [123, 127]]
+      max_facts: 6
+      max_items: 4
+      recall_weights: [2, 1, 1]
+      min_gap: 64

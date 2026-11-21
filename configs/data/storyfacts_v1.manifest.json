@@ -1,0 +1,160 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [],
+  "name": "storyfacts_v1",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "plain.out_of_range.train.npz",
+      "hash": "a5f6f0118eee96789a4d99fc1ab995d0edbd0961b8ea9f3c589efc560c5a7608",
+      "n_docs": 18476,
+      "n_loss": 27468790,
+      "n_tokens": 27487266,
+      "split": "train",
+      "task": "plain",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "plain.out_of_range.dev.npz",
+      "hash": "7be703c9c0902500390a913d65945fc6352c394f922ccfebcb8af63c43db8f70",
+      "n_docs": 2106,
+      "n_loss": 3138000,
+      "n_tokens": 3140106,
+      "split": "dev",
+      "task": "plain",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "plain.out_of_range.test.npz",
+      "hash": "d385b5f1b3da29b4309d452f3171fc2ae5f681c78224d36b82e3fd3961d6f3d5",
+      "n_docs": 2061,
+      "n_loss": 3016982,
+      "n_tokens": 3019043,
+      "split": "test",
+      "task": "plain",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "stated.out_of_range.train.npz",
+      "hash": "f2e7e608574df0f064679c90d4c346f93daae89b3c7939f3ad1e64b2f3e0a153",
+      "n_docs": 2983,
+      "n_loss": 4511432,
+      "n_tokens": 4514415,
+      "split": "train",
+      "task": "stated",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "stated.out_of_range.dev.npz",
+      "hash": "e11baaaee8062ca47e0f48ae86cc5e6170e723a791ff27f56565c65e6a7014d4",
+      "n_docs": 323,
+      "n_loss": 490150,
+      "n_tokens": 490473,
+      "split": "dev",
+      "task": "stated",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "stated.out_of_range.test.npz",
+      "hash": "41d76d10abfee86c545afededb532d05941cb9d4ed650b48853cf67f2216f4d9",
+      "n_docs": 320,
+      "n_loss": 471943,
+      "n_tokens": 472263,
+      "split": "test",
+      "task": "stated",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "facts.out_of_range.train.npz",
+      "hash": "827f187a62d7add5f75cee80ad550e1a382c699e1dab0f9dbb1d3d699b938ccf",
+      "n_docs": 14541,
+      "n_loss": 23404747,
+      "n_tokens": 23419288,
+      "split": "train",
+      "task": "facts",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "facts.out_of_range.dev.npz",
+      "hash": "1b73ca54059d87da0a079b89335368c38a642adec3f3c0b012f38e2f4989aac6",
+      "n_docs": 1571,
+      "n_loss": 2505000,
+      "n_tokens": 2506571,
+      "split": "dev",
+      "task": "facts",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "facts.out_of_range.test.npz",
+      "hash": "4e3c52d7a16c51a9defbd8363a1e812f3e295673cd5c0d39d22a3d6614679547",
+      "n_docs": 1619,
+      "n_loss": 2597906,
+      "n_tokens": 2599525,
+      "split": "test",
+      "task": "facts",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "kv.out_of_range.train.npz",
+      "hash": "b289ac95ec795e442db332d1738c16456fc259730d1e72e9c9748b86c3f38e33",
+      "n_docs": 18000,
+      "n_loss": 6265178,
+      "n_tokens": 6283178,
+      "split": "train",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "kv.out_of_range.dev.npz",
+      "hash": "a3f1a8044c0f5e90f7effbd07dea9fa0a35f0b11ffdb671aa03dd7823043d951",
+      "n_docs": 2000,
+      "n_loss": 694541,
+      "n_tokens": 696541,
+      "split": "dev",
+      "task": "kv",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "storyfacts",
+      "file": "kv.out_of_range.test.npz",
+      "hash": "401b3ece78d5eafc801f07372bd78ac81ce4eb37fa11bf65eb10130dedb3eb67",
+      "n_docs": 2000,
+      "n_loss": 698839,
+      "n_tokens": 700839,
+      "split": "test",
+      "task": "kv",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "9074c7ff7236b6bfab11dedc775948fabbfe73650ad68dc3af1cc3037b416d5a",
+  "split_hashes": {
+    "dev": "dfc223b0222f62f04e7125e0998e4aa5bb9d165eb8d1ccda4e3e4e30db295c78",
+    "test": "f8a7404aefd66c57ba0dce59ee7624702f2d11a1107e129bdb2cf6e52a5dbf0c",
+    "train": "25137733cc6025f83bdae1717e8f6e1678f0bee48700af6717995fbd2a702b32"
+  },
+  "unroll": 256
+}

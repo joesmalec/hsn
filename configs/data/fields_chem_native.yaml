@@ -1,0 +1,46 @@
+# fields_chem_native: chemistry native of the field datasets (19-20 Nov 2026; docs/field_datasets.md).
+#
+# Source: PubChem-10M (DeepChem / ChemBERTa), canonicalised with RDKit,
+#   https://huggingface.co/datasets/sagawa/pubchem-10m-canonicalized at commit f83219601635a0a80fc99c13a9ca37f99ef34f0a
+#   Licence: Apache-2.0 (card); PubChem records are public domain.
+#
+# Document: 32 PubChem molecules as canonical SMILES, one per line; capped at 16384 bytes, at least
+# 64. Split by blake2b('fields_chem_native/<key>') mod 10000: below 200 held out, below 6000 used
+# (python/hsn/data/fields.py).
+#
+# The raw files (not in the repository) come from the pinned sources (the build checks their
+# SHA-256):
+#
+#   python -m hsn.data.fields fetch fields_chem_native --root <dir>
+#   python -m hsn.data.fields convert fields_chem_native --root <dir>     # <dir>/raw/fields_chem_native/
+#   python -m hsn.data.text build --spec configs/data/fields_chem_native.yaml \
+#       --raw <dir>/raw/fields_chem_native --out data/fields_chem_native \
+#       --golden configs/data/fields_chem_native.manifest.json
+#
+# Select it with
+#   data.dataset=fields_chem_native data.manifest=data/fields_chem_native/manifest.json
+#   data.tasks=[fields_chem_native] data.variants=[out_of_range]
+# Golden manifest: configs/data/fields_chem_native.manifest.json.
+
+name: fields_chem_native
+unroll: 256
+task: fields_chem_native
+variant: out_of_range # documents are longer than a window
+family: text
+context_id: 13 # SMILES
+separator: "<|endoftext|>"
+min_bytes: 64
+newline: 16
+tab: 17
+max_train_tokens: 200000000
+n_dev: 2000
+n_test: 2000
+n_gram: 32
+
+train:
+  file: train.txt
+  sha256: a7c0d01189e5b5a17b4b124c0717a82cad80425206346bd8bb48ec075f708b45
+
+heldout:
+  file: heldout.txt
+  sha256: a3e775b898d5da675802051675f71a90a7b198e7469d226e7d299789309e25d0
