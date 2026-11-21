@@ -1,0 +1,150 @@
+# hsn_t_memory: the recipe for HSN-T with its memory in main's form (the user's decision of 16 Nov 2026).
+#
+# HSN-T (docs/hsn_t.md) is the HSN's memory core behind a Transformer reader. This file is hsn_recipe_a6.yaml
+# with the overrides the HSN-T memory specs of 15-16 Nov 2026 pass on top of it (mem_read.yaml, mem_read_s1.yaml:
+# their base.overrides without the data, steps, profile and compile lines), written out:
+#   model_name hsn_t; model.k_select 12 and model.n_cells 64 (12 routed cells of 64, no fast cells);
+#   model.reader transformer with model.reader_span 32 (the short-sighted reader, the main form);
+#   A12's address gate reading the summary (A13); A9's two-byte addresses with their history carried
+#   (address_history ngram, required by HSN-T); A11's wrapped scorer position;
+#   train.feedback_detach [summary, eps, router] (the cell's read of the state keeps its gradient);
+#   train.unit_credit executed (amendment A7, on in this recipe by the user's decision of 16 Nov 2026; not in
+#   the HSN recipes); train.soft_until_step 0 (no soft warm-up).
+# It resolves to hsn_recipe_a6.yaml with those overrides exactly (the same arm ids, and the same configuration
+# hash once run_id and notes are aligned: tests/test_hsn_t_memory_recipe.py).
+#
+# The attention read of the cells, "C-read" (model.cell_attention_heads, docs/amendments/cell_attention_read.md),
+# is off here since 16 Nov 2026 (the user's decision; PR #81 had it on, 4 heads, that morning) after the recall
+# tasks: five-task mix (9k, seed 0) overall 83.67 -> 88.58 % but kv 94.33 -> 83.38, delayed 99.34 -> 96.38; hold-out
+# (18k) seed 0 99.34 -> 98.43, seed 2 93.54 -> 89.33 (delayed2h 90.01 -> 67.55). It stays an opt-in key (code
+# default 0) for text, where it helps (TinyStories names, 27k: 0.53 -> 0.26 bits per letter): a text arm adds
+# model.cell_attention_heads=4 (+53,504 parameters, 2,037,801 -> 2,091,305; autograd window only).
+#
+# hardware.graph_alias_index=true (main's HSN-T specs set it: compiled CUDA graphs, bookkeeping only) is not in
+# this file: a `hardware` block in a configuration replaces the whole profile, so it stays an override. The
+# data block is hsn_recipe_a6's (the delayed task); a spec sets its own data (TinyStories: data.dataset,
+# data.manifest, data.tasks, data.variants). In an experiment spec the family is hsn_t. A CUDA arm:
+#
+#   base: {config: configs/experiments/hsn_t_memory.yaml,
+#          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead, hardware.graph_alias_index=true]}
+#
+# Everything not listed keeps its Appendix A default (configs/_example.yaml).
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file. (The C-read
+# change of 16 Nov 2026 was made while no spec used this file.)
+
+run_id: hsn_t_memory
+seed: 0
+notes: "HSN-T with its memory in main's form (hsn_recipe_a6 + reader span 32, 12 of 64 cells, summary-gated A12, A9 ngram, A11 wrap, cut C, executed credit); the attention read of the cells off."
+profile: cpu # hardware profile: configs/hardware/<profile>.yaml; override with `profile=<name>`
+model_name: hsn_t
+
+model: # Appendix A.1
+  vocab_size: 256 # byte vocabulary V
+  d: 64 # width
+  n_cells: 64 # N (hsn_recipe_a6: 32)
+  n_units: 8 # M
+  k_select: 12 # K cells per round (hsn_recipe_a6: 4)
+  k_min: 1 # minimum selected cells
+  r_max: 1 # internal rounds cap R
+  in_degree: 4 # D_g
+  random_edges: 0 # extra random candidate edges
+  edge_norm: softmax # softmax | sigmoid
+  hidden: 512 # H for every two-layer MLP
+  n_context: 16 # context symbols
+  context_dim: 64 # context embedding width (= d)
+  activation: gelu # MLP activation (paper unspecified)
+  init: trunc_normal_0.02 # weight init of embeddings, scorer, halting, decoder (paper unspecified)
+  state_init: fan_in # P1.5a (amendment A1): E, P, S, units, V, W_out, gate weight; fan_in | trunc_normal_<std>
+  cell_norm: rms # P1.5a: RMSNorm over the 4d cell input before the units and the gate; rms | none
+  gate_bias_init: -3.0 # P1.5a: gate bias at init, sigmoid(-3) = 0.047 (cells retain by default)
+  cand_norm: rms # P1.13 amendment A4: RMSNorm before the candidate's tanh
+  key_address: true # amendment A5: fixed byte/cell address features (the key binding)
+  selected_readout: true # amendment A5: the selected cells' mean appended to the decoder input
+  address_ngram: 2 # amendment A9: addresses of the last two bytes
+  address_history: ngram # A9's bytes carried across windows of a document (HSN-T requires it)
+  address_gate: true # amendment A12: the scorer's address weights follow the position
+  address_gate_input: summary # amendment A13: the gate reads the carried summary q_{t-1}
+  scorer_position: wrap # amendment A11: the scorer's position feature is (pos mod unroll) / unroll
+  scorer: linear # linear | mlp; Appendix C counts the linear scorer (200 -> 8)
+  scorer_hidden: 128 # hidden width when scorer = mlp (the C.2 "two-layer scorer" row)
+  scorer_features:
+    exclude: [] # feature names to zero (ablation; e.g. [eps])
+  routing: topk # learned top-K routing (dense | topk | greedy_budget | random | fixed)
+  fixed_route: [] # cells for routing = fixed
+  budget: 1.0 # B_t as a fraction of the dense step cost
+  lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
+  deadline_ms: null # wall-clock deadline (serving)
+  cost_profile: null # P2.1: cost profile (P0.6 report + cost_profile block) for the router's cost table; null = uniform placeholder
+  static_k: true # pad selection to fixed K (needed for graphs / compile)
+  age_max: 64 # refresh-probe threshold
+  halt_threshold: 0.5 # inference halting threshold
+  predictor_target: fixed_embedding # fixed_embedding | ema_encoder (P1.6)
+  disabled_cells: [] # test hook
+  ablate_shared_u: false # ablation: remove u from v (not covered by the P1.1 closed forms)
+  reader: transformer # HSN-T: the reader in front of the memory core (width 64, 2 blocks, 4 heads by default)
+  reader_span: 32 # the reader attends over the last 32 bytes only; a distant fact is the memory's
+  cell_attention_heads: 0 # C-read off (16 Nov 2026: it costs kv and delayed recall); text arms may set 4
+  state_schema_version: 1 # bumped on any state layout change
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [delayed] # hsn_recipe_a6's task; the HSN-T specs set their own data (TinyStories)
+  variants: [in_range] # the designated in-range state tasks
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train: # hsn_recipe_a6's, with the HSN-T specs' changes marked
+  unroll: 256 # TBPTT window T
+  batch: 32
+  micro_batch: 32
+  grad_accum: 1
+  precision: bf16 # bf16 | fp16 | fp32 | fp64
+  optimizer: lazy_adamw # P2.6: the routed HSN's optimiser
+  lr: 2.5e-3
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps: 200
+  schedule: wsd # warmup-stable-decay (P1.13): the peak holds until the last 20 %
+  decay_fraction: 0.2
+  grad_clip: 1.0
+  grad_norm_precision: float64 # A5: the global gradient norm and its clip reduced in float64
+  steps: 9000
+  eval_every: 500
+  ckpt_every: 9000
+  stats_every: 100
+  q_resync_every: 64
+  lambda_p: 1.0 # L_pred with the fixed-embedding target (P1.6)
+  search_trials: 4 # as hsn_recipe_a6 (unused by the harness)
+  probe_horizon: null # the probes read to the window end
+  # unguarded: no spike guard and no rollback
+  spike_factor: null
+  rollback_every: null
+  # amendment A6's cut without `state` ("cut C", the state gradient): the summary, eps and router reads are
+  # constants in the backward pass, the cell's read of the state keeps its gradient (hsn_recipe_a6 cuts all four)
+  feedback_detach: [summary, eps, router]
+  # the update caps of exp 346 (hsn_recipe_a6's)
+  update_limit:
+    groups:
+      memory: {selectors: ["cell.*"], max_ratio: 0.003}
+      routing: {selectors: ["router.*"], max_ratio: 0.003}
+    norm_floor: 1.0e-12
+    norm_growth_limits: {routing: 1.0}
+  # A6: evaluations, probes and the final checkpoint score a moving average of the weights (decay 0.99)
+  weight_ema: 0.99
+  # A6: the route guard (its other keys at their defaults: configs/_example.yaml)
+  route_guard:
+    enabled: true
+  # amendment A7 (on here by the user's decision of 16 Nov 2026; code default softmax): the straight-through
+  # unit weight of an executed slot differentiates the executed unit's score alone
+  unit_credit: executed
+  # P2.2 routing controls: the straight-through gate, no soft warm-up, the others at their defaults
+  gate_mode: ste
+  soft_until_step: 0
+  temperature_start: 1.0
+  temperature_end: 1.0
+  temperature_steps: 0
+  epsilon_start: 0.0
+  epsilon_end: 0.0
+  epsilon_steps: 0
+  p_dense: 0.0
+  reinforce_baseline_decay: 0.9

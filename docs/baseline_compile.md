@@ -39,9 +39,10 @@ break raises) and static shapes. Nothing of a baseline's architecture changes.
 
 | Family | Compiled | Stays eager |
 | --- | --- | --- |
-| `transformer`, `reader`, `hsn_t_nomem` | The whole forward of a window, as one graph, and its backward. | |
+| `transformer`, `reader`, `hsn_t_nomem` | The whole forward of a window, as one graph, and its backward; with a carried cache (`model.reader_carry`, or `baseline.transformer.carry`: Transformer-XL, `docs/transformer_xl_baseline.md`) the cache goes in and out of that graph. | |
 | `gru` | The embeddings before the recurrence and the read-out after it (LayerNorm and head), as two graphs, and their backward. | The recurrence, `torch.nn.GRU`: cuDNN on CUDA, called between the two graphs as before. |
-| `selective_ssm` | Outside the scope: refused at load. | |
+| `selective_ssm` | The whole forward of a window, as one graph, and its backward, with every block's scan run as `_plain_scan` (below). | |
+| `gated_deltanet` (17 November 2026) | Nothing: the key is refused for this family when the configuration is loaded. | Everything. The delta rule runs as flash-linear-attention's own Triton kernels, which `torch.compile` does not take into a graph (`docs/gated_deltanet_baseline.md`, "Compiled or eager"). |
 
 For every family the loss, the gradient clipping, the guards and the optimiser stay eager, as
 under the HSN's compiled window. The harness's edit probes and trained-state pass run on the
@@ -54,15 +55,33 @@ recurrence already is a vendor kernel, so it is left as PyTorch calls it. What t
 of the GRU is a small part of its step: two embedding lookups and a sum before the recurrence,
 a LayerNorm and a linear layer after it. Expect its step time to move little.
 
-**The selective state-space model.** Its scan is a Python loop that writes every position's
-state into one window-sized tensor in place (`hs[:, t].addcmul_(...)`), with a hand-written
-backward that does the same. The whole window compiles and gives the eager values, but a
-compiled graph has no in-place writes and the loop's cost then grows with the square of the
-window: on the CPU (B2, 512 channels of 16 states) the scan's forward loop takes 4, 73 and
-339 ms compiled at 32, 64 and 128 positions against 0.4, 1.0 and 3.2 ms eager, and one
-training window at the default size (4 blocks, T256) 3.0 to 10.5 s against 0.5 s, after 4 to 6
-minutes of compiling. That would be a "compiled Mamba" slower than the eager one, so the
-family is outside the scope.
+**The selective state-space model.** This is the one family whose compiled window does not
+run the eager forward's own code, and the part of this change to decide on (it is a commit of
+its own). The eager scan (`_SelectiveScan`) is a Python loop that writes every position's state
+into one window-sized tensor in place (`hs[:, t].addcmul_(...)`), with a hand-written backward
+that does the same. Compiled as it is, the window gives the eager values, but a compiled graph
+has no in-place writes and the loop's cost grows with the square of the window: on the CPU (B2,
+512 channels of 16 states) the scan's forward loop takes 4, 73 and 339 ms compiled at 32, 64
+and 128 positions against 0.4, 1.0 and 3.2 ms eager, and one training window at the default
+size (4 blocks, T256) 3.0 to 10.5 s against 0.5 s. That would be a "compiled Mamba" slower
+than the eager one.
+
+The compiled window therefore runs the scan as `hsn.baselines.mamba._plain_scan`: the same
+recurrence as plain tensor operations (`h_t = drive_t + decay_t * h_{t-1}`, the states stacked
+at the end), differentiated by autograd, with the resets applied at every position (a position
+where no row resets is unchanged), so one graph serves every window and no reset column is
+read from the device. Its forward values are the eager scan's bit for bit in eager mode and
+its gradients equal the hand-written ones to rounding (`test_plain_scan_equals_the_selective_scan`,
+float64); the architecture, the parameters and the state are untouched, and the eager run does
+not use it. In eager mode this form is the one the hand-written backward was written to avoid
+(autograd walks a few nodes per position); compiled, those nodes are gone. On the CPU, where
+there is no launch overhead to save, one training window at the default size takes 0.40 s
+compiled against 0.60 s eager (B2, one thread, best of three; logits within 1.0e-6 and
+gradients within 1.7e-8 of the eager ones), after 7 minutes of compiling. What it does on the
+card is not known. The graph holds 256 positions of four blocks, so its compile will take
+minutes there too (the inductor cache keeps it), and autograd keeps the decays, the states and
+their stacked copy for the backward where the hand-written one keeps the decays and the states
+(up to one and a half times the memory).
 
 ## How it runs
 
@@ -81,7 +100,8 @@ training windows and in its evaluation (`Trainer.compiled_baseline`).
   `compile_seconds`, not to `train_seconds` or `tokens_per_s`, as for the HSN.
 - **CUDA graphs** (`reduce-overhead`, `max-autotune`, on CUDA): every window starts a new
   graph step (`torch.compiler.cudagraph_mark_step_begin`); a window's logits are graph memory,
-  read before the next window; `train.grad_accum > 1` is refused, as for the HSN.
+  read before the next window (the state of a `selective_ssm` window is cloned out of it);
+  `train.grad_accum > 1` is refused, as for the HSN.
 
 Refused when the trainer is built (`NotImplementedError`): dropout above 0 (a compiled random
 draw differs from the eager one; every shipped baseline configuration has dropout 0) and

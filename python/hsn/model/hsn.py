@@ -151,6 +151,35 @@ graph, the gate, the router, the addresses and the state layout are unchanged. I
 compiled block and :meth:`_position` are the code they were. :meth:`step` has no window to read
 and refuses the key; the split and fused windows refuse it too. With ``model.fast_cells`` kept
 beside the reader, ``S`` reads ``[z ; q ; ctx ; c ; f]`` and ``D`` reads ``[q ; u ; r ; f ; c]``.
+``train.reach_dropout`` (``docs/reach_dropout.md``; opt-in, training only): in a training window
+the rows the trainer hands over (:meth:`HSN.set_reach_rows`) read with a short span; no equation
+changes, and evaluation reads as configured. With the carried reader below the short span also
+narrows what a row reads of the reader's cache.
+
+Reading past the window with the memory on (``model.reader_carry = C > 0`` with
+``model.memory``, ``docs/amendments/reader_carry_memory.md``; opt-in, 17 Nov 2026): ``c_t``
+also reads the last ``C`` positions of its document before the window, from the reader's cache
+of detached keys and values (:meth:`hsn.model.reader.Reader.read`, the mechanism of HSN-T
+without its memory), so the reader's sight does not fall to one byte at a window boundary.
+Nothing after ``c_t`` changes. The cache is not part of :class:`CellGraphState`: it rides with
+the address carry, as a :class:`WindowCarry` that :func:`address_history` builds from the
+window's ``info`` (:data:`READER_CACHE_KEYS`) and :meth:`forward` takes as ``prev_tokens``.
+The prologue is eager in the compiled window too, so no graph changes. At ``C = 0`` (default)
+every line of the reader's path is the one it was.
+
+The attention read of the cells (``model.cell_attention_heads = H > 0``, HSN-T only,
+``docs/amendments/cell_attention_read.md``; opt-in candidate): at every position ``c_t`` queries
+all cells (:class:`~hsn.model.cell_read.CellAttentionRead`: keys from each cell's state and its
+fixed address code, values from its state, softmax over every cell) and the result ``m_t``
+(``[B, d]``) is one more input of the decoder, ``D([q_t ; u_t ; r_t ; c_t ; m_t])``. It reads the
+state ``r_t`` reads, ``h`` after position ``t``, with its gradient and on ``r_t``'s terms: no
+path of ``train.feedback_detach`` cuts it (none cuts ``r_t``), and what it passes back into the
+state meets ``train.state_grad_clip`` at the entry of the position like every other gradient.
+In a window ``m_t`` travels behind ``r_t`` in the per-position readout
+(:meth:`HSN._window_readout`) and :meth:`HSN._window_epilogue` puts it after ``c_t``, so the
+loop, the compiled block and :meth:`_position` are the code they were. The cells, the router
+and its selection, the units, the gates, the graph, ``q`` and the write path do not read it.
+:meth:`step` refuses HSN-T as before, and the split and fused windows refuse the key.
 
 The byte-content options (``docs/key_content.md``; both opt-in, HSN and HSN-T): at some
 positions ``E`` and the reader read a zero row in place of the byte's row of their content
@@ -189,17 +218,31 @@ from torch import Tensor, nn
 from hsn.config import FEEDBACK_PATHS, GateMode, ModelConfig, RunConfig
 from hsn.data.synthetic import BOS
 from hsn.model.cell import PDGCell, WindowConsts, profiler_segment
+from hsn.model.cell_read import CellAttentionRead
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding, replace_content
 from hsn.model.encoder import Decoder, EMATarget, Encoder, Predictor, SharedTransform
 from hsn.model.gradclip import clip_row_grad
 from hsn.model.halting import HaltingHead
-from hsn.model.reader import Reader
+from hsn.model.reader import Cache, Reader
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
+from hsn.model.word_address import state_width
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
-__all__ = ["PARAM_REPORT_ROWS", "HSN", "StepMode", "StepOutput", "address_history"]
+__all__ = [
+    "PARAM_REPORT_ROWS",
+    "READER_CACHE_KEYS",
+    "HSN",
+    "StepMode",
+    "StepOutput",
+    "WindowCarry",
+    "address_history",
+    "clone_carry",
+    "pack_carry",
+    "reader_carried",
+    "split_packed_carry",
+]
 
 StepMode = Literal["dense", "masked", "sparse"]
 _INDEX_DTYPES = (torch.int64, torch.int32)
@@ -364,6 +407,17 @@ class _Prologue(NamedTuple):
     #: HSN-T (``model.reader``): the reader's output ``c [B, T, w]``, which ``context`` also ends
     #: in and the decoder reads after the loop; ``None`` without the key.
     reader: Tensor | None = None
+    #: ``model.write_events`` (HSN-T): the event positions (bool ``[B, T]``,
+    #: :func:`event_positions`) and ``pos`` before each step (``[B, T]``); ``None`` at ``byte``.
+    events: Tensor | None = None
+    positions: Tensor | None = None
+    #: ``model.word_address``: what the next window of the same rows takes as ``prev_tokens``
+    #: (:func:`address_history`): the address bytes, then the word state; ``None`` without it.
+    address_carry: Tensor | None = None
+    #: ``model.reader_carry`` with the memory on: the reader's cache after the window
+    #: (:meth:`hsn.model.reader.Reader.read`, detached), which ``info`` hands to
+    #: :func:`address_history` (:data:`READER_CACHE_KEYS`); ``None`` without the key.
+    reader_cache: Cache | None = None
 
     def dense_counters(self, t: int) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         """The P1.10b dense window's ``(age, pos)`` before and after position ``t`` (``None``
@@ -375,7 +429,156 @@ class _Prologue(NamedTuple):
         return age, positions[:, t], zero_age, positions_after[:, t]
 
 
-def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = None) -> Tensor:
+#: ``model.write_events``: the most event slots per block of the eager event loop, the
+#: compiled window's ``MAX_BLOCK`` (:func:`hsn.train.compile.block_size`).
+EVENT_BLOCK = 16
+
+
+def event_block(T: int) -> int:
+    """The event slots per block for a window of ``T``: the largest divisor of ``T`` that is at
+    most :data:`EVENT_BLOCK` (16 for the A.1 unroll of 256), which is the compiled window's
+    block, so that the eager and the compiled event loop lay out the same slots."""
+    return max(b for b in range(1, min(T, EVENT_BLOCK) + 1) if T % b == 0)
+
+
+def event_positions(kind: str, tokens: Tensor, previous: Tensor, reset: Tensor) -> Tensor:
+    """``model.write_events``: where the memory runs in a window, bool ``[B, T]``.
+
+    ``word``: at every word end, a byte that is not an ASCII letter or digit directly after one
+    that is (bytes >= 128 count as letters; the control and marker symbols 0..31, so the
+    newline marker 16 and the tab marker 17, are separators like every other byte), and at
+    every position where a document starts (``reset``), so that a new document's state is set
+    up there. ``previous [B, T]`` is the byte before each position: the window's own bytes and,
+    at column 0, the last byte of the window before (A5's carried ``prev_tokens``; BOS when
+    nothing is carried). ``all`` (a test value): every position."""
+    if kind == "all":
+        return torch.ones_like(reset)
+
+    def wordy(x: Tensor) -> Tensor:
+        digit = (x >= 48) & (x <= 57)
+        upper = (x >= 65) & (x <= 90)
+        lower = (x >= 97) & (x <= 122)
+        return digit | upper | lower | (x >= 128)
+
+    return (wordy(previous) & ~wordy(tokens)) | reset
+
+
+def _take_rows(x: Tensor, index: Tensor) -> Tensor:
+    """``x [B, S, …]`` at ``index [B, T]`` along dim 1, ``[B, T, …]``. Whole slices are copied
+    (``index_select`` on the flattened ``[B · S, …]``): for wide slices that, and its
+    backward, cost far less than ``gather`` with an expanded index."""
+    B, S = int(x.shape[0]), int(x.shape[1])
+    flat = (index + torch.arange(B, device=index.device)[:, None] * S).reshape(-1)
+    taken = x.reshape(B * S, *x.shape[2:]).index_select(0, flat)
+    return taken.view(*index.shape, *x.shape[2:])
+
+
+class _Events(NamedTuple):
+    """The event slots of a window (:meth:`HSN._event_slots`, ``model.write_events``): every
+    row's event positions in order in the first slots, padding behind them. ``E`` slots, a
+    multiple of the block. ``valid`` (bool ``[B, E]``) marks a row's real events, ``where``
+    (int64 ``[B, E]``) the byte column of each slot (a padding slot holds a column without an
+    event: real inputs, discarded results). ``z``, ``context``, ``scalars``, ``reset`` and
+    ``pos`` are the window's per-position inputs at those columns (``[B, E, …]``). ``at`` and
+    ``before`` (int64 ``[B, T]``) count a row's events at or before, and strictly before, each
+    byte: the index of the state a byte reads in the stack ``[start ; slot 0 ; … ; slot E−1]``."""
+
+    valid: Tensor
+    where: Tensor
+    z: Tensor
+    context: Tensor
+    scalars: Tensor
+    reset: Tensor
+    pos: Tensor
+    at: Tensor
+    before: Tensor
+
+
+#: ``model.reader_carry`` with the memory on: the keys under which a window's ``info`` holds the
+#: reader's next cache (``keys``, ``values``, ``valid``: :meth:`hsn.model.reader.Reader.read`).
+READER_CACHE_KEYS: tuple[str, str, str] = (
+    "reader_cache_keys",
+    "reader_cache_values",
+    "reader_cache_valid",
+)
+
+
+class WindowCarry(NamedTuple):
+    """``model.reader_carry`` with the memory on (``docs/amendments/reader_carry_memory.md``):
+    what a caller carries from a window to the next window of the same rows, in the place of
+    A5's ``prev_tokens``. ``address`` is what :func:`address_history` returns without the key
+    (the bytes, or with ``model.word_address`` the int64 address carry); ``reader`` is the
+    reader's cache after the window (``keys`` / ``values [L, B, H, C, w / H]``, ``valid
+    [B, C]``), detached. :func:`address_history` builds it from the window's ``info`` and
+    :meth:`HSN.forward` takes it as ``prev_tokens``, so a caller that carries the address
+    carries the reader's sight with it and :class:`~hsn.model.state.CellGraphState` keeps its
+    layout."""
+
+    address: Tensor
+    reader: Cache
+
+
+def reader_carried(cfg: ModelConfig) -> bool:
+    """Whether the reader's cache rides with the address carry: HSN-T with its memory and
+    ``model.reader_carry > 0`` (HSN-T without its memory carries the cache as its state)."""
+    return cfg.reader != "none" and cfg.reader_carry > 0 and cfg.memory
+
+
+def clone_carry(carry: Tensor | WindowCarry | None) -> Tensor | WindowCarry | None:
+    """A detached copy of a window's carry (``prev_tokens``), on its device."""
+    if carry is None:
+        return None
+    if isinstance(carry, WindowCarry):
+        return WindowCarry(
+            carry.address.detach().clone(), tuple(t.detach().clone() for t in carry.reader)
+        )
+    return carry.detach().clone()
+
+
+def pack_carry(carry: Tensor | WindowCarry | None) -> Any:
+    """A window's carry for a checkpoint: CPU copies in plain containers (``weights_only``
+    loads them). A tensor stays a tensor; a :class:`WindowCarry` is ``{"address": ...,
+    "reader": [keys, values, valid]}``."""
+    if carry is None:
+        return None
+    if isinstance(carry, WindowCarry):
+        return {
+            "address": carry.address.detach().to(device="cpu", copy=True),
+            "reader": [t.detach().to(device="cpu", copy=True) for t in carry.reader],
+        }
+    return carry.detach().to(device="cpu", copy=True)
+
+
+def split_packed_carry(
+    cfg: ModelConfig, packed: Any, where: str
+) -> tuple[Any, list[Tensor] | None]:
+    """:func:`pack_carry`'s value as ``(address, reader)``: the address part as a checkpoint
+    without the key holds it, and the reader's cache tensors (None without
+    ``model.reader_carry`` on the memory, or for ``None``). ``where`` names the file."""
+    if not reader_carried(cfg) or packed is None:
+        return packed, None
+    if not (isinstance(packed, dict) and set(packed) == {"address", "reader"}):
+        raise ValueError(
+            f"{where}: with model.reader_carry={cfg.reader_carry} on the memory, prev_tokens "
+            "must hold the address carry and the reader's cache ({'address', 'reader'}); the "
+            "checkpoint was written without the key"
+        )
+    reader = packed["reader"]
+    if not (
+        isinstance(reader, list | tuple)
+        and len(reader) == 3
+        and all(isinstance(t, Tensor) for t in reader)
+    ):
+        raise ValueError(f"{where}: the reader's cache must be three tensors (keys, values, valid)")
+    return packed["address"], list(reader)
+
+
+def address_history(
+    cfg: ModelConfig,
+    tokens: Tensor,
+    previous: Tensor | WindowCarry | None = None,
+    info: dict[str, Tensor] | None = None,
+) -> Tensor | WindowCarry:
     """What a caller carries from the window ``tokens [B, T]`` to the next window of the same
     rows, as that window's ``prev_tokens`` (A5 / A9's address features).
 
@@ -383,7 +586,44 @@ def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = 
     last ``n = model.address_ngram`` bytes, newest first, ``[B, n]``; a window shorter than ``n``
     is completed from ``previous`` (what was carried into it; BOS where there is nothing). The
     receiving window masks whatever a row's document does not reach back to, so bytes of an
-    earlier document in the carry are never read."""
+    earlier document in the carry are never read.
+
+    ``model.word_address``: the carry also holds the running word code, which only the window
+    itself can compute (it reads the contexts, the resets and the fixed tables). It is
+    ``info["address_carry"]`` of that window's forward pass (int64 ``[B, n + 2d + 6]``: the
+    bytes above, then :func:`hsn.model.word_address.state_width` integers), so ``info`` is
+    required.
+
+    ``model.reader_carry`` with the memory on (:func:`reader_carried`): the carry is a
+    :class:`WindowCarry`, the address carry above and the reader's cache after the window,
+    which only the window's forward pass has (``info``, :data:`READER_CACHE_KEYS`), so ``info``
+    is required; ``previous`` is then the :class:`WindowCarry` carried into the window."""
+    reader: Cache | None = None
+    if reader_carried(cfg):
+        if info is None or any(key not in info for key in READER_CACHE_KEYS):
+            raise ValueError(
+                f"model.reader_carry={cfg.reader_carry} with the memory on: the carry holds the "
+                "reader's cache after the window; pass the info of the window's forward pass "
+                "to address_history"
+            )
+        reader = tuple(info[key].detach() for key in READER_CACHE_KEYS)
+    if isinstance(previous, WindowCarry):
+        previous = previous.address
+    address: Tensor
+    if cfg.word_address != "none":
+        if info is None or "address_carry" not in info:
+            raise ValueError(
+                f"model.word_address={cfg.word_address}: the carried address holds the running "
+                "word code; pass the info of the window's forward pass to address_history"
+            )
+        address = info["address_carry"].detach().clone()
+    else:
+        address = _byte_history(cfg, tokens, previous)
+    return address if reader is None else WindowCarry(address, reader)
+
+
+def _byte_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None) -> Tensor:
+    """:func:`address_history`'s bytes: ``[B]``, or ``[B, n]`` with ``address_history=ngram``."""
     if cfg.address_history == "byte":
         return tokens[:, -1].detach().clone()
     n = cfg.address_ngram
@@ -396,6 +636,11 @@ def address_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None = 
         fill = newest.new_full((newest.shape[0], n), BOS)
         newest = torch.cat([newest, older.to(newest.device), fill], dim=1)[:, :n]
     return newest.clone()
+
+
+def _stack_record_join(parts: Sequence[Tensor]) -> Tensor:
+    """Blocks of a :func:`_stack_record` record joined over the window."""
+    return torch.cat(list(parts), dim=1 if parts[0].ndim > 1 else 0)
 
 
 def _stack_record(values: Sequence[Tensor]) -> Tensor:
@@ -449,6 +694,12 @@ class HSN(nn.Module):
             raise ValueError(
                 f"model.reader={cfg.reader!r} belongs to the HSN-T family "
                 "(hsn.model.hsn_t.HSNT, model_name: hsn_t): the HSN has no sequence attention"
+            )
+        if cfg.cell_attention_heads and not self._takes_reader:
+            raise ValueError(
+                f"model.cell_attention_heads={cfg.cell_attention_heads} is HSN-T's attention "
+                "read of the cells (hsn.model.hsn_t.HSNT, model_name: hsn_t): the HSN has no "
+                "attention"
             )
         if ste_scope not in ("selected", "all"):
             raise ValueError(f"ste_scope must be 'selected' or 'all', got {ste_scope!r}")
@@ -591,10 +842,20 @@ class HSN(nn.Module):
         #: ``model.address_gate_input = reader_prev``: the width of ``c_{t−1}`` at the end of a
         #: window's context columns (behind ``c_t``), which only the address gate reads; else 0.
         self._gate_rides: int = cfg.reader_width if self.scorer.gate_input == "reader_prev" else 0
+        #: ``model.cell_attention_heads`` (HSN-T, opt-in): the attention read of the cells, or
+        #: ``None``. Built after everything else and from its own generator, like the reader.
+        self.cell_read: CellAttentionRead | None = (
+            CellAttentionRead(cfg, seed=seed) if cfg.cell_attention_heads else None
+        )
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
         self._fixed_route: Tensor | None = (
             torch.tensor(cfg.fixed_route, dtype=torch.int64) if cfg.routing == "fixed" else None
         )
+        #: ``train.reach_dropout`` (HSN-T, ``docs/reach_dropout.md``): the rows of the training
+        #: window that read with a short span (with ``model.reader_carry`` its positions), and
+        #: the span (:meth:`set_reach_rows`); None: every row reads as configured. Read in
+        #: training mode only.
+        self._reach: tuple[Tensor, int] | None = None
 
     @property
     def scorer(self) -> Scorer:
@@ -711,6 +972,38 @@ class HSN(nn.Module):
                 if zero is not None:
                     zero = zero & ~drop  # a dropped position reads the dropout's target
         return zero, unknown
+
+    def set_reach_rows(self, rows: Tensor | None, span: int = 0) -> None:
+        """``train.reach_dropout`` (HSN-T, ``docs/reach_dropout.md``): the batch rows (bool
+        ``[B]`` on the model's device) whose reader reads with the per-block span ``span`` in
+        the training windows from now on, as the reader with ``model.reader_span = span``
+        would; ``None`` clears them. The trainer sets them before a training window and clears
+        them after it. A window in evaluation mode ignores them: it always reads as
+        configured.
+
+        With ``model.reader_carry`` the rows narrow the cached positions as well
+        (:meth:`hsn.model.reader.Reader.read`: a short row reads as with ``model.reader_carry =
+        span − 1``), and ``rows`` may be bool ``[B, T]``, one flag per window position: the
+        trainer keeps a document short or whole from its start to its end, also where it
+        starts inside a window (``docs/reach_dropout.md``, "With the carried reader")."""
+        if rows is None:
+            self._reach = None
+            return
+        if self.reader is None:
+            raise ValueError("reach rows shorten HSN-T's reader; this model has none")
+        if rows.dtype is not torch.bool or rows.dim() not in (1, 2):
+            raise ValueError(
+                f"rows must be a bool [B] tensor (with model.reader_carry also [B, T]), got "
+                f"{rows.dtype} {tuple(rows.shape)}"
+            )
+        if rows.dim() == 2 and not self.reader.carry:
+            raise ValueError(
+                f"rows per position ([B, T], got {tuple(rows.shape)}) are the carried reader's "
+                "(model.reader_carry > 0); this reader takes a bool [B] tensor"
+            )
+        if isinstance(span, bool) or not isinstance(span, int) or span < 1:
+            raise ValueError(f"span must be an int >= 1, got {span!r}")
+        self._reach = (rows, span)
 
     # -- placement --------------------------------------------------------------------------------
 
@@ -934,6 +1227,66 @@ class HSN(nn.Module):
         if self.cfg.fast_readout:
             parts.append(self._summary_read(self._fast_read(h_prev)))
         return torch.cat(parts, dim=-1)
+
+    def front_layout(self) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+        """``hardware.round_products=merged``: ``P`` and ``S`` as one two-layer map (the fused
+        sweep's merged front of P2.10, here with autograd). ``(w1, b1, w2, b2)`` in
+        ``nn.Linear``'s layout: ``w1 [H_S + H_P, in_S + d]`` and ``w2 [d_u + d, H_S + H_P]``
+        are block-diagonal, ``S``'s block first, so the map reads ``[x_S ; q]`` (``x_S``:
+        :meth:`_shared_input`, in which ``S``'s own read of ``q`` may be detached; ``P`` reads
+        the carried ``q`` itself) and returns ``[u ; ẑ]``. The zero blocks add exact zeros to
+        the products and their gradients are dropped, so the values and the gradients are
+        those of the two maps to rounding. ``None`` when the two maps do not share an
+        activation (they then keep their own products). Built with autograd, in the masters'
+        dtype."""
+        pred, shared = self.predictor, self.shared
+        if type(pred.act) is not type(shared.act) or pred.activation_name != shared.activation_name:
+            return None
+        s1, p1, s2, p2 = shared.fc1, pred.fc1, shared.fc2, pred.fc2
+        with torch.autocast(device_type=s1.weight.device.type, enabled=False):
+            w1 = torch.cat(
+                [
+                    torch.cat([s1.weight, s1.weight.new_zeros(shared.hidden, pred.in_dim)], dim=1),
+                    torch.cat([p1.weight.new_zeros(pred.hidden, shared.in_dim), p1.weight], dim=1),
+                ],
+                dim=0,
+            )
+            w2 = torch.cat(
+                [
+                    torch.cat([s2.weight, s2.weight.new_zeros(shared.out_dim, pred.hidden)], dim=1),
+                    torch.cat([p2.weight.new_zeros(pred.out_dim, shared.hidden), p2.weight], dim=1),
+                ],
+                dim=0,
+            )
+            b1 = torch.cat([s1.bias, p1.bias])
+            b2 = torch.cat([s2.bias, p2.bias])
+        return w1, b1, w2, b2
+
+    def merged_consts(self, *, units: bool = True, front: bool = True) -> WindowConsts:
+        """The window constants of ``hardware.round_products=merged``
+        (:class:`~hsn.model.cell.WindowConsts`; inside :meth:`PDGCell.window`): with ``units``
+        the unit pass on the merged layouts (the gate riding, ``W_out`` folded), with
+        ``front`` the merged ``P`` / ``S`` layout. Either one alone is for measurements."""
+        consts = self.cell.window_consts(merged=units)
+        layout = self.front_layout() if front else None
+        if layout is None:
+            return consts
+        w1, b1, w2, b2 = layout
+        return consts._replace(front_w1=w1, front_b1=b1, front_w2=w2, front_b2=b2)
+
+    def _front(
+        self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor, consts: WindowConsts
+    ) -> tuple[Tensor, Tensor]:
+        """``(ẑ, u)`` of a position from the merged front (:meth:`front_layout`): ``ẑ =
+        P(q_{t−1})`` and ``u = S(x_S)`` as one product per layer of ``[x_S ; q_{t−1}]``."""
+        assert consts.front_w1 is not None and consts.front_w2 is not None
+        x = self._shared_input(z, q_prev, ctx, h_prev)
+        first = F.linear(
+            torch.cat([x, q_prev.to(x.dtype)], dim=-1), consts.front_w1, consts.front_b1
+        )
+        out = F.linear(self.shared.act(first), consts.front_w2, consts.front_b2)
+        width = self.shared.out_dim
+        return out[:, width:], out[:, :width]
 
     def _gate_read(
         self, z: Tensor, q_prev: Tensor, ctx: Tensor, h_prev: Tensor, dtype: torch.dtype
@@ -1315,7 +1668,7 @@ class HSN(nn.Module):
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """Run positions ``0 .. T−1`` of ``tokens [B, T]`` / ``ctx [B, T]`` from ``state``.
 
@@ -1387,6 +1740,12 @@ class HSN(nn.Module):
         B, T = self._check_window_inputs(tokens, ctx, state, reset)
         if not isinstance(capture, bool):
             raise TypeError(f"capture must be a bool, got {capture!r}")
+        if (
+            self.cfg.write_events != "byte"
+        ):  # the loop over events (docs/amendments/write_events.md)
+            if reset_columns is not None:  # validated; every slot resets as tensor ops
+                self._reset_columns(reset, reset_columns)
+            return self._forward_events(tokens, ctx, state, reset, capture, prev_tokens)
         resets_at = [False] * T
         for column in self._reset_columns(reset, reset_columns):
             resets_at[column] = True
@@ -1429,7 +1788,9 @@ class HSN(nn.Module):
                 state = result.state
                 if self.cfg.selected_readout:
                     readouts.append(
-                        self._selected_readout(state, result.selection, controls.gate, mode)
+                        self._window_readout(
+                            state, result.selection, controls.gate, mode, pro.ctx_steps[t]
+                        )
                     )
                 z_hats.append(result.z_hat)
                 epss.append(result.eps)
@@ -1523,15 +1884,31 @@ class HSN(nn.Module):
         mode: StepMode,
         *,
         reset_first: bool,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
+        steps: bool = True,
     ) -> _Prologue:
         """The window-invariant work of :meth:`forward` (P1.10a): the embeddings, ``E`` and the
         prediction target over ``[B, T]``, the context embeddings, the position-independent scorer
         features, and (P1.10b, dense routing without disabled cells) the window's ``age`` / ``pos``
         counters, with the age feature in front of the scalars. ``reset_first`` says whether column
-        0 resets (it decides the start age)."""
+        0 resets (it decides the start age). With ``model.reader_carry`` on the memory
+        ``prev_tokens`` is the :class:`WindowCarry` of the window before (None: a stream's first
+        window, nothing cached) and the reader reads the window after its cache. ``steps``:
+        whether the per-position views of ``z``, the context and the scalars are made
+        (``z_steps`` / ``ctx_steps`` / ``scalar_steps``, which the eager loop over positions
+        reads). The compiled window reads blocks of columns and passes ``False``: 768 views a
+        window that nothing read, 0.8 ms of host time at T 256 while the card waits
+        (``docs/perbyte_speed.md``); the fields are then empty."""
         cfg = self.cfg
         B, T = (int(n) for n in tokens.shape)
+        reader_cache: Cache | None = None
+        if self.reader is not None and self.reader.carry:
+            prev_tokens, reader_cache = self._split_window_carry(prev_tokens, B, tokens.device)
+        elif isinstance(prev_tokens, WindowCarry):
+            raise ValueError(
+                "prev_tokens is a WindowCarry (the carry of model.reader_carry on the memory), "
+                "but the model has no carried reader"
+            )
         emb = self.byte_emb(tokens)  # [B, T, d]
         # the byte-content options (docs/key_content.md): where E and the reader read a zero
         # row and where their learned unknown row; (None, None) (every key at its default):
@@ -1544,11 +1921,32 @@ class HSN(nn.Module):
         if self.reader is not None:
             # HSN-T: c_t travels behind the context embedding, so S reads [z; q; ctx; c] at every
             # position with the loop, the compiled block and _position unchanged
-            reader_out = (
-                self.reader(tokens, reset)
-                if zero is None and unknown is None
-                else self.reader(tokens, reset, blank=zero, unknown=unknown)
-            )  # [B, T, w]
+            # train.reach_dropout: the training window's short rows (docs/reach_dropout.md).
+            # Without them the reader is called as before, so the default is the code it was
+            # and a stand-in for reader.forward (the sighted reading of
+            # tests/test_reader_carry_memory.py) still fits
+            short = self._reach if self.training else None
+            # the byte-content options (docs/key_content.md): the positions whose embedding row
+            # the reader replaces, handed to reader.forward only where there are some, so that
+            # with every key at its default it is called as before
+            content: dict[str, Tensor] = {}
+            if zero is not None:
+                content["blank"] = zero
+            if unknown is not None:
+                content["unknown"] = unknown
+            if reader_cache is not None:
+                # model.reader_carry on the memory: c_t also reads the cached keys and values of
+                # the last C positions before the window (same document); the next cache leaves
+                # in info, detached. Short rows narrow the cached positions with the window's.
+                # The options replace the window's own rows; the cached positions keep what
+                # they were read with in their window
+                reader_out, reader_cache = self.reader.read(
+                    tokens, reset, reader_cache, short, blank=zero, unknown=unknown
+                )
+            elif short is None:
+                reader_out = self.reader(tokens, reset, **content)  # [B, T, w]
+            else:
+                reader_out = self.reader(tokens, reset, short, **content)
             context = torch.cat([context, reader_out], dim=-1)
             if self._gate_rides:
                 # address_gate_input=reader_prev: c_{t−1} behind c_t, for the address gate alone;
@@ -1556,6 +1954,10 @@ class HSN(nn.Module):
                 before = torch.cat([torch.zeros_like(reader_out[:, :1]), reader_out[:, :-1]], 1)
                 context = torch.cat([context, before.masked_fill(reset[:, :, None], 0.0)], dim=-1)
         positions = _window_positions(state.pos, reset)  # [B, T]: pos before each step
+        word_state: Tensor | None = None
+        if cfg.word_address != "none":  # the carry is A5's bytes, then the word state
+            prev_tokens, word_state = self._split_address_carry(prev_tokens, B)
+        byte_carry = prev_tokens
         previous_window: Tensor | None = None
         carried: Tensor | None = None  # x_{-2} .. x_{-n} of the window before, when carried
         if cfg.key_address:
@@ -1586,6 +1988,20 @@ class HSN(nn.Module):
                 lag = lag.masked_fill(positions < back, BOS)
                 lags.append(lag)
             older_window = {"older": torch.stack(lags, dim=-1)}
+        events: Tensor | None = None
+        address_carry: Tensor | None = None
+        if cfg.word_address != "none":
+            # model.word_address: the events follow the word rule, and at an event a_cur and
+            # a_prev read the word it closes and the word of the event before; A9's features
+            # (older_window) keep reading the bytes
+            text = torch.zeros_like(reset)
+            for context_id in cfg.word_contexts:
+                text = text | (ctx == context_id)
+            words = self.scorer.word_codes(tokens, text, reset, word_state)
+            events = words.events
+            older_window["codes"] = (words.current, words.previous)
+            history = _byte_history(cfg, tokens, byte_carry).reshape(B, -1).to(torch.int64)
+            address_carry = torch.cat([history, words.state], dim=1)
         scalars = self.scorer.window_scalars(
             ctx,
             positions,
@@ -1596,8 +2012,13 @@ class HSN(nn.Module):
             prev_tokens=previous_window,
             **older_window,
         )  # [B, T, N, 7] (9 with A5; 7 + 2n with A9)
-        # P1.10b: the dense round writes every cell, so its counters are known for the window
-        dense_window = mode == "dense" and not self.cell.disabled_cells
+        if cfg.write_events != "byte" and events is None:
+            # the byte before each position is A5's (BOS at a reset, which is an event anyway)
+            assert previous_window is not None  # the configuration requires model.key_address
+            events = event_positions(cfg.write_events, tokens, previous_window, reset)
+        # P1.10b: the dense round writes every cell, so its counters are known for the window;
+        # the event loop keeps the per-position bookkeeping: a slot is not a byte
+        dense_window = mode == "dense" and not self.cell.disabled_cells and events is None
         counters: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
         if dense_window:
             start_age = state.age.masked_fill(reset[:, 0, None], 0) if reset_first else state.age
@@ -1611,12 +2032,57 @@ class HSN(nn.Module):
             z_target=z_target,
             context=context,
             scalars=scalars,
-            z_steps=z.unbind(1),
-            ctx_steps=context.unbind(1),
-            scalar_steps=scalars.unbind(1),
+            z_steps=z.unbind(1) if steps else (),
+            ctx_steps=context.unbind(1) if steps else (),
+            scalar_steps=scalars.unbind(1) if steps else (),
             counters=counters,
             reader=reader_out,
+            events=events,
+            positions=positions if events is not None else None,
+            address_carry=address_carry,
+            reader_cache=reader_cache,
         )
+
+    def _split_window_carry(
+        self, carry: Tensor | WindowCarry | None, B: int, device: torch.device
+    ) -> tuple[Tensor | None, Cache]:
+        """``model.reader_carry`` on the memory: a window's ``prev_tokens`` as the address carry
+        and the reader's cache. ``None`` (a stream's first window) is no address carry and an
+        empty cache; anything but a :class:`WindowCarry` is refused, so a caller that carries
+        the bytes alone cannot read a later window blind without noticing."""
+        assert self.reader is not None
+        if carry is None:
+            cache = self.reader.init_cache(B, device)
+            assert cache is not None
+            return None, cache
+        if not isinstance(carry, WindowCarry):
+            raise ValueError(
+                f"model.reader_carry={self.reader.carry} with the memory on: prev_tokens must be "
+                "the WindowCarry of the window before (address_history(cfg, tokens, previous, "
+                "info), which needs the window's info), or None at a stream's first window; got "
+                f"{type(carry).__name__}"
+            )
+        return carry.address, self.reader.check_cache(carry.reader, B)
+
+    def _split_address_carry(
+        self, carry: Tensor | None, B: int
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """``model.word_address``: a window's ``prev_tokens`` (:func:`address_history`: int64
+        ``[B, n + 2d + 6]``) as A5 / A9's bytes (``[B]``, or ``[B, n]`` with
+        ``address_history=ngram``) and the word state; ``(None, None)`` for ``None``."""
+        if carry is None:
+            return None, None
+        cfg = self.cfg
+        n = cfg.address_ngram if cfg.address_history == "ngram" else 1
+        shape = (B, n + state_width(cfg.d))
+        if not isinstance(carry, Tensor) or carry.dtype != torch.int64 or carry.shape != shape:
+            raise ValueError(
+                f"model.word_address={cfg.word_address}: prev_tokens must be the int64 {shape} "
+                "address carry of the window before (info['address_carry'], address_history), "
+                f"got {tuple(carry.shape) if isinstance(carry, Tensor) else type(carry).__name__}"
+            )
+        history = carry[:, :n] if cfg.address_history == "ngram" else carry[:, 0]
+        return history, carry[:, n:]
 
     def _position(
         self,
@@ -1639,7 +2105,9 @@ class HSN(nn.Module):
         bool ``[B]``, or ``None`` for a column without one), ``ẑ_t = P(q_{t−1})``, ``ε_t``,
         ``u_t = S([z_t ; q_{t−1} ; ctx_t])``, the scorer and the round (:meth:`step`'s, shared
         code). ``dense_counters`` (the P1.10b dense window) are the ``age`` / ``pos`` before and
-        after the position. ``static`` / ``consts``: P2.8's capturable round (:meth:`_update`)."""
+        after the position. ``static`` / ``consts``: P2.8's capturable round (:meth:`_update`);
+        with ``consts.front_w1`` (``hardware.round_products=merged``) ``ẑ_t`` and ``u_t`` come
+        from one product per layer (:meth:`_front`), the same values to rounding."""
         if dense_counters is not None:
             h, q = state.h, state.q
             if reset_t is not None:  # age and pos already account for the reset
@@ -1650,9 +2118,13 @@ class HSN(nn.Module):
             state = state.reset(reset_t)
         state = self._clip_state_grad(state)  # A6: what this position passes back is limited
         q_prev = state.q
-        z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
+        if consts is not None and consts.front_w1 is not None:
+            # hardware.round_products=merged: P and S in one product per layer
+            z_hat, u = self._front(z_t, q_prev, ctx_t, state.h, consts)
+        else:
+            z_hat = self.predictor(q_prev)  # from the carried summary only (global rule 2)
+            u = self.shared(self._shared_input(z_t, q_prev, ctx_t, state.h))
         eps = z_t - z_hat
-        u = self.shared(self._shared_input(z_t, q_prev, ctx_t, state.h))
         # P1.7: see step. A6: the reads of the cell and the scorer (the same values)
         u_s, eps_s = u.to(state.dtype), self._eps_read(z_t, z_hat, eps).to(state.dtype)
         age = None if dense_counters is not None else state.age  # dense: a column of the scalars
@@ -1729,12 +2201,15 @@ class HSN(nn.Module):
         gates: Tensor | None,
         written: Tensor | None,
         readouts: Tensor | None = None,
+        live: Tensor | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """The work after the loop (P1.10a): the decoder over the stacked ``[q_t ; u_t]``, the
         statistics from the stacks and ``info`` (:meth:`forward`). Every argument is stacked over
         the window's positions (``[B, T, …]``; ``routed`` the stacked
         :meth:`_selection_record`). ``state_abs_max`` is already reduced to ``[T]``;
-        ``hs`` is materialized only for an explicit diagnostic capture."""
+        ``hs`` is materialized only for an explicit diagnostic capture. ``live`` (the event
+        loop, bool ``[B, E]``): the memory's stacks are per event slot and the statistics are
+        means over each slot's valid rows."""
         T = int(z_hats.shape[1])
         if pro.counters is not None:
             positions_after = pro.counters[3]
@@ -1744,7 +2219,13 @@ class HSN(nn.Module):
         if pro.reader is not None:  # HSN-T: the decoder reads c_t after [q; u; r] (and A8's f)
             if readouts is None:
                 raise ValueError("HSN-T's reader needs A5's per-position readouts")
-            readouts = torch.cat([readouts, pro.reader], dim=-1)
+            if self.cell_read is not None:
+                # the attention read m_t rode behind r_t (_window_readout): D reads it last,
+                # [q; u; r; c; m]
+                d = self.cfg.d
+                readouts = torch.cat([readouts[..., :-d], pro.reader, readouts[..., -d:]], dim=-1)
+            else:
+                readouts = torch.cat([readouts, pro.reader], dim=-1)
         logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
             "z": pro.z,
@@ -1757,9 +2238,20 @@ class HSN(nn.Module):
             probs = torch.softmax(unit_logits, dim=-1)
             log_probs = F.log_softmax(unit_logits, dim=-1)
             info["state_abs_max"] = state_abs_max
-            info["eps_abs_mean"] = epss.abs().mean(dim=(0, 2))
-            info["alpha_entropy"] = -(probs * log_probs).sum(dim=-1).mean(dim=(0, 2))
-        if routed is not None:
+            if live is None:
+                info["eps_abs_mean"] = epss.abs().mean(dim=(0, 2))
+                info["alpha_entropy"] = -(probs * log_probs).sum(dim=-1).mean(dim=(0, 2))
+            else:
+                rows = live.to(epss.dtype)
+                n_live = rows.sum(dim=0).clamp_min(1.0)
+                entropy = -(probs * log_probs).sum(dim=-1).mean(dim=2)  # [B, E]
+                info["eps_abs_mean"] = (epss.abs().mean(dim=2) * rows).sum(dim=0) / n_live
+                info["alpha_entropy"] = (entropy * rows.to(entropy.dtype)).sum(dim=0) / n_live
+        if routed is not None and live is not None:
+            cost_rows = routed["cost_per_row"] * live.to(routed["cost_per_row"].dtype)
+            cost = cost_rows.sum(dim=0) / live.sum(dim=0).clamp_min(1)
+            info["cost"] = cost.to(state.dtype).to(self.dtype)
+        elif routed is not None:
             cost_per_row = routed["cost_per_row"]
             info["cost"] = cost_per_row.mean(dim=0).to(state.dtype).to(self.dtype)
         else:
@@ -1783,7 +2275,258 @@ class HSN(nn.Module):
             info["cell_states"] = hs
             info["cell_gates"] = gates
             info["cell_written"] = written
+        if pro.reader_cache is not None:  # model.reader_carry on the memory: the next window's
+            info.update(zip(READER_CACHE_KEYS, pro.reader_cache, strict=True))
         return logits, state, info
+
+    # -- model.write_events: the loop over events (docs/amendments/write_events.md) --------------
+
+    def _event_slots(self, pro: _Prologue, reset: Tensor, block: int) -> _Events:
+        """Gather a window's per-position inputs into event slots (:class:`_Events`). The number
+        of slots is the batch's largest event count rounded up to a multiple of ``block`` (at
+        least one block, at most ``T``): one host read per window, the only data-dependent
+        shape of the event loop."""
+        events, positions = pro.events, pro.positions
+        assert events is not None and positions is not None
+        B, T = (int(n) for n in events.shape)
+        count = events.sum(dim=1)  # [B]
+        most = int(count.max())
+        E = min(T, max(block, -(-most // block) * block))
+        # a row's event columns in order, then its other columns: the padding slots run on real
+        # inputs (never a reset: a reset is an event), and their results are discarded
+        order = torch.argsort((~events).to(torch.int8), dim=1, stable=True)[:, :E]
+        valid = torch.arange(E, device=events.device)[None, :] < count[:, None]
+        at = events.cumsum(dim=1)
+        return _Events(
+            valid=valid,
+            where=order,
+            z=_take_rows(pro.z, order),
+            context=_take_rows(pro.context, order),
+            scalars=_take_rows(pro.scalars, order),
+            reset=_take_rows(reset, order),
+            pos=_take_rows(positions, order),
+            at=at,
+            before=at - events.to(at.dtype),
+        )
+
+    def _event_block(
+        self,
+        h: Tensor,
+        q: Tensor,
+        age: Tensor,
+        z_b: Tensor,
+        c_b: Tensor,
+        s_b: Tensor,
+        r_b: Tensor,
+        v_b: Tensor,
+        p_b: Tensor,
+        mode: StepMode,
+        controls: _Controls,
+        dense_rows: Tensor | None,
+        *,
+        static: bool = False,
+        consts: WindowConsts | None = None,
+        dense_indices: Tensor | None = None,
+        keep_cells: bool = False,
+    ) -> dict[str, Tensor]:
+        """A block of consecutive event slots: :meth:`_position`, unchanged, on each slot's
+        inputs (``z_b`` / ``c_b`` / ``s_b`` ``[B, n, …]``, the reset ``r_b`` and the session
+        position ``p_b``, ``[B, n]``), and a masked update: a row whose slot is padding
+        (``v_b [B, n]`` False) keeps ``h``, ``q`` and ``age`` as they were, with tensor
+        operations and no branch. Returns the state after the block and the per-slot stacks:
+        ``z_hat``, ``eps``, ``u``, the summary ``qs`` and A5's read ``readouts`` after each
+        slot (what the decoder gathers per byte, with their gradient), with ``keep_cells`` the
+        cell states ``cells [B, n, N, d]`` (for the attention read), and the records of
+        :func:`hsn.train.compile._block` with ``valid`` cleared in padding slots."""
+        n = int(z_b.shape[1])
+        z_hats: list[Tensor] = []
+        epss: list[Tensor] = []
+        us: list[Tensor] = []
+        qs: list[Tensor] = []
+        cells: list[Tensor] = []
+        state_maxima: list[Tensor] = []
+        logit_steps: list[Tensor] = []
+        records: list[dict[str, Tensor]] = []
+        readouts: list[Tensor] = []
+        for i in range(n):
+            state = CellGraphState._make(h=h, q=q, age=age, pos=p_b[:, i])
+            result = self._position(
+                state,
+                r_b[:, i],
+                z_b[:, i],
+                c_b[:, i],
+                s_b[:, i],
+                mode,
+                controls,
+                dense_rows,
+                False,
+                None,
+                static=static,
+                consts=consts,
+                dense_indices=dense_indices,
+            )
+            after = result.state
+            live = v_b[:, i]
+            # the read of the state the event left; a padding slot's is never gathered
+            readouts.append(self._selected_readout(after, result.selection, controls.gate, mode))
+            h = torch.where(live[:, None, None], after.h, h)
+            q = torch.where(live[:, None], after.q, q)
+            age = torch.where(live[:, None], after.age, age)
+            z_hats.append(result.z_hat)
+            epss.append(result.eps)
+            us.append(result.u)
+            qs.append(q)
+            if keep_cells:
+                cells.append(h)
+            state_maxima.append(h.detach().abs().amax())
+            logit_steps.append(result.unit_logits.detach())
+            if result.selection is not None:
+                record = self._selection_record(result.selection)
+                record["valid"] = record["valid"] & live[:, None]
+                records.append(record)
+        out = {
+            "h": h,
+            "q": q,
+            "age": age.contiguous(),
+            "z_hat": torch.stack(z_hats, dim=1),
+            "eps": torch.stack(epss, dim=1),
+            "u": torch.stack(us, dim=1),
+            "qs": torch.stack(qs, dim=1),
+            "state_abs_max": torch.stack(state_maxima),
+            "unit_logits_d": torch.stack(logit_steps, dim=1),
+            "readouts": torch.stack(readouts, dim=1),
+        }
+        if records:
+            for key in self.selection_record_keys:
+                out["sel_" + key] = _stack_record([r[key] for r in records])
+        if keep_cells:
+            out["cells"] = torch.stack(cells, dim=1)
+        return out
+
+    def _forward_events(
+        self,
+        tokens: Tensor,
+        ctx: Tensor,
+        state: CellGraphState,
+        reset: Tensor,
+        capture: bool,
+        prev_tokens: Tensor | WindowCarry | None,
+    ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
+        """:meth:`forward` with ``model.write_events``: the prologue, the event slots, one
+        eager :meth:`_event_block` over all of them and :meth:`_event_epilogue`."""
+        self._refuse_event_capture(capture)
+        mode = self._window_mode()
+        dense_rows = self._draw_dense_rows(int(tokens.shape[0]), state)
+        dense_indices = self._dense_indices(dense_rows)
+        controls = self._controls()
+        pro = self._window_prologue(
+            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
+        )
+        ev = self._event_slots(pro, reset, event_block(int(tokens.shape[1])))
+        with self.cell.window():
+            out = self._event_block(
+                state.h,
+                state.q,
+                state.age,
+                ev.z,
+                ev.context,
+                ev.scalars,
+                ev.reset,
+                ev.valid,
+                ev.pos,
+                mode,
+                controls,
+                dense_rows,
+                dense_indices=dense_indices,
+                keep_cells=self.cell_read is not None,
+            )
+        return self._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
+
+    @staticmethod
+    def _refuse_event_capture(capture: bool) -> None:
+        if capture:
+            raise NotImplementedError(
+                "capture=True is not built into the event loop (model.write_events): the "
+                "diagnostics read cell states, gates and written masks per byte, and the "
+                "loop keeps them per event slot"
+            )
+
+    def _event_epilogue(
+        self,
+        pro: _Prologue,
+        ev: _Events,
+        start: CellGraphState,
+        blocks: Sequence[dict[str, Tensor]],
+        h: Tensor,
+        q: Tensor,
+        age: Tensor,
+    ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
+        """The work after the event loop: what the decoder reads at every byte, then
+        :meth:`_window_epilogue`. ``blocks`` are :meth:`_event_block`'s outputs in order,
+        ``start`` the state the window started from and ``h``, ``q``, ``age`` the state after
+        the last slot.
+
+        Every byte ``t`` reads the latest event at or before ``t`` (the event at ``t`` itself
+        is visible at ``t``, as ``r_t`` is in the loop over bytes): ``q_t`` and ``r_t`` are
+        that event's, and ``m_t`` is the attention read with ``t``'s own query ``c_t`` over the
+        cells as that event left them. Before a row's first event the state is the window's
+        starting state: its ``q`` and cells, and zeros for ``r`` (which cells the last event of
+        the window before selected is not carried). ``u_t = S([z_t ; q ; ctx_t ; c_t])`` is
+        computed once more for all bytes with the summary before ``t`` (after the latest event
+        strictly before it); at an event that is the value the event's slot computed, and the
+        slot's own tensor is taken there, so that its gradient passes the position's entry as
+        in the loop over bytes."""
+        events, positions = pro.events, pro.positions
+        assert events is not None and positions is not None
+
+        def joined(key: str) -> Tensor:
+            return blocks[0][key] if len(blocks) == 1 else torch.cat([b[key] for b in blocks], 1)
+
+        def latest(first: Tensor, slots: Tensor, index: Tensor) -> Tensor:
+            stack = torch.cat([first[:, None].to(slots.dtype), slots], dim=1)  # [B, 1 + E, …]
+            return _take_rows(stack, index)
+
+        slot_q, slot_r = joined("qs"), joined("readouts")
+        q_at = latest(start.q, slot_q, ev.at)
+        q_before = latest(start.q, slot_q, ev.before)
+        u_between = self.shared(self._shared_input(pro.z, q_before, pro.context, start.h))
+        slot_u = _take_rows(joined("u"), (ev.at - 1).clamp_min(0))  # an event's own slot
+        us = torch.where(events[:, :, None], slot_u, u_between.to(slot_u.dtype))
+        readouts = latest(torch.zeros_like(slot_r[:, 0]), slot_r, ev.at)
+        if self.cell_read is not None:
+            assert pro.reader is not None
+            stages = torch.cat([start.h[:, None], joined("cells")], dim=1)  # [B, 1 + E, N, d]
+            m = self.cell_read.read_latest(pro.reader, stages, ev.at, self.scorer.cell_addresses)
+            readouts = torch.cat([readouts, m.to(readouts.dtype)], dim=-1)
+        routed: dict[str, Tensor] | None = None
+        if "sel_cell_idx" in blocks[0]:
+            routed = {
+                key: _stack_record_join([b["sel_" + key] for b in blocks])
+                for key in self.selection_record_keys
+            }
+        final = CellGraphState._make(h=h, q=q, age=age, pos=(positions[:, -1] + 1).contiguous())
+        logits, final, info = self._window_epilogue(
+            pro,
+            final,
+            z_hats=joined("z_hat"),
+            epss=joined("eps"),
+            us=us,
+            qs=q_at,
+            hs=None,
+            state_abs_max=torch.cat([b["state_abs_max"] for b in blocks]),
+            unit_logits=joined("unit_logits_d"),
+            routed=routed,
+            gates=None,
+            written=None,
+            readouts=readouts,
+            live=ev.valid,
+        )
+        # what the per-slot stacks of info (z_hat, eps, the selections) are aligned to
+        info["event_valid"] = ev.valid
+        info["event_pos"] = ev.where
+        if pro.address_carry is not None:  # model.word_address: the next window's prev_tokens
+            info["address_carry"] = pro.address_carry
+        return logits, final, info
 
     def _previous_tokens(self, tokens: Tensor, previous: Tensor | None) -> Tensor:
         """A5's external previous byte; it never changes CellGraphState's schema."""
@@ -1829,6 +2572,28 @@ class HSN(nn.Module):
             inputs.append(readout)
         logits: Tensor = self.decoder(torch.cat(inputs, dim=-1))
         return logits
+
+    def _window_readout(
+        self,
+        state: CellGraphState,
+        selection: Selection | None,
+        gate: GateMode | None,
+        mode: StepMode | None,
+        ctx_t: Tensor,
+    ) -> Tensor:
+        """What a position of a window reads of the cells for the decoder: A5's ``r_t``
+        (:meth:`_selected_readout`, and A8's ``f_t`` behind it), and with
+        ``model.cell_attention_heads`` (HSN-T) the attention read ``m_t`` of all cells behind
+        that, ``[B, … + d]``. ``state`` is the state after position ``t`` for both reads, with
+        its gradient for both. ``ctx_t`` is the position's context columns, which hold the
+        reader's ``c_t`` behind the context embedding (:meth:`_window_prologue`)."""
+        readout = self._selected_readout(state, selection, gate, mode)
+        if self.cell_read is None:
+            return readout
+        start = self.cfg.context_dim
+        c_t = ctx_t[..., start : start + self.cfg.reader_width]
+        m_t = self.cell_read(c_t, state.h, self.scorer.cell_addresses)
+        return torch.cat([readout, m_t.to(readout.dtype)], dim=-1)
 
     def _selected_readout(
         self,
@@ -1879,7 +2644,9 @@ class HSN(nn.Module):
         """Measured parameter counts: the Appendix C.1 rows in table order and their ``total``
         (the closed form of :func:`hsn.train.memory_plan.expected_param_count`), then ``edges``
         (the P1.4 edge logits, outside Appendix C), with ``model.reader`` (HSN-T) ``reader``
-        (:func:`hsn.train.memory_plan.reader_param_count`), and ``total_trainable`` (every
+        (:func:`hsn.train.memory_plan.reader_param_count`), with
+        ``model.cell_attention_heads`` ``cell_read``
+        (:func:`hsn.train.memory_plan.cell_read_param_count`), and ``total_trainable`` (every
         parameter of this module; the run manifest's ``param_count``)."""
         modules: dict[str, nn.Module] = {
             "byte_emb": self.byte_emb,
@@ -1905,12 +2672,16 @@ class HSN(nn.Module):
         if self.reader is not None:  # HSN-T: outside Appendix C, like the edge logits
             report["reader"] = sum(p.numel() for p in self.reader.parameters())
             accounted += report["reader"]
+        if self.cell_read is not None:  # the attention read of the cells: outside Appendix C too
+            report["cell_read"] = sum(p.numel() for p in self.cell_read.parameters())
+            accounted += report["cell_read"]
         report["total_trainable"] = sum(p.numel() for p in self.parameters())
         if report["total_trainable"] != accounted:
             raise RuntimeError(
                 f"param_report: {report['total_trainable']} trainable parameters, but the Appendix "
                 f"C rows ({report['total']}), the edge logits ({report['edges']}) and HSN-T's "
-                f"reader ({report.get('reader', 0)}) give {accounted}; a submodule carries "
+                f"reader ({report.get('reader', 0)}) and attention read "
+                f"({report.get('cell_read', 0)}) give {accounted}; a submodule carries "
                 "unaccounted parameters"
             )
         return report

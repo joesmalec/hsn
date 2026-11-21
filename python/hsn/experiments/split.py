@@ -2,17 +2,18 @@
 
 In a ``delayed`` document (:class:`hsn.data.synthetic._Delayed`) the loss positions are the key
 positions of the queries ``QRY k v``, in order: slot 0 always asks the first fact (answerable by
-position alone), slots 1 to 3 ask later facts by key. The audit's analysis of 8 Nov 2026 found
+position alone), the later slots ask later facts by key (1 to 3 in synthetic_v1, up to 7 in
+synthetic_v2). The audit's analysis of 8 Nov 2026 found
 every strong model at about 1.0 on slot 0 and about 0.60 on the later slots, just under the
 key-blind bound, so one dev accuracy hides the task's real test. This module splits the
 evaluation's own per-position values (:func:`hsn.eval.evaluate.evaluate_windows` with
 ``position_groups``) by query slot:
 
-* :class:`QuerySlots` labels every loss position of the dev set: ``first``, ``later/1``,
-  ``later/2``, ``later/3`` in delayed/in_range documents (parsed and checked: each loss position
+* :class:`QuerySlots` labels every loss position of the dev set: ``first``, ``later/1`` through
+  ``later/7`` in delayed/in_range documents (parsed and checked: each loss position
   follows ``QRY`` and is a key, slot 0 asks the first fact), ``other`` everywhere else;
 * :func:`split_block` turns the evaluation's ``per_position_group`` into the record's ``split``
-  block (``first``, ``later`` over slots 1 to 3, and each later slot: accuracy, loss and ``n``)
+  block (``first``, ``later`` over slots 1 to 7, and each later slot: accuracy, loss and ``n``)
   and checks it against the frozen per-group metric (errors over silence): the counts and the
   correct answers of the slots sum to the group's, and the losses to its total.
 
@@ -38,6 +39,7 @@ from torch import Tensor
 
 from hsn.data.dataset import ByteDataset
 from hsn.data.synthetic import QRY, DelayedParams
+from hsn.experiments.split_labels import LATER_SLOTS, MAX_QUERIES, NAMES, OTHER, SLOT_NAMES
 
 __all__ = [
     "LATER_SLOTS",
@@ -60,23 +62,18 @@ _KEYS = range(
 _VALUES = range(*_DELAYED.values)
 #: the documents the split covers (the reads-state probe's group)
 SPLIT_GROUP = ("delayed", "in_range")
-#: slot 0 and the later slots (the generator asks at most ``max_queries`` = 4)
-SLOT_NAMES: tuple[str, ...] = ("first", *(f"later/{q}" for q in range(1, _DELAYED.max_queries)))
-LATER_SLOTS: tuple[str, ...] = SLOT_NAMES[1:]
-OTHER = "other"
-NAMES: tuple[str, ...] = (*SLOT_NAMES, OTHER)
 _OTHER_ID = NAMES.index(OTHER)
 
 
 def query_slots(tokens: np.ndarray, loss_mask: np.ndarray) -> list[int]:
     """The query slot (0, 1, ...) of every loss position of a delayed document, in order. Raises
     when a loss position does not follow ``QRY`` or is not a key, when slot 0 does not ask the first
-    fact, or when there are more queries than the generator asks."""
+    fact, or when there are more queries than the supported dataset schema (eight)."""
     positions = [int(p) for p in np.flatnonzero(loss_mask)]
     if not positions:
         raise ValueError("delayed document without a loss position")
-    if len(positions) > _DELAYED.max_queries:
-        raise ValueError(f"{len(positions)} queries, more than max_queries={_DELAYED.max_queries}")
+    if len(positions) > MAX_QUERIES:
+        raise ValueError(f"{len(positions)} queries, more than max_queries={MAX_QUERIES}")
     for p in positions:
         if p < 1 or int(tokens[p - 1]) != QRY or int(tokens[p]) not in _KEYS:
             raise ValueError(f"loss position {p} is not the key of a QRY k v query")
@@ -250,9 +247,7 @@ def derived_split(
     return {
         "first_acc": float(first_query_accuracy),
         "later_acc": later,
-        "later_1": None,
-        "later_2": None,
-        "later_3": None,
+        **dict.fromkeys(name.replace("/", "_") for name in LATER_SLOTS),
     }
 
 
@@ -374,7 +369,7 @@ def backfill_split(
             entry["recomputed"] = {
                 "first_acc": block["first"]["accuracy"],
                 "later_acc": block["later"]["accuracy"],
-                **{f"later_{q}": block[f"later/{q}"]["accuracy"] for q in (1, 2, 3)},
+                **{name.replace("/", "_"): block[name]["accuracy"] for name in LATER_SLOTS},
                 "overall": overall,
                 "overall_minus_stored_answers": (
                     round((overall - float(dev_acc)) * n_all) if dev_acc is not None else None
@@ -387,7 +382,7 @@ def backfill_split(
         best = entry.get("recomputed") or entry.get("derived")
         if best is not None:
             entry["tier"] = "recomputed" if "recomputed" in entry else "derived"
-            for col in ("first_acc", "later_acc", "later_1", "later_2", "later_3"):
+            for col in ("first_acc", "later_acc", *(n.replace("/", "_") for n in LATER_SLOTS)):
                 entry[col] = best.get(col)
         runs.append(entry)
     return {"runs": runs, "recompute": recompute, "cpu": cpu}
@@ -399,16 +394,17 @@ def backfill_table(result: Mapping[str, Any]) -> str:
     def f(x: Any, d: int = 4) -> str:
         return "" if x is None else (f"{x:.{d}f}" if isinstance(x, float) else str(x))
 
+    slot_numbers = [name.split("/")[1] for name in LATER_SLOTS]
     lines = [
         "| exp | label | family | dev | probe first | derived later | recomputed first | "
-        "recomputed later | later 1 / 2 / 3 | recomputed - stored (answers) |",
+        f"recomputed later | later {' / '.join(slot_numbers)} | recomputed - stored (answers) |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for r in result["runs"]:
         if "skipped" in r:
             continue
         d, c = r.get("derived") or {}, r.get("recomputed") or {}
-        slots = " / ".join(f(c.get(f"later_{q}"), 3) for q in (1, 2, 3)) if c else ""
+        slots = " / ".join(f(c.get(f"later_{q}"), 3) for q in slot_numbers) if c else ""
         lines.append(
             f"| {r['exp_id']} | {r['label']} | {r['family']} | {f(r.get('stored_dev_accuracy'))} | "
             f"{f(r.get('probe_first_query_accuracy'), 3)} | {f(d.get('later_acc'))} | "

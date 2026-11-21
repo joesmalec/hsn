@@ -75,5 +75,11 @@ files = ["python/hsn"]
 module = ["pyarrow", "pyarrow.*"] # ships no type information (P0.8 result store)
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# flash-linear-attention's kernels (hsn.baselines.gated_deltanet): not a dependency, absent from
+# the project environment, untyped where installed (docs/gated_deltanet_baseline.md)
+module = ["fla", "fla.*"]
+ignore_missing_imports = true
+
 [tool.coverage.run]
 branch = true # P0.7 definition of done: 100 % branch coverage on python/hsn/eval/gates.py

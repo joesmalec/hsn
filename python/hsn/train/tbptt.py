@@ -7,16 +7,18 @@ P0.5 parameter groups, the learning-rate schedule, the AMP policy of :mod:`hsn.t
 evaluation, the step :class:`~hsn.train.loop.History` and the checkpoint files) and owns the HSN
 window loop::
 
-    per window:  state = state.detach()                          (every ``train.q_resync_every``
-                 q     = state.recompute_q()                      windows, at the window start)
+    per window:  state = state.detach()     (a segment's first window; each window by default)
+                 q     = state.recompute_q()     (every ``train.q_resync_every`` windows, at the
+                                                  window start)
                  logits, state, info = model(tokens, ctx, state, reset)
                  extras = auxiliary_terms(info, cfg, model.cell.graph)       (P2.4)
                  terms  = assemble_terms({"logits": logits, **info}, batch, cfg, extras)
                  terms  = _routing_terms(terms, info)                         (P2.2 REINFORCE)
                  total = terms_total(terms)
                  grad_norm_report(model, terms) on the first window of a stats step
-                 backward (scaled under fp16)
-                 the window's statistics, issued on the device, not read yet    (P2.10b)
+    per segment: backward of its windows' summed objectives (scaled under fp16)
+                 state = state.detach()
+                 its windows' statistics, issued on the device, not read yet    (P2.10b)
     per step:    unscale; grad_norm per group; clip to train.grad_clip; read the windows'
                  statistics (one transfer per window); optimiser step (with the
                  units the step's windows executed, P2.6); scheduler step; model.update_target();
@@ -25,11 +27,27 @@ window loop::
 * **Truncated BPTT.** Every window starts from ``state.detach()``: the carried
   :class:`~hsn.model.state.CellGraphState` keeps its values and loses its autograd history, so a
   window's gradient never reaches an earlier one (plan §2.6: fixed unroll, carried detached state;
-  one optimiser step is ``train.grad_accum`` windows, P0.5 semantics). Document resets are the
-  loader's ``reset`` mask (True at every document start) and are applied by the model itself,
-  position by position, before the position is processed (P1.5). The trainer passes the columns
-  that hold a reset, read from the CPU window, as ``reset_columns`` (P1.10b), so the model resets
-  only there without a device-to-host copy.
+  one optimiser step is ``train.grad_accum`` windows, P0.5 semantics). ``train.tbptt_windows = K``
+  (opt-in, ``docs/tbptt_windows.md``; default 1, the behaviour just described) cuts the step's
+  windows into segments of ``K`` consecutive windows: the state is detached at a segment's first
+  window only and carried attached into the next ``K − 1`` windows (``age``, ``pos`` and the
+  address bytes as always), each window still reads its own ``T`` columns through its own call of
+  the model, and the segment's objectives (each window's, weighted as without the key) take one
+  backward pass at its last window, so a window's loss trains what the earlier windows of its
+  segment wrote. The optimiser, clipping and every per-step hook still run once per step, after
+  all its segments; checkpoints and evaluations stay at step boundaries with the state detached.
+  A per-row document reset (``masked_fill``) cuts the gradient of that row only. Document
+  resets are the loader's ``reset`` mask (True at every document start) and are applied by the
+  model itself, position by position, before the position is processed (P1.5). The trainer
+  passes the columns that hold a reset, read from the CPU window, as ``reset_columns`` (P1.10b),
+  so the model resets only there without a device-to-host copy.
+* **Reach dropout** (``train.reach_dropout``, opt-in, ``docs/reach_dropout.md``): before each
+  training window the trainer draws the rows that read with a short span (:meth:`_reach_rows`)
+  and hands them to the model (:meth:`~hsn.model.hsn.HSN.set_reach_rows`), and clears them after
+  the window's forward pass; evaluation reads as configured. With the carried reader
+  (``model.reader_carry`` on the memory) a row's draw is held until its next document start, so
+  no position reads a cached entry that was computed under the other span; the held draws are
+  part of every checkpoint.
 * **Periodic ``q`` resync.** Every ``train.q_resync_every`` windows the summary is replaced by the
   exact mean over cells (:meth:`~hsn.model.state.CellGraphState.recompute_q`) at the window start,
   which removes the floating-point drift incremental sparse updates accumulate (P1.3 pitfall). The
@@ -206,7 +224,15 @@ from hsn.losses import (
     terms_total,
     utility_loss,
 )
-from hsn.model.hsn import HSN, address_history
+from hsn.model.hsn import (
+    HSN,
+    WindowCarry,
+    address_history,
+    clone_carry,
+    pack_carry,
+    reader_carried,
+    split_packed_carry,
+)
 from hsn.model.router import SCORED_MODES
 from hsn.model.state import CellGraphState
 from hsn.train.amp import autocast_ctx, autocast_name
@@ -221,7 +247,12 @@ from hsn.train.checkpoint import (
     save_checkpoint,
     unpack_cell_state,
 )
-from hsn.train.compile import CompiledWindow, compile_window, install_graph_alias_index
+from hsn.train.compile import (
+    CompiledWindow,
+    apply_message_gradients,
+    compile_window,
+    install_graph_alias_index,
+)
 from hsn.train.grad_norm import clip_grad_norm_, norm_float64
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices, active_units_packed
 from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
@@ -310,6 +341,22 @@ class _WindowStatistics:
 
 
 @dataclass
+class _SegmentWindow:
+    """A window of the open gradient segment (``train.tbptt_windows``): what its statistics,
+    the route guard and the P2.3 features read once the segment's backward pass is issued."""
+
+    info: Mapping[str, Tensor]
+    fwd: Batch
+    logits: Tensor
+    terms: Mapping[str, Tensor]
+    total: Tensor
+    count: int
+    raw_task: float | None
+    tokens: int
+    probe: ProbeResult | None
+
+
+@dataclass
 class _StepStatistics:
     """A step's sums over its windows (the accumulators of :meth:`TBPTTTrainer.fit`)."""
 
@@ -359,7 +406,7 @@ class _CompiledEval:
         state: CellGraphState,
         reset: Tensor,
         *,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         if self.cfg.key_address:
             return self.window(tokens, ctx, state, reset, prev_tokens=prev_tokens)
@@ -461,8 +508,16 @@ class TBPTTTrainer(Trainer):
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0
-        # A5's previous byte belongs to the stream, not CellGraphState's versioned layout.
-        self._prev_tokens: Tensor | None = None
+        # A5's previous byte belongs to the stream, not CellGraphState's versioned layout. With
+        # model.reader_carry on the memory it is a WindowCarry: the address carry and the
+        # reader's cache (docs/amendments/reader_carry_memory.md), carried and saved together.
+        self._prev_tokens: Tensor | WindowCarry | None = None
+        # train.reach_dropout on the carried reader (docs/reach_dropout.md, "With the carried
+        # reader"): a row's draw is held until its next document start. The draw of the document
+        # going on in every row after the last window (bool [B], CPU; None before the first
+        # window), carried and saved like the carry itself
+        self._reach_hold = cfg.train.reach_dropout > 0.0 and reader_carried(cfg.model)
+        self._reach_held: Tensor | None = None
         self.reinforce_baseline: float | None = None  # P2.2: the EMA reward baseline
         # A6: the route-takeover guard (train.route_guard; None: off)
         self.route_guard: RouteGuard | None = (
@@ -489,11 +544,17 @@ class TBPTTTrainer(Trainer):
         # P2.8: the compiled training window (None: eager windows), built before the cut decision
         # (a compiled window keeps one fixed T)
         self._compiled: CompiledWindow | None = None
+        # opt-in (hardware.message_gradients): the dtype of the messages' gradient sums
+        apply_message_gradients(model, cfg.hardware.message_gradients)
         if ctx.compile_enabled:
             if cfg.hardware.graph_alias_index:  # opt-in: PyTorch's alias check by index
                 install_graph_alias_index()
             window = compile_window(
-                model, ctx, cfg.hardware.compile_mode, grad_accum=cfg.train.grad_accum
+                model,
+                ctx,
+                cfg.hardware.compile_mode,
+                grad_accum=cfg.train.grad_accum,
+                merged=cfg.hardware.round_products == "merged",
             )
             if isinstance(window, CompiledWindow):  # MPS without compile support: eager
                 self._compiled = window
@@ -560,6 +621,37 @@ class TBPTTTrainer(Trainer):
         seed = np.random.SeedSequence([self.cfg.seed, 0x50323033, self.windows]).generate_state(1)
         return torch.Generator(device="cpu").manual_seed(int(seed[0]))
 
+    def _reach_rows(self, B: int, reset: Tensor | None = None) -> Tensor | None:
+        """``train.reach_dropout`` (``docs/reach_dropout.md``): the rows of this training window
+        that read with the short span, bool ``[B]`` on the device, or ``None`` when the key is
+        off. Drawn on the CPU from a generator seeded by ``(run.seed, window counter)``, as the
+        probes' (the global random stream is untouched, a resume replays them, every backend
+        draws the same rows), and copied without waiting for the device.
+
+        With the carried reader (``model.reader_carry`` on the memory) a document keeps one
+        draw from its start to its end, so what the reader's cache holds of it was read under
+        the span it is read with: ``reset`` (the CPU window's, bool ``[B, T]``) is required,
+        the positions of the document going on keep the draw held for their row
+        (:attr:`_reach_held`), a document that starts in this window takes this window's draw,
+        and the draw of each row's last document is held for the next window. The result is
+        then bool ``[B, T]``, one flag per position."""
+        p = self.cfg.train.reach_dropout
+        if p <= 0.0:
+            return None
+        seed = np.random.SeedSequence([self.cfg.seed, 0x52454143, self.windows]).generate_state(1)
+        rows = torch.rand(B, generator=torch.Generator().manual_seed(int(seed[0]))) < p
+        if self._reach_hold:
+            if reset is None or reset.dtype is not torch.bool or reset.dim() != 2:
+                raise ValueError("reach dropout on the carried reader needs the window's reset")
+            held = rows if self._reach_held is None else self._reach_held
+            going_on = reset.to("cpu").cumsum(dim=1) == 0  # before the row's first document start
+            rows = torch.where(going_on, held[:, None], rows[:, None])  # [B, T]
+            self._reach_held = rows[:, -1].clone()
+        cuda = self.ctx.device.type == "cuda"
+        if cuda and self.cfg.hardware.pinned_memory:
+            rows = rows.pin_memory()
+        return rows.to(self.ctx.device, non_blocking=cuda)
+
     def _counterfactual_probe(
         self, train_ds: ByteDataset, window: Batch, batch: Batch, state: CellGraphState
     ) -> ProbeResult | None:
@@ -595,6 +687,7 @@ class TBPTTTrainer(Trainer):
         reset_columns: list[int],
         probe: ProbeResult | None,
         reference_cost: float,
+        task_weight: float | None = None,
     ) -> dict[str, float]:
         """P2.4's per-term gradient norms of a statistics step under P2.8's compiled window: one
         extra compiled pass of the window per term with a gradient path (the window's forward from
@@ -602,8 +695,10 @@ class TBPTTTrainer(Trainer):
         that term), since a CUDA-Graph backward is replayed once per forward and cannot take the
         eager path's several retained backwards. The CPU generator is restored around the passes
         (the dense-fallback draw of every pass and of the window itself is the same). The norms
-        equal the eager ones to rounding; the keys come in the eager report's order. Compiled
-        windows require grad_accum=1, so their task weight is identically one."""
+        equal the eager ones to rounding; the keys come in the eager report's order.
+        ``task_weight`` is the window's weight of the task term under gradient accumulation
+        (``None``: one window per step, no weight), applied as :meth:`fit` applies it (a compiled
+        window without CUDA graphs, ``hardware.compile_mode=default``, may accumulate)."""
         cfg = self.cfg
         graph = self.hsn.cell.graph
         scale = self.scaler.get_scale() if self.scaler is not None else 1.0
@@ -623,6 +718,8 @@ class TBPTTTrainer(Trainer):
             terms = self._routing_terms(terms, info, int(fwd["loss_mask"].sum()))
             if self.counterfactual:
                 terms = {**terms, "utility": self._utility_term(probe)}
+            if task_weight is not None:
+                terms = {**terms, "task": terms["task"] * task_weight}
             return terms
 
         terms = objective()
@@ -686,7 +783,7 @@ class TBPTTTrainer(Trainer):
 
     # window helpers --------------------------------------------------------------------------
 
-    def _address_kwargs(self) -> dict[str, Tensor | None]:
+    def _address_kwargs(self) -> dict[str, Tensor | WindowCarry | None]:
         """Only A5 forwards receive a previous byte; legacy call signatures stay unchanged."""
         return {"prev_tokens": self._prev_tokens} if self.cfg.model.key_address else {}
 
@@ -710,10 +807,32 @@ class TBPTTTrainer(Trainer):
         self._cut_pending = cut < T
         return cut
 
-    def _window_start(self, state: CellGraphState) -> CellGraphState:
-        """The state a window starts from: detached, and with ``q`` recomputed exactly every
-        ``train.q_resync_every`` windows."""
-        state = state.detach()
+    @staticmethod
+    def _slot_view(info: Mapping[str, Tensor], batch: Batch) -> Batch:
+        """``batch`` as the window's selection stacks are aligned. With ``model.write_events``
+        they are per event slot (``info["event_pos"]``, ``info["event_valid"]``): the bytes,
+        loss positions and documents at each slot's column, a padding slot counting as padding
+        (no loss position, ``doc = -1``). Otherwise ``batch`` itself."""
+        where = info.get("event_pos")
+        if where is None:
+            return batch
+        live = info["event_valid"]
+        return {
+            **batch,
+            "tokens": batch["tokens"].gather(1, where),
+            "loss_mask": batch["loss_mask"].gather(1, where) & live,
+            "doc": batch["doc"].gather(1, where).masked_fill(~live, -1),
+        }
+
+    def _window_start(self, state: CellGraphState, *, detach: bool = True) -> CellGraphState:
+        """The state a window starts from: detached at the start of a gradient segment (every
+        window while ``train.tbptt_windows = 1``; ``detach=False`` inside a segment keeps the
+        autograd history of the window before), and with ``q`` recomputed exactly every
+        ``train.q_resync_every`` windows. The resync is not under ``no_grad``: inside a segment
+        the recomputed ``q`` is a function of the attached ``h`` (the segment's gradient reaches
+        the earlier window through it)."""
+        if detach:
+            state = state.detach()
         self.windows += 1
         self.windows_since_resync += 1
         if self.windows_since_resync >= self.cfg.train.q_resync_every:
@@ -759,6 +878,7 @@ class TBPTTTrainer(Trainer):
         ``unit_idx`` stands in for ``info["unit_idx"]``."""
         if "unit_idx" not in info or self.hsn.schedule.gate(self.step) == "soft":
             return None
+        batch = self._slot_view(info, batch)
         units = self.cfg.model.n_units
         indices, valid = info["unit_idx"] if unit_idx is None else unit_idx, info["valid"]
         counts = torch.zeros(*indices.shape[:2], units, dtype=torch.int32, device=indices.device)
@@ -979,6 +1099,16 @@ class TBPTTTrainer(Trainer):
             history.autocast,
             json.dumps(report, sort_keys=True),
         )
+        if train.reach_dropout > 0.0:
+            logger.info(
+                "reach dropout (docs/reach_dropout.md): each row of a training window reads "
+                "with the span %d with probability %g; evaluation reads as configured%s",
+                train.reach_dropout_span,
+                train.reach_dropout,
+                "; with the carried reader a row's draw is held until its next document start"
+                if self._reach_hold
+                else "",
+            )
         if self._cut_enabled:
             logger.info("trailing-padding cut (P1.10d): on (dense routing, data.align_docs)")
         else:
@@ -1008,6 +1138,13 @@ class TBPTTTrainer(Trainer):
         groups = self._grad_groups()
         max_norm = train.grad_clip if train.grad_clip > 0.0 else math.inf
         n_windows = train.grad_accum
+        # train.tbptt_windows: the windows one gradient segment joins (1: every window detached)
+        per_segment = train.tbptt_windows
+        if n_windows % per_segment:  # the configuration refuses it; a hand-built one may not
+            raise ValueError(
+                f"train.grad_accum={n_windows} is not a multiple of train.tbptt_windows="
+                f"{per_segment}"
+            )
         reference_cost = self.hsn.router.costs.dense_cost()  # P2.4: the cost term's normaliser
         graph = self.hsn.cell.graph
         reset_peak(device)
@@ -1040,6 +1177,11 @@ class TBPTTTrainer(Trainer):
             # step's sums from then on
             totals = _StepStatistics()
             pending: list[_WindowStatistics] = []
+            # train.tbptt_windows: the open segment's loss (the sum of its windows' scaled
+            # objectives, one backward pass at its last window) and what each of its windows
+            # hands to its statistics after that backward pass
+            segment_loss: Tensor | None = None
+            segment_windows: list[_SegmentWindow] = []
             tokens_in_step = 0
             positions_sum = 0  # P1.10d: the columns the step's windows computed
             probe_counts = {
@@ -1062,7 +1204,8 @@ class TBPTTTrainer(Trainer):
                 # the columns the model computes: device views of the window (the probes of P2.3,
                 # routed runs only, read the full window)
                 fwd = batch if cut == window["doc"].shape[1] else _columns(batch, cut)
-                state = self._window_start(state)
+                # detached at a segment's first window only; attached to the window before inside
+                state = self._window_start(state, detach=window_index % per_segment == 0)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
                 # model.zero_unseen_bytes: the bytes this window trains on count as seen from
                 # here on (nothing happens with the key off)
@@ -1076,6 +1219,11 @@ class TBPTTTrainer(Trainer):
                     if self.counterfactual
                     else None
                 )  # P2.3: before the forward pass, from the window-start state
+                # train.reach_dropout: the window's short rows, for its forward pass and a
+                # statistics step's term passes; cleared after the window
+                reach = self._reach_rows(int(fwd["tokens"].shape[0]), window["reset"][:, :cut])
+                if reach is not None:
+                    self.hsn.set_reach_rows(reach, train.reach_dropout_span)
                 # P1.10b: the columns where some row resets, so that HSN.forward needs no
                 # device-to-host copy to find them. Correct by construction: they are read from the
                 # CPU reset of this very window, cut exactly like the device views it hands over
@@ -1090,9 +1238,14 @@ class TBPTTTrainer(Trainer):
                 own_graph = self._compiled is None or (
                     self._split is not None and self._split.splits_now()
                 )
+                task_weight = (
+                    (n_windows * count / step_loss_positions if step_loss_positions else 0)
+                    if n_windows > 1
+                    else None
+                )
                 if stats_step and window_index == 0 and not own_graph:
                     term_norms = self._compiled_term_norms(
-                        fwd, state, reset_columns, probe, reference_cost
+                        fwd, state, reset_columns, probe, reference_cost, task_weight
                     )  # P2.8: before the window's own forward pass, from the same start state
                 logits, state, info = self._forward(
                     fwd,
@@ -1101,9 +1254,11 @@ class TBPTTTrainer(Trainer):
                     reset_columns=reset_columns,
                     **self._address_kwargs(),
                 )
+                if reach is not None:
+                    self.hsn.set_reach_rows(None)
                 if self.cfg.model.key_address:
                     self._prev_tokens = address_history(
-                        self.cfg.model, fwd["tokens"], self._prev_tokens
+                        self.cfg.model, fwd["tokens"], self._prev_tokens, info
                     )
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)
@@ -1115,10 +1270,7 @@ class TBPTTTrainer(Trainer):
                         probe_counts["probe_pairs"] += float(probe.n_pairs)
                         probe_counts["probe_positions"] += float(probe.positions)
                 raw_task = float(terms["task"].detach()) if n_windows > 1 else None
-                if n_windows > 1:
-                    task_weight = (
-                        n_windows * count / step_loss_positions if step_loss_positions else 0
-                    )
+                if task_weight is not None:
                     terms = {**terms, "task": terms["task"] * task_weight}
                 total = terms_total(terms)
                 if stats_step and window_index == 0 and own_graph:  # P2.4: one window
@@ -1129,25 +1281,49 @@ class TBPTTTrainer(Trainer):
                 window_tokens = int((window["doc"] >= 0).sum())
                 tokens_in_step += window_tokens
                 scaled = total / n_windows
+                segment_loss = scaled if segment_loss is None else segment_loss + scaled
+                segment_windows.append(
+                    _SegmentWindow(
+                        info, fwd, logits, terms, total, count, raw_task, window_tokens, probe
+                    )
+                )
+                if (window_index + 1) % per_segment:
+                    continue  # the segment stays open: the next window reads this state attached
+                # the segment's one backward pass: every window's objective, through the
+                # carried state into the windows before it in the segment (one window: P1.7)
                 with self._segment("backward", tokens=tokens_in_step):
                     if self.scaler is not None:
-                        scaled = self.scaler.scale(scaled)
-                    scaled.backward()  # type: ignore[no-untyped-call]
-                # P2.10b: with the backward pass on its way, the statistics of the window (no
-                # host read here; read below, after the gradient norm) and the guard's counts
-                statistics = self._window_statistics(
-                    info, fwd, logits, terms, total, count, raw_task, window_tokens
-                )
-                pending.append(statistics)
-                if self.route_guard is not None:  # A6: slots per (input byte, unit)
-                    observed = (
-                        info
-                        if statistics.unit_idx is None
-                        else {**info, "unit_idx": statistics.unit_idx}
+                        segment_loss = self.scaler.scale(segment_loss)
+                    segment_loss.backward()  # type: ignore[no-untyped-call]
+                segment_loss = None
+                state = state.detach()  # the graph is released; the state leaves it
+                # P2.10b: with the backward pass on its way, the statistics of the segment's
+                # windows (no host read here; read below, after the gradient norm) and the
+                # guard's counts, window by window, from detached values
+                for done in segment_windows:
+                    statistics = self._window_statistics(
+                        done.info,
+                        done.fwd,
+                        done.logits,
+                        done.terms,
+                        done.total,
+                        done.count,
+                        done.raw_task,
+                        done.tokens,
                     )
-                    self.route_guard.observe(fwd["tokens"], fwd["loss_mask"], observed)
-                if self.counterfactual:  # P2.3: once per window, after its selections ran
-                    self._update_ema(info, fwd, probe)
+                    pending.append(statistics)
+                    if self.route_guard is not None:  # A6: slots per (input byte, unit)
+                        observed = (
+                            done.info
+                            if statistics.unit_idx is None
+                            else {**done.info, "unit_idx": statistics.unit_idx}
+                        )
+                        # model.write_events: per event slot
+                        slots = self._slot_view(done.info, done.fwd)
+                        self.route_guard.observe(slots["tokens"], slots["loss_mask"], observed)
+                    if self.counterfactual:  # P2.3: once per window, after its selections ran
+                        self._update_ema(done.info, done.fwd, done.probe)
+                segment_windows.clear()
 
             def settle(
                 pending: list[_WindowStatistics] = pending,
@@ -1443,17 +1619,9 @@ class TBPTTTrainer(Trainer):
             "q_resync": q_resync_counter(c["windows"], c["windows_since_resync"], c["resyncs"]),
             "reinforce_baseline": c["reinforce_baseline"],  # P2.2 (None unless reinforce ran)
             "cut_pending": c["cut_pending"],  # P1.10d: the next window must reset every row
-            **(
-                {
-                    "prev_tokens": (
-                        None
-                        if c["prev_tokens"] is None
-                        else c["prev_tokens"].detach().to(device="cpu", copy=True)
-                    )
-                }
-                if self.cfg.model.key_address
-                else {}
-            ),
+            **({"prev_tokens": pack_carry(c["prev_tokens"])} if self.cfg.model.key_address else {}),
+            # train.reach_dropout on the carried reader: the rows' held draws
+            **({"reach_held": c["reach_held"]} if self._reach_hold else {}),
             **self._guard_extra(c),  # P1.12: the non-finite-gradient guard's counts
             **self._ema_extra(),  # A6: the averaged weights (train.weight_ema)
             **(
@@ -1474,12 +1642,13 @@ class TBPTTTrainer(Trainer):
             "cut_pending": self._cut_pending,
             "reinforce_baseline": self.reinforce_baseline,
             **(
-                {
-                    "prev_tokens": (
-                        None if self._prev_tokens is None else self._prev_tokens.detach().clone()
-                    )
-                }
+                {"prev_tokens": clone_carry(self._prev_tokens)}
                 if self.cfg.model.key_address
+                else {}
+            ),
+            **(
+                {"reach_held": None if self._reach_held is None else self._reach_held.clone()}
+                if self._reach_hold
                 else {}
             ),
         }
@@ -1522,9 +1691,16 @@ class TBPTTTrainer(Trainer):
         if self.cfg.model.key_address:
             if "prev_tokens" not in extra:
                 raise ValueError(f"{path}: an A5 checkpoint must hold prev_tokens")
-            previous = extra["prev_tokens"]
+            # model.reader_carry on the memory: the address carry and the reader's cache
+            previous, reader_cache = split_packed_carry(
+                self.cfg.model, extra["prev_tokens"], str(path)
+            )
             if previous is not None:
-                if (
+                if self.cfg.model.word_address != "none":
+                    # model.word_address: the bytes, then the word state (checked by the window)
+                    if not isinstance(previous, Tensor) or previous.dtype != torch.int64:
+                        raise ValueError(f"{path}: prev_tokens must be the int64 address carry")
+                elif (
                     not isinstance(previous, Tensor)
                     or previous.dtype not in (torch.int32, torch.int64)
                     or tuple(previous.shape)
@@ -1539,7 +1715,31 @@ class TBPTTTrainer(Trainer):
                         "[train.batch, model.address_ngram]"
                     )
                 previous = previous.to(self.ctx.device).clone()
+            if reader_cache is not None:
+                reader = self.hsn.reader
+                if reader is None or not isinstance(previous, Tensor):
+                    raise ValueError(f"{path}: a reader's cache without a reader or an address")
+                cache = tuple(t.to(self.ctx.device).clone() for t in reader_cache)
+                try:
+                    cache = reader.check_cache(cache, int(previous.shape[0]))
+                except ValueError as error:
+                    raise ValueError(f"{path}: {error}") from error
+                previous = WindowCarry(previous, cache)
             self._prev_tokens = previous
+        if self._reach_hold:  # train.reach_dropout on the carried reader: the held draws
+            if "reach_held" not in extra:
+                raise ValueError(
+                    f"{path}: train.reach_dropout with model.reader_carry needs the rows' held "
+                    "draws (reach_held); the checkpoint was written without them"
+                )
+            held = extra["reach_held"]
+            if held is not None and not (
+                isinstance(held, Tensor)
+                and held.dtype is torch.bool
+                and tuple(held.shape) == (self.cfg.train.batch,)
+            ):
+                raise ValueError(f"{path}: reach_held must be a bool [train.batch] tensor or None")
+            self._reach_held = None if held is None else held.to("cpu").clone()
         if "q_resync" not in extra:
             raise ValueError(f"{path} has no q_resync counters (not a TBPTT checkpoint)")
         counters = check_q_resync(extra["q_resync"], str(path))

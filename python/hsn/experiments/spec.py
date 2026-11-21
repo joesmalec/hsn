@@ -80,7 +80,14 @@ from typing import Annotated, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from hsn.config import REPO_ROOT, RunConfig, config_hash, load_config
+from hsn.config import (
+    HASH_EXCLUDED,
+    REPO_ROOT,
+    GatedDeltaNetBaselineConfig,
+    RunConfig,
+    config_hash,
+    load_config,
+)
 from hsn.experiments.rules import (
     Cadence,
     RuleSet,
@@ -109,8 +116,19 @@ __all__ = [
     "slug",
 ]
 
-FAMILIES = ("hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm")
-Family = Literal["hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm"]
+FAMILIES = (
+    "hsn",
+    "hsn_t",
+    "hsn_t_nomem",
+    "reader",
+    "gru",
+    "transformer",
+    "selective_ssm",
+    "gated_deltanet",
+)
+Family = Literal[
+    "hsn", "hsn_t", "hsn_t_nomem", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet"
+]
 #: The families trained by the HSN's window trainer: the HSN and HSN-T (``docs/hsn_t.md``).
 #: ``hsn_t_nomem`` (HSN-T without its memory) is not one: the generic trainer trains it.
 HSN_FAMILIES = ("hsn", "hsn_t")
@@ -536,10 +554,14 @@ def data_hash(cfg: RunConfig, repo: Path, *, required: bool) -> str:
 
 
 def config_view(cfg: RunConfig) -> dict[str, Any]:
-    """The non-default values of the resolved configuration, without ``run_id`` and ``notes``."""
+    """The non-default values of the resolved configuration, without ``run_id`` and ``notes``
+    and without the evaluation-only sections (:data:`hsn.config.HASH_EXCLUDED`: ``eval.*``
+    changes nothing a run trains, so it is not part of an arm's identity)."""
     view = cfg.model_dump(mode="json", exclude_defaults=True)
     view.pop("run_id", None)
     view.pop("notes", None)
+    for section in HASH_EXCLUDED:
+        view.pop(section, None)
     return view
 
 
@@ -615,6 +637,22 @@ def _plain(value: Any) -> Any:
     return value
 
 
+#: The reader's position keys and their defaults: :func:`memory_key` leaves them out at these.
+_READER_POSITION_DEFAULTS: dict[str, Any] = {
+    "reader_position": "rotary",
+    "reader_positions": 256,
+    "reader_rotary_pairs": None,
+    "reader_rotary_dtype": "working",
+    "reader_rotary_base": 10_000.0,
+    "reader_carry": 0,  # the reader's carried context (15 Nov 2026), likewise
+    "reader_top_words": 0,
+    "reader_mask": "document",  # the reader's attention mask (17 Nov 2026), likewise
+}
+#: The Transformer baseline's Transformer-XL keys (``baseline.transformer.*``, 17 Nov 2026) and
+#: their defaults: :func:`memory_key` leaves them out at these.
+_TRANSFORMER_XL_DEFAULTS: dict[str, Any] = {"position": "learned", "carry": 0}
+
+
 def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str:
     dump = cfg.model_dump(mode="json")
     if dump["hardware"]["baseline_compile"] == "none":
@@ -622,10 +660,41 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # stored memory and step-time estimates of the eager baselines still apply); a compiled
         # baseline has a key of its own
         del dump["hardware"]["baseline_compile"]
+    if dump["hardware"]["round_products"] == "separate":
+        # likewise: the compiled round's products at their default (17 Nov 2026) stay out; with
+        # the key set the step time changes, and the arm has a memory key of its own
+        del dump["hardware"]["round_products"]
+    if dump["hardware"]["message_gradients"] == "autocast":
+        # likewise (18 Nov 2026): the messages' gradient dtype at its default stays out
+        del dump["hardware"]["message_gradients"]
     if dump["model"]["memory"] is True:
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates
         del dump["model"]["memory"]
+    for key, default in _READER_POSITION_DEFAULTS.items():
+        # the reader's position keys (15 Nov 2026) at their defaults stay out, for the same reason
+        if dump["model"][key] == default:
+            del dump["model"][key]
+    if dump["model"]["cell_attention_heads"] == 0:
+        # likewise: without the attention read of the cells an arm keeps its memory key
+        del dump["model"]["cell_attention_heads"]
+    if dump["model"]["write_events"] == "byte":
+        # likewise: a model that writes at every byte keeps its memory key
+        del dump["model"]["write_events"]
+    if dump["model"]["word_address"] == "none":
+        # likewise: without the word address (and its contexts, read only with it)
+        del dump["model"]["word_address"]
+        del dump["model"]["word_contexts"]
+    for key, default in _TRANSFORMER_XL_DEFAULTS.items():
+        # the Transformer baseline's positions and cache (17 Nov 2026) at their defaults stay
+        # out: every arm, of every family, keeps its memory key
+        if dump["baseline"]["transformer"][key] == default:
+            del dump["baseline"]["transformer"][key]
+    if cfg.baseline.gated_deltanet == GatedDeltaNetBaselineConfig():
+        # likewise: the Gated DeltaNet baseline's sizes (17 Nov 2026) at their defaults stay
+        # out, so the arms from before the family keep their memory key (a gated_deltanet arm
+        # of the default size is told apart by its model_name)
+        del dump["baseline"]["gated_deltanet"]
     if dump["model"]["zero_unseen_bytes"] is False:
         # model.zero_unseen_bytes (docs/key_content.md) at its default stays out, for the same
         # reason; train.content_dropout is a train.* key and so never in the memory key
@@ -647,6 +716,15 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
             "protocol": {
                 k: protocol.get(k) for k in ("name", "eval_batch", "probe_batch", "diag_docs")
             },
+            # the windows per step and per gradient segment (train.tbptt_windows, 16 Nov 2026):
+            # they set the step time and the activations held; at their defaults (one window,
+            # one per segment) they stay out, so every earlier arm keeps its memory key
+            **({"grad_accum": cfg.train.grad_accum} if cfg.train.grad_accum != 1 else {}),
+            **({"tbptt_windows": cfg.train.tbptt_windows} if cfg.train.tbptt_windows != 1 else {}),
+            # the generic trainer's host reads and fused optimiser (17 Nov 2026) set the step
+            # time too; at their defaults they stay out, likewise
+            **({"host_sync": cfg.train.host_sync} if cfg.train.host_sync != "per_step" else {}),
+            **({"fused_adamw": True} if cfg.train.fused_adamw else {}),
         }
     )
 

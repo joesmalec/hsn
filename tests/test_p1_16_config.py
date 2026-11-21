@@ -3,8 +3,11 @@ configuration written before them at its hash (old checkpoints resume, old dumps
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from hsn.config import (
+    HASH_EXCLUDED,
     HASH_OMIT_AT_DEFAULT,
     REPO_ROOT,
     ROLLBACK_KEYS,
@@ -40,8 +43,18 @@ HASHES_80B893D = {
 def test_p1_16_config_hash_unchanged_at_defaults(path: str, overrides: tuple[str, ...]) -> None:
     cfg = load_config(REPO_ROOT / path, list(overrides))
     assert config_hash(cfg) == HASHES_80B893D[(path, overrides)]
+    dumped = json.loads(canonical_json(cfg))
+    assert not set(HASH_EXCLUDED) & set(dumped)
     for dotted in HASH_OMIT_AT_DEFAULT:
-        assert f'"{dotted.split(".")[1]}"' not in canonical_json(cfg)
+        parts = dotted.split(".")
+        if len(parts) == 2:
+            assert f'"{parts[1]}"' not in canonical_json(cfg)
+            continue
+        # a key two levels down (baseline.transformer.position): absent from its own section
+        node = dumped
+        for section in parts[:-1]:
+            node = node.get(section, {})
+        assert parts[-1] not in node, dotted
 
 
 def test_p1_16_rollback_keys_defaults_off() -> None:
@@ -107,11 +120,35 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.address_history",
         "hardware.baseline_compile",  # the baselines' compiled windows (opt-in)
         "model.memory",  # HSN-T without its memory
+        "model.reader_position",  # the reader's positions (opt-in, 15 Nov 2026)
+        "model.reader_positions",
+        "model.reader_rotary_pairs",
+        "model.reader_rotary_dtype",
+        "model.reader_rotary_base",  # the rotation's base (opt-in, 15 Nov 2026)
+        "model.reader_carry",  # the reader's carried keys (opt-in, 15 Nov 2026)
+        "model.reader_top_words",  # the top block's word ends (opt-in, 15 Nov 2026)
+        "model.cell_attention_heads",  # HSN-T's attention read of the cells (opt-in candidate)
+        "model.write_events",  # HSN-T's loop over events (opt-in candidate)
+        "model.word_address",  # the event loop's word address (opt-in candidate)
+        "model.word_contexts",  # the text contexts of the word address
+        "train.tbptt_windows",  # windows joined into one gradient segment (opt-in, 16 Nov 2026)
+        "model.reader_mask",  # the reader's causal mask (opt-in, 17 Nov 2026)
+        "train.host_sync",  # the generic trainer's host reads (opt-in, 17 Nov 2026)
+        "train.fused_adamw",  # the fused AdamW (opt-in, 17 Nov 2026)
+        "hardware.round_products",  # the compiled round's merged products (17 Nov 2026)
+        "baseline.transformer.position",  # the Transformer as Transformer-XL (opt-in, 17 Nov)
+        "baseline.transformer.carry",
+        "train.reach_dropout",  # short-span rows of HSN-T's reader in training (opt-in, 17 Nov)
+        "train.reach_dropout_span",
+        "baseline.gated_deltanet",  # the Gated DeltaNet baseline's sizes (17 Nov 2026)
+        "hardware.message_gradients",  # the messages' gradient sums in fp32 (opt-in, 18 Nov)
         "train.content_dropout",  # the byte-content options (opt-in, docs/key_content.md)
         "model.zero_unseen_bytes",
         "train.content_dropout_target",  # the learned unknown rows (opt-in)
         "model.unseen_bytes_as",
     )
+    # evaluation-only sections are never hashed, whatever they hold (eval.*, 18 Nov 2026)
+    assert HASH_EXCLUDED == ("eval",)
 
 
 def test_p1_16_rollback_key_set_changes_hash() -> None:

@@ -1,0 +1,72 @@
+# DRAFT for the user's OK (joe-c1 9 Nov ~16:15: job 2, "do runs longer than 9,000 steps let any model bind?"). The two
+# controls at 3x the budget, each with its own best recipe and the schedule stretched to the new length:
+# - gru_2m: exp 154's final-bar recipe (lr 5e-4, beta2 0.999 (default), WSD decay 0.2, warmup 200, B32, wd 0.01, clip 1.0;
+#   0.7930 at 9,000) with steps 27,000, so the WSD's stable phase and 20 % decay span 27k;
+# - transformer_2m: exps 146 to 149's lr 1.25e-4 (beta2 0.999 default) on WSD 0.2 over 27k (exp 147 = WSD 9k: 0.504).
+# Protocol reads_state v3 (probes v1 / v2 / v3: value edit and key swap), seed 0 each, timing arms, keep_every 4,500 with
+# keep_last 6, plus regular train.ckpt_every=4500 (all six checkpoints 4.5k to 27k survive
+# successful-run cleanup under the pinned runtime's default checkpoint=final policy).
+# keep_every alone only keeps temporary recovery checkpoints. Comparison controls only (architecture rule:
+# GRU and Transformer arms are controls). Registered in evidence/EFF/AUDIT.md before any run. Runs from /home/joe/hsn
+# (main ff57fc8) on a dedicated worker.
+
+name: baselines_27k
+description: "gru_2m (exp 154 recipe) and transformer_2m (lr 1.25e-4) on WSD 0.2 over 27,000 steps, seed 0: does a longer run bind keys?"
+base:
+  config: configs/baselines/gru_2m.yaml
+  overrides:
+    - profile=rtx3060
+    - hardware.compile_mode=none
+    - train.batch=32
+    - train.micro_batch=32
+    - train.steps=27000
+    - train.eval_every=500
+    - train.ckpt_every=4500
+    - train.stats_every=100
+    - train.warmup_steps=200
+    - train.weight_decay=0.01
+    - train.grad_clip=1.0
+    - train.schedule=wsd
+    - train.decay_fraction=0.2
+    - data.tasks=[delayed]
+    - data.variants=[in_range]
+families:
+  transformer:
+    config: configs/baselines/transformer_2m.yaml
+protocol: {name: reads_state, version: 3, steps: 27000, diag_every: 500, diag_docs: 32, eval_batch: 128, probe_batch: 64, keep_every: 4500, keep_last: 6}
+timing: true
+constants:
+  chance: 0.0208333
+  key_blind_later: 0.623 # the audit's key-blind bound on later queries (evidence/EFF/ceiling_check.py)
+seeds: [0]
+rules:
+  verdicts:
+    reads_state: {preset: reads_state}
+    reads_state_v3: {preset: reads_state_v3}
+    binds_keys: {preset: binds_keys}
+    later_above_key_blind:
+      cases:
+        - label: above the key-blind bound
+          when: {metric: "final:split/later/accuracy", op: ">", value: key_blind_later}
+      default: at or below
+    beats_bar:
+      cases:
+        - label: above 0.7930
+          when:
+            all:
+              - {metric: "final:delayed/in_range/accuracy", op: ">", value: 0.7930}
+      default: not above 0.7930
+    nonfinite_skips:
+      cases:
+        - label: none skipped
+          when:
+            all:
+              - {metric: "final:skipped_nonfinite_steps", op: "==", value: 0}
+      default: some skipped
+arms:
+  - name: b27_gru2m_wsd27k
+    family: gru
+    overrides: [train.lr=0.0005]
+  - name: b27_tf2m_wsd27k
+    family: transformer
+    overrides: [train.lr=0.000125]

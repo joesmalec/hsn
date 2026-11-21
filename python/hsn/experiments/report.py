@@ -18,7 +18,7 @@ attempt (``done`` or ``stopped_early``), else the latest attempt. Columns:
 * P1.15: probe v3's value-edit follow / unchanged fractions with its vocabulary, and the key
   swap's (``v3_follow``, ``v3_unchanged``, ``v3_vocab``, ``swap_follow``, ``swap_unchanged``);
 * P1.15: the first/later split of the final evaluation (``first_acc``, ``later_acc``, ``later_1`` to
-  ``later_3``, :mod:`hsn.experiments.split`) and where it comes from (``split_src``: ``record``, or
+  ``later_7``, :mod:`hsn.experiments.split`) and where it comes from (``split_src``: ``record``, or
   for a run stored before P1.15 the ``derived`` / ``recomputed`` values of a ``split-backfill``
   file given as ``split_backfill``);
 * early stops; failures (P1.14: ``<reason> @ <last step>`` of an attempt that failed or was
@@ -45,6 +45,7 @@ from typing import Any
 
 from hsn.experiments.db import FINISHED, Database, loads
 from hsn.experiments.rules import RuleSet, evaluate_verdicts, parse_rules
+from hsn.experiments.split_labels import LATER_SLOTS
 
 __all__ = ["Report", "build_report", "format_csv", "format_markdown"]
 
@@ -176,9 +177,7 @@ V3_COLUMNS = ("v3_follow", "v3_unchanged", "v3_vocab", "swap_follow", "swap_unch
 SPLIT_COLUMNS = {
     "first_acc": "split/first/accuracy",
     "later_acc": "split/later/accuracy",
-    "later_1": "split/later/1/accuracy",
-    "later_2": "split/later/2/accuracy",
-    "later_3": "split/later/3/accuracy",
+    **{name.replace("/", "_"): f"split/{name}/accuracy" for name in LATER_SLOTS},
 }
 
 

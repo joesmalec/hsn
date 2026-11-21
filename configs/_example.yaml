@@ -10,7 +10,7 @@ run_id: example
 seed: 0
 notes: "Appendix A example: every key at its default."
 profile: cpu # hardware profile: configs/hardware/<profile>.yaml (Appendix A.5) unless `hardware:` is inline
-model_name: hsn # hsn | gru | transformer | selective_ssm | moe
+model_name: hsn # hsn | gru | transformer | selective_ssm | gated_deltanet | moe
 
 model: # Appendix A.1
   vocab_size: 256 # byte vocabulary V
@@ -66,7 +66,19 @@ model: # Appendix A.1
   reader_layers: 2 # HSN-T: the reader's blocks
   reader_heads: 4 # HSN-T: attention heads per block
   reader_span: null # HSN-T: n = a position reads itself and the n - 1 bytes before it only (short-sighted); null = the document up to the position, inside the window
+  reader_position: rotary # HSN-T reader (opt-in, docs/hsn_t.md): rotary = positions as rotations of the attention's queries and keys (distances only, no parameter) | learned = a position table added to the byte embedding, as the Transformer baseline's, and no rotation (the reader then reads the window position)
+  reader_positions: 256 # HSN-T reader: the rows of the learned table (reader_position: learned), the longest window it reads; not read with rotary positions
+  reader_rotary_pairs: null # HSN-T reader (opt-in): n = only the first n pairs of each head (the highest frequencies) are rotated, the others are compared as they are at every distance; a list = n for each block (0 = that block's attention is not rotated); null = all width / heads / 2 pairs in every block
+  reader_rotary_dtype: working # HSN-T reader (opt-in): working = the rotation runs in the dtype of the queries and keys (bf16 under bf16 autocast) | parameters = in the parameters' dtype (float32), cast back for the attention
+  reader_rotary_base: 10000.0 # HSN-T reader (opt-in): b = the base of the rotation's frequency ladder, pair i of a head turns by t * b^(-i / half) at distance t; larger = longer wavelengths for the slower pairs; finite, above 1; not read with reader_position: learned (refused there)
+  reader_carry: 0 # HSN-T reader (opt-in, untested candidate): C = every block keeps the keys and values of the last C positions of the windows before (detached, carried as model state) and position t reads distances 0..C of its document, cached or in the window; 0 = every window read alone; needs rotary positions and no reader_span; HSN-T without its memory and model_name: reader carry the cache as their state, HSN-T with its memory carries it with the address bytes (opt-in of 17 Nov 2026, docs/amendments/reader_carry_memory.md)
+  reader_top_words: 0 # HSN-T reader (opt-in, untested candidate): N = the top block also reads the keys and values at the last N word ends of its document before the window (a byte that is not a letter or digit right after one; bytes >= 128 count as letters), carried and detached; entries inside the carried span are not read twice; needs reader_carry > 0 and the top block unrotated (last reader_rotary_pairs entry 0)
+  reader_mask: document # HSN-T reader (opt-in, docs/reader_causal_flash.md): document = the block-diagonal causal mask over a row's documents (an additive bias; the memory-efficient kernel on CUDA) | causal = SDPA is_causal with no mask (the flash kernel on CUDA), the same mask when resets are at column 0 only; needs reader_span null, reader_carry 0 and data.align_docs: true, and asserts it on the device
   memory: true # HSN-T only (docs/hsn_t_no_memory.md): false = HSN-T without its memory, stateless and parallel over the window (embeddings, E, reader, S, D; zeros where q and r are read), trained by the generic trainer
+  cell_attention_heads: 0 # HSN-T only, opt-in candidate (docs/amendments/cell_attention_read.md): H > 0 = at every position the reader's output attends over all cells (H heads of width d / H; keys from each cell's state and its address code) and the result is one more decoder input, D([q; u; r; c; m]); needs reader, memory, key_address and d a multiple of H; 0 = no read
+  write_events: byte # HSN-T only, opt-in candidate (docs/amendments/write_events.md): byte = the memory runs at every byte | word = only at word ends (a byte that is not a letter or digit after one that is) and document starts, the position loop runs over those events and the decoder reads the latest event's q, r and cells at every byte; needs reader, memory, key_address, selected_readout | all = every byte through the event path (a test value)
+  word_address: none # opt-in candidate (docs/amendments/write_events.md, "The word address"); needs write_events=word: none = at an event A5's two features read the byte at the event and the byte before | exact | bag = they read whole words: a_cur the word the event closes, a_prev the word of the event before; the event rule becomes the word rule (letters, digits, an apostrophe between letters; A-Z folded in the address), every byte of a context outside word_contexts is its own word and an event. exact = product of fixed ±1 tables per byte position; bag = unit sum of fixed codes of the word's 2- and 3-grams. Tables are buffers from the run seed, nothing learned
+  word_contexts: [6] # the context ids whose bytes are text for word_address (TinyStories is 6); read only with word_address
   address_ngram: 1 # amendment A9: longest byte n-gram with an address feature pair (needs key_address); 1 = A5 only
   address_history: byte # A9 across windows: byte = one byte carried (every run before 14 Nov 2026; the older bytes read as BOS at a continuing window's first column) | ngram = the last address_ngram bytes carried (needs address_ngram > 1)
   zero_unseen_bytes: false # opt-in (docs/key_content.md), HSN and HSN-T: true = E and the reader read a zero row at every byte that no training window has held as an input (a never-trained row of the content tables)
@@ -163,6 +175,11 @@ train: # Appendix A.3
   batch: 4
   micro_batch: 4
   grad_accum: 1
+  tbptt_windows: 1 # opt-in: consecutive windows of a step joined into one gradient segment (docs/tbptt_windows.md)
+  host_sync: per_step # opt-in (docs/trainer_host_sync.md), the generic trainer only: per_step = a step's loss, accuracy and gradient norm read on the host within the step, as before | stats = kept on the device and read one step later (and at stats, evaluation and checkpoint steps); masked-mean loss, non-finite steps skipped on the device; needs fused_adamw and refuses the per-step host features (spike_factor, rollback_every, adaptive_lr, gradient_growth, update_limit, weight_ema, divergence_dump, answer_weight != 1, grad_norm_precision float64, fp16)
+  fused_adamw: false # opt-in, the generic trainer only: torch.optim.AdamW(fused=True), the same update to rounding
+  reach_dropout: 0.0 # opt-in, HSN-T with its memory: probability that a row of a training window reads with the span below (docs/reach_dropout.md); 0 = off
+  reach_dropout_span: 16 # the per-block span of those rows (as model.reader_span); needs model.reader_span null; with model.reader_carry = C it must be <= C (the rows read as model.reader_carry = span - 1)
   precision: bf16 # bf16 | fp16 | fp32 | fp64 (fp64 only for gradcheck)
   grad_clip: 1.0 # global norm clip
   grad_norm_precision: native # native | float64; wide global reduction and clipping, opt-in
@@ -273,6 +290,13 @@ serve: # Appendix A.4 (P5.3 / P5.4)
     rps_per_tenant: 10.0
   capture_policy: disabled # disabled | local_only | shared_candidates
 
+eval: # opt-in evaluation reports (not in Appendix A); nothing here changes training or a metric, and the section is never part of the config hash or an arm id
+  by_distance: # score by distance (docs/distance_eval.md); off = nothing runs
+    enabled: false # true: when training ends, one more evaluation pass per set and the bucket tables in the run record (by_distance)
+    every_eval: false # also at every evaluation of the run (dev set only; each evaluation entry gains by_distance)
+    max_docs: null # the first max_docs documents of every task/variant group of a set; null = all
+    sets: [] # more dev sets scored at the end: [{name: far, manifest: data/synthetic_far/manifest.json, tasks: [], variants: []}]
+
 baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which baseline runs
   gru: # 1,977,856 parameters measured for V=256, 16 context symbols
     d_model: 384 # embedding and hidden width
@@ -284,6 +308,8 @@ baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which ba
     n_heads: 4 # attention heads
     ffn_hidden: 768 # MLP hidden width (4 x d_model)
     dropout: 0.0 # embeddings, attention, residual branches
+    position: learned # learned (a table over the window) | rotary (RoPE; Transformer-XL's positions)
+    carry: 0 # Transformer-XL's memory: cached positions of the windows before (needs rotary; 0 = none)
   selective_ssm: # Mamba-style control (model_name: selective_ssm); 1,887,744 parameters measured
     d_model: 256 # residual width
     n_layers: 4 # Mamba blocks
@@ -291,5 +317,14 @@ baseline: # P0.5 baseline sizes (not in Appendix A); model_name selects which ba
     d_conv: 4 # taps of the causal depthwise convolution
     expand: 2 # inner width = expand x d_model
     dt_rank: null # rank of the step-size path; null = d_model / 16
+  gated_deltanet: # Gated DeltaNet control (model_name: gated_deltanet); 1,932,584 parameters measured
+    d_model: 176 # residual width
+    n_layers: 4 # blocks of [Gated DeltaNet mixer, gated MLP]
+    num_heads: 3 # heads, each with a fast-weight memory of its own
+    head_dim: 44 # key and query width of a head
+    expand_v: 2 # value width of a head = expand_v x head_dim
+    d_conv: 4 # taps of the causal depthwise convolution on q, k, v
+    mlp_hidden: null # gated MLP width; null = the reference's rule (512 at d_model 176)
+    norm_eps: 1.0e-6 # every RMS norm of the model
   address_input: false # the HSN's fixed byte codes (A5) as an input of the baselines (a control)
   address_dim: 64 # width of those codes; 64 = the recipe's model.d, the router's own table

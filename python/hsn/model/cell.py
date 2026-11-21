@@ -127,6 +127,21 @@ class WindowConsts(NamedTuple):
     fast_b1: Tensor | None = None
     fast_w2: Tensor | None = None
     fast_b2: Tensor | None = None
+    #: ``hardware.round_products=merged`` (opt-in, ``docs/word_event_speed.md``): the static
+    #: sparse round's unit pass on merged layouts (:meth:`UnitBank.merged_layout`,
+    #: :meth:`UnitBank.forward_static_merged`): ``w1_gate`` / ``b1_gate`` above carry the
+    #: gate's linear, and ``fold_w2 [H, M·d]`` / ``fold_b2 [M·d]`` are the second layers with
+    #: ``W_out`` folded in. With autograd, in the masters' dtype. ``None`` (default): every
+    #: unit's second layer on every pair, the gate's and ``W_out``'s own products, as before.
+    fold_w2: Tensor | None = None
+    fold_b2: Tensor | None = None
+    #: ``hardware.round_products=merged``: ``P`` and ``S`` as one two-layer map of ``[x_S ;
+    #: q]`` (:meth:`hsn.model.hsn.HSN.front_layout`: block-diagonal weights in ``nn.Linear``'s
+    #: layout, ``S``'s rows first). ``None`` (default): two products per layer, as before.
+    front_w1: Tensor | None = None
+    front_b1: Tensor | None = None
+    front_w2: Tensor | None = None
+    front_b2: Tensor | None = None
 
 
 def _mix(alpha: Tensor, unit_out: Tensor) -> Tensor:
@@ -237,16 +252,22 @@ class PDGCell(nn.Module):
             finally:
                 self._in_window = previous
 
-    def window_consts(self, fast_slots: int = 0) -> WindowConsts:
+    def window_consts(self, fast_slots: int = 0, merged: bool = False) -> WindowConsts:
         """The :class:`WindowConsts` of this window (P2.8): the same tensors the rounds of the
         window read from the caches. Only inside :meth:`window`. ``fast_slots = F > 0`` (P2.10c:
         the split window's sweep of a model with ``model.fast_units = fixed``) adds the layouts
-        of the first ``F`` slots' fixed units; ``0`` (default): the constants as before."""
+        of the first ``F`` slots' fixed units; ``0`` (default): the constants as before.
+        ``merged`` (``hardware.round_products=merged``): the static sparse round's unit pass
+        on the merged layouts, the gate riding in its first product and ``W_out`` folded into
+        its second (:class:`WindowConsts`); ``False``: the all-units pass."""
         if not self._in_window:
             raise RuntimeError("PDGCell.window_consts is only available inside PDGCell.window()")
         consts = WindowConsts(
             edge_weights=self.graph._padded_weights(), w1_flat=self.units._w1_flat()
         )
+        if merged:
+            w1, b1, w2, b2 = self.units.merged_layout(self.gate, self.W_out)
+            consts = consts._replace(w1_gate=w1, b1_gate=b1, fold_w2=w2, fold_b2=b2)
         if not fast_slots:
             return consts
         fast_w1, fast_b1, fast_w2, fast_b2 = self.units.slot_layout(fast_slots)
@@ -361,6 +382,12 @@ class PDGCell(nn.Module):
         instead of the grouped pass with its host-side histogram. The messages, the gate and the
         update are the same ops; the unit outputs agree to rounding. ``consts`` as in
         :meth:`step_dense`.
+
+        ``consts.fold_w2`` (``hardware.round_products=merged``, with ``static``): the unit
+        pass, the gate and ``W_out`` run as two products (:meth:`UnitBank.forward_static_merged`
+        on :meth:`UnitBank.merged_layout`) instead of four. The round is the same to rounding;
+        ``info["unit_out"]`` and ``info["mixed"]`` then hold ``W_out``'s output (the unit
+        output itself is not formed).
         """
         if self._in_window or consts is not None or static:  # validated by the caller (P1.10e)
             B, N, d = (int(n) for n in state.h.shape)
@@ -394,11 +421,28 @@ class PDGCell(nn.Module):
                     m = native.csr_messages(h_read, self.graph, self.V, cells)  # [B, K, d]
                 v_raw = native.gather_concat(u_read, eps, h_read, m, cells)  # [B, K, 4d]
                 v = self.norm(v_raw)  # P1.5a: the same normalisation as the dense round
-                b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
+                folded: Tensor | None = None
+                if static and consts is not None and consts.fold_w2 is not None:
+                    # hardware.round_products=merged: the gate's linear (the same input) rides
+                    # in the unit bank's first product, only the chosen unit's second layer
+                    # runs and W_out is folded into it: `folded` is W_out(F_j(v))
+                    assert consts.w1_gate is not None and consts.b1_gate is not None
+                    assert consts.fold_b2 is not None
+                    folded, gate_pre = self.units.forward_static_merged(
+                        v.reshape(B * K, in_dim),
+                        units.reshape(B * K),
+                        (consts.w1_gate, consts.b1_gate, consts.fold_w2, consts.fold_b2),
+                    )
+                    folded = folded.reshape(B, K, d)
+                    b = torch.sigmoid(gate_pre.reshape(B, K, d).to(state.dtype))
+                else:
+                    b = torch.sigmoid(self.gate(v).to(state.dtype))  # P1.9: see step_dense
                 if sel.write_mask is not None:  # A10: the write decision multiplies the gate
                     b = b * sel.write_mask.gather(1, cells).unsqueeze(-1).to(state.dtype)
             with profiler_segment(profiler, "selected_cells", B):
-                if static and consts is not None and consts.fast_w1 is not None:
+                if folded is not None:
+                    unit_out = folded  # W_out's output: the unit output itself is not formed
+                elif static and consts is not None and consts.fast_w1 is not None:
                     # P2.10c: the fast slots against their own unit's weights, the others as below
                     assert consts.fast_b1 is not None
                     assert consts.fast_w2 is not None and consts.fast_b2 is not None
@@ -429,7 +473,11 @@ class PDGCell(nn.Module):
                 # α (fp32, the selection's gradient entry) promotes the unit output like the dense
                 # path's mixing does; W_out recasts under autocast.
                 mixed = sel.alpha.unsqueeze(-1) * unit_out  # α_i F_j(v_i)
-                if self.cand_norm_kind == "none":
+                if folded is not None:
+                    # the fold: W_out has no bias, so W_out(α F) = α W_out(F) in both forms
+                    pre = self.cand_norm(folded.to(state.dtype))
+                    c = torch.tanh(sel.alpha.unsqueeze(-1).to(state.dtype) * pre)
+                elif self.cand_norm_kind == "none":
                     c = torch.tanh(self.W_out(mixed).to(state.dtype))  # P1.9: see step_dense
                 else:  # P1.13: α after the norm keeps the selection gradient (module docstring)
                     pre = self.cand_norm(self.W_out(unit_out).to(state.dtype))

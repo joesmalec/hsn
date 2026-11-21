@@ -4,10 +4,11 @@ step, without custom kernels.
 At the reference scale HSN is launch-bound (plan A.2): a training window is ``T`` positions of
 small kernels issued from Python, so the card waits on the host between launches. This module
 compiles the work of a window with ``torch.compile`` (``hardware.compile_mode``: ``none`` |
-``reduce-overhead`` | ``max-autotune``, passed through as the compile mode) and, on CUDA, replays
-it as CUDA Graphs. What it compiles is the same code the eager path runs
-(:meth:`hsn.model.hsn.HSN._position`), with three changes that make the shapes and the control flow
-static (plan P2.8, "static shapes are required for graph capture"):
+``default`` | ``reduce-overhead`` | ``max-autotune``, passed through as the compile mode) and, on
+CUDA, replays it as CUDA Graphs (``reduce-overhead`` and ``max-autotune``; ``default`` compiles
+without them, added 16 Nov 2026 for ``train.tbptt_windows``). What it compiles is the same code
+the eager path runs (:meth:`hsn.model.hsn.HSN._position`), with three changes that make the shapes
+and the control flow static (plan P2.8, "static shapes are required for graph capture"):
 
 * **Blocks of positions.** :func:`compile_window` compiles a block of ``block_size(T)``
   consecutive positions (at most :data:`MAX_BLOCK`, a divisor of ``T``) as one graph and calls it
@@ -39,6 +40,15 @@ IDs within a bucket never changes the graph. At B32 there are six nonempty bucke
 pass still runs on all rows. State maxima are reduced within each position; only ``capture=True``
 on the eager path materializes the full state history.
 
+``hardware.round_products = merged`` (opt-in, 17 Nov 2026, ``docs/word_event_speed.md``): the
+blocks of the autograd window take the sparse round's matrix products merged, as the fused
+sweep of P2.10 does without autograd: only the chosen unit's activation and second layer run
+(:meth:`~hsn.model.units.UnitBank.forward_static_merged`), the gate's linear rides in the unit
+bank's first product, ``W_out`` is folded into its second, and ``P`` and ``S`` share one product
+per layer (:meth:`HSN.front_layout`). 21 matrix products per position where ``separate`` (the
+default, the round as it was) has 33, forward and backward together. The same dot products in
+other matmul shapes: equal to rounding, like the compiled window against the eager one.
+
 The compiled window matches eager ``HSN.forward`` to rounding (fused kernels round differently),
 not bit for bit; ``hardware.compile_mode = none`` leaves every path eager and unchanged.
 ``profile:rtx3060`` compiles by default (``reduce-overhead``, the user's decision of 7 Nov 2026);
@@ -64,9 +74,16 @@ CUDA Graphs and the trainer (:class:`~hsn.train.tbptt.TBPTTTrainer`): the traine
 step per window, takes the carried state out of graph memory (a replay overwrites it), runs full
 windows (no trailing cut: one fixed ``T``), takes a statistics step's per-term gradient norms from
 one extra compiled pass per term (several retained backwards of one recorded graph are refused by
-CUDA Graph trees) and refuses ``train.grad_accum > 1`` (a gradient held in ``.grad`` from one
-window would live in graph memory the next window's replay overwrites). Compile time is reported
-apart from the steady state (the ``compile`` segment, never inside step timings).
+CUDA Graph trees) and refuses ``train.grad_accum > 1`` in the CUDA-graph modes (a gradient held
+in ``.grad`` from one window would live in graph memory the next window's replay overwrites).
+Compile time is reported apart from the steady state (the ``compile`` segment, never inside step
+timings). Without CUDA graphs (``default``) the trainer may accumulate windows and join them into
+gradient segments (``train.tbptt_windows``, ``docs/tbptt_windows.md``): a block's outputs keep
+their autograd edges to its inputs (AOTAutograd), so a window started from an attached state
+passes the gradient back into the window before; CUDA-graph replay stays refused for that
+(``tbptt_windows_scope_error``), since the next replay would overwrite what a live segment's
+backward pass still reads. Measured on the CPU only (inductor and ``aot_eager``); the CUDA step
+time of ``default`` is unmeasured.
 
 :func:`compile_step` is the serving step (P5.2's inference path in miniature): one position under
 ``no_grad`` on a preallocated state updated in place, so that its buffers keep their addresses and
@@ -93,12 +110,14 @@ from typing import Any, Literal, cast
 import torch
 from torch import Tensor, nn
 
+from hsn.config import CUDA_GRAPH_COMPILE_MODES
 from hsn.device import DeviceContext
 from hsn.kernels import window as window_kernels
 from hsn.model.cell import WindowConsts
 from hsn.model.hsn import (
     HSN,
     StepMode,
+    WindowCarry,
     _Controls,
     _Prologue,
     _stack_record,
@@ -112,6 +131,7 @@ __all__ = [
     "CompileMode",
     "CompiledWindow",
     "ServingStep",
+    "apply_message_gradients",
     "block_size",
     "check_compile_scope",
     "compile_step",
@@ -121,8 +141,8 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
-_MODES: tuple[CompileMode, ...] = ("none", "reduce-overhead", "max-autotune")
+CompileMode = Literal["none", "default", "reduce-overhead", "max-autotune"]
+_MODES: tuple[CompileMode, ...] = ("none", "default", "reduce-overhead", "max-autotune")
 
 #: The largest block of positions compiled as one graph: 16 (module docstring: half the compile of
 #: 32 for a step about 1 % slower; larger blocks only add compile time).
@@ -140,7 +160,29 @@ MAX_BLOCK = 16
 #:   (31)"); kept as a guard, since one node (a wide ``cat``) can read many buffers.
 MPS_INDUCTOR_OPTIONS: dict[str, Any] = {"max_fusion_size": 1, "max_fusion_unique_io_buffers": 24}
 
+#: ``hardware.round_products=merged``: the unit pass runs on the merged layouts
+#: (:meth:`hsn.model.units.UnitBank.forward_static_merged`: the chosen unit's second layer only,
+#: the gate riding in the first product, ``W_out`` folded into the second). False keeps the
+#: all-units pass under the key (measurements).
+MERGE_UNITS = True
+#: ``hardware.round_products=merged``: ``P`` and ``S`` share one product per layer
+#: (:meth:`hsn.model.hsn.HSN.front_layout`). False keeps their own under the key (measurements).
+MERGE_FRONT = True
+
 WindowOut = tuple[Tensor, CellGraphState, dict[str, Tensor]]
+
+
+def apply_message_gradients(model: nn.Module, kind: str) -> None:
+    """``hardware.message_gradients`` on ``model`` (``docs/perbyte_speed.md``): ``state``
+    makes the sparse round's messages accumulate the gradients of their two gathers in the
+    state's dtype (:attr:`hsn.model.graph.CellGraph.state_gradients`); ``autocast`` (the
+    default) leaves them in the autocast dtype, as before. The trainer and the runner's
+    profile pass call it on the model they run; a model without the memory's cells is left
+    alone (the configuration refuses the key there)."""
+    if kind not in ("autocast", "state"):
+        raise ValueError(f"hardware.message_gradients must be autocast or state, got {kind!r}")
+    if isinstance(model, HSN):
+        model.cell.graph.state_gradients = kind == "state"
 
 
 def block_size(T: int) -> int:
@@ -156,9 +198,13 @@ def block_size(T: int) -> int:
 # --------------------------------------------------------------------------------------------------
 
 
-def check_compile_scope(model: HSN, *, grad_accum: int = 1) -> None:
+def check_compile_scope(
+    model: HSN, *, grad_accum: int = 1, mode: CompileMode = "reduce-overhead"
+) -> None:
     """Raise ``NotImplementedError`` (with the reason) unless ``model`` is in the compiled scope
-    (module docstring): routing, gate, exploration, master dtype and ``train.grad_accum``."""
+    (module docstring): routing, gate, exploration, master dtype and, for a ``mode`` that replays
+    CUDA graphs (:data:`~hsn.config.CUDA_GRAPH_COMPILE_MODES`, on every device, so that a
+    configuration means the same everywhere), ``train.grad_accum``."""
     if not isinstance(model, HSN):
         raise TypeError(f"compile needs an HSN model, got {type(model).__name__}")
     cfg = model.cfg
@@ -194,11 +240,14 @@ def check_compile_scope(model: HSN, *, grad_accum: int = 1) -> None:
             "the fp64 master dtype is not compiled: the gradchecks (configs/tiny_gradcheck.yaml) "
             "stay eager (P2.8 'Do not')"
         )
-    if isinstance(grad_accum, bool) or not isinstance(grad_accum, int) or grad_accum != 1:
+    if isinstance(grad_accum, bool) or not isinstance(grad_accum, int) or grad_accum < 1:
+        raise ValueError(f"grad_accum must be an int >= 1, got {grad_accum!r}")
+    if grad_accum != 1 and mode in CUDA_GRAPH_COMPILE_MODES:
         raise NotImplementedError(
-            f"train.grad_accum={grad_accum!r} is not compiled: a CUDA-Graph backward output "
-            "held in .grad across windows would be overwritten by the next window's replay; use "
-            "train.grad_accum=1 or hardware.compile_mode=none"
+            f"train.grad_accum={grad_accum!r} is not compiled with CUDA graphs "
+            f"(hardware.compile_mode={mode}): a CUDA-Graph backward output held in .grad across "
+            "windows would be overwritten by the next window's replay; use train.grad_accum=1, "
+            "hardware.compile_mode=default (compiled without CUDA graphs) or none"
         )
 
 
@@ -322,7 +371,7 @@ def install_graph_alias_index() -> bool:
 
 
 def _uses_cuda_graphs(ctx: DeviceContext, mode: CompileMode, backend: Backend) -> bool:
-    return ctx.device.type == "cuda" and backend == "inductor" and mode != "none"
+    return ctx.device.type == "cuda" and backend == "inductor" and mode in CUDA_GRAPH_COMPILE_MODES
 
 
 def _mps_supported(backend: Backend, device: torch.device) -> tuple[bool, str]:
@@ -415,7 +464,9 @@ def _block(
             gates.append(result.gate)
             written.append(result.written)
         if model.cfg.selected_readout:
-            readouts.append(model._selected_readout(state, result.selection, controls.gate, mode))
+            readouts.append(
+                model._window_readout(state, result.selection, controls.gate, mode, c_b[:, i])
+            )
         z_hats.append(result.z_hat)
         epss.append(result.eps)
         us.append(result.u)
@@ -446,6 +497,113 @@ def _block(
         out["cap_gate"] = torch.stack(gates, dim=1)
         out["cap_written"] = torch.stack(written, dim=1)
     return out
+
+
+def _event_block(
+    model: HSN,
+    h: Tensor,
+    q: Tensor,
+    age: Tensor,
+    z_b: Tensor,
+    c_b: Tensor,
+    s_b: Tensor,
+    r_b: Tensor,
+    v_b: Tensor,
+    p_b: Tensor,
+    dense_rows: Tensor | None,
+    dense_indices: Tensor | None,
+    consts: WindowConsts,
+    mode: StepMode,
+    controls: _Controls,
+    keep_cells: bool,
+) -> dict[str, Tensor]:
+    """A block of consecutive event slots (``model.write_events``; the compile unit of the
+    event loop): :meth:`HSN._event_block` with the capturable round and the window's
+    constants. ``v_b [B, n]`` marks each row's real events; a padding slot leaves the row's
+    state unchanged."""
+    return model._event_block(
+        h,
+        q,
+        age,
+        z_b,
+        c_b,
+        s_b,
+        r_b,
+        v_b,
+        p_b,
+        mode,
+        controls,
+        dense_rows,
+        static=True,
+        consts=consts,
+        dense_indices=dense_indices,
+        keep_cells=keep_cells,
+    )
+
+
+def _block_columns(x: Tensor, cols: slice) -> Tensor:
+    """The event slots ``cols`` of ``x [B, E, …]`` (:meth:`HSN._event_slots`) as a dense
+    ``[B, n, …]`` tensor of their own: the input of one compiled block.
+
+    Dynamo guards on the strides of a compiled function's tensor inputs (static shapes), and a
+    slice of ``[B, E, …]`` carries ``E`` in its first stride: every new number of event slots
+    compiled a new graph of :func:`_event_block`, and with ``fullgraph`` the ninth one raised
+    ``FailOnRecompileLimitHit``. ``model.word_address`` makes every byte of a context that is
+    not text an event (the padding behind a document under ``data.align_docs`` among them), so
+    on TinyStories ``E`` took 10 values in 400 training windows of B32 (64 to 256; the byte
+    address's events: 64 in all of them), and the runs compiled for 20 minutes on a card without
+    a step. A dense copy of the block's columns has the strides of ``[B, n, …]`` whatever ``E``
+    is: one graph.
+
+    17 Nov 2026 (``docs/word_event_speed.md``): until then the slots were padded to ``[B, T,
+    …]`` and a block read a slice of that. The strides were free of ``E`` as well, but a CUDA
+    graph copies a strided input by the byte extent it spans, which for a slice of 16 columns
+    of the padded scorer features is nearly all of it: 22 MB per block at B 32, T 256 and 64
+    cells, four times a window, after the padding itself. The dense block is a sixteenth of
+    that; the values are the same."""
+    return x[:, cols].contiguous()
+
+
+def _plus_zero(grad: Tensor) -> Tensor:
+    """``grad + 0.0``: what summing a gradient with exact zeros leaves of it (every value
+    itself, ``-0.0`` as ``+0.0``). The gradient hook of :func:`_window_blocks`."""
+    return grad + 0.0
+
+
+def _window_blocks(x: Tensor, blk: int) -> tuple[Tensor, ...]:
+    """The blocks of ``blk`` consecutive columns of ``x [B, T, …]`` (a window's per-position
+    input of the loop over bytes: the encoded bytes, the context, the scorer's scalars, the
+    resets) as ``T / blk`` dense ``[B, blk, …]`` tensors: the inputs of the compiled blocks.
+
+    18 Nov 2026 (``docs/perbyte_speed.md``): until then a block read the slice ``x[:, cols]``.
+    The values are the same; what changes is what the step pays around the blocks:
+
+    * **The graph's input copy.** A CUDA graph copies a strided input by the byte extent it
+      spans (:func:`_block_columns`), and a slice of 16 columns of ``[B, T, …]`` spans nearly
+      all of it: every one of the 16 blocks copied the whole window's scalars, context and
+      encoded bytes (517 MB a step at B 32, T 256, 64 cells and the top0 reader's width:
+      3.1 ms on the RTX 3060). Here the window is copied once, block by block (one copy with
+      the blocks as the leading dimension), and a block's input is a dense piece of that
+      copy: 32 MB a step (0.7 ms, and 0.2 ms for the one copy).
+    * **The backward pass between the blocks.** Each slice's backward made a zero tensor of
+      the window's size, copied the block's gradient into it and added it to the other
+      blocks': 16 times for the encoded bytes and for the context (1.6 ms of the 3.2 ms
+      between the backward replays). ``unbind`` has one backward node, which lays the 16
+      gradients side by side once.
+
+    The gradient that reaches ``x`` is bit for bit the one the slices gave: every element of
+    ``x`` lies in exactly one block, so the old sum was that block's gradient plus exact
+    zeros, which is the gradient itself except that ``-0.0`` becomes ``+0.0``;
+    :func:`_plus_zero` does the same to the gradient here (with one block there was no sum,
+    and there is no hook). One block is ``x`` itself, no copy."""
+    B, T = int(x.shape[0]), int(x.shape[1])
+    n = T // blk
+    if n == 1:
+        return (x,)
+    dense = x.reshape(B, n, blk, *x.shape[2:]).transpose(0, 1).contiguous()
+    if dense.requires_grad:
+        dense.register_hook(_plus_zero)  # type: ignore[no-untyped-call]
+    return dense.unbind(0)
 
 
 #: The parameters autocast casts at every use (the linears of P, S, the scorer, V, the gate,
@@ -1219,16 +1377,29 @@ class CompiledWindow:
     time of the calls that compiled or recorded (the first call of each new variant), ``calls``
     counts calls."""
 
-    def __init__(self, model: HSN, ctx: DeviceContext, mode: CompileMode, backend: Backend) -> None:
+    def __init__(
+        self,
+        model: HSN,
+        ctx: DeviceContext,
+        mode: CompileMode,
+        backend: Backend,
+        *,
+        merged: bool = False,
+    ) -> None:
         self.model = model
         self.ctx = ctx
         self.mode = mode
         self.backend = backend
+        #: ``hardware.round_products=merged``: the autograd window's blocks take the sparse
+        #: round's matrix products merged (:meth:`_consts`); False: one product per map.
+        self.merged = merged
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
         self._block = _compiler(mode, backend, ctx.device.type)(_block)
         self._bucket_blocks: dict[int, Any] = {0: self._block}
         #: The capture variant's compiled blocks (their own code objects and recompile budgets).
         self._capture_blocks: dict[int, Any] = {}
+        #: The event loop's compiled blocks (``model.write_events``), per dense-fallback bucket.
+        self._event_blocks: dict[int, Any] = {}
         #: The split window's forward sweep (P2.10): compiled on first use (:meth:`tape`), one
         #: compiled function for the native round and one for the fused round.
         self._tape_blocks: dict[tuple[bool, bool, int, int], Any] = {}
@@ -1239,6 +1410,14 @@ class CompiledWindow:
         self.calls = 0
         self.compile_seconds = 0.0
         self._variants: set[tuple[object, ...]] = set()
+
+    def _consts(self) -> WindowConsts:
+        """The window constants of the autograd window's blocks (inside the cell's window):
+        the cell's own, or with ``hardware.round_products=merged`` the merged layouts
+        (:meth:`HSN.merged_consts`)."""
+        if not self.merged:
+            return self.model.cell.window_consts()
+        return self.model.merged_consts(units=MERGE_UNITS, front=MERGE_FRONT)
 
     def variant(
         self, B: int, T: int, dense_bucket: int, capture: bool = False
@@ -1274,7 +1453,7 @@ class CompiledWindow:
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> WindowOut:
         model = self.model
         if not isinstance(capture, bool):
@@ -1332,6 +1511,7 @@ class CompiledWindow:
         self._block = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
         self._bucket_blocks = {0: self._block}
         self._capture_blocks = {}
+        self._event_blocks = {}
         self._tape_blocks = {}
         self._variants.clear()
         gc.collect()
@@ -1431,7 +1611,7 @@ class CompiledWindow:
         mode: StepMode,
         controls: _Controls,
         dense_rows: Tensor | None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
         dense_indices: Tensor | None = None,
         *,
         capture: bool = False,
@@ -1440,8 +1620,11 @@ class CompiledWindow:
         T = int(tokens.shape[1])
         blk = block_size(T)
         pro = model._window_prologue(
-            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens
+            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens, steps=False
         )
+        if pro.events is not None:  # model.write_events: the loop over event slots
+            model._refuse_event_capture(capture)
+            return self._run_events(pro, state, reset, mode, controls, dense_rows, dense_indices)
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age, pos = state.h, state.q, state.age, state.pos
@@ -1461,9 +1644,14 @@ class CompiledWindow:
             # needs at most six fallback shapes, independent of which row IDs were drawn.
             table[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(_block)
         block = table[bucket]
+        # every block's inputs as dense tensors: one copy of the window, not one per block
+        z_blocks = _window_blocks(pro.z, blk)
+        context_blocks = _window_blocks(pro.context, blk)
+        scalar_blocks = _window_blocks(pro.scalars, blk)
+        reset_blocks = _window_blocks(reset, blk)
         with model.cell.window():
-            consts = model.cell.window_consts()
-            for start in range(0, T, blk):
+            consts = self._consts()
+            for index, start in enumerate(range(0, T, blk)):
                 cols = slice(start, start + blk)
                 dense_in: tuple[Tensor, Tensor] | None = None
                 if pro.counters is not None:
@@ -1475,10 +1663,10 @@ class CompiledWindow:
                     q,
                     age,
                     pos,
-                    pro.z[:, cols],
-                    pro.context[:, cols],
-                    pro.scalars[:, cols],
-                    reset[:, cols],
+                    z_blocks[index],
+                    context_blocks[index],
+                    scalar_blocks[index],
+                    reset_blocks[index],
                     dense_in,
                     dense_rows,
                     dense_indices,
@@ -1517,6 +1705,69 @@ class CompiledWindow:
             written=joined("cap_written") if capture else None,
             readouts=joined("readouts") if model.cfg.selected_readout else None,
         )
+
+    def _run_events(
+        self,
+        pro: _Prologue,
+        state: CellGraphState,
+        reset: Tensor,
+        mode: StepMode,
+        controls: _Controls,
+        dense_rows: Tensor | None,
+        dense_indices: Tensor | None,
+    ) -> WindowOut:
+        """:meth:`_run` with ``model.write_events``: the compiled :func:`_event_block` over the
+        window's event slots, a block at a time. The number of blocks follows the batch (its
+        largest event count); the loop over blocks is eager, and every block's inputs are
+        dense copies of its slots (:func:`_block_columns`: strides without ``E``), so no new
+        graph is compiled for another number of slots. The per-byte reads run after the loop
+        (:meth:`HSN._event_epilogue`)."""
+        model = self.model
+        T = int(reset.shape[1])
+        blk = block_size(T)
+        ev = model._event_slots(pro, reset, blk)
+        if self.cuda_graphs:
+            torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
+        h, q, age = state.h, state.q, state.age
+        if torch.is_grad_enabled() and not (h.requires_grad or q.requires_grad):
+            h = h.detach().requires_grad_(True)  # one graph for every block, as in _run
+            q = q.detach().requires_grad_(True)
+        start = CellGraphState._make(h=h, q=q, age=age, pos=state.pos)
+        bucket = 0 if dense_indices is None else int(dense_indices.numel())
+        if bucket not in self._event_blocks:
+            self._event_blocks[bucket] = _compiler(self.mode, self.backend, self.ctx.device.type)(
+                _event_block
+            )
+        block = self._event_blocks[bucket]
+        keep_cells = model.cell_read is not None
+        blocks: list[dict[str, Tensor]] = []
+        with model.cell.window():
+            consts = self._consts()
+            for first in range(0, int(ev.valid.shape[1]), blk):
+                cols = slice(first, first + blk)
+                out = block(
+                    model,
+                    h,
+                    q,
+                    age,
+                    _block_columns(ev.z, cols),
+                    _block_columns(ev.context, cols),
+                    _block_columns(ev.scalars, cols),
+                    _block_columns(ev.reset, cols),
+                    _block_columns(ev.valid, cols),
+                    _block_columns(ev.pos, cols),
+                    dense_rows,
+                    dense_indices,
+                    consts,
+                    mode,
+                    controls,
+                    keep_cells,
+                )
+                h, q, age = out["h"], out["q"], out["age"]
+                blocks.append(out)
+        if self.cuda_graphs:  # out of graph memory: the next replay overwrites the outputs
+            h, q, age = h.clone(), q.clone(), age.clone()
+        return model._event_epilogue(pro, ev, start, blocks, h, q, age)
 
 
 def run_tape(
@@ -1603,7 +1854,7 @@ def _eager_window(model: HSN) -> Callable[..., WindowOut]:
         *,
         capture: bool = False,
         reset_columns: Sequence[int] | None = None,
-        prev_tokens: Tensor | None = None,
+        prev_tokens: Tensor | WindowCarry | None = None,
     ) -> WindowOut:
         result: WindowOut = model(
             tokens,
@@ -1626,16 +1877,19 @@ def compile_window(
     *,
     backend: Backend = "inductor",
     grad_accum: int = 1,
+    merged: bool = False,
 ) -> Callable[..., WindowOut]:
     """The training window of ``model`` at compile level ``mode`` (module docstring): ``none``
     returns the eager ``model.forward``; otherwise a :class:`CompiledWindow` (after
     :func:`check_compile_scope`). On MPS a backend that cannot compile falls back to eager with a
     logged notice. ``backend`` is ``inductor`` (what ``hardware.compile_mode`` means); tests pass
-    ``aot_eager`` where inductor's C++ toolchain is absent."""
+    ``aot_eager`` where inductor's C++ toolchain is absent. ``merged``
+    (``hardware.round_products=merged``): the blocks take the sparse round's matrix products
+    merged (:meth:`CompiledWindow._consts`, ``docs/word_event_speed.md``)."""
     mode = _check_mode(mode)
     if mode == "none":
         return _eager_window(model)
-    check_compile_scope(model, grad_accum=grad_accum)
+    check_compile_scope(model, grad_accum=grad_accum, mode=mode)
     if ctx.device.type == "mps":
         ok, reason = _mps_supported(backend, ctx.device)
         if not ok:
@@ -1648,7 +1902,7 @@ def compile_window(
                 reason,
             )
             return _eager_window(model)
-    return CompiledWindow(model, ctx, mode, backend)
+    return CompiledWindow(model, ctx, mode, backend, merged=merged)
 
 
 # --------------------------------------------------------------------------------------------------

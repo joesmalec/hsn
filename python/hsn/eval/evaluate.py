@@ -18,6 +18,11 @@ returns the averages overall and per *group* (``"<task>/<variant>"`` by default,
 loss position of a pass, for example by query slot (:class:`hsn.experiments.split.QuerySlots`); a
 second accumulator averages the same per-position values by those labels, reported under
 ``"per_position_group"``. The overall and per-group results are computed exactly as without it.
+
+**Observer (18 Nov 2026).** ``observer`` (optional, :data:`WindowObserver`) is called once per
+window, after the metrics, with the loader's window (CPU fields) and the window's logits
+(float32, on the device). It reads; nothing it does enters a metric (:mod:`hsn.eval.distance`
+keeps every loss position's loss and prediction with it).
 """
 
 from __future__ import annotations
@@ -31,13 +36,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from hsn.model.hsn import address_history
+from hsn.model.hsn import WindowCarry, address_history
 
 __all__ = [
     "DEFAULT_METRICS",
     "Metric",
     "MetricAccumulator",
     "PositionGroups",
+    "WindowObserver",
     "bits_per_byte",
     "evaluate_windows",
     "nll",
@@ -46,6 +52,8 @@ __all__ = [
 
 Metric = Callable[[Tensor, Tensor], Tensor]
 Batch = dict[str, Tensor]
+#: Called per evaluated window with ``(window, logits [B, T, V] float32)`` (module docstring).
+WindowObserver = Callable[[Mapping[str, Tensor], Tensor], None]
 
 
 class PositionGroups(Protocol):
@@ -188,6 +196,7 @@ def evaluate_windows(
     group_of_doc: Tensor | None = None,
     group_names: Sequence[str] = (),
     position_groups: PositionGroups | None = None,
+    observer: WindowObserver | None = None,
 ) -> dict[str, Any]:
     """Run ``model`` over consecutive ``windows`` without gradients and average the metrics.
 
@@ -197,7 +206,8 @@ def evaluate_windows(
     ``group_of_doc[d]`` (int64, on any device) is the index into ``group_names`` of document
     ``d``; when given, per-group results are reported under ``"per_group"``. The result also
     carries ``n_windows`` and ``n_tokens`` (non-padding positions seen). ``position_groups``
-    (P1.15, module docstring) adds ``per_position_group``.
+    (P1.15, module docstring) adds ``per_position_group``; ``observer`` sees every window and
+    its logits and changes nothing.
     """
     accumulator = MetricAccumulator(metrics, group_names)
     by_position: MetricAccumulator | None = None
@@ -213,7 +223,8 @@ def evaluate_windows(
     n_windows = 0
     n_tokens = 0
     state: Any = None
-    prev_tokens: Tensor | None = None
+    # A5's carried bytes; with model.reader_carry on the memory also the reader's cache
+    prev_tokens: Tensor | WindowCarry | None = None
     underlying = getattr(model, "model", model)
     key_address = bool(getattr(getattr(underlying, "cfg", None), "key_address", False))
     batch_size: int | None = None
@@ -234,9 +245,9 @@ def evaluate_windows(
                 targets = window["targets"].to(device)
                 with ctx:
                     kwargs = {"prev_tokens": prev_tokens} if key_address else {}
-                    logits, state, _info = model(tokens, context, state, reset, **kwargs)
+                    logits, state, info = model(tokens, context, state, reset, **kwargs)
                 if key_address:
-                    prev_tokens = address_history(underlying.cfg, tokens, prev_tokens)
+                    prev_tokens = address_history(underlying.cfg, tokens, prev_tokens, info)
                 group_ids: Tensor | None = None
                 if groups is not None:
                     doc = window["doc"].to(device)
@@ -245,6 +256,8 @@ def evaluate_windows(
                 if by_position is not None and labeller is not None:  # P1.15
                     labels = labeller(window).to(device)
                     by_position.update(logits.float(), targets, loss_mask, labels)
+                if observer is not None:
+                    observer(window, logits.float())
                 n_windows += 1
                 n_tokens += int((window["doc"] >= 0).sum())
     finally:

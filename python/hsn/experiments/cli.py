@@ -302,6 +302,22 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
                 ["label", "arm id", "existing", "exp"],
             )
         )
+    for s in report.skipped:
+        if not s.get("eval_differs"):
+            continue
+        # eval.* is evaluation-only and not part of an arm id: the arm is the one that exists
+        if s["status"] in dbm.FINISHED:
+            print(
+                f"note: {s['label']}: exp {s['exp_id']} ({s['status']}) was run with other "
+                "eval.* settings, which are not part of an arm id, so nothing was queued. Score "
+                f"the run that exists: python -m hsn.eval.distance --run-dir {s['run_dir']} "
+                "(--force trains the arm again)"
+            )
+        else:
+            print(
+                f"note: {s['label']}: exp {s['exp_id']} ({s['status']}) keeps the eval.* "
+                "settings it was queued with; cancel it and enqueue again to change them"
+            )
     row = db.row(
         "SELECT COUNT(*) AS n FROM sweeps WHERE name = ? AND id <= ?", (spec.name, report.sweep_id)
     )

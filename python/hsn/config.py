@@ -38,7 +38,9 @@ every other configuration unchanged; such a configuration must be routed, probe 
 windows, keep the horizon inside the window and not run soft gates throughout. P1.16's rollback
 keys (``train.rollback_*``, :data:`ROLLBACK_KEYS`) are off by default and, at their defaults, left
 out of the hash (:data:`HASH_OMIT_AT_DEFAULT`), so every configuration written before them keeps its
-``config_hash``.
+``config_hash``. ``eval.*`` (18 Nov 2026) holds opt-in evaluation reports
+(``eval.by_distance``, :mod:`hsn.eval.distance`); the whole section is evaluation-only and never
+enters the hash or an arm id, whatever it holds (:data:`HASH_EXCLUDED`).
 
 Override values (``load_config(path, overrides=["model.k_select=4"])``) are parsed as YAML scalars
 (``4``, ``0.5``, ``true``, ``null``, ``[0, 1]``, ``{a: 1}``) unless the target field is a string, a
@@ -67,6 +69,7 @@ __all__ = [
     "AUX_TERMS",
     "BASELINE_COMPILE_MODEL_NAMES",
     "HARDWARE_PROFILE_DIR",
+    "HASH_EXCLUDED",
     "HASH_OMIT_AT_DEFAULT",
     "HSN_MODEL_NAMES",
     "RETIRED_KEYS",
@@ -75,9 +78,13 @@ __all__ = [
     "REPO_ROOT",
     "ROLLBACK_KEYS",
     "BaselineConfig",
+    "ByDistanceConfig",
     "DataConfig",
+    "DistanceSetConfig",
+    "EvalConfig",
     "FastConfig",
     "GRUBaselineConfig",
+    "GatedDeltaNetBaselineConfig",
     "GrowthConfig",
     "HardwareConfig",
     "ModelConfig",
@@ -128,7 +135,10 @@ Profile = Literal["rtx3060", "a100", "dgx_spark", "m_series", "cpu", "gpu8gb"]
 Device = Literal["cuda", "mps", "cpu"]
 AutocastDtype = Literal["bf16", "fp16", "fp32"]
 MasterDtype = Literal["fp32", "fp64"]
-CompileMode = Literal["none", "reduce-overhead", "max-autotune"]
+CompileMode = Literal["none", "default", "reduce-overhead", "max-autotune"]
+#: The values of ``hardware.compile_mode`` that replay the HSN's compiled window as CUDA graphs on
+#: CUDA (``default`` compiles without them).
+CUDA_GRAPH_COMPILE_MODES: tuple[str, ...] = ("reduce-overhead", "max-autotune")
 #: Opt-in: the ``torch.compile`` mode of a baseline's training and evaluation windows
 #: (``hardware.baseline_compile``, :mod:`hsn.train.baseline_compile`). ``none`` runs the baseline
 #: eager, as before the key; the other values are passed to ``torch.compile`` as its mode
@@ -138,15 +148,29 @@ BaselineCompileMode = Literal[
 ]
 #: The model names whose windows ``hardware.baseline_compile`` compiles; ``hsn_t`` is one more
 #: with ``model.memory = false`` (HSN-T without its memory: stateless, on the generic trainer).
-BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "reader")
+BASELINE_COMPILE_MODEL_NAMES: tuple[str, ...] = ("gru", "transformer", "selective_ssm", "reader")
 #: P2.10: how a routed training window runs. ``autograd`` is the window of P1.7 / P2.8 (one
 #: autograd graph over the positions); ``split`` is the forward sweep without autograd plus one
 #: batched replay (:mod:`hsn.train.split`; needs the full A6 feedback cut); ``fused`` is ``split``
 #: with the sweep's cell round as one fused CUDA op (:mod:`hsn.kernels.window`): experimental,
 #: correct but slower than ``split`` as measured on 11 Nov 2026 (docs/p2_10_split_window.md).
 WindowMode = Literal["autograd", "split", "fused"]
+#: Opt-in (``hardware.round_products``, ``docs/word_event_speed.md``): how the compiled autograd
+#: window's sparse round takes its matrix products. ``separate``: one product per map and every
+#: unit on every selected pair, as since P2.8. ``merged``: the same dot products in fewer and
+#: smaller products (equal to rounding).
+RoundProducts = Literal["separate", "merged"]
+#: Opt-in (``hardware.message_gradients``, ``docs/perbyte_speed.md``): the dtype in which the
+#: sparse round's messages accumulate the two gradients of their gathers (the edge weights' and
+#: ``V h``'s). ``autocast``: in the autocast dtype, as before. ``state``: in the state's dtype
+#: (fp32 under bf16 autocast). The forward values are the same bit for bit.
+MessageGradients = Literal["autocast", "state"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
-ModelName = Literal["hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "moe"]
+ModelName = Literal[
+    "hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet", "moe"
+]
+#: ``baseline.transformer.position``: the learned position table (default) or rotary positions.
+TransformerPosition = Literal["learned", "rotary"]
 #: The model names built on the HSN's cells: the HSN, and HSN-T, the family of its own that puts
 #: a Transformer reader in front of the HSN's memory core (``model.reader``, ``docs/hsn_t.md``).
 #: Everything "HSN-only" in this schema applies to both; ``model.reader`` separates them.
@@ -383,6 +407,65 @@ class ModelConfig(_StrictModel):
     # short-sighted reader, which must leave everything further back to the memory).
     # null (default): every byte of the document up to the position, inside the window.
     reader_span: int | None = Field(default=None, ge=1)
+    # --- the reader's positions (docs/hsn_t.md, "The reader's positions"; opt-in, 15 Nov 2026) ---
+    # reader_position: how the reader learns where a byte is. "rotary" (default): the rotation
+    # of the attention's queries and keys, which reads distances only and has no parameter.
+    # "learned": a table of reader_positions rows added to the byte embedding by window
+    # position, as the Transformer baseline's, and no rotation; the reader then reads the
+    # position in the window, so its output is no longer a function of distances alone. A
+    # diagnostic: it tells the rotation's share of the text gap to the baseline.
+    reader_position: Literal["rotary", "learned"] = "rotary"
+    # The rows of the learned table: the longest window the reader then reads (train.unroll
+    # must not exceed it). Not read with rotary positions.
+    reader_positions: int = Field(default=256, ge=1)
+    # reader_rotary_pairs = n: only the first n pairs of each head's query and key (the n
+    # highest frequencies, unchanged) are rotated; the other pairs are compared as they are, at
+    # every distance. A list gives n for each block, first to last (the baseline adds its
+    # positions once, before the first block; the reader rotates in every block). 0 rotates
+    # nothing: that block's attention compares queries and keys as they are. null (default):
+    # all width / heads / 2 pairs in every block. Distances only, as before.
+    reader_rotary_pairs: int | list[int] | None = None
+    # reader_rotary_dtype: the arithmetic of the rotation. "working" (default): the dtype of
+    # the queries and keys, which is bf16 under bf16 autocast. "parameters": the dtype of the
+    # parameters (float32 master weights), the rotated queries and keys cast back for the
+    # attention. Without autocast the two are the same computation.
+    reader_rotary_dtype: Literal["working", "parameters"] = "working"
+    # reader_rotary_base = b: the base of the rotation's frequency ladder; pair i of a head
+    # (half = width / heads / 2 pairs) turns by t * b^(-i / half) at distance t. 10000
+    # (default) is the reader as it was. A larger base gives the slower pairs longer
+    # wavelengths (pair 0 keeps one radian a position). Must be finite and above 1. Read only
+    # by the rotary positions: refused with reader_position=learned, as the other rotation keys.
+    reader_rotary_base: float = 10_000.0
+    # --- end the reader's positions ---
+    # --- the reader's carried context (docs/hsn_t_no_memory.md, "Reading past the window";
+    # opt-in, 15 Nov 2026; untested candidates) ---
+    # reader_carry = C: every reader block keeps the keys and values of the last C positions of
+    # the windows before, detached (no gradient across windows), as model state the trainer
+    # carries; position t reads the keys at distances 0..C of its document, cached or of the
+    # window: a sliding span, so no distance exceeds C at any window or document length. Needs
+    # rotary positions and no reader_span. HSN-T without its memory and model_name = reader
+    # carry the cache as their state. HSN-T with its memory takes it too (17 Nov 2026,
+    # docs/amendments/reader_carry_memory.md; opt-in): the cache is not part of the cells' state
+    # and rides with the address carry (hsn.model.hsn.WindowCarry), so it needs
+    # model.key_address, and it refuses reader_top_words, address_gate_input=reader_prev and
+    # train.lambda_u > 0. 0 (default): no cache, every window read alone.
+    reader_carry: int = Field(default=0, ge=0)
+    # reader_top_words = N: the top block also reads the keys and values at the last N word
+    # ends of its document before the window (a byte that is not a letter or digit directly
+    # after one; ASCII letters, digits and bytes >= 128 count as letters), carried and
+    # detached as the cache is; an entry inside the local span (distance <= reader_carry) is
+    # not read twice. Needs reader_carry > 0 and the top block unrotated (the last entry of
+    # reader_rotary_pairs 0, or 0 for all blocks). 0 (default): no word entries.
+    reader_top_words: int = Field(default=0, ge=0)
+    # --- end the reader's carried context ---
+    # reader_mask (docs/reader_causal_flash.md; opt-in, 17 Nov 2026): how the reader's attention
+    # is masked. "document" (default): the block-diagonal causal mask over the documents of a
+    # row, passed to SDPA as an additive bias (the memory-efficient kernel on CUDA), the reader
+    # as it was. "causal": SDPA with is_causal=True and no mask (the flash kernel on CUDA). The
+    # same mask, so the same reader, wherever no window has a reset after column 0: allowed only
+    # with reader_span null, reader_carry 0 and data.align_docs true (RunConfig), and the reader
+    # asserts on the device, without a host read, that no window has such a reset.
+    reader_mask: Literal["document", "causal"] = "document"
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
     # embeddings, E, the reader, S and D, with no cells, router, units, graph, predictor or
@@ -391,6 +474,51 @@ class ModelConfig(_StrictModel):
     # memory are then not read; the generic trainer trains it on the next-byte loss alone.
     # true (default): the model with its memory, unchanged.
     memory: bool = True
+    # cell_attention_heads (docs/amendments/cell_attention_read.md; opt-in candidate, HSN-T
+    # only): H > 0 adds an attention read of the cells beside the router's read. At every
+    # position the reader's output c_t queries all n_cells cells with H heads of width d / H
+    # (keys from each cell's state and its fixed address code, values from its state, softmax
+    # over every cell, no top-k), and the result m_t (width d) is one more input of the
+    # decoder: D([q; u; r; c; m]). The cells, the router and its selection, the units, the
+    # gates, the graph, q, the write path and the losses are unchanged. Needs model.reader
+    # (the queries), model.memory, model.key_address (the address codes) and d a multiple of
+    # H; built into the autograd window only. 0 (default): no read, the model as it was.
+    cell_attention_heads: int = Field(default=0, ge=0)
+    # write_events (docs/amendments/write_events.md; opt-in candidate, HSN-T only): when the
+    # memory runs. byte (default): once per byte, the model as it was. word: only at events,
+    # and the position loop runs over those instead of over every byte. An event is a word
+    # end (a byte that is not an ASCII letter or digit directly after one that is; bytes >=
+    # 128 count as letters, every control and marker symbol as a separator) or a position
+    # where a document starts (reset). The cells, the router, the units, the gates, eps, the
+    # graph, q's update and the write equations are unchanged and run at events only; age
+    # counts events, pos keeps counting bytes. The decoder still reads every byte: q_t and
+    # r_t of the latest event at or before t, m_t (cell_attention_heads) with t's own query
+    # over the cells as that event left them, and u_t = S([z_t; q before t; ctx_t; c_t]).
+    # L_pred is taken at the events. all: every byte is an event, through the same event
+    # path; a test value (it must reproduce byte), not for runs.
+    write_events: Literal["byte", "word", "all"] = "byte"
+    # word_address (docs/amendments/write_events.md, "The word address"; opt-in candidate, needs
+    # write_events=word): what A5's two address features read at an event. none (default): the
+    # byte at the event and the byte before it, the event loop as it was. exact | bag: the
+    # whole word. The key of an event is the word it closes (the word of letters that ended
+    # just before it; at a document start or under a context that is not text, the byte at the
+    # event); a_cur reads the code of the event's key and a_prev the code of the key of the
+    # event before (BOS at a document start), so a fact "k v" is written at v's event under
+    # k's code in a_prev and read at k's later event under k's code in a_cur. The event rule
+    # becomes the word rule: under a text context (word_contexts) a word byte is an ASCII
+    # letter or digit or an apostrophe directly between two letters, and every other byte is
+    # a word of one byte; under every other context each byte is its own word and an event,
+    # so there the model is the loop over bytes with A5's address. The address folds A-Z to
+    # a-z (text contexts only); the content path still reads the capital. exact: the product
+    # of one fixed ±1 table per byte position, d^(-1/2) s_1[f_1] * ... * s_j[f_j] (positions
+    # past 16 reuse the 16th table). bag: the unit sum of fixed ±1 codes of the word's 2- and
+    # 3-grams with a start and an end mark. A word of one byte keeps A5's byte code under
+    # both. The tables are buffers drawn from the run seed after everything A5 and A9 draw;
+    # nothing in the address is trained. A9's features (address_ngram > 1) still read bytes.
+    word_address: Literal["none", "exact", "bag"] = "none"
+    # word_contexts: the context ids whose bytes are text for word_address (TinyStories is
+    # 6). Read only with word_address; every other context keeps one word per byte.
+    word_contexts: list[int] = [6]
     # --- end HSN-T ---
     # --- Never-trained bytes (docs/key_content.md; opt-in, 15 Nov 2026; HSN and HSN-T) ---
     # zero_unseen_bytes: a byte that no training window has held as an input has never received
@@ -542,6 +670,13 @@ class ModelConfig(_StrictModel):
             )
         # --- end A8 ---
         # --- HSN-T: the window reader ---
+        base_default = type(self).model_fields["reader_rotary_base"].default
+        if not 1.0 < self.reader_rotary_base < float("inf"):  # also refuses NaN
+            raise ValueError(
+                f"model.reader_rotary_base={self.reader_rotary_base} must be a finite number "
+                f"above 1: the base of the rotation's frequency ladder ({base_default} is the "
+                "default)"
+            )
         if self.reader == "none":
             if self.address_gate_input == "reader_prev":
                 raise ValueError(
@@ -552,6 +687,27 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     f"model.reader_span={self.reader_span} (HSN-T) is the span of model.reader; "
                     "set model.reader=transformer or leave it null"
+                )
+            if (
+                self.reader_position != "rotary"
+                or self.reader_rotary_pairs is not None
+                or self.reader_rotary_dtype != "working"
+                or self.reader_rotary_base != base_default
+            ):
+                raise ValueError(
+                    "model.reader_position / reader_rotary_pairs / reader_rotary_dtype / "
+                    "reader_rotary_base are the positions of model.reader; set "
+                    "model.reader=transformer or leave them at their defaults"
+                )
+            if self.reader_carry or self.reader_top_words:
+                raise ValueError(
+                    "model.reader_carry / model.reader_top_words: each carries the keys of "
+                    "model.reader across windows; set model.reader=transformer or leave them at 0"
+                )
+            if self.reader_mask != "document":
+                raise ValueError(
+                    f"model.reader_mask={self.reader_mask} is the mask of model.reader's "
+                    "attention; set model.reader=transformer or leave it at document"
                 )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
@@ -566,6 +722,75 @@ class ModelConfig(_StrictModel):
                     f"model.reader_heads={self.reader_heads} with an even width per head (the "
                     "positions rotate pairs of the attention's query and key)"
                 )
+            if self.reader_position == "learned" and (
+                self.reader_rotary_pairs is not None
+                or self.reader_rotary_dtype != "working"
+                or self.reader_rotary_base != base_default
+            ):
+                raise ValueError(
+                    "model.reader_position=learned has no rotation: leave "
+                    "model.reader_rotary_pairs, model.reader_rotary_dtype and "
+                    "model.reader_rotary_base at their defaults"
+                )
+            pairs = self.reader_rotary_pairs
+            if isinstance(pairs, list) and len(pairs) != self.reader_layers:
+                raise ValueError(
+                    f"model.reader_rotary_pairs={pairs} names {len(pairs)} blocks and the "
+                    f"reader has model.reader_layers={self.reader_layers}: one count for each "
+                    "block, or one number for all of them"
+                )
+            counts = pairs if isinstance(pairs, list) else [] if pairs is None else [pairs]
+            if any(n < 0 or n > per_head // 2 for n in counts):
+                raise ValueError(
+                    f"model.reader_rotary_pairs={pairs} must lie between 0 and the "
+                    f"{per_head // 2} pairs of a head (model.reader_width / model.reader_heads "
+                    "/ 2); null rotates all of them"
+                )
+            if self.reader_carry and self.reader_position == "learned":
+                raise ValueError(
+                    f"model.reader_carry={self.reader_carry} with model.reader_position=learned: "
+                    "a learned position is the position in the window, so a key carried from "
+                    "an earlier window would hold a position the current window also has; "
+                    "the cache needs the rotary positions (distances only)"
+                )
+            if self.reader_carry and self.reader_span is not None:
+                raise ValueError(
+                    f"model.reader_carry={self.reader_carry} with model.reader_span="
+                    f"{self.reader_span}: the carry is itself a sliding span (distances "
+                    "0..reader_carry); leave model.reader_span null"
+                )
+            if self.reader_top_words and not self.reader_carry:
+                raise ValueError(
+                    f"model.reader_top_words={self.reader_top_words} extends the carried span "
+                    "of model.reader_carry, which is 0: set model.reader_carry > 0"
+                )
+            if self.reader_mask == "causal" and self.reader_span is not None:
+                raise ValueError(
+                    f"model.reader_mask=causal with model.reader_span={self.reader_span}: the "
+                    "span limits the distances a position reads, which the causal mask alone "
+                    "does not; leave model.reader_span null or the mask at document"
+                )
+            if self.reader_mask == "causal" and self.reader_carry:
+                raise ValueError(
+                    f"model.reader_mask=causal with model.reader_carry={self.reader_carry}: the "
+                    "carried positions are read through a mask of their own (reader.read); "
+                    "leave model.reader_carry at 0 or the mask at document"
+                )
+            top = counts[-1] if counts else None  # None: every pair rotated (the default)
+            if self.reader_top_words and top != 0:
+                raise ValueError(
+                    f"model.reader_top_words={self.reader_top_words} needs the top block "
+                    "unrotated (the last entry of model.reader_rotary_pairs 0, got "
+                    f"{pairs}): a word entry keeps no position, and its distance to a query "
+                    "changes from window to window"
+                )
+        table_rows = type(self).model_fields["reader_positions"].default
+        if self.reader_position != "learned" and self.reader_positions != table_rows:
+            raise ValueError(
+                f"model.reader_positions={self.reader_positions} is the size of the learned "
+                "position table: set model.reader_position=learned or leave it at "
+                f"{table_rows}"
+            )
         if not self.memory:
             if self.reader == "none":
                 raise ValueError(
@@ -595,6 +820,72 @@ class ModelConfig(_StrictModel):
                     "built into the window trainer of the model with its memory, which marks "
                     "the bytes it trains on; the generic trainer of this model marks none, so "
                     "every byte would be unseen. Leave it at 'own'"
+                )
+        if self.cell_attention_heads:
+            key = f"model.cell_attention_heads={self.cell_attention_heads}"
+            if self.reader == "none":
+                raise ValueError(
+                    f"{key} is HSN-T's attention read of the cells (model_name: hsn_t): its "
+                    "queries are the reader's output, so set model.reader=transformer. The "
+                    "HSN has no attention"
+                )
+            if not self.memory:
+                raise ValueError(
+                    f"{key} reads the cells of the memory, and model.memory=false has none; "
+                    "leave it at 0"
+                )
+            if not (self.key_address and self.selected_readout):
+                raise ValueError(
+                    f"{key} needs model.key_address=true (a key reads the cell's fixed address "
+                    "code) and model.selected_readout=true (the read stands beside r_t)"
+                )
+            if self.d % self.cell_attention_heads:
+                raise ValueError(
+                    f"{key}: the heads share the cell width, so model.d={self.d} must be a "
+                    "multiple of the number of heads"
+                )
+        if self.write_events != "byte":
+            key = f"model.write_events={self.write_events}"
+            if self.reader == "none":
+                raise ValueError(
+                    f"{key} is HSN-T's event loop (model_name: hsn_t): the decoder reads "
+                    "every byte through the reader between two writes, so set "
+                    "model.reader=transformer. The HSN writes at every byte"
+                )
+            if not self.memory:
+                raise ValueError(
+                    f"{key} says when the memory writes, and model.memory=false has none; "
+                    "leave it at byte"
+                )
+            if not (self.key_address and self.selected_readout):
+                raise ValueError(
+                    f"{key} needs model.key_address=true (the last byte of the window before "
+                    "is carried with A5's previous bytes, so that a window's first byte can "
+                    "end a word) and model.selected_readout=true (r_t is kept per event)"
+                )
+            if self.fast_cells or self.fast_readout:
+                raise ValueError(
+                    f"{key}: model.fast_cells / model.fast_readout (A8) are not built into "
+                    "the event loop (S reads the fast group of the position before at every "
+                    "byte); leave them off"
+                )
+            if self.write_gate:
+                raise ValueError(
+                    f"{key}: model.write_gate (A10) is not built into the event loop (its "
+                    "write cost is a mean over positions, and an event slot is not one)"
+                )
+        if self.word_address != "none":
+            key = f"model.word_address={self.word_address}"
+            if self.write_events != "word":
+                raise ValueError(
+                    f"{key} is the address of the loop over word ends: set "
+                    f"model.write_events=word (it is {self.write_events})"
+                )
+            bad = [c for c in self.word_contexts if not 0 <= c < self.n_context]
+            if bad or len(set(self.word_contexts)) != len(self.word_contexts):
+                raise ValueError(
+                    f"{key}: model.word_contexts={self.word_contexts} must be distinct context "
+                    f"ids below model.n_context={self.n_context}"
                 )
         # --- end HSN-T ---
         if self.zero_unseen_bytes and self.unseen_bytes_as != "own":
@@ -829,6 +1120,45 @@ class TrainConfig(_StrictModel):
     batch: int = Field(default=4, ge=1)  # batching (P4.3)
     micro_batch: int = Field(default=4, ge=1)
     grad_accum: int = Field(default=1, ge=1)
+    # Opt-in (16 Nov 2026; docs/tbptt_windows.md): the windows one gradient segment joins. The
+    # train.grad_accum windows of an optimiser step are cut into segments of tbptt_windows
+    # consecutive windows (grad_accum must be a multiple); the carried state is detached at a
+    # segment's start only and stays attached between its windows, and the segment's loss takes
+    # one backward pass, so a later window's loss reaches what an earlier window of the segment
+    # wrote. The HSN trainer's eager or compiled window without CUDA graphs only. A trainer
+    # option: no model equation changes. 1 (default): every window starts detached (P1.7).
+    tbptt_windows: int = Field(default=1, ge=1)
+    # --- the generic trainer's host reads (docs/trainer_host_sync.md; opt-in, 17 Nov 2026) ---
+    # host_sync: when the generic trainer (HSN-T without its memory and the baselines; refused
+    # for the HSN trainer) reads a step's loss, accuracy and gradient norm on the host.
+    # "per_step" (default): within the step, as before (five synchronisations a step), bit for
+    # bit. "stats": they stay on the device; the loss is the masked mean (no boolean indexing),
+    # a non-finite step is skipped on the device by the fused optimiser (fused_adamw), and the
+    # host reads a step's values one step later without draining the card, at once at a stats,
+    # evaluation or checkpoint step, and when a step record is read; the skip count, its log and
+    # the stop rule follow then. Refuses what needs a step's value on the host before the next
+    # step (host_sync_refusals): spike_factor, rollback_every, adaptive_lr, gradient_growth,
+    # update_limit, weight_ema, divergence_dump, answer_weight != 1, grad_norm_precision
+    # float64, fp16. Both keys left out of the configuration hash at their defaults.
+    host_sync: Literal["per_step", "stats"] = "per_step"
+    # fused_adamw: torch.optim.AdamW(fused=True), one kernel for every tensor, in place of the
+    # foreach implementation; the same update to rounding. The generic trainer only.
+    fused_adamw: bool = False
+    # --- end the generic trainer's host reads ---
+    # Opt-in (17 Nov 2026; docs/reach_dropout.md): reach dropout of HSN-T's reader, training only.
+    # In every training window each batch row reads, with probability reach_dropout, through the
+    # reader with the per-block span reach_dropout_span (the mask model.reader_span=S gives); the
+    # other rows read the whole window. Drawn per row from a generator seeded by the run seed
+    # and the window counter (the global random stream is untouched; a resume replays it).
+    # Evaluation and every other forward pass read as configured. A trainer option: no model
+    # equation or parameter changes. Needs hsn_t with its memory and model.reader_span null.
+    # With model.reader_carry = C > 0 (allowed since 18 Nov 2026) the short rows also read the
+    # reader's cache with the span, as model.reader_carry = S - 1 would (S <= C), and a row's
+    # draw is held until its next document start (docs/reach_dropout.md).
+    # 0.0 (default): off, bit for bit. Both keys hashed when set; the span is read only when
+    # reach_dropout > 0.
+    reach_dropout: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    reach_dropout_span: int = Field(default=16, ge=1)
     precision: Precision = "bf16"  # autocast dtype (fp64 only for gradcheck)
     grad_clip: float = Field(default=1.0, ge=0.0)  # global norm clip
     # Opt-in wide norm reduction AND scaling; native preserves historical clipping bitwise.
@@ -896,7 +1226,9 @@ class TrainConfig(_StrictModel):
     # other unit's score at that position, and a unit with most of the slots at a kind of position
     # pushes the others down there. "executed": the executed unit's score alone (the other units'
     # scores are constants of that softmax): a unit that did not run gets no gradient from the
-    # slot. Not adopted by any recipe: an amendment would have to do that.
+    # slot. Amendment A7 (docs/amendments/A7_unit_credit.md): "executed" is on in the HSN-T
+    # memory recipe (configs/experiments/hsn_t_memory.yaml, the user's decision of 16 Nov 2026);
+    # off by default and in the HSN recipes (hsn_recipe_a6 and before).
     unit_credit: Literal["softmax", "executed"] = "softmax"
     # Opt-in warm start (13 Nov 2026): the weights of a checkpoint written by another run whose
     # model has the same parameters (strict key match); the run's weight average is taken when
@@ -1096,6 +1428,13 @@ class TrainConfig(_StrictModel):
                 f"{self.rollback_every}: the rollback's snapshots do not hold the averaged "
                 "weights; use one of them"
             )
+        # --- train.tbptt_windows: segments of whole optimiser steps ---
+        if self.grad_accum % self.tbptt_windows:
+            raise ValueError(
+                f"train.tbptt_windows={self.tbptt_windows} joins that many windows of one "
+                f"optimiser step, but train.grad_accum={self.grad_accum} is not a multiple of it: "
+                "a segment never spans two optimiser steps; set train.grad_accum to a multiple"
+            )
         return self
 
 
@@ -1226,6 +1565,13 @@ class TransformerBaselineConfig(_StrictModel):
 
     Defaults are the documented ≈2M-parameter setting for the reference data and ``train.unroll``
     256: 1,930,624 parameters as measured by ``TransformerBaseline.param_report``.
+
+    Two opt-in keys (17 Nov 2026, ``docs/transformer_xl_baseline.md``) make it the
+    Transformer-XL-style control: ``position: rotary`` replaces the learned position table by a
+    rotation of the queries and keys (no parameter; scores depend on distances only), and
+    ``carry: M`` keeps the keys and values of the last ``M`` positions of the windows before,
+    detached, for every block to attend (segment-level recurrence). At their defaults (``learned``,
+    0) the model is the one above, bit for bit, and the keys stay out of the configuration hash.
     """
 
     d_model: int = Field(default=192, ge=1)  # width; must be a multiple of n_heads
@@ -1233,6 +1579,11 @@ class TransformerBaselineConfig(_StrictModel):
     n_heads: int = Field(default=4, ge=1)  # attention heads
     ffn_hidden: int = Field(default=768, ge=1)  # MLP hidden width (4 × d_model)
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)  # embeddings, attention, residual branches
+    # learned: a position table over the window (the model as it was); rotary: queries and keys
+    # rotated by their position (RoPE), no parameter, needed by `carry`
+    position: TransformerPosition = "learned"
+    # Transformer-XL's memory length M: the cached positions of the windows before (0: none)
+    carry: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
@@ -1240,6 +1591,17 @@ class TransformerBaselineConfig(_StrictModel):
             raise ValueError(
                 f"baseline.transformer.d_model={self.d_model} must be a multiple of "
                 f"n_heads={self.n_heads}"
+            )
+        if self.position == "rotary" and (self.d_model // self.n_heads) % 2:
+            raise ValueError(
+                f"baseline.transformer.position=rotary rotates pairs of channels: the head width "
+                f"d_model / n_heads = {self.d_model // self.n_heads} must be even"
+            )
+        if self.carry and self.position != "rotary":
+            raise ValueError(
+                f"baseline.transformer.carry={self.carry} needs baseline.transformer.position="
+                "rotary: a learned position is the position in the window, which a cached key "
+                "would share with a key of the current window"
             )
         return self
 
@@ -1260,12 +1622,41 @@ class SelectiveSSMBaselineConfig(_StrictModel):
     dt_rank: int | None = Field(default=None, ge=1)  # rank of the step-size path; None = d_model/16
 
 
+class GatedDeltaNetBaselineConfig(_StrictModel):
+    """``baseline.gated_deltanet.*``: Gated DeltaNet (Yang, Kautz and Hatamizadeh, 2024), the
+    fast-weight associative-memory control (:mod:`hsn.baselines.gated_deltanet`,
+    ``docs/gated_deltanet_baseline.md``). Its module needs the kernels of flash-linear-attention
+    (``fla-core``), which are not a dependency of this package.
+
+    Defaults are a ≈2M-parameter setting for the reference data: 1,932,584 parameters as measured
+    by ``GatedDeltaNetBaseline.param_report``. The reference keeps ``num_heads × head_dim`` at
+    three quarters of ``d_model`` and ``expand_v`` at 2.
+    """
+
+    d_model: int = Field(default=176, ge=1)  # residual width
+    n_layers: int = Field(default=4, ge=1)  # blocks of [Gated DeltaNet mixer, gated MLP]
+    num_heads: int = Field(default=3, ge=1)  # heads, each with a memory of its own
+    head_dim: int = Field(default=44, ge=1)  # key and query width of a head
+    expand_v: int = Field(default=2, ge=1)  # value width of a head = expand_v × head_dim
+    d_conv: int = Field(default=4, ge=1)  # taps of the causal depthwise convolution on q, k, v
+    mlp_hidden: int | None = Field(default=None, ge=1)  # None = the reference's rule (below)
+    norm_eps: float = Field(default=1e-6, gt=0.0)  # every RMS norm of the model
+
+    def mlp_width(self) -> int:
+        """The gated MLP's hidden width: ``mlp_hidden``, or the reference's rule for a hidden
+        ratio of 4 (two thirds of ``4 × d_model``, rounded up to a multiple of 256)."""
+        if self.mlp_hidden is not None:
+            return self.mlp_hidden
+        return 256 * ((int(self.d_model * 4 * 2 / 3) + 255) // 256)
+
+
 class BaselineConfig(_StrictModel):
     """``baseline.*``: sizes of the P0.5 baselines (``model_name`` selects which one runs)."""
 
     gru: GRUBaselineConfig = GRUBaselineConfig()
     transformer: TransformerBaselineConfig = TransformerBaselineConfig()
     selective_ssm: SelectiveSSMBaselineConfig = SelectiveSSMBaselineConfig()
+    gated_deltanet: GatedDeltaNetBaselineConfig = GatedDeltaNetBaselineConfig()
     # The HSN's fixed byte codes (amendment A5, ``model.key_address``) as a baseline input: the
     # codes of the current and of the previous byte, frozen, through one learned projection
     # (:mod:`hsn.baselines.address`). Opt-in; a control for how much of the HSN's score on keys it
@@ -1273,6 +1664,74 @@ class BaselineConfig(_StrictModel):
     # which with the same seed gives the HSN's own code table.
     address_input: bool = False
     address_dim: int = Field(default=64, ge=1)
+
+
+# --------------------------------------------------------------------------------------------------
+# eval.*  (not in Appendix A; opt-in evaluation reports)
+# --------------------------------------------------------------------------------------------------
+
+_SET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]*$")
+
+
+class DistanceSetConfig(_StrictModel):
+    """One more dev set that ``eval.by_distance`` scores at the end of a run (for example
+    recall distances the run did not train on: ``data/synthetic_far/manifest.json``). Always the
+    manifest's ``dev`` split."""
+
+    name: str  # the set's key in the report; "dev" is the run's own dev set
+    manifest: Path  # split manifest (CWD-relative, as data.manifest)
+    tasks: list[str] = []  # empty = every task of the manifest
+    variants: list[Variant] = []  # empty = every variant of the manifest
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _SET_NAME_RE.match(value) or value == "dev":
+            raise ValueError(
+                f"eval.by_distance.sets: name {value!r} must be letters, digits and '_' and not "
+                "'dev' (the run's own dev set)"
+            )
+        return value
+
+
+class ByDistanceConfig(_StrictModel):
+    """``eval.by_distance`` (opt-in, 18 Nov 2026; ``docs/distance_eval.md``): score by distance.
+
+    Evaluation-only, so never part of the configuration hash or an arm id, on or off
+    (:data:`HASH_EXCLUDED`). Off (default): nothing runs. On: when
+    training ends, the run's dev set and every set of ``sets`` take one more evaluation pass
+    each (the cost of one of the run's evaluations per set, plus host-side tables), and the
+    bucket tables go to the run record as ``by_distance`` (:mod:`hsn.eval.distance`): accuracy
+    by recall distance, query slot, answer kind and fact position on the synthetic tasks; bits
+    per letter of repeated names and content words by the distance of the previous mention on
+    text. Evaluation only: training, the model and every existing metric are unchanged.
+    """
+
+    enabled: bool = False
+    # also at every evaluation of the run (the dev set only; each evaluation entry gains
+    # ``by_distance``): the pass is the evaluation itself, the cost its per-position copies
+    every_eval: bool = False
+    # the first max_docs documents of every task/variant group of a set (None: all of them)
+    max_docs: int | None = Field(default=None, ge=1)
+    sets: list[DistanceSetConfig] = []
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if not self.enabled and (self.every_eval or self.max_docs is not None or self.sets):
+            raise ValueError(
+                "eval.by_distance: every_eval, max_docs and sets are read only with "
+                "eval.by_distance.enabled=true"
+            )
+        names = [entry.name for entry in self.sets]
+        if len(set(names)) != len(names):
+            raise ValueError(f"eval.by_distance.sets: names must differ, got {names}")
+        return self
+
+
+class EvalConfig(_StrictModel):
+    """``eval.*``: opt-in evaluation reports. Nothing here changes training or a metric."""
+
+    by_distance: ByDistanceConfig = ByDistanceConfig()
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1321,6 +1780,25 @@ class HardwareConfig(_StrictModel):
     # mode. compile_mode above keeps its meaning (the HSN's window; the generic trainer ignores
     # it). none (default): the baselines train eager, as before the key.
     baseline_compile: BaselineCompileMode = "none"
+    # Opt-in (17 Nov 2026, docs/word_event_speed.md): how the compiled autograd window's sparse
+    # round takes its matrix products. separate (default): as before. merged: fewer and smaller
+    # products for the same dot products: a (cell, unit) pair is multiplied with its own unit's
+    # weights only (UnitBank.forward_static_segments; separate runs every unit on every pair
+    # and gathers one), the gate's linear rides in the unit bank's first product and W_out is
+    # folded into its second, and P and S share one product per layer. Equal to rounding (other
+    # matmul shapes), not bit for bit. Needs hardware.compile_mode and model.routing=topk.
+    round_products: RoundProducts = "separate"
+    # Opt-in (18 Nov 2026, docs/perbyte_speed.md): the dtype in which the sparse round's
+    # messages accumulate the gradients of their two gathers: the edge weights (one row per
+    # selected cell) and V h (one row per source of a selected cell). autocast (default): as
+    # before, in the autocast dtype (bf16 on the cards), where a compiled window runs both
+    # accumulations outside its fused kernels (an index_put with a sort and a scatter-add: 39 µs
+    # at every position on the RTX 3060). state: in the state's dtype (fp32 under bf16
+    # autocast), where they fuse. The forward values are the same bit for bit and without
+    # autocast the two are one computation; under autocast the two gradients are summed in
+    # fp32 instead of bf16 (equal to rounding, not bit for bit). Needs the memory's cells
+    # and a routed round on the autograd window.
+    message_gradients: MessageGradients = "autocast"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1361,6 +1839,7 @@ class RunConfig(_StrictModel):
     stream: StreamConfig = StreamConfig()
     serve: ServeConfig = ServeConfig()
     baseline: BaselineConfig = BaselineConfig()  # P0.5 baseline sizes (not in Appendix A)
+    eval: EvalConfig = EvalConfig()  # opt-in evaluation reports; never hashed (HASH_EXCLUDED)
     hardware: HardwareConfig  # resolved from `profile` by load_config, or given inline
     run_id: str = "default"
     seed: int = Field(default=0, ge=0)
@@ -1404,6 +1883,14 @@ class RunConfig(_StrictModel):
             raise ValueError(
                 f"run_id={self.run_id!r} must match {_RUN_ID_RE.pattern} (it names a directory)"
             )
+        # --- train.tbptt_windows (docs/tbptt_windows.md): where a gradient segment is defined ---
+        if self.train.tbptt_windows > 1:
+            reason = tbptt_windows_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"train.tbptt_windows={self.train.tbptt_windows} is not available for this "
+                    f"configuration: {reason}"
+                )
         # --- P2.10: the split window is only defined inside its scope ---
         if self.hardware.window != "autograd":
             reason = split_window_scope_error(self)
@@ -1412,10 +1899,33 @@ class RunConfig(_StrictModel):
                     f"hardware.window={self.hardware.window!r} is not available for this "
                     f"configuration: {reason}"
                 )
+        if self.hardware.round_products != "separate":
+            reason = round_products_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.round_products={self.hardware.round_products} is not available "
+                    f"for this configuration: {reason}"
+                )
+        if self.hardware.message_gradients != "autocast":
+            reason = message_gradients_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.message_gradients={self.hardware.message_gradients} is not "
+                    f"available for this configuration: {reason}"
+                )
         if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
                 "baseline.address_input is an input of the baselines; the HSN's own address "
                 "features are model.key_address"
+            )
+        transformer = self.baseline.transformer
+        if (transformer.position != "learned" or transformer.carry) and (
+            self.model_name != "transformer"
+        ):
+            raise ValueError(
+                "baseline.transformer.position and baseline.transformer.carry belong to the "
+                f"Transformer baseline (model_name: transformer); model_name={self.model_name!r} "
+                "does not read them: leave them at learned and 0"
             )
         memory_off = self.model_name == "hsn_t" and not self.model.memory
         if (
@@ -1430,6 +1940,10 @@ class RunConfig(_StrictModel):
                 + (
                     "the HSN's own compiled window is hardware.compile_mode"
                     if self.model_name in HSN_MODEL_NAMES
+                    else "its delta-rule kernels are flash-linear-attention's own (Triton), "
+                    "which torch.compile does not trace: it runs eager with them "
+                    "(docs/gated_deltanet_baseline.md)"
+                    if self.model_name == "gated_deltanet"
                     else "it is outside the compiled scope (hsn.train.baseline_compile)"
                 )
             )
@@ -1466,6 +1980,71 @@ class RunConfig(_StrictModel):
                 "model_name=reader is the HSN-T reader alone with a next-byte head: set "
                 "model.reader=transformer and the reader_* keys of the reader it stands for"
             )
+        if self.model.cell_attention_heads and self.model_name != "hsn_t":
+            raise ValueError(
+                f"model.cell_attention_heads={self.model.cell_attention_heads} is HSN-T's "
+                f"attention read of the cells; model_name={self.model_name!r} has no cells to "
+                "read: leave it at 0"
+            )
+        if self.model_name == "hsn_t" and self.model.memory and self.model.reader_carry:
+            # docs/amendments/reader_carry_memory.md (17 Nov 2026, opt-in): the reader's cache
+            # is carried beside the cells' state, with the address carry
+            carry = f"model.reader_carry={self.model.reader_carry} with the memory on"
+            if not self.model.key_address:
+                raise ValueError(
+                    f"{carry}: the reader's cache is handed from window to window with the "
+                    "address carry (prev_tokens, address_history), which only a model with "
+                    "model.key_address=true has; set it (the HSN-T memory recipes do)"
+                )
+            if self.model.reader_top_words:
+                raise ValueError(
+                    f"{carry}: model.reader_top_words={self.model.reader_top_words} (the top "
+                    "block's word slots) is built for HSN-T without its memory only; leave it "
+                    "at 0"
+                )
+            if self.model.address_gate_input == "reader_prev":
+                raise ValueError(
+                    f"{carry}: model.address_gate_input=reader_prev reads c_(t-1), which at a "
+                    "window's first column is zero, not the carried reader's output of the "
+                    "window before; that case is not built. Use address_gate_input=summary"
+                )
+            if self.train.lambda_u > 0.0:
+                raise ValueError(
+                    f"{carry}: train.lambda_u > 0 (the counterfactual probes) replays windows "
+                    "with A5's bytes alone and would read them without the reader's cache; set "
+                    "train.lambda_u=0"
+                )
+        if self.model.reader_mask == "causal" and not self.data.align_docs:
+            # docs/reader_causal_flash.md: the causal mask is the document mask only where no
+            # window has a reset after column 0, which data.align_docs guarantees (StreamLoader
+            # starts a document at a window boundary only). train.reach_dropout gives some rows
+            # a span mask, so reach_dropout_scope_error refuses it with reader_mask=causal.
+            raise ValueError(
+                "model.reader_mask=causal needs data.align_docs=true: without it a document can "
+                "start inside a window, where the reader's document mask is not the causal mask"
+            )
+        if (
+            self.model.reader_position == "learned"
+            and self.train.unroll > self.model.reader_positions
+        ):
+            raise ValueError(
+                f"model.reader_position=learned: the table has model.reader_positions="
+                f"{self.model.reader_positions} rows and a window has train.unroll="
+                f"{self.train.unroll} positions; raise model.reader_positions"
+            )
+        if self.model.write_events != "byte":
+            key = f"model.write_events={self.model.write_events}"
+            if self.model_name != "hsn_t":
+                raise ValueError(
+                    f"{key} is HSN-T's event loop; model_name={self.model_name!r} has no "
+                    "memory behind a reader: leave it at byte"
+                )
+            refused = write_events_refusals(self)
+            if refused:
+                raise ValueError(
+                    f"{key}: the memory's records are per event slot, not per byte, and "
+                    "these settings read them per byte: " + "; ".join(refused)
+                )
         if not self.model.memory:
             if self.model_name != "hsn_t":
                 raise ValueError(
@@ -1479,7 +2058,18 @@ class RunConfig(_StrictModel):
                     "and the generic trainer trains it on the next-byte loss alone, so these "
                     "settings could not act: " + "; ".join(refused)
                 )
+        if self.train.reach_dropout > 0.0:  # docs/reach_dropout.md
+            reason = reach_dropout_scope_error(self)
+            if reason is not None:
+                raise ValueError(f"train.reach_dropout={self.train.reach_dropout}: {reason}")
         # --- end HSN-T ---
+        if self.train.host_sync != "per_step" or self.train.fused_adamw:
+            refused = host_sync_refusals(self)
+            if refused:
+                raise ValueError(
+                    "train.host_sync / train.fused_adamw (docs/trainer_host_sync.md): "
+                    + "; ".join(refused)
+                )
         # --- the byte-content options (docs/key_content.md) are built into the HSN's window ---
         content = [
             f"{key}={value}"
@@ -1958,11 +2548,40 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.address_history",
     "hardware.baseline_compile",
     "model.memory",
+    "model.reader_position",
+    "model.reader_positions",
+    "model.reader_rotary_pairs",
+    "model.reader_rotary_dtype",
+    "model.reader_rotary_base",
+    "model.reader_carry",
+    "model.reader_top_words",
+    "model.cell_attention_heads",
+    "model.write_events",
+    "model.word_address",
+    "model.word_contexts",
+    "train.tbptt_windows",
+    "model.reader_mask",
+    "train.host_sync",
+    "train.fused_adamw",
+    "hardware.round_products",
+    "baseline.transformer.position",
+    "baseline.transformer.carry",
+    "train.reach_dropout",
+    "train.reach_dropout_span",
+    "baseline.gated_deltanet",
+    "hardware.message_gradients",
     "train.content_dropout",
     "model.zero_unseen_bytes",
     "train.content_dropout_target",
     "model.unseen_bytes_as",
 )
+
+#: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
+#: (:func:`hsn.experiments.spec.config_view`), whatever they hold: evaluation-only reports
+#: (``eval.*``). They read a model and change nothing a run trains, so a run with a report on is
+#: the same run (the same hash, the same arm, checkpoints that resume either way) as without
+#: it. A key that could change a trained weight does not belong in such a section.
+HASH_EXCLUDED: tuple[str, ...] = ("eval",)
 
 
 #: ``model.memory = false`` (HSN-T without its memory, ``docs/hsn_t_no_memory.md``): the
@@ -1988,13 +2607,15 @@ MEMORY_TRAIN_KEYS: dict[str, str] = {
     "p_dense": "the routed round's dense fallback",
     "aux_enabled": "the routing penalties",
     "address_gate_hold_step": "the address gate's weights",
+    "tbptt_windows": "the carried state's gradient across windows",
+    "reach_dropout": "the names the short-span rows leave to the memory",
 }
 #: The loss weights of ``train.*``: the generic trainer's objective has none of their terms.
 LOSS_WEIGHT_KEYS: tuple[str, ...] = tuple(
     f"lambda_{term}" for term in ("p", "r", "d", "e", "c", "b", "g", "u", "ponder", "w")
 )
 #: The top-level modules of an HSN-T that are its memory (the others stay with the memory off).
-MEMORY_MODULES: tuple[str, ...] = ("predictor", "cell", "router", "halting")
+MEMORY_MODULES: tuple[str, ...] = ("predictor", "cell", "router", "halting", "cell_read")
 
 
 def memory_off_refusals(cfg: RunConfig) -> list[str]:
@@ -2024,6 +2645,68 @@ def memory_off_refusals(cfg: RunConfig) -> list[str]:
         if lost:
             refused.append(f"{key} selects {lost} (parameters of the memory)")
     return refused
+
+
+def write_events_refusals(cfg: RunConfig) -> list[str]:
+    """``model.write_events`` other than ``byte`` (``docs/amendments/write_events.md``): the
+    training settings of ``cfg`` that cannot work with event slots, each with its reason;
+    empty when the configuration can be trained. In the event loop the memory's records
+    (selections, logits, costs) are per event slot, and a row's unused slots are padding."""
+    train = cfg.train
+    refused: list[str] = []
+    if train.gate_mode == "reinforce":
+        refused.append(
+            "train.gate_mode=reinforce (its log-probability is summed over the positions of "
+            "a window; padding slots would be counted)"
+        )
+    if "cost" in train.aux_enabled or train.lambda_c > 0.0:
+        refused.append(
+            "the cost term (train.aux_enabled / train.lambda_c: a batch mean per position; "
+            "padding slots would be counted)"
+        )
+    if train.lambda_u > 0.0:
+        refused.append(
+            f"train.lambda_u={train.lambda_u} (the counterfactual probes replay byte positions)"
+        )
+    if train.lambda_w > 0.0:
+        refused.append(f"train.lambda_w={train.lambda_w} (A10's write cost, per position)")
+    return refused
+
+
+def round_products_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot run ``hardware.round_products=merged``
+    (``docs/word_event_speed.md``), or ``None`` when it can. The key changes how the compiled
+    autograd window's sparse round takes its matrix products; a configuration in which no
+    such round runs is refused instead of ignoring the key."""
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return f"model_name={cfg.model_name!r} without the memory's cells has no sparse round"
+    if cfg.hardware.compile_mode == "none":
+        return (
+            "hardware.compile_mode=none: the eager round groups the pairs by unit already "
+            "(UnitBank.forward_selected); the key is the compiled window's"
+        )
+    if cfg.model.routing != "topk":
+        return f"model.routing={cfg.model.routing!r}: only the routed sparse round selects pairs"
+    return None
+
+
+def message_gradients_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot run ``hardware.message_gradients=state``
+    (``docs/perbyte_speed.md``), or ``None`` when it can. The key changes the dtype in which
+    the sparse round's messages accumulate two gradients
+    (:meth:`hsn.model.graph.CellGraph.messages_selected`); a configuration in which that
+    round does not run, or runs on a window that takes the messages its own way, is refused
+    instead of ignoring the key."""
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return f"model_name={cfg.model_name!r} without the memory's cells has no sparse round"
+    if cfg.model.routing == "dense":
+        return "model.routing=dense: the dense round gathers no messages by selection"
+    if cfg.hardware.window != "autograd":
+        return (
+            f"hardware.window={cfg.hardware.window}: the split and fused windows take the "
+            "messages in their own sweep and replay (not measured with the key)"
+        )
+    return None
 
 
 def split_window_scope_error(
@@ -2064,6 +2747,16 @@ def split_window_scope_error(
     sweep would cost more than the autograd window, and the configuration is never offered
     it."""
     model, train = cfg.model, cfg.train
+    if model.write_events != "byte":
+        return (
+            f"model.write_events={model.write_events}: the event loop is built into the "
+            "autograd window only"
+        )
+    if model.cell_attention_heads:
+        return (
+            f"model.cell_attention_heads={model.cell_attention_heads}: the attention read of "
+            "the cells is built into the autograd window only"
+        )
     if cfg.model_name != "hsn":  # HSN-T too: its reader is not built into the split window
         return f"model_name={cfg.model_name!r} is not the HSN"
     if model.routing != "topk":
@@ -2135,10 +2828,147 @@ def split_window_scope_error(
     return None
 
 
+def host_sync_refusals(cfg: RunConfig) -> list[str]:
+    """``train.host_sync = stats`` and ``train.fused_adamw`` (``docs/trainer_host_sync.md``):
+    every setting of ``cfg`` they cannot run with, each with its reason; empty when they can.
+    Both are the generic trainer's (:class:`hsn.train.loop.Trainer`). With ``stats`` a step's
+    loss, accuracy and gradient norm reach the host one step later (or at a stats,
+    evaluation or checkpoint step), so a setting that needs one of them on the host before the
+    next step begins is refused rather than run late."""
+    train = cfg.train
+    refused: list[str] = []
+    if cfg.model_name in HSN_MODEL_NAMES and cfg.model.memory:
+        refused.append(
+            f"model_name={cfg.model_name} trains with the HSN trainer (TBPTTTrainer), whose step "
+            "these keys do not change; they are the generic trainer's (the baselines, HSN-T "
+            "with model.memory=false)"
+        )
+    if train.optimizer != "adamw":
+        refused.append(f"train.optimizer={train.optimizer} (they build torch.optim.AdamW)")
+    if train.host_sync != "stats":
+        return refused
+    what = "needs the step's {} on the host before the next step"
+    if not train.fused_adamw:
+        refused.append(
+            "train.fused_adamw=false: a non-finite step is skipped on the device by the fused "
+            "optimiser (its found_inf), so host_sync=stats needs train.fused_adamw=true"
+        )
+    keyed = {
+        "spike_factor": (train.spike_factor is not None, "gradient norm"),
+        "rollback_every": (train.rollback_every is not None, "gradient norm"),
+        "adaptive_lr.enabled": (train.adaptive_lr.enabled, "update and gradient norm"),
+        "gradient_growth.enabled": (train.gradient_growth.enabled, "gradient norms"),
+        "update_limit.groups": (bool(train.update_limit.groups), "update"),
+        "weight_ema": (train.weight_ema is not None, "applied update (a skip is on the device)"),
+        "divergence_dump": (
+            train.divergence_dump,
+            "skip (the dump holds the weights as the skipped step left them); set it false",
+        ),
+        "answer_weight": (train.answer_weight != 1.0, "loss positions (boolean indexing)"),
+        "grad_norm_precision": (train.grad_norm_precision != "native", "gradient norm"),
+        "precision": (train.precision == "fp16", "loss scale (GradScaler)"),
+    }
+    for key, (on, needs) in keyed.items():
+        if on:
+            refused.append(f"train.{key}={_getattr_dotted(train, key)!r} {what.format(needs)}")
+    return refused
+
+
+def _getattr_dotted(obj: object, dotted: str) -> object:
+    """``obj.a.b`` for ``dotted = "a.b"``."""
+    for part in dotted.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def tbptt_windows_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``train.tbptt_windows > 1`` (gradient segments of several windows,
+    ``docs/tbptt_windows.md``) cannot run with ``cfg``; ``None`` when it can. The segments are
+    the HSN trainer's (:class:`~hsn.train.tbptt.TBPTTTrainer`), over its autograd window, eager
+    or compiled without CUDA graphs."""
+    train, hardware = cfg.train, cfg.hardware
+    if cfg.model_name not in HSN_MODEL_NAMES or not cfg.model.memory:
+        return (
+            f"model_name={cfg.model_name!r}"
+            + ("" if cfg.model.memory else " with model.memory=false")
+            + " trains on the generic trainer, whose state (if any) is detached at every "
+            "window; the segments are the HSN trainer's (model_name hsn, or hsn_t with its memory)"
+        )
+    if hardware.window != "autograd":
+        return (
+            f"hardware.window={hardware.window!r}: the split window's forward tape and replay "
+            "end at the window (no gradient into its start state); use hardware.window=autograd"
+        )
+    if hardware.compile_mode in CUDA_GRAPH_COMPILE_MODES:
+        return (
+            f"hardware.compile_mode={hardware.compile_mode!r} replays the window as CUDA graphs, "
+            "whose next replay overwrites what a live segment's backward pass still needs; use "
+            "hardware.compile_mode=default (compiled without CUDA graphs) or none (eager)"
+        )
+    if train.lambda_u > 0.0:
+        return (
+            f"train.lambda_u={train.lambda_u} (P2.3): the scorer's EMA features are updated in "
+            "place after every window, while a segment's graph still holds them; set "
+            "train.lambda_u=0"
+        )
+    return None
+
+
+def reach_dropout_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``train.reach_dropout > 0`` (``docs/reach_dropout.md``) cannot run with ``cfg``;
+    ``None`` when it can. It shortens, in some rows of a training window, the whole-window
+    reader of HSN-T with its memory (or the span of its carried reader, ``model.reader_carry``),
+    so that the memory has to carry what lies beyond the short span. (HSN-T without its memory
+    is refused by :func:`memory_off_refusals`.)"""
+    model, train = cfg.model, cfg.train
+    if cfg.model_name != "hsn_t":
+        return (
+            f"model_name={cfg.model_name!r} has no memory behind a reader; the key is HSN-T's "
+            "(model_name hsn_t with its memory and model.reader=transformer)"
+        )
+    if model.reader_span is not None:
+        return (
+            f"model.reader_span={model.reader_span} already limits every row; the key "
+            "shortens a whole-window reader in some rows: leave model.reader_span null (the "
+            "short reader in every row and in evaluation is model.reader_span alone)"
+        )
+    if model.reader_mask == "causal":
+        # docs/reader_causal_flash.md: the causal mask is SDPA's is_causal with no mask tensor,
+        # which a short row's span mask cannot narrow
+        return (
+            "model.reader_mask=causal reads with SDPA's causal mask and no mask tensor, so the "
+            "short rows' span mask could not act (docs/reader_causal_flash.md); leave "
+            "model.reader_mask at document"
+        )
+    if model.reader_carry and train.reach_dropout_span > model.reader_carry:
+        # the carried reader (docs/amendments/reader_carry_memory.md) is itself a sliding span
+        # of reader_carry + 1 positions; since 18 Nov 2026 the short rows narrow it, over the
+        # cached and the window positions (Reader.read), to the span of reader_carry = S - 1
+        return (
+            f"train.reach_dropout_span={train.reach_dropout_span} is not shorter than the "
+            f"carried reader's own span (model.reader_carry={model.reader_carry}, "
+            f"{model.reader_carry + 1} positions): a short row would read as every other row"
+        )
+    if train.reach_dropout_span >= train.unroll:
+        return (
+            f"train.reach_dropout_span={train.reach_dropout_span} is not shorter than the "
+            f"window (train.unroll={train.unroll}): a short row would read the whole window"
+        )
+    if train.lambda_u > 0.0:
+        return (
+            f"train.lambda_u={train.lambda_u} (P2.3) is untested with it: the counterfactual "
+            "probes run before the window's rows are drawn; set train.lambda_u=0"
+        )
+    return None
+
+
 def _hash_view(cfg: RunConfig) -> dict[str, Any]:
     """The configuration dump :func:`canonical_json` hashes: :meth:`RunConfig.model_dump` without
-    the :data:`HASH_OMIT_AT_DEFAULT` keys that hold their default."""
+    the :data:`HASH_EXCLUDED` sections and without the :data:`HASH_OMIT_AT_DEFAULT` keys that
+    hold their default."""
     dump = cfg.model_dump(mode="json")
+    for section in HASH_EXCLUDED:
+        dump.pop(section, None)
     for dotted in HASH_OMIT_AT_DEFAULT:
         parts = dotted.split(".")
         node = dump

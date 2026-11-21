@@ -1,0 +1,52 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [],
+  "name": "tinystories_w1024",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "tinystories.out_of_range.train.npz",
+      "hash": "18afe55102cebbb2a2e309ad57fef33bda44b3939b62c02cf57bcf695475df0c",
+      "n_docs": 248173,
+      "n_loss": 199751432,
+      "n_tokens": 199999605,
+      "split": "train",
+      "task": "tinystories",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "tinystories.out_of_range.dev.npz",
+      "hash": "4aafee156a7724970f3ab305e44655dedcf65a9d53e323278486491c824002df",
+      "n_docs": 2000,
+      "n_loss": 1592796,
+      "n_tokens": 1594796,
+      "split": "dev",
+      "task": "tinystories",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 6,
+      "family": "text",
+      "file": "tinystories.out_of_range.test.npz",
+      "hash": "060b9b38a642b9de1d04f1c9bad6ec2cc0f0880b4128b8a5289bddab666d8640",
+      "n_docs": 2000,
+      "n_loss": 1601343,
+      "n_tokens": 1603343,
+      "split": "test",
+      "task": "tinystories",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "04052eddb0435fb559258e15943528b5983bf0585a110854484f21dbd5152ae7",
+  "split_hashes": {
+    "dev": "66a27eabe4edaf1eed7cd802927b3d4af984fe0a7d9d756e4b3344add1e2ec79",
+    "test": "fb4cca766b31141980bfa413b11a0e85e9b2fcdcfeb24fad0951132158862437",
+    "train": "2a89699d33fc624455e67e0d3e0812e85c8c2be65fe841da52e9f58a2f0ddde2"
+  },
+  "unroll": 1024
+}

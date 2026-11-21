@@ -49,7 +49,7 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
 **P1.15.**
 - Every reads_state evaluation is labelled by query slot (:class:`hsn.experiments.split.QuerySlots`,
   the trainer's ``eval_position_groups``): each evaluation entry carries ``split`` (``first``,
-  ``later``, ``later/1`` to ``later/3``: accuracy, loss, ``n``), checked against the frozen
+  ``later``, ``later/1`` to ``later/7``: accuracy, loss, ``n``), checked against the frozen
   delayed/in_range metric, and ``final`` carries it flattened (``split/<g>/<key>``).
 - The gradient-spike guard (``train.spike_factor``): ``final.skipped_spike_steps`` (``None`` with
   the guard off), ``skipped_steps`` (every step a guard skipped, with its reason), a ``skipped``
@@ -79,6 +79,16 @@ accuracy, gradient norm and learning rate), ``final``, ``trained_state``, ``prob
   such a record ``failed: … (from step X: …)`` (:mod:`hsn.experiments.rules`). The same assessment
   of the newest saved checkpoint is also stored as ``latest_saved``; it is diagnostic only and
   changes neither the failure nor the conservative partial verdict.
+
+**Score by distance (18 Nov 2026).** With ``eval.by_distance.enabled`` (opt-in,
+:mod:`hsn.eval.distance`, ``docs/distance_eval.md``) a training record gains ``by_distance``:
+after the trained state and the probes, the run's dev set and every set of
+``eval.by_distance.sets`` take one more evaluation pass each (the weights the evaluations
+scored; ``walls.by_distance_s``, stage ``by_distance``), and the block holds their bucket
+tables. The sets are loaded during setup, so a wrong manifest fails before training; a set that
+fails to score keeps an ``error`` in its entry and the run's record stands. With
+``eval.by_distance.every_eval`` every evaluation entry carries ``by_distance`` (the dev set's
+groups) as well. Off (default): no key, no pass.
 """
 
 from __future__ import annotations
@@ -328,6 +338,8 @@ def _eval_entry(e: Mapping[str, Any], *, audit_keys: bool) -> dict[str, Any]:
         out["split"] = split_block(
             e["per_position_group"], group, total_positions=e.get("n_positions")
         )
+    if e.get("by_distance") is not None:  # eval.by_distance.every_eval: the dev set's groups
+        out["by_distance"] = e["by_distance"]
     return out
 
 
@@ -729,6 +741,14 @@ def _train(
         from hsn.experiments.split import QuerySlots
 
         trainer.eval_position_groups = QuerySlots(dev_ds)
+    # eval.by_distance (opt-in): its sets are loaded here, so a wrong manifest fails before the fit
+    by_distance: Any = None
+    if cfg.eval.by_distance.enabled:
+        from hsn.eval.distance import RunScorer
+
+        by_distance = RunScorer(cfg, dev_ds)
+        if cfg.eval.by_distance.every_eval:
+            trainer.eval_observer = by_distance.observer()
     diag_every = params.diag_every
     # P1.14: the mixed cadence samples an explicit schedule; the single cadence keeps diag_every
     dense = params.diag_dense_every > 0
@@ -778,6 +798,7 @@ def _train(
             history = trainer.fit(train_ds, dev_ds, arm.steps, callback=callback)
         finally:
             callback.release_collector()  # the frozen objects are collectable again from here
+            trainer.eval_observer = None  # eval.by_distance.every_eval: the fit's evaluations only
     except BaseException as exc:
         # P1.14: what the fit produced before it raised (the P1.12 stop, OOM, SIGTERM, ...)
         arm.walls["fit_s"] = time.perf_counter() - t1
@@ -941,6 +962,13 @@ def _train(
         else:
             record["trained_state"], record["probe"], record["probes"] = state, summary, probes
             record.update(v2)
+    if by_distance is not None:  # eval.by_distance: one more pass per set, the tables
+        arm.stage = "by_distance"
+        t6 = time.perf_counter()
+        stages["by_distance"] = [time.time()]
+        record["by_distance"] = by_distance.final(trainer)
+        arm.walls["by_distance_s"] = time.perf_counter() - t6
+        stages["by_distance"].append(time.time())
     if params.checkpoint == "none":
         for path in history.checkpoints:
             Path(path).unlink(missing_ok=True)
