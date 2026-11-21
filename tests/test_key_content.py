@@ -902,7 +902,7 @@ def test_trainer_marks_the_bytes_of_its_training_windows_and_no_others(tmp_path:
     warm = build_model(cfg)
     assert isinstance(warm, HSN) and warm_start(warm, checkpoint)["step"] == steps
     assert warm.byte_seen is not None and torch.equal(warm.byte_seen, seen)
-    with pytest.raises(RuntimeError, match="byte_seen"):
+    with pytest.raises(ValueError, match="byte_seen"):  # the options to set are named
         warm_start(build_model(hsn_config(steps, *TRAINED_FAMILIES["hsn_t"])), checkpoint)
 
 

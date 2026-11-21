@@ -2126,6 +2126,15 @@ class RunConfig(_StrictModel):
                 "untested: the counterfactual probes replay parts of a window, whose positions "
                 "would be drawn anew"
             )
+        if self.train.content_dropout > 0.0 and self.train.tbptt_windows > 1:
+            raise ValueError(
+                f"train.content_dropout={self.train.content_dropout} with train.tbptt_windows="
+                f"{self.train.tbptt_windows}: the positions are drawn once per optimiser step "
+                "(from the run seed and the step), so every window of a gradient segment would "
+                "drop the same columns, and the segment's one backward pass would read a mask "
+                "that repeats every train.unroll positions instead of independent positions "
+                "(docs/key_content.md); leave train.tbptt_windows at 1"
+            )
         # --- end byte-content options ---
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:

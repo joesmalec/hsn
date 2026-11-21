@@ -231,6 +231,7 @@ from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
 __all__ = [
+    "CONTENT_STATE_KEYS",
     "PARAM_REPORT_ROWS",
     "READER_CACHE_KEYS",
     "HSN",
@@ -254,6 +255,11 @@ _CONTENT_DROP_TAG = 0x4B43444F
 #: embedding (``b"KCUR"``).
 _UNKNOWN_BYTE_TAG = 0x4B435542
 _UNKNOWN_READER_TAG = 0x4B435552
+#: The state-dict entries of the byte-content options (``docs/key_content.md``): the seen bytes
+#: (``model.zero_unseen_bytes``, ``model.unseen_bytes_as`` other than ``own``) and the learned
+#: unknown rows (``train.content_dropout_target = unknown``). A model has them only with its
+#: option on, so a checkpoint loads (strictly) only into a model with the same options.
+CONTENT_STATE_KEYS: tuple[str, ...] = ("byte_seen", "byte_emb.unknown", "reader.emb_unknown")
 
 
 def _tagged_generator(seed: int, tag: int) -> torch.Generator:
@@ -1939,7 +1945,8 @@ class HSN(nn.Module):
                 # the last C positions before the window (same document); the next cache leaves
                 # in info, detached. Short rows narrow the cached positions with the window's.
                 # The options replace the window's own rows; the cached positions keep what
-                # they were read with in their window
+                # they were read with in their window (docs/key_content.md, "Where they can be
+                # set")
                 reader_out, reader_cache = self.reader.read(
                     tokens, reset, reader_cache, short, blank=zero, unknown=unknown
                 )

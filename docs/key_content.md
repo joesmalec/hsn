@@ -1,7 +1,8 @@
 # Byte-content options: content dropout, zero rows and a learned unknown row for never-trained bytes (experimental)
 
 Status: **four opt-in keys for the HSN and HSN-T, built on 15 Nov 2026 (branch
-`claude/key-content`, from main f3f271a); not adopted. The runs of `key_content.yaml` are
+`claude/key-content`, from main f3f271a; merged with main c5bfa5a on 20 Nov 2026, section
+"Where they can be set"); not adopted. The runs of `key_content.yaml` are
 quoted (not filed) in the section on the learned unknown row; none of `key_unknown.yaml`
 exists.**
 - `train.content_dropout = p` (default 0.0): training only. In every training window a random
@@ -92,7 +93,9 @@ step (the resume and the statistics step are tested; no dump was replayed with t
 the global random stream is never read, at any `p`. The columns of a window are
 drawn one after the other, so a window that the eager trainer cuts at its trailing padding
 (P1.10d) blanks the positions that the uncut, compiled window blanks on those columns. The
-windows of one optimiser step (`train.grad_accum > 1`) draw the same positions.
+windows of one optimiser step (`train.grad_accum > 1`) draw the same positions; with
+`train.tbptt_windows > 1` (main, 16 Nov 2026), where they share one backward pass, the key is
+refused.
 
 Evaluation and inference run without it: the evaluation-mode model with the key is the model
 without it, bit for bit.
@@ -149,8 +152,11 @@ snapshots and a divergence dump hold the tensors of the state dict, so by the co
 it too; neither was run with the key. Loading is strict as before, so a checkpoint written
 with the key does not load into a model without it, and the reverse; a warm start
 (`train.init_from`) needs a source run with the key, because the bytes that run trained on
-are not otherwise known. The weight average (`train.weight_ema`) holds parameters only; the
-averaged model reads the run's `byte_seen`.
+are not otherwise known. Since the merge with main (20 Nov 2026) a warm start whose source
+and model differ in `byte_seen` or the unknown rows is refused with a `ValueError` that names
+the options to set (`hsn.runner.warm_start`; other mismatches keep the loader's own error).
+The weight average (`train.weight_ema`) holds parameters only; the averaged model reads the
+run's `byte_seen`.
 
 ## The learned unknown row (`train.content_dropout_target`, `model.unseen_bytes_as`)
 
@@ -230,6 +236,12 @@ on seeds 0, 2 and 3, and `_cdunk05` (the same at 0.05) on seed 0. `key_content.y
 | `hardware.window = fused` | refused: untested, the fused sweep runs on the card only |
 | `model.memory = false`, `model_name: reader`, the baselines | refused: the generic trainer trains them; it draws no positions and marks no bytes |
 | `train.content_dropout` with `train.lambda_u > 0` | refused: untested; the counterfactual probes replay parts of a window |
+| `model.reader_carry` (HSN-T, with `model.reader_top_words`) | every key. `Reader.read` takes the masks for the window's own positions; the cache holds the keys and values of earlier positions as they were computed when those positions were the window (a position dropped in its training window stays cached without its content; it is never embedded again). In training every window's bytes are marked before it runs, so a cached training position read its own row unless dropped; at evaluation nothing is marked or dropped, and an unseen byte is cached as it was read. The attention mask, the cache's validity and the word ends are computed from the bytes |
+| `train.reach_dropout` (whole-window and carried reader) | every key: the short rows narrow the reader's mask, the options replace its embedding rows; both are handed to the same call |
+| `model.write_events = word`, `model.word_address`, `model.cell_attention_heads` | every key: the event loop, its epilogue and the attention read of the cells read `z` and `c` from the prologue; the events and the word address are computed from the bytes |
+| `hardware.compile_mode` (`default`, CUDA graphs), `hardware.round_products`, `hardware.message_gradients` | every key: the compiled event loop also runs after the eager prologue. Tested on the CPU (inductor, word events with the carry and C-read); not run on the card |
+| `train.content_dropout` with `train.tbptt_windows > 1` | refused: the draw is one per optimiser step, so every window of a gradient segment would drop the same columns and the segment's one backward pass would read a mask that repeats every `train.unroll` positions. The seen-byte keys are allowed (each window's bytes are marked before it runs) |
+| `train.host_sync`, `train.fused_adamw`, `hardware.baseline_compile`, the Transformer-XL and Gated DeltaNet baselines, `model.memory = false` recipes | refused: the generic trainer's keys and models (refused by their own rules or by the rule above) |
 
 ## Where it is in the code
 
@@ -238,8 +250,13 @@ on seeds 0, 2 and 3, and `_cdunk05` (the same at 0.05) on seed 0. `key_content.y
 - `python/hsn/model/hsn.py`: `HSN.content_drop_mask`, `HSN.mark_bytes_seen`,
   `HSN._content_blank`; the mask is applied to `E`'s input in `_window_prologue` and in
   `_shared_path` (`step`), and handed to the reader in `_window_prologue`.
-- `python/hsn/model/reader.py`: `Reader.forward(..., blank=None)` zeroes the embedding's rows
-  at the blank positions.
+- `python/hsn/model/reader.py`: `Reader.forward(..., blank=None, unknown=None)` and
+  `Reader.read(..., blank=None, unknown=None)` look the window's rows up through
+  `Reader._embed`, which puts the zero and unknown rows in place (before the learned position
+  table is added).
+- `python/hsn/runner.py`: `warm_start` names the options when a checkpoint's `byte_seen` or
+  unknown rows do not match the model's (`hsn.model.hsn.CONTENT_STATE_KEYS`);
+  `HSNTNoMemory.load_memory_on_state` refuses those tensors.
 - `python/hsn/train/tbptt.py`: the trainer marks each training window's bytes, and checks
   that the model was built from the configuration it trains.
 - `python/hsn/experiments/spec.py`: `model.zero_unseen_bytes` at its default stays out of the
@@ -262,7 +279,20 @@ with the 32-byte reader alone on the RTX 3060 (15 Nov 2026) that is 0.1 to 0.2 %
 spread of that timing (p95 0.9 ms above the median). A timing run on the card has to confirm
 it.
 
-## Tests (`tests/test_key_content.py`)
+## Tests (`tests/test_key_content.py`, `tests/test_key_content_main.py`)
+
+`tests/test_key_content_main.py` (the merge with main, 20 Nov 2026): every configuration file of
+main keeps the configuration hash, memory key and arm id main computes (c5bfa5a), also with the
+four keys named at their defaults; the refusals and the combinations that run; three training
+windows and one evaluation window of a stream with the carried reader, reach dropout, word
+events and C-read are, bit for bit and in every gradient, the windows of the model without the
+options with its two content reads replaced from outside (the next cache and the carried
+address included); the cache holds what its window read; the compiled event loop with the
+carry equals the eager one over five windows without a recompile; thirty trainer steps with
+the carry and reach dropout, and with word events, the carry and C-read, train the unknown
+rows; the warm-start and memory-off refusals. Two tests need the card and were not run (the
+card was busy): twelve compiled trainer steps with CUDA Graphs (fp32, bf16) of those two
+recipes, and the compiled event window with the carry against the eager one with CUDA Graphs.
 
 The defaults keep the configuration hash, memory key and arm id that f3f271a computes, build
 no buffer and no state-dict key, and leave the initialisation alone; the refusals. Content

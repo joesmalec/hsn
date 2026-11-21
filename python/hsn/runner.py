@@ -70,7 +70,7 @@ from hsn.eval.results import (
     RunRecord,
     evidence_package,
 )
-from hsn.model.hsn import HSN, WindowCarry, address_history
+from hsn.model.hsn import CONTENT_STATE_KEYS, HSN, WindowCarry, address_history
 from hsn.model.hsn_t import HSNT, HSNTNoMemory
 from hsn.model.router import SCORED_MODES
 from hsn.profiler import (
@@ -201,10 +201,19 @@ def warm_start(model: nn.Module, path: str | Path) -> dict[str, Any]:
 
     One exception to the strict match: a model with A10's write output
     (:data:`WRITE_OUTPUT_KEYS`) accepts a checkpoint without it; the record then lists those
-    keys under ``not_loaded``."""
+    keys under ``not_loaded``. The byte-content options (``docs/key_content.md``) have no such
+    exception: a checkpoint loads only into a model with the same seen bytes and unknown rows
+    (:data:`~hsn.model.hsn.CONTENT_STATE_KEYS`), and a mismatch is refused with the options to
+    set."""
     own = set(model.state_dict())
     allow = tuple(key for key in WRITE_OUTPUT_KEYS if key in own)
-    loaded = load_checkpoint(path, model, averaged=True, allow_missing=allow)
+    try:
+        loaded = load_checkpoint(path, model, averaged=True, allow_missing=allow)
+    except (RuntimeError, ValueError) as exc:
+        mismatch = _content_state_mismatch(own, path)
+        if mismatch is None:
+            raise
+        raise ValueError(f"train.init_from={path}: {mismatch}") from exc
     extra = loaded.get("extra") or {}
     record: dict[str, Any] = {
         "path": str(path),
@@ -216,6 +225,46 @@ def warm_start(model: nn.Module, path: str | Path) -> dict[str, Any]:
     if not_loaded:
         record["not_loaded"] = not_loaded
     return record
+
+
+def _content_state_mismatch(own: set[str], path: str | Path) -> str | None:
+    """Why the checkpoint at ``path`` cannot warm-start a model with the state-dict keys
+    ``own`` because of the byte-content options (``docs/key_content.md``), or ``None`` (they
+    agree, or the checkpoint cannot be read: the loader's own error stands)."""
+    try:
+        theirs = set(torch.load(path, map_location="cpu", weights_only=True)["model"])
+    except Exception:  # noqa: BLE001 - the loader's error is the one to report
+        return None
+    mine = {key for key in CONTENT_STATE_KEYS if key in own}
+    held = {key for key in CONTENT_STATE_KEYS if key in theirs}
+    if mine == held:
+        return None
+    reasons = []
+    if "byte_seen" in mine - held:
+        reasons.append(
+            "this model reads a zero or the unknown row at the bytes no training window has "
+            "held (model.zero_unseen_bytes / model.unseen_bytes_as), and the checkpoint has no "
+            "byte_seen: the bytes its run trained on are not known"
+        )
+    if "byte_seen" in held - mine:
+        reasons.append(
+            "the checkpoint's run read never-trained bytes as a zero or the unknown row "
+            "(byte_seen), and this model reads every byte's own rows "
+            "(model.unseen_bytes_as=own)"
+        )
+    rows = sorted((mine ^ held) - {"byte_seen"})
+    if rows:
+        side = "this model has" if set(rows) <= mine else "the checkpoint holds"
+        reasons.append(
+            f"{side} the learned unknown rows {rows} (train.content_dropout_target=unknown) "
+            "and the other side has none"
+        )
+    return (
+        "the byte-content options of the checkpoint's run and of this configuration differ "
+        f"(docs/key_content.md): {'; '.join(reasons)}. A warm start loads these tensors "
+        "strictly; set the source run's train.content_dropout_target and "
+        "model.unseen_bytes_as (or model.zero_unseen_bytes)"
+    )
 
 
 def _detach(state: Any) -> Any:
