@@ -116,6 +116,19 @@ on the device, with no host read (no synchronisation; under ``torch.compile`` a 
 fused into the graph, CUDA graphs included); a reset after column 0 stops the run (on CUDA a
 device-side assert, which ends the process). At ``document`` (the default) nothing of this
 runs and the reader is the one above, bit for bit.
+
+Normalised queries and keys (``docs/amendments/reader_qk_norm.md``; opt-in, 21 Nov 2026).
+``model.reader_qk_norm`` (true for every block, or a list with one entry for each): in an
+enabled block the queries and the keys are normalised per head after the projection and before
+the rotation, ``q ← g_q ⊙ q / sqrt(mean(q²) + eps)`` over a head's ``w / H`` channels, and so
+for ``k`` with ``g_k`` (:func:`_head_norm`). ``g_q`` and ``g_k`` are parameters of width
+``w / H`` shared by the heads, initialised to 1, made without a random draw (every other
+parameter starts as it would without the key); ``eps`` is that of the block's LayerNorms. The
+values are not normalised and the softmax scale stays ``1 / sqrt(w / H)``, so a logit is at most
+``max|g_q| · max|g_k| · sqrt(w / H)`` (the rotation keeps a pair's length), whatever the qkv
+and LayerNorm weights. With ``model.reader_carry`` the cache holds the normalised keys, the
+keys the same positions have in a pass without the cache. At false (the default) a block has
+no such parameter and runs the code it ran, bit for bit.
 """
 
 from __future__ import annotations
@@ -196,6 +209,16 @@ def _rotate(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat([first * cos - second * sin, first * sin + second * cos], dim=-1)
 
 
+def _head_norm(x: Tensor, norm: nn.RMSNorm) -> Tensor:
+    """``model.reader_qk_norm``: ``x [B, H, T, w / H]`` (queries or keys) normalised over each
+    head's channels with ``norm``'s weight ``[w / H]`` (shared by the heads) and eps. Computed
+    in float32 at least (under bf16 autocast the projection's output is bf16) and returned in
+    ``x``'s dtype, the attention's working dtype."""
+    wide = x if x.dtype in (torch.float32, torch.float64) else x.float()
+    normed = F.rms_norm(wide, norm.normalized_shape, norm.weight.to(wide.dtype), norm.eps)
+    return normed.to(x.dtype)
+
+
 def _attention_bias(mask: Tensor, x: Tensor) -> Tensor:
     """Share SDPA's bool-to-additive conversion across the blocks of one window.
 
@@ -244,7 +267,14 @@ class _ReaderBlock(nn.Module):
     """One pre-norm block: causal multi-head self-attention with rotary positions and a GELU
     MLP, both residual."""
 
-    def __init__(self, width: int, heads: int, *, rotate_in: str = "working") -> None:
+    #: ``model.reader_qk_norm``: the queries' and the keys' RMSNorm over a head's channels
+    #: (:func:`_head_norm`); None in a block without it (no parameter, no state-dict entry)
+    q_norm: nn.RMSNorm | None
+    k_norm: nn.RMSNorm | None
+
+    def __init__(
+        self, width: int, heads: int, *, rotate_in: str = "working", qk_norm: bool = False
+    ) -> None:
         super().__init__()
         self.heads = heads
         #: ``model.reader_rotary_dtype``: "working" rotates in the dtype of the queries and keys,
@@ -256,6 +286,24 @@ class _ReaderBlock(nn.Module):
         self.norm_mlp = nn.LayerNorm(width)
         self.fc_in = nn.Linear(width, 4 * width)
         self.fc_out = nn.Linear(4 * width, width)
+        if qk_norm:  # made last and without a draw: the other parameters start as without it
+            per_head = width // heads
+            self.q_norm = nn.RMSNorm(per_head, eps=self.norm_attn.eps)
+            self.k_norm = nn.RMSNorm(per_head, eps=self.norm_attn.eps)
+        else:
+            self.q_norm = self.k_norm = None
+
+    def _project(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """The queries, keys and values ``[B, H, T, w / H]`` of ``x [B, T, w]``, not rotated;
+        with ``model.reader_qk_norm`` the queries and keys normalised per head."""
+        B, T, w = x.shape
+        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
+        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
+        k = k.view(B, T, self.heads, -1).transpose(1, 2)
+        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        if self.q_norm is not None and self.k_norm is not None:
+            q, k = _head_norm(q, self.q_norm), _head_norm(k, self.k_norm)
+        return q, k, v
 
     def forward(
         self, x: Tensor, mask: Tensor | None, cos: Tensor | None, sin: Tensor | None
@@ -264,10 +312,7 @@ class _ReaderBlock(nn.Module):
         ``None`` for no rotation (``model.reader_position = learned``). ``mask`` None: the
         causal mask (``model.reader_mask = causal``), SDPA's ``is_causal``."""
         B, T, w = x.shape
-        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
-        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
-        k = k.view(B, T, self.heads, -1).transpose(1, 2)
-        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        q, k, v = self._project(x)
         if cos is not None and sin is not None:
             if self.rotate_in == "parameters":  # in the cos / sin's dtype, then cast back
                 working = q.dtype
@@ -303,13 +348,10 @@ class _ReaderBlock(nn.Module):
         [B, H, N, w / H]`` (``model.reader_top_words``, the top block, which rotates nothing):
         ``N`` more columns after them, the mask ``[B, 1, T, C + T + N]``. Returns the output
         and the window's un-rotated keys and its values ``[B, H, T, w / H]`` (the next
-        cache's)."""
+        cache's; with ``model.reader_qk_norm`` the keys normalised, as the cached ones are)."""
         B, T, w = x.shape
         C = keys.shape[2]
-        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
-        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
-        k = k.view(B, T, self.heads, -1).transpose(1, 2)
-        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        q, k, v = self._project(x)
         all_k = torch.cat([keys.to(k.dtype), k], dim=2)  # [B, H, C + T, w / H]
         all_v = torch.cat([values.to(v.dtype), v], dim=2)
         if cos is not None and sin is not None:
@@ -382,6 +424,16 @@ class Reader(nn.Module):
                 "model.reader_mask=causal is the document mask only without model.reader_span "
                 "and model.reader_carry"
             )
+        qk_norm = cfg.reader_qk_norm
+        #: ``model.reader_qk_norm`` for each block, first to last (module docstring)
+        self.qk_norm: list[bool] = (
+            list(qk_norm) if isinstance(qk_norm, list) else [qk_norm] * cfg.reader_layers
+        )
+        if len(self.qk_norm) != cfg.reader_layers:
+            raise ValueError(
+                f"model.reader_qk_norm={qk_norm} names {len(self.qk_norm)} blocks and the reader "
+                f"has {cfg.reader_layers}"
+            )
         half = width // heads // 2
         counts = (
             list(self.rotary_pairs)
@@ -402,8 +454,8 @@ class Reader(nn.Module):
             torch.set_rng_state(generator.get_state())
             self.emb = nn.Embedding(cfg.vocab_size, width)
             self.blocks = nn.ModuleList(
-                _ReaderBlock(width, heads, rotate_in=cfg.reader_rotary_dtype)
-                for _ in range(cfg.reader_layers)
+                _ReaderBlock(width, heads, rotate_in=cfg.reader_rotary_dtype, qk_norm=on)
+                for on in self.qk_norm
             )
             self.norm = nn.LayerNorm(width)
             for module in self.modules():
@@ -825,4 +877,6 @@ class Reader(nn.Module):
             text += f", top_words={self.top_words}"
         if self.causal:
             text += ", mask=causal"
+        if any(self.qk_norm):
+            text += f", qk_norm={True if all(self.qk_norm) else self.qk_norm}"
         return text

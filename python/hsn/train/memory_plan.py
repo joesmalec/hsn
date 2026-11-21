@@ -146,12 +146,21 @@ def reader_param_count(m: ModelConfig) -> int:
     ``w → w`` maps, the MLP ``w → 4w → w``) and the final LayerNorm ``2 w``: 116,480 for the
     default reader (``w`` 64, two blocks) at ``V`` 256. With ``model.reader_position =
     learned`` the position table adds ``model.reader_positions × w``; the rotary positions
-    have no parameter."""
+    have no parameter. ``model.reader_qk_norm`` adds ``2 w / heads`` in every block it enables
+    (the queries' and the keys' RMSNorm weights, shared by the heads)."""
     if m.reader == "none":
         return 0
     w = m.reader_width
     table = m.reader_positions * w if m.reader_position == "learned" else 0
-    return m.vocab_size * w + m.reader_layers * (12 * w * w + 13 * w) + 2 * w + table
+    qk = m.reader_qk_norm
+    normed = sum(qk) if isinstance(qk, list) else m.reader_layers * int(qk)
+    return (
+        m.vocab_size * w
+        + m.reader_layers * (12 * w * w + 13 * w)
+        + 2 * w
+        + table
+        + normed * 2 * (w // m.reader_heads)
+    )
 
 
 def cell_read_param_count(m: ModelConfig) -> int:

@@ -647,6 +647,7 @@ _READER_POSITION_DEFAULTS: dict[str, Any] = {
     "reader_carry": 0,  # the reader's carried context (15 Nov 2026), likewise
     "reader_top_words": 0,
     "reader_mask": "document",  # the reader's attention mask (17 Nov 2026), likewise
+    "reader_qk_norm": False,  # the reader's normalised queries and keys (21 Nov 2026), likewise
 }
 #: The Transformer baseline's Transformer-XL keys (``baseline.transformer.*``, 17 Nov 2026) and
 #: their defaults: :func:`memory_key` leaves them out at these.

@@ -466,6 +466,16 @@ class ModelConfig(_StrictModel):
     # with reader_span null, reader_carry 0 and data.align_docs true (RunConfig), and the reader
     # asserts on the device, without a host read, that no window has such a reset.
     reader_mask: Literal["document", "causal"] = "document"
+    # reader_qk_norm (docs/amendments/reader_qk_norm.md; opt-in, 21 Nov 2026): in an enabled
+    # block the attention's queries and keys are normalised per head after the projection and
+    # before the rotation: RMSNorm over a head's reader_width / reader_heads channels, with a
+    # learned weight of that width shared by the heads (one for the queries, one for the keys,
+    # initialised to 1) and the eps of the reader's LayerNorms. A logit is then at most
+    # max|g_q| * max|g_k| * sqrt(width / heads), whatever the qkv and norm_attn weights. The
+    # values are not normalised and the softmax scale stays 1 / sqrt(width / heads). true: every
+    # block; a list: one entry for each block, first to last (as reader_rotary_pairs). false
+    # (default): the reader as it was, the same parameters and outputs.
+    reader_qk_norm: bool | list[bool] = False
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
     # embeddings, E, the reader, S and D, with no cells, router, units, graph, predictor or
@@ -680,6 +690,12 @@ class ModelConfig(_StrictModel):
                     f"model.reader_mask={self.reader_mask} is the mask of model.reader's "
                     "attention; set model.reader=transformer or leave it at document"
                 )
+            if self.reader_qk_norm is not False:
+                raise ValueError(
+                    f"model.reader_qk_norm={self.reader_qk_norm} normalises the queries and "
+                    "keys of model.reader's attention; set model.reader=transformer or leave "
+                    "it false"
+                )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
                 raise ValueError(
@@ -709,6 +725,13 @@ class ModelConfig(_StrictModel):
                     f"model.reader_rotary_pairs={pairs} names {len(pairs)} blocks and the "
                     f"reader has model.reader_layers={self.reader_layers}: one count for each "
                     "block, or one number for all of them"
+                )
+            qk_norm = self.reader_qk_norm
+            if isinstance(qk_norm, list) and len(qk_norm) != self.reader_layers:
+                raise ValueError(
+                    f"model.reader_qk_norm={qk_norm} names {len(qk_norm)} blocks and the reader "
+                    f"has model.reader_layers={self.reader_layers}: one entry for each block, "
+                    "or one value for all of them"
                 )
             counts = pairs if isinstance(pairs, list) else [] if pairs is None else [pairs]
             if any(n < 0 or n > per_head // 2 for n in counts):
@@ -2443,6 +2466,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.reach_dropout_span",
     "baseline.gated_deltanet",
     "hardware.message_gradients",
+    "model.reader_qk_norm",
 )
 
 #: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
