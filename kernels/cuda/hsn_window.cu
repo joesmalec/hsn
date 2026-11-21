@@ -1428,3 +1428,4 @@ extern "C" __global__ void hsn_win_back_tail(HsnWinArgs a) {
 
 /* The trainer's per-step passes (P2.10b) share this fatbin and its launcher. */
 #include "hsn_trainer.cu"
+#include "hsn_event.cu"
