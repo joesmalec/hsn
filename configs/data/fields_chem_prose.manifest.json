@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 530754,
+      "test": "fields_chem_prose/out_of_range/dev",
+      "test_docs_with_overlap": 1977,
+      "train": "fields_chem_prose/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 517265,
+      "test": "fields_chem_prose/out_of_range/test",
+      "test_docs_with_overlap": 1978,
+      "train": "fields_chem_prose/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 130058,
+      "test": "fields_chem_prose/out_of_range/test",
+      "test_docs_with_overlap": 1925,
+      "train": "fields_chem_prose/out_of_range/dev"
+    }
+  ],
+  "name": "fields_chem_prose",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 10,
+      "family": "text",
+      "file": "fields_chem_prose.out_of_range.train.npz",
+      "hash": "2a104d7f6b555982e4d0fb536ccc669357f9315135c9cda95696c308ea111c49",
+      "n_docs": 16268,
+      "n_loss": 199982486,
+      "n_tokens": 199998754,
+      "split": "train",
+      "task": "fields_chem_prose",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 10,
+      "family": "text",
+      "file": "fields_chem_prose.out_of_range.dev.npz",
+      "hash": "6e4f2c221687b62fe8b39e5909c0ffef00d82764d3b769eaf38bacd0f3cec3a0",
+      "n_docs": 2000,
+      "n_loss": 24609554,
+      "n_tokens": 24611554,
+      "split": "dev",
+      "task": "fields_chem_prose",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 10,
+      "family": "text",
+      "file": "fields_chem_prose.out_of_range.test.npz",
+      "hash": "26ec4fe4c39aa829e7a4a90fd6475639ce19be4e5b3d97049ee6f8eedc8b64f4",
+      "n_docs": 2000,
+      "n_loss": 24804436,
+      "n_tokens": 24806436,
+      "split": "test",
+      "task": "fields_chem_prose",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "c566396b901bcab9286d55a4412911a4d71fd84e97689cfd83d7585a8a6f6771",
+  "split_hashes": {
+    "dev": "fd83c346926cade24fb02eadadbf302c18fedb1c08f5deb0143922e1ce7162dd",
+    "test": "64476e108263ad3871aedcfb6cdfecfa1310aa3238e951420d8663313faf982b",
+    "train": "bc6364783552cc04a0b506ad9367d46dd19ac9f6c3559d3cedb7c889fd515500"
+  },
+  "unroll": 256
+}

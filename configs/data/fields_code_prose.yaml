@@ -1,0 +1,46 @@
+# fields_code_prose: coding prose of the field datasets (19-20 Nov 2026; docs/field_datasets.md).
+#
+# Source: Stack Overflow Python questions and answers, Aug 2008 - Oct 2016 (Kaggle set),
+#   https://huggingface.co/datasets/koutch/stackoverflow_python at commit ee6f39553b6fe4424f0a52b61a8de2a893390744
+#   Licence: CC BY-SA 3.0 (Stack Overflow user contributions).
+#
+# Document: a Stack Overflow Python question (title, body) and its answers, best first; capped at
+# 16384 bytes, at least 64. Split by blake2b('fields_code_prose/<key>') mod 10000: below 150 held
+# out, below 4000 used (python/hsn/data/fields.py).
+#
+# The raw files (not in the repository) come from the pinned sources (the build checks their
+# SHA-256):
+#
+#   python -m hsn.data.fields fetch fields_code_prose --root <dir>
+#   python -m hsn.data.fields convert fields_code_prose --root <dir>     # <dir>/raw/fields_code_prose/
+#   python -m hsn.data.text build --spec configs/data/fields_code_prose.yaml \
+#       --raw <dir>/raw/fields_code_prose --out data/fields_code_prose \
+#       --golden configs/data/fields_code_prose.manifest.json
+#
+# Select it with
+#   data.dataset=fields_code_prose data.manifest=data/fields_code_prose/manifest.json
+#   data.tasks=[fields_code_prose] data.variants=[out_of_range]
+# Golden manifest: configs/data/fields_code_prose.manifest.json.
+
+name: fields_code_prose
+unroll: 256
+task: fields_code_prose
+variant: out_of_range # documents are longer than a window
+family: text
+context_id: 11 # Stack Overflow prose
+separator: "<|endoftext|>"
+min_bytes: 64
+newline: 16
+tab: 17
+max_train_tokens: 200000000
+n_dev: 2000
+n_test: 2000
+n_gram: 32
+
+train:
+  file: train.txt
+  sha256: 9d5598a4a4a2b2013d3b1ca9fe443e62c55900b6597d7b1e25e147da730c3dd8
+
+heldout:
+  file: heldout.txt
+  sha256: a3b3660bc80b0c02e4c7d9cc9514821baa527eb8705784d09c9cf243676313cc

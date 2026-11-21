@@ -1,0 +1,77 @@
+{
+  "format": 1,
+  "hsn_version": "0.1.0",
+  "leakage": [
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 86258,
+      "test": "fields_bio_prose/out_of_range/dev",
+      "test_docs_with_overlap": 1898,
+      "train": "fields_bio_prose/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 88728,
+      "test": "fields_bio_prose/out_of_range/test",
+      "test_docs_with_overlap": 1902,
+      "train": "fields_bio_prose/out_of_range/train"
+    },
+    {
+      "exact_duplicates": 0,
+      "n_gram": 32,
+      "overlapping_ngrams": 6789,
+      "test": "fields_bio_prose/out_of_range/test",
+      "test_docs_with_overlap": 934,
+      "train": "fields_bio_prose/out_of_range/dev"
+    }
+  ],
+  "name": "fields_bio_prose",
+  "numpy_version": "2.5.4",
+  "shards": [
+    {
+      "context_id": 10,
+      "family": "text",
+      "file": "fields_bio_prose.out_of_range.train.npz",
+      "hash": "a96d3260bf7466be4fb0d022d8677b31173303204af74b0f5024ab97b87da93d",
+      "n_docs": 151980,
+      "n_loss": 199847939,
+      "n_tokens": 199999919,
+      "split": "train",
+      "task": "fields_bio_prose",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 10,
+      "family": "text",
+      "file": "fields_bio_prose.out_of_range.dev.npz",
+      "hash": "531f20bcfd8050cbc387c68b53473338fa33ad5bcb0d3e5a6af6534d1a288127",
+      "n_docs": 2000,
+      "n_loss": 2634277,
+      "n_tokens": 2636277,
+      "split": "dev",
+      "task": "fields_bio_prose",
+      "variant": "out_of_range"
+    },
+    {
+      "context_id": 10,
+      "family": "text",
+      "file": "fields_bio_prose.out_of_range.test.npz",
+      "hash": "4bf4363b160a0e2f2b239f7d7ff100ed869e2b7743bde90b79999a1f3dd9b3a3",
+      "n_docs": 2000,
+      "n_loss": 2652114,
+      "n_tokens": 2654114,
+      "split": "test",
+      "task": "fields_bio_prose",
+      "variant": "out_of_range"
+    }
+  ],
+  "spec_hash": "c139131c2d518dfe4dfc2a58053a412ed7196e6ef0d1bd0dc7c8494a6b6a585d",
+  "split_hashes": {
+    "dev": "b7a06adda714f4a7c2ba3fbd5e8d7748be7dde12d259fe72e27290b36ed778aa",
+    "test": "0788f5313d17029a548bac1ea3f7d9ef85a0687285d8578814d5bd8a67ae2326",
+    "train": "64d4db385f4c2ec16bfcf775308e97f742a0171d830b4d547a12ae930031b05e"
+  },
+  "unroll": 256
+}
