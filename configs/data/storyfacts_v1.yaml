@@ -1,4 +1,4 @@
-# storyfacts_v1: stories with stated facts, the corpus of the recall router (18 Nov 2026; docs/recall_router.md).
+# storyfacts_v1: stories with stated facts, the corpus of the recall router (18 Nov 2026; the router itself is not on main).
 #
 # Why: HSN-T with its memory wins keyed recall, a fast model is as good or better on plain story text. To train a router that
 # sends a document to the memory model only where recall is needed, both models must be trained and scored on ONE corpus that

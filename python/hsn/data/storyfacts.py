@@ -1,5 +1,5 @@
 """Stories with stated facts, in the P0.4 shard format (18 Nov 2026): the corpus of the recall
-router (``docs/recall_router.md``).
+router (the router itself, a per-document classifier, is not on main).
 
 One corpus that holds what a fast model reads well and what only a memory recalls, so that a
 model pair trained on it can be compared document by document. Everything is ordinary story
