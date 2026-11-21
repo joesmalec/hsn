@@ -352,6 +352,8 @@ forward plus backward.
   `configs/experiments/hsn_t_memory_words_carry.yaml` (18 Nov 2026: that recipe with the top0
   reader and `model.reader_carry=256`; TinyStories 27k 0.7413 / 0.7381 dev bits per byte, s0 /
   s1, against 0.7972 without the carry; `docs/amendments/reader_carry_memory.md`, "The recipes").
+- The same with the paper's balance loss: `configs/experiments/hsn_t_memory_words_carry_bal.yaml`
+  (21 Nov 2026: `train.aux_enabled=[balance]`, `train.lambda_b=0.02`; evidence in its header).
 - Spec, not queued: `~/hsn-experiments/remote/specs/mem_events.yaml`.
 
 ## What is left of the full idea
