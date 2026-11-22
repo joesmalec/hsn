@@ -3,7 +3,7 @@
 pass written by hand.
 
 The compiled event loop (:meth:`hsn.model.hsn.HSN._event_block` through
-:mod:`hsn.train.compile`) runs :meth:`HSN._position` at every event slot with autograd: about 86
+:mod:`hsn.train.compile`) runs :meth:`HSN._position` at every event slot with autograd: about 108
 small kernels per slot, forward and backward. Here an event slot ("round") is
 
 * **forward**, no autograd: the front (``P`` and ``S`` on the carried summary), the scorer's
@@ -68,6 +68,7 @@ __all__ = [
     "local_backward",
     "round_reference",
     "scope_error",
+    "sweep_buffered",
     "sweep_reference",
 ]
 
@@ -477,12 +478,14 @@ def forward_reference(
     live: Tensor,
     *,
     product_dtype: torch.dtype | None = None,
+    cell_consts: CellConstants | None = None,
 ) -> dict[str, Tensor]:
     """The forward sweep of a block of ``E`` event slots in plain PyTorch
     (:func:`round_reference` at every slot): the tape (:data:`TAPE_KEYS`, stacked ``[B, E, …]``;
     the batch statistics ``[E]``) and the state after the block (``h``, ``q``, ``age``).
     ``z [B, E, d]``, ``ctx [B, E, d_ctx]``, ``scalars [B, E, N, 7 + A]``, ``reset`` and ``live``
-    bool ``[B, E]``."""
+    bool ``[B, E]``. ``cell_consts`` (the reverse sweep's constants, which the card's forward
+    sweep sizes its buffers from) is not read here."""
     slots: list[dict[str, Tensor]] = []
     for t in range(int(z.shape[1])):
         slot = round_reference(
@@ -497,6 +500,11 @@ def forward_reference(
     }
     tape.update(h=h, q=q, age=age, reset=reset)
     return tape
+
+
+#: The cell norm's backward of a block on the card: ``(dv [P, n], row_of [P], tape, gain) ->
+#: (d_u, d_eps, dm, g_norm)`` or ``None`` (:meth:`hsn.kernels.event.EventKernels.pairs`).
+Pairs = Callable[..., "tuple[Tensor, Tensor, Tensor, Tensor] | None"]
 
 
 def _by_unit(units: Tensor, n_units: int) -> tuple[Tensor, Tensor, list[tuple[int, int]]]:
@@ -527,6 +535,7 @@ def local_backward(
     scalars: Tensor,
     *,
     product_dtype: torch.dtype | None = None,
+    pairs: Pairs | None = None,
 ) -> dict[str, Tensor | None]:
     """The parameters' part of the block's backward pass, for all its slots at once and
     without autograd: from the total ``dL/dc`` and ``dL/db`` of every slot (``[B, E, K, d]``,
@@ -545,7 +554,10 @@ def local_backward(
 
     The unit bank's products are taken per unit over that unit's rows of the whole block
     (``M`` products per layer and direction), not at every slot. ``product_dtype``: the dtype
-    those products run in (bf16 on the card under autocast; ``None``: the state's)."""
+    those products run in (bf16 on the card under autocast; ``None``: the state's). ``pairs``:
+    the cell norm's backward of every slot as one kernel
+    (:meth:`hsn.kernels.event.EventKernels.pairs`); ``None``, or a call that returns ``None``:
+    the tensor operations here."""
     dtype = dc.dtype
     pd = dtype if product_dtype is None else product_dtype
     B, E, K, d = (int(n) for n in dc.shape)
@@ -562,67 +574,109 @@ def local_backward(
     scaled = w.cand_gain * dz
     dy = (rho * scaled - rho.pow(3) * y * (y * scaled).mean(dim=-1, keepdim=True)).reshape(P, d)
     d_gate = (db * b * (1.0 - b)).reshape(P, d)
-    # the unit bank, one unit at a time over its rows of the whole block
+    # the unit bank, one unit at a time over its rows of the whole block. A tape may hold a
+    # per-slot buffer slot-major (``<key>_eb [E, B, K, ·]``: what a product read on the card);
+    # its rows are then taken straight in unit order
     order, inverse, segments = _by_unit(tape["units"].reshape(P), M)
-    hid_s = tape["hidden"].reshape(P, H).index_select(0, order)
-    act_s = _act(spec.unit_act, hid_s.to(dtype)).to(pd)
+    slot_major = (
+        torch.arange(E, device=dc.device)[None, :, None] * B
+        + torch.arange(B, device=dc.device)[:, None, None]
+    ) * K + torch.arange(K, device=dc.device)  # [B, E, K]: a slot's row in an [E, B, K] buffer
+    order_eb = slot_major.reshape(P).index_select(0, order)
+
+    def by_unit(key: str, width: int) -> Tensor:
+        if key + "_eb" in tape:
+            return tape[key + "_eb"].reshape(P, width).index_select(0, order_eb)
+        return tape[key].reshape(P, width).index_select(0, order)
+
+    v_s = by_unit("v", n).to(pd)
+    hid_s: Tensor | None = None
+    if "act" in tape or "act_eb" in tape:
+        act_s = by_unit("act", H).to(pd)
+    else:
+        hid_s = by_unit("hidden", H).to(dtype)
+        act_s = _act(spec.unit_act, hid_s).to(pd)
     dy_s = dy.index_select(0, order).to(pd)
-    v_all = tape["v"].reshape(P, n)
-    v_s = v_all.index_select(0, order).to(pd)
     w1_p, w2_p = w.w1.to(pd), w.w2.to(pd)
-    g_w1 = w.w1.new_zeros(n, M * H + d)
+    # every product writes where its result is read: no copies of slices
+    g_w2_u = act_s.new_zeros(M, H, d)  # per unit: actᵀ dy
+    g_w1_u = act_s.new_zeros(M, n, H)  # per unit: vᵀ dhid
     g_b1 = w.b1.new_zeros(M * H + d)
-    g_w2 = w.w2.new_zeros(H, M * d)
     g_b2 = w.b2.new_zeros(M * d)
-    d_act = act_s.new_zeros(P, H)
     for j, (lo, hi) in enumerate(segments):
         if hi > lo:
-            g_w2[:, j * d : (j + 1) * d] = (act_s[lo:hi].t() @ dy_s[lo:hi]).to(dtype)
-            g_b2[j * d : (j + 1) * d] = dy_s[lo:hi].to(dtype).sum(dim=0)
-            d_act[lo:hi] = dy_s[lo:hi] @ w2_p[:, j * d : (j + 1) * d].t()
-    d_hid = (d_act.to(dtype) * activation_grad(spec.unit_act, hid_s.to(dtype))).to(pd)
+            torch.mm(act_s[lo:hi].t(), dy_s[lo:hi], out=g_w2_u[j])
+            g_b2[j * d : (j + 1) * d] = dy_s[lo:hi].sum(dim=0, dtype=dtype)
+    if "d_hid" in tape:
+        # the reverse sweep kept dhid of every slot (its middle step computes it anyway)
+        d_hid = by_unit("d_hid", H).to(pd)
+    else:
+        d_act = act_s.new_zeros(P, H)
+        for j, (lo, hi) in enumerate(segments):
+            if hi > lo:
+                torch.mm(dy_s[lo:hi], w2_p[:, j * d : (j + 1) * d].t(), out=d_act[lo:hi])
+        if hid_s is None:
+            hid_s = by_unit("hidden", H).to(dtype)
+        d_hid = (d_act.to(dtype) * activation_grad(spec.unit_act, hid_s)).to(pd)
+    w1_t = w1_p[:, : M * H].reshape(n, M, H).permute(1, 2, 0).contiguous()  # [M, H, n]
     dv_s = d_hid.new_zeros(P, n)
     for j, (lo, hi) in enumerate(segments):
         if hi > lo:
-            g_w1[:, j * H : (j + 1) * H] = (v_s[lo:hi].t() @ d_hid[lo:hi]).to(dtype)
-            g_b1[j * H : (j + 1) * H] = d_hid[lo:hi].to(dtype).sum(dim=0)
-            dv_s[lo:hi] = d_hid[lo:hi] @ w1_p[:, j * H : (j + 1) * H].t()
-    d_gate_p = d_gate.to(pd)
-    v_p = v_all.to(pd)
-    g_w1[:, M * H :] = (v_p.t() @ d_gate_p).to(dtype)
+            torch.mm(v_s[lo:hi].t(), d_hid[lo:hi], out=g_w1_u[j])
+            g_b1[j * H : (j + 1) * H] = d_hid[lo:hi].sum(dim=0, dtype=dtype)
+            torch.mm(d_hid[lo:hi], w1_t[j], out=dv_s[lo:hi])
+    # the gate rides the first layer: its columns of the weight's gradient and its part of dv
+    d_gate_s = d_gate.index_select(0, order).to(pd)
+    g_w1 = torch.cat([g_w1_u.permute(1, 0, 2).reshape(n, M * H), v_s.t() @ d_gate_s], dim=1).to(
+        dtype
+    )
+    g_w2 = g_w2_u.permute(1, 0, 2).reshape(H, M * d).to(dtype)
     g_b1[M * H :] = d_gate.sum(dim=0)
-    dv = (dv_s.index_select(0, inverse) + d_gate_p @ w1_p[:, M * H :].t()).to(dtype)
-    # the cell norm: v = g_n ⊙ x · r
+    dv_s.addmm_(d_gate_s, w1_p[:, M * H :].t())
+    # the cell norm: v = g_n ⊙ x · r. On the card one kernel takes every slot's backward from
+    # the rows of dv where they lie; here the same in tensor operations
     u, eps = tape["u"], tape["eps"]
-    x = torch.cat(
-        [
-            u[:, :, None].expand(B, E, K, d),
-            eps[:, :, None].expand(B, E, K, d),
-            tape["h_old"],
-            tape["m"],
-        ],
-        dim=-1,
-    ).reshape(P, n)
-    r = tape["rms"].reshape(P, 1)
-    scaled_dv = w.norm_gain * dv
-    inner = (x * scaled_dv).sum(dim=-1, keepdim=True)
-    dx = r * scaled_dv - (r.pow(3) / n) * x * inner
-    g_norm = (dv * x * r).sum(dim=0)
-    dx = dx.reshape(B, E, K, n)
-    d_u = dx[..., :d].sum(dim=2)
-    d_eps = dx[..., d : 2 * d].sum(dim=2)
-    dm = dx[..., 3 * d :].reshape(P, d)
+    done = None if pairs is None else pairs(dv_s, inverse, tape, w.norm_gain)
+    if done is not None:
+        d_u, d_eps, dm_slots, g_norm = done
+        dm = dm_slots.reshape(P, d)
+    else:
+        dv = dv_s.index_select(0, inverse).to(dtype)
+        x = torch.cat(
+            [
+                u[:, :, None].expand(B, E, K, d),
+                eps[:, :, None].expand(B, E, K, d),
+                tape["h_old"],
+                tape["m"],
+            ],
+            dim=-1,
+        ).reshape(P, n)
+        r = tape["rms"].reshape(P, 1)
+        scaled_dv = w.norm_gain * dv
+        inner = (x * scaled_dv).sum(dim=-1, keepdim=True)
+        dx = r * scaled_dv - (r.pow(3) / n) * x * inner
+        g_norm = (dv * x * r).sum(dim=0)
+        dx = dx.reshape(B, E, K, n)
+        d_u = dx[..., :d].sum(dim=2)
+        d_eps = dx[..., d : 2 * d].sum(dim=2)
+        dm = dx[..., 3 * d :].reshape(P, d)
     # the messages: m = Σ_e a_e · V h[src_e]
     cells = tape["cells"]
-    h_pre = tape["h_pre"]  # [B, E, N, d]
     D = spec.D
     src = spec.pad_src[cells]  # [B, E, K, D]
-    rows = torch.arange(B * E, device=dc.device).reshape(B, E, 1, 1) * N
-    h_src = h_pre.reshape(B * E * N, d).index_select(0, (rows + src).reshape(-1)).reshape(P, D, d)
-    a_sel = w.edge[cells].reshape(P, D)
-    g_v = dm.t() @ (h_src * a_sel[:, :, None]).sum(dim=1)
+    states_eb = "h_pre_eb" in tape  # the states the slots read, [E, B, N, d] or [B, E, N, d]
+    if states_eb:
+        h_flat = tape["h_pre_eb"].reshape(E * B * N, d)
+        rows = slot_major[:, :, :1, None] // K * N  # [B, E, 1, 1]: the slot's first state row
+    else:
+        h_flat = tape["h_pre"].reshape(B * E * N, d)
+        rows = torch.arange(B * E, device=dc.device).reshape(B, E, 1, 1) * N
+    h_src = h_flat.index_select(0, (rows + src).reshape(-1)).reshape(P, D, d)
+    a_sel = w.edge[cells].reshape(P, 1, D)
+    weighted = torch.bmm(a_sel, h_src).reshape(P, d)  # Σ_e a_e h[src_e]
+    g_v = (dm.to(pd).t() @ weighted.to(pd)).to(dtype)
     through = dm @ w.v  # [P, d]: Vᵀ dm
-    per_edge = (h_src * through[:, None, :]).sum(dim=-1)  # [P, D]
+    per_edge = torch.bmm(h_src, through[:, :, None]).reshape(P, D)
     g_edge = (
         w.edge.new_zeros(N * D)
         .index_add(
@@ -661,17 +715,21 @@ def local_backward(
     g_sw[:, :d] = per_row.t() @ u.reshape(B * E, d)
     g_sw[:, d : 2 * d] = per_row.t() @ eps.reshape(B * E, d)
     flat_log = d_log.reshape(B * E * N, M)
-    g_sw[:, 2 * d : 3 * d] = flat_log.t() @ h_pre.reshape(B * E * N, d)
-    age_f = (tape["age_pre"].to(dtype) / spec.age_max).reshape(B * E * N)
-    g_sw[:, 3 * d] = flat_log.t() @ age_f
+    # (in the products' dtype: under autocast the scorer reads its features in bf16, and this
+    # is the largest product of the scorer's gradient: every cell's state of every slot)
+    by_state = d_log.transpose(0, 1).reshape(E * B * N, M) if states_eb else flat_log
+    g_sw[:, 2 * d : 3 * d] = (by_state.to(pd).t() @ h_flat.to(pd)).to(dtype)
+    age_f = (tape["age_pre"].to(dtype) / spec.age_max).reshape(B * E * N, 1)
     scal = scalars.to(dtype).reshape(B * E * N, -1)
-    g_sw[:, 3 * d + 1 :] = flat_log.t() @ scal
+    g_sw[:, 3 * d :] = (flat_log.to(pd).t() @ torch.cat([age_f, scal], dim=1).to(pd)).to(dtype)
     g_sb = flat_log.sum(dim=0)
     g_gate: Tensor | None = None
     if w.gate_w is not None:
         read = tape["q_pre"] if spec.gate_input == "summary" else u
         address = scal[:, scal.shape[-1] - A :].reshape(B * E, N, A)
-        d_gate_rows = torch.einsum("rnm,rna->rma", d_log.reshape(B * E, N, M), address)
+        # Σ_n dlog[r, n, m] · address[r, n, a] (one product and a sum: a batched contraction
+        # of 2,048 small matrices takes 0.57 ms on the card)
+        d_gate_rows = (d_log.reshape(B * E, N, M, 1) * address[:, :, None, :]).sum(dim=1)
         g_gate = d_gate_rows.reshape(B * E, M * A).t() @ read.reshape(B * E, d)
     return {
         "w1": g_w1,
@@ -731,6 +789,62 @@ def sweep_reference(
     return dc, db, dh0, dq0
 
 
+def sweep_buffered(
+    tape: dict[str, Tensor],
+    consts: CellConstants,
+    n_cells: int,
+    d_q_pre: Tensor | None,
+    d_q_post: Tensor | None,
+    d_h_sel: Tensor | None,
+    initial: tuple[Tensor, Tensor] | None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """:func:`sweep_reference` through the buffered sweep
+    (:class:`hsn.train.state_sweep.ReverseSweep`, its PyTorch steps: any device and dtype),
+    which also keeps every slot's ``dhid``: ``tape["d_hid"]`` is set, and
+    :func:`local_backward` then takes ``dhid`` from it instead of computing it again. The
+    form the card runs (:meth:`hsn.kernels.event.EventKernels.sweep`), as a reference."""
+    from hsn.train.state_sweep import ReverseSweep, sweep_shape
+
+    c = tape["c"]
+    dtype = c.dtype
+    record = {
+        "y": tape["y"],
+        "hidden": tape["hidden"],
+        "gate_pre": tape["gate_pre"],
+        "m": tape["m"],
+        "rms": tape["rms"],
+    }
+    shape = sweep_shape(c, record, consts, n_cells, 0, 0)
+    back = ReverseSweep(
+        shape,
+        consts,
+        device=c.device,
+        state_dtype=dtype,
+        product_dtype=tape["hidden"].dtype,
+        kernels=False,
+    )
+    back.d_hid = torch.zeros_like(tape["hidden"])
+    back.load(
+        c,
+        tape["b"],
+        tape["h_old"],
+        tape["cells"],
+        tape["units"],
+        tape["valid"],
+        tape["reset"],
+        d_q_pre,
+        d_q_post,
+        d_h_sel,
+        None,
+        record,
+        consts,
+        initial,
+    )
+    dc, db = back.run()
+    tape["d_hid"] = back.d_hid
+    return dc, db, back.A, back.R
+
+
 class EventRun:
     """What the node of one block keeps for its backward pass: the tape, the weights and sizes
     of the window, the slots' scalars, the cell's constants for the reverse sweep, and the
@@ -746,8 +860,10 @@ class EventRun:
         *,
         sweep: Sweep | None = None,
         product_dtype: torch.dtype | None = None,
+        pairs: Pairs | None = None,
     ) -> None:
         self.tape = tape
+        self.pairs = pairs
         self.weights = weights
         self.spec = spec
         self.scalars = scalars
@@ -831,7 +947,7 @@ class EventRecurrence(torch.autograd.Function):
         run.dc, run.db = dc, db
         grads = local_backward(
             run.weights, spec, tape, dc, db, d_readout, d_logits, run.scalars,
-            product_dtype=run.product_dtype,
+            product_dtype=run.product_dtype, pairs=run.pairs,
         )  # fmt: skip
         return (
             grads["u"],
@@ -872,6 +988,7 @@ def fused_event_block(
     *,
     forward: Forward | None = None,
     sweep: Sweep | None = None,
+    pairs: Pairs | None = None,
     product_dtype: torch.dtype | None = None,
     runs: list[EventRun] | None = None,
 ) -> dict[str, Tensor]:
@@ -882,8 +999,9 @@ def fused_event_block(
     and the replay of ``S`` and ``P`` around it (module docstring). ``consts``: the merged
     window constants (:meth:`HSN.merged_consts`), inside the cell's window.
 
-    ``forward`` / ``sweep``: the forward and the reverse sweep to run (``None``: the PyTorch
-    references; on the card :class:`hsn.kernels.event.EventKernels`). ``product_dtype``: the
+    ``forward`` / ``sweep`` / ``pairs``: the forward sweep, the reverse sweep and the cell
+    norm's backward to run (``None``: the PyTorch references; on the card
+    :class:`hsn.kernels.event.EventKernelSet`'s). ``product_dtype``: the
     dtype of the matrix products (``None``: the state's). ``runs`` receives the block's
     :class:`EventRun` (tests and measurements)."""
     controls = model._controls() if controls is None else controls
@@ -895,13 +1013,16 @@ def fused_event_block(
     spec = event_spec(model, controls)
     weights = event_weights(model, consts, dtype, product_dtype)
     run_forward = forward_reference if forward is None else forward
+    sweep_consts = cell_constants(cell, dtype)  # the window's edge weights: in its grad mode
     with torch.no_grad():
         tape = run_forward(
             model, weights, spec, h.detach(), q.detach(), age, z_b.detach(), c_b.detach(), s_b,
-            r_b, v_b, product_dtype=product_dtype,
+            r_b, v_b, product_dtype=product_dtype, cell_consts=sweep_consts,
         )  # fmt: skip
-    sweep_consts = cell_constants(cell, dtype)  # the window's edge weights: in its grad mode
-    run = EventRun(tape, weights, spec, s_b, sweep_consts, sweep=sweep, product_dtype=product_dtype)
+    run = EventRun(
+        tape, weights, spec, s_b, sweep_consts, sweep=sweep, product_dtype=product_dtype,
+        pairs=pairs,
+    )  # fmt: skip
     # S on the taped summary (a constant under the summary cut): the local half of u, with
     # its gradient into S, the encoder and the reader
     u = model.shared(model._shared_input(z_b, tape["q_pre"], c_b, h))
@@ -967,6 +1088,7 @@ def forward_events(
     *,
     forward: Forward | None = None,
     sweep: Sweep | None = None,
+    pairs: Pairs | None = None,
     product_dtype: torch.dtype | None = None,
     runs: list[EventRun] | None = None,
 ) -> tuple[Tensor, Any, dict[str, Tensor]]:
@@ -986,7 +1108,7 @@ def forward_events(
         consts = model.merged_consts()
         out = fused_event_block(
             model, state.h, state.q, state.age, ev.z, ev.context, ev.scalars, ev.reset, ev.valid,
-            consts, controls, forward=forward, sweep=sweep, product_dtype=product_dtype,
-            runs=runs,
+            consts, controls, forward=forward, sweep=sweep, pairs=pairs,
+            product_dtype=product_dtype, runs=runs,
         )  # fmt: skip
     return model._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])

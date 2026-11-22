@@ -196,6 +196,11 @@ class ReverseSweep:
         self.sigma = state(B, K)
         # what the sweep returns
         self.dc, self.db = state(B, T, K, d), state(B, T, K, d)
+        #: ``[B, T, K, H]`` in the products' dtype, or ``None`` (default): when set, the middle
+        #: step also writes every position's ``dhid`` there (zeros on padded slots), for a
+        #: backward pass that takes the weights' gradients from all positions at once
+        #: (:func:`hsn.train.event_fused.local_backward`).
+        self.d_hid: Tensor | None = None
         self._graph: torch.cuda.CUDAGraph | None = None
         self.kernels = self._kernels_fit() if kernels is None else kernels
         if self.kernels and not self._kernels_fit():
@@ -493,6 +498,8 @@ class ReverseSweep:
         d_hid = torch.where(ok, d_act * activation_grad(self.activation, hidden), zero)
         self.sigma.add_((d_hid * (hidden - self.b1[units])).sum(dim=-1))
         self._write_blocks(self.op2, self.op2_fast, d_hid, t, s.H)
+        if self.d_hid is not None:
+            self.d_hid[:, t] = d_hid.to(self.d_hid.dtype)
 
     def tail_reference(self, t: int) -> None:
         s = self.shape

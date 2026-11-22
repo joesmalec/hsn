@@ -1173,9 +1173,12 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
  * and writes dhid into the slot's unit block of op2 (clearing the block position t + 1 used) or
  * into op2_fast.
  *   p: 0 act_r [B Kr, H], 1 act_f [F,B,H] (f32 | bf16); 2 hidden [B,T,K,H] (f32 | bf16);
- *      3 units, 4 valid; 5 b1 [M,H] f32; 6 op2, 7 op2_fast; 8 sigma [B,K] f32.
+ *      3 units, 4 valid; 5 b1 [M,H] f32; 6 op2, 7 op2_fast; 8 sigma [B,K] f32;
+ *      9 dhid [B,T,K,H] (the operands' dtype; with i[11]): record t receives dhid of every slot
+ *        (zeros on padded slots), for a backward pass that takes the weights' gradients from
+ *        all positions at once (the fused word-event block, hsn_event.cu).
  *   i: 0 B, 1 T, 2 K, 3 d, 4 M, 5 H, 6 F, 7 t, 8 the products and operands are bf16,
- *      9 hidden is bf16, 10 the activation's code.
+ *      9 hidden is bf16, 10 the activation's code, 11 write p9 (0: as before).
  * Shared: (3 K + K blockDim / 32) words. K <= 32 (a thread keeps one partial sum per slot).
  * With bf16 buffers, H a multiple of 128 dividing 4 blockDim and d a multiple of 4, a thread
  * reads and stores four values at a time (the same values; sigma's sum in another order).
@@ -1185,6 +1188,7 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
     const int B = a.i[0], T = a.i[1], K = a.i[2], d = a.i[3], M = a.i[4], H = a.i[5];
     const int F = a.i[6], t = a.i[7], code = a.i[10];
     const bool half = a.i[8] != 0, hid_half = a.i[9] != 0;
+    const bool keep = a.i[11] != 0;  // write dhid to the tape p9
     const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     const int Kr = K - F, warps = nt / 32;
     const int64_t rt = static_cast<int64_t>(row) * T + t;
@@ -1216,6 +1220,7 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
     uintptr_t bases = reinterpret_cast<uintptr_t>(a.p[2]) | reinterpret_cast<uintptr_t>(a.p[5]);
     if (Kr > 0) bases |= reinterpret_cast<uintptr_t>(a.p[0]) | reinterpret_cast<uintptr_t>(a.p[6]);
     if (F > 0) bases |= reinterpret_cast<uintptr_t>(a.p[1]) | reinterpret_cast<uintptr_t>(a.p[7]);
+    if (keep) bases |= reinterpret_cast<uintptr_t>(a.p[9]);
     if (half && hid_half && (H & 127) == 0 && (d & 3) == 0 && nt % chunks == 0
         && (bases & 15) == 0) {
         const int G = nt / chunks, g = tid / chunks, h0 = (tid - g * chunks) << 2;
@@ -1256,6 +1261,9 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
                 *reinterpret_cast<uint64_t*>(
                     op_fast + (static_cast<int64_t>(k) * B + row) * (H + d) + h0) = out;
             }
+            if (keep)
+                *reinterpret_cast<uint64_t*>(static_cast<uint16_t*>(a.p[9]) + hid_row
+                    + static_cast<int64_t>(k) * H + h0) = out;
             for (int w = 16; w > 0; w >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, w);
             if ((tid & 31) == 0) part[k * warps + (tid >> 5) % group_warps] = sum;
         }
@@ -1300,6 +1308,7 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
                 } else {
                     store_value(a.p[7], (static_cast<int64_t>(k) * B + row) * (H + d) + h, half, dh);
                 }
+                if (keep) store_value(a.p[9], hid_row + static_cast<int64_t>(k) * H + h, half, dh);
             }
         }
     }

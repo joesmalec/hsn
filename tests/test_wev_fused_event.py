@@ -89,21 +89,21 @@ def _inputs(
 ) -> tuple[Tensor, Tensor, CellGraphState, Tensor]:
     """Text with a word end every third byte, a row without one (a padding row), a row that
     starts a document at column 0 and one that starts one mid-window; a start state away from
-    zero with ages past the probes' threshold."""
+    zero with ages past the probes' threshold. On the model's device."""
     generator = torch.Generator().manual_seed(seed)
-    m = model.cfg
+    m, dev = model.cfg, model.device
     tokens = torch.randint(97, 123, (b, t), generator=generator)
     tokens[:, 2::3] = 32
     tokens[0] = 97
     ctx = torch.randint(0, m.n_context, (b, t), generator=generator)
-    h = (torch.rand(b, m.n_cells, m.d, generator=generator) * 1.6 - 0.8).to(model.dtype)
+    h = (torch.rand(b, m.n_cells, m.d, generator=generator) * 1.6 - 0.8).to(dev, model.dtype)
     state = model.init_state(b).with_dense(h)
     for _ in range(5):
-        state = state.tick(torch.rand(b, m.n_cells, generator=generator) < 0.4)
+        state = state.tick((torch.rand(b, m.n_cells, generator=generator) < 0.4).to(dev))
     reset = torch.zeros(b, t, dtype=torch.bool)
     reset[1, 5] = True
     reset[2, 0] = True
-    return tokens, ctx, state, reset
+    return tokens.to(dev), ctx.to(dev), state, reset.to(dev)
 
 
 def _objective(logits: Tensor, final: CellGraphState, info: dict[str, Tensor]) -> Tensor:
@@ -187,6 +187,27 @@ def test_fused_block_equals_the_autograd_event_loop(name: str) -> None:
     live = got["info"]["event_valid"]
     assert not bool(tape["valid"][~live].any())  # a padding row writes nothing
     assert sum(float(g.abs().sum()) > 0.0 for g in got["grads"].values()) > 20
+
+
+@pytest.mark.parametrize("name", ["recipe", "no_gate", "every_cell", "silu", "more_units"])
+def test_buffered_sweep_with_the_kept_dhid_equals_the_autograd_event_loop(name: str) -> None:
+    """The form the card runs: the reverse sweep on static buffers (its PyTorch steps here),
+    which keeps every slot's ``dhid``, and the local backward that reads it instead of taking
+    the second layer's transposed product and the activation's derivative again. The same
+    equality in float64, the start state's gradient included."""
+    model = _model(*VARIANTS[name])
+    inputs = _inputs(model)
+    ref = _run(model, model, inputs)
+    runs: list[ef.EventRun] = []
+    got = _run(
+        model,
+        lambda *a: ef.forward_events(model, *a, sweep=ef.sweep_buffered, runs=runs),
+        inputs,
+    )
+    _assert_same(ref, got, value=1e-11, grad=1e-9)
+    kept = runs[0].tape["d_hid"]
+    assert float(kept.abs().max()) > 0.0
+    assert float(kept[~runs[0].tape["valid"]].abs().max()) == 0.0  # zeros on padded slots
 
 
 def test_the_cases_cover_probes_resets_and_padding_rows() -> None:
@@ -383,36 +404,51 @@ CARD_SHAPE: tuple[str, ...] = (
 )
 
 
+#: The least gap between the scores that a decision of the card cases separates.
+MIN_MARGIN = 1e-3
+
+
+def _least_margin(tape: dict[str, Tensor], k: int) -> float:
+    """The least margin of a block's decisions on its live rows: between the last selected
+    and the first unselected cell score, and between a cell's best two units."""
+    logits = tape["logits"].float()  # [B, E, N, M]
+    best = logits.sort(dim=-1, descending=True).values
+    cells = best[..., 0].sort(dim=-1, descending=True).values  # [B, E, N]
+    gaps = [cells[..., k - 1] - cells[..., k]] if k < cells.shape[-1] else []
+    gaps.append((best[..., 0] - best[..., 1]).amin(dim=-1))
+    live = tape["sel_valid"].any(dim=-1)
+    return float(torch.stack(gaps).amin(dim=0)[live].min())
+
+
 def _card_case(
     product: torch.dtype,
 ) -> tuple[HSNT, tuple[Tensor, Tensor, CellGraphState, Tensor], Any]:
     from hsn.kernels import event as ek
 
     model = _model(*CARD_SHAPE, dtype=torch.float32, scale=0.15).to("cuda")
-    tokens, ctx, state, reset = _inputs(model, b=6, t=32)
-    dev = torch.device("cuda")
-    state = CellGraphState._make(
-        h=state.h.to(dev), q=state.q.to(dev), age=state.age.to(dev), pos=state.pos.to(dev)
-    )
-    inputs = (tokens.to(dev), ctx.to(dev), state, reset.to(dev))
+    # inputs whose every decision has a margin (checked): two cells or two units whose scores
+    # agree to fp32 rounding are chosen by the last bit of a sum, which is not the test
+    for seed in range(3, 23):
+        inputs = _inputs(model, seed=seed, b=6, t=32)
+        runs: list[ef.EventRun] = []
+        with torch.no_grad():
+            ef.forward_events(model, *inputs, runs=runs)
+        if _least_margin(runs[0].tape, model.cfg.k_select) > MIN_MARGIN:
+            break
+    else:
+        raise AssertionError("no inputs with a margin at every decision")
     pd = None if product == torch.float32 else product
-    holder: dict[str, Any] = {}
-
-    def forward(m: HSN, w: Any, spec: Any, *args: Any, **kwargs: Any) -> dict[str, Tensor]:
-        if "kern" not in holder:
-            z, scalars = args[3], args[5]
-            holder["kern"] = ek.EventKernels(
-                spec, w, ef.cell_constants(m.cell, torch.float32), B=int(z.shape[0]),
-                E=int(z.shape[1]), n_scalars=int(scalars.shape[-1]), device=dev,
-                product_dtype=product,
-            )  # fmt: skip
-        return holder["kern"].forward(m, w, spec, *args, **kwargs)
-
-    def sweep(*args: Any) -> Any:
-        return holder["kern"].sweep(*args)
+    kernels = ek.EventKernelSet()
 
     def window(*a: Any) -> Any:
-        return ef.forward_events(model, *a, forward=forward, sweep=sweep, product_dtype=pd)
+        return ef.forward_events(
+            model,
+            *a,
+            forward=kernels.forward,
+            sweep=kernels.sweep,
+            pairs=kernels.pairs,
+            product_dtype=pd,
+        )
 
     return model, inputs, window
 

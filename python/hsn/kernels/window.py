@@ -1239,9 +1239,11 @@ def back_mid(sweep: ReverseSweep, t: int) -> None:
             sweep.op2,
             sweep.op2_fast,
             sweep.sigma,
+            # the fused word-event block keeps dhid of every position (ReverseSweep.d_hid)
+            sweep.sigma if sweep.d_hid is None else sweep.d_hid,
         ],
         [s.B, s.T, s.K, s.d, s.M, s.H, s.n_fast, t, _half(sweep.act_r), _half(sweep.hidden)]
-        + [ACTIVATION_CODES[sweep.activation]],
+        + [ACTIVATION_CODES[sweep.activation], 0 if sweep.d_hid is None else 1],
         [],
     )
 
