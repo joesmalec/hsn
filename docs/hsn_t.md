@@ -373,6 +373,10 @@ it was measured once.
 Since 21 Nov 2026 `hsn_t_memory_words_carry_bal.yaml` is the word-event carry recipe with the
 paper's balance loss (`train.aux_enabled=[balance]`, `train.lambda_b=0.02`; the user's decision
 of 21 Nov 2026, evidence in its header).
+`hsn_t_memory_words_carry_bal_qk.yaml` (22 Nov 2026; proposed, adoption pending the user's
+decision) is that recipe with the reader's unrotated top block normalised
+(`model.reader_qk_norm=[false,false,false,true]`, `docs/amendments/reader_qk_norm.md`; its CUDA
+arm adds `hardware.event_kernel=fused`, evidence in its header).
 
 ## Reach dropout (`train.reach_dropout`)
 
