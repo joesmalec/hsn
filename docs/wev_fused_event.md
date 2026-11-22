@@ -645,8 +645,10 @@ experiment harness (`~/hsn-experiments/wev-fused/p2/step_time.py`).
 
 A step's time is `StepRecord.seconds`. Counted: steps 101 to 600 without the statistics steps
 and without the steps that compiled or captured (495 steps a run). Means, in ms; the second
-pair is the quiet one (host load 1.2 to 1.7; during the first pair another session's job put
-it at 4.9 for a while).
+pair is the quiet one (host load 1.2 to 1.7). In the first pair the load was 4.9 when the run
+without the key ended and 4.6 when the run with it began: that run compiled from a cold
+cache (88 s of window compiles against 31 s in the second pair), which is the likely cause;
+what else ran on the host then was not checked.
 
 | Windows | Key off | Key on | Saved | Phase 1b projected |
 | --- | ---: | ---: | ---: | ---: |
