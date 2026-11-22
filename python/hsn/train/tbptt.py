@@ -483,6 +483,28 @@ class TBPTTTrainer(Trainer):
                 f"{cfg.train.state_grad_clip} / {cfg.train.state_grad_ratio}; build the model "
                 "with HSN.from_config(cfg)"
             )
+        if model.content_dropout != cfg.train.content_dropout:  # docs/key_content.md
+            raise ValueError(
+                f"the model's content_dropout {model.content_dropout} is not the "
+                f"configuration's train.content_dropout {cfg.train.content_dropout}; build the "
+                "model with HSN.from_config(cfg)"
+            )
+        if model.content_dropout_target != cfg.train.content_dropout_target:
+            raise ValueError(
+                f"the model's content_dropout_target {model.content_dropout_target!r} is not "
+                f"the configuration's train.content_dropout_target "
+                f"{cfg.train.content_dropout_target!r}; build the model with HSN.from_config(cfg)"
+            )
+        if model.unseen_bytes_as != cfg.model.unseen_bytes_mode or (
+            (model.byte_seen is not None) != (cfg.model.unseen_bytes_mode != "own")
+        ):
+            raise ValueError(
+                f"model.zero_unseen_bytes={cfg.model.zero_unseen_bytes} / model.unseen_bytes_as="
+                f"{cfg.model.unseen_bytes_as!r} but the model reads {model.unseen_bytes_as!r} "
+                f"at a never-trained byte and "
+                f"{'keeps' if model.byte_seen is not None else 'does not keep'} the bytes it "
+                "has seen; build the model with HSN.from_config(cfg)"
+            )
         self.windows = 0  # windows processed in this run (resumed runs continue the count)
         self.windows_since_resync = 0
         self.resyncs = 0
@@ -1185,6 +1207,9 @@ class TBPTTTrainer(Trainer):
                 # detached at a segment's first window only; attached to the window before inside
                 state = self._window_start(state, detach=window_index % per_segment == 0)
                 self.hsn.set_train_step(self.step)  # P2.2: the schedules read it
+                # model.zero_unseen_bytes: the bytes this window trains on count as seen from
+                # here on (nothing happens with the key off)
+                self.hsn.mark_bytes_seen(fwd["tokens"])
                 if self._warm_up_recorded and self._split is not None and self._split.splits_now():
                     self._warm_up_recorded = False  # the first hard-gate step: once
                     if self._compiled is not None:

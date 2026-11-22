@@ -1,0 +1,166 @@
+# hsn_t_memory_words_carry_bal: the recipe for HSN-T with its memory writing at word ends, its reader carried
+# across windows and the paper's balance loss on (the user's decision of 21 Nov 2026).
+#
+# The user's decision of 21 Nov 2026: the balance loss of the paper (Appendix A.3, the routed assignments kept
+# spread over the units) is adopted for the word-event recipe, as a recipe of its own.
+# hsn_t_memory_words_carry.yaml is unchanged (past runs and specs use it).
+# This file is hsn_t_memory_words_carry.yaml with two keys changed, written out:
+#   train.aux_enabled [balance] (hsn_t_memory_words_carry.yaml: [], no auxiliary loss);
+#   train.lambda_b 0.02, the balance loss's weight (hsn_t_memory_words_carry.yaml: 0.0; 0.02 is the value of
+#   docs/a6_takeover_followup.md).
+# It resolves to hsn_t_memory_words_carry.yaml with those two overrides exactly (the same configuration hash once
+# run_id and notes are aligned: tests/test_hsn_t_memory_words_carry_bal_recipe.py; with the code-native data lines
+# a spec on it expands to the arm id of the measured run below, e5e8d3bbb89bc354, spec fields_27k_fix). 3,298,025
+# trainable parameters, as hsn_t_memory_words_carry.yaml (the balance loss adds none).
+#
+# Evidence (the field runs of 20-21 Nov 2026: the local RTX 3060, 27,000 steps, batch 32 x 256; dev bits per byte /
+# next-byte accuracy % at the last step, seed 0 unless said; each reference is the same configuration without the
+# balance loss):
+#   Code native (fields_code_native), word events with the top0 reader of hsn_t_memory_words_carry.yaml: without
+#     the balance loss the router took over, with 84 (s0) and 181 (s1) route-guard events, ending at 1.277 / 75.57
+#     (s0) and 1.327 / 74.46 (s1). With the balance loss: 0 guard events, ending at 1.172 / 77.38.
+#   Bio prose (fields_bio_prose), the top0 reader: 1.291 / 73.20 with the balance loss against 1.297 / 73.08
+#     without, and 0 guard events.
+#   With the reader's top block rotated (model.reader_rotary_pairs [20, 20, 20, 20]) on code native, with the
+#     balance loss: 1.025 / 79.94 (s0) and 1.030 / 79.87 (s1), with no guard events.
+# Open:
+#   The reader's top block stays unrotated (top0, model.reader_rotary_pairs [20, 20, 20, 0]) in this file. The
+#     per-field reader choice is still being tested (rotated on code native; top0 on prose); a code arm may set
+#     model.reader_rotary_pairs=[20,20,20,20].
+#
+# Everything else is hsn_t_memory_words_carry.yaml's, and its header holds for this file: the reader, the carry, the
+# word events, the CUDA arm's lines (the alias index and the two speed keys of PR #101 stay overrides of the arm)
+# and the data a spec sets. In an experiment spec the family is hsn_t. A CUDA arm:
+#
+#   base: {config: configs/experiments/hsn_t_memory_words_carry_bal.yaml,
+#          overrides: [profile=rtx3060, hardware.compile_mode=reduce-overhead, hardware.graph_alias_index=true,
+#                      hardware.message_gradients=state, hardware.round_products=merged]}
+#
+# Everything not listed keeps its Appendix A default (configs/_example.yaml).
+# Do not edit a recipe once a spec uses it (its arm ids would change): a new recipe gets a new file.
+
+run_id: hsn_t_memory_words_carry_bal
+seed: 0
+notes: "HSN-T with its memory writing at word ends, the reader carried across windows and the paper's balance loss: hsn_t_memory_words_carry + train.aux_enabled [balance] and train.lambda_b 0.02."
+profile: cpu # hardware profile: configs/hardware/<profile>.yaml; override with `profile=<name>`
+model_name: hsn_t
+
+model: # Appendix A.1
+  vocab_size: 256 # byte vocabulary V
+  d: 64 # width
+  n_cells: 64 # N (hsn_recipe_a6: 32)
+  n_units: 8 # M
+  k_select: 12 # K cells per round (hsn_recipe_a6: 4)
+  k_min: 1 # minimum selected cells
+  r_max: 1 # internal rounds cap R
+  in_degree: 4 # D_g
+  random_edges: 0 # extra random candidate edges
+  edge_norm: softmax # softmax | sigmoid
+  hidden: 512 # H for every two-layer MLP
+  n_context: 16 # context symbols
+  context_dim: 64 # context embedding width (= d)
+  activation: gelu # MLP activation (paper unspecified)
+  init: trunc_normal_0.02 # weight init of embeddings, scorer, halting, decoder (paper unspecified)
+  state_init: fan_in # P1.5a (amendment A1): E, P, S, units, V, W_out, gate weight; fan_in | trunc_normal_<std>
+  cell_norm: rms # P1.5a: RMSNorm over the 4d cell input before the units and the gate; rms | none
+  gate_bias_init: -3.0 # P1.5a: gate bias at init, sigmoid(-3) = 0.047 (cells retain by default)
+  cand_norm: rms # P1.13 amendment A4: RMSNorm before the candidate's tanh
+  key_address: true # amendment A5: fixed byte/cell address features (the key binding)
+  selected_readout: true # amendment A5: the selected cells' mean appended to the decoder input
+  address_ngram: 2 # amendment A9: addresses of the last two bytes
+  address_history: ngram # A9's bytes carried across windows of a document (HSN-T requires it)
+  address_gate: true # amendment A12: the scorer's address weights follow the position
+  address_gate_input: summary # amendment A13: the gate reads the carried summary q_{t-1}
+  scorer_position: wrap # amendment A11: the scorer's position feature is (pos mod unroll) / unroll
+  scorer: linear # linear | mlp; Appendix C counts the linear scorer (200 -> 8)
+  scorer_hidden: 128 # hidden width when scorer = mlp (the C.2 "two-layer scorer" row)
+  scorer_features:
+    exclude: [] # feature names to zero (ablation; e.g. [eps])
+  routing: topk # learned top-K routing (dense | topk | greedy_budget | random | fixed)
+  fixed_route: [] # cells for routing = fixed
+  budget: 1.0 # B_t as a fraction of the dense step cost
+  lambda_cost: 0.0 # lambda_cost in score = U - lambda * c
+  deadline_ms: null # wall-clock deadline (serving)
+  cost_profile: null # P2.1: cost profile (P0.6 report + cost_profile block) for the router's cost table; null = uniform placeholder
+  static_k: true # pad selection to fixed K (needed for graphs / compile)
+  age_max: 64 # refresh-probe threshold
+  halt_threshold: 0.5 # inference halting threshold
+  predictor_target: fixed_embedding # fixed_embedding | ema_encoder (P1.6)
+  disabled_cells: [] # test hook
+  ablate_shared_u: false # ablation: remove u from v (not covered by the P1.1 closed forms)
+  reader: transformer # HSN-T: the reader in front of the memory core (4 heads; its width and blocks follow)
+  reader_width: 160 # the top0 reader: 160 wide (hsn_t_memory_words.yaml: 64, the default)
+  reader_layers: 4 # four blocks (hsn_t_memory_words.yaml: 2, the default)
+  reader_rotary_pairs: [20, 20, 20, 0] # top0: the top block's queries and keys unrotated (hsn_t_memory_words.yaml: all rotated)
+  reader_span: null # no span (the carry refuses one: it is the reader's span) (hsn_t_memory_words.yaml: 32)
+  reader_carry: 256 # every block reads up to 256 positions back in its document, across windows (hsn_t_memory_words.yaml: 0)
+  cell_attention_heads: 0 # C-read off (as hsn_t_memory_words.yaml); with the carry it was measured once (header)
+  write_events: word # the memory runs at word ends and document starts (as hsn_t_memory_words.yaml)
+  word_address: exact # an event's address is the whole word it closes (as hsn_t_memory_words.yaml)
+  word_contexts: [0, 6] # TinyStories' text and its padding (as hsn_t_memory_words.yaml; code default [6]); specs add theirs
+  state_schema_version: 1 # bumped on any state layout change
+
+data:
+  dataset: synthetic_v1
+  manifest: data/synthetic_v1/manifest.json # built by `python -m hsn.data.synthetic build`
+  tasks: [delayed] # hsn_recipe_a6's task; a spec sets its own data
+  variants: [in_range] # the designated in-range state tasks
+  align_docs: true # every document starts at a window boundary (in_range = fits one window)
+
+train: # hsn_t_memory_words_carry.yaml's, with the balance loss on (lambda_b, aux_enabled)
+  unroll: 256 # TBPTT window T
+  batch: 32
+  micro_batch: 32
+  grad_accum: 1
+  precision: bf16 # bf16 | fp16 | fp32 | fp64
+  optimizer: lazy_adamw # P2.6: the routed HSN's optimiser
+  lr: 1.25e-3 # the user's decision of 17 Nov 2026 for word events (as hsn_t_memory_words.yaml)
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps: 200
+  schedule: wsd # warmup-stable-decay (P1.13): the peak holds until the last 20 %
+  decay_fraction: 0.2
+  grad_clip: 1.0
+  grad_norm_precision: float64 # A5: the global gradient norm and its clip reduced in float64
+  steps: 9000
+  eval_every: 500
+  ckpt_every: 9000
+  stats_every: 100
+  q_resync_every: 64
+  lambda_p: 1.0 # L_pred with the fixed-embedding target (P1.6)
+  lambda_b: 0.02 # the balance loss's weight, the user's decision of 21 Nov 2026 (hsn_t_memory_words_carry.yaml: 0.0)
+  aux_enabled: [balance] # the paper's balance loss on (Appendix A.3; hsn_t_memory_words_carry.yaml: [])
+  search_trials: 4 # as hsn_recipe_a6 (unused by the harness)
+  probe_horizon: null # the probes read to the window end
+  # unguarded: no spike guard and no rollback
+  spike_factor: null
+  rollback_every: null
+  # amendment A6's cut without `state` ("cut C", the state gradient): the summary, eps and router reads are
+  # constants in the backward pass, the cell's read of the state keeps its gradient (hsn_recipe_a6 cuts all four)
+  feedback_detach: [summary, eps, router]
+  # the update caps of exp 346 (hsn_recipe_a6's)
+  update_limit:
+    groups:
+      memory: {selectors: ["cell.*"], max_ratio: 0.003}
+      routing: {selectors: ["router.*"], max_ratio: 0.003}
+    norm_floor: 1.0e-12
+    norm_growth_limits: {routing: 1.0}
+  # A6: evaluations, probes and the final checkpoint score a moving average of the weights (decay 0.99)
+  weight_ema: 0.99
+  # A6: the route guard (its other keys at their defaults: configs/_example.yaml)
+  route_guard:
+    enabled: true
+  # amendment A7 (on in hsn_t_memory.yaml by the user's decision of 16 Nov 2026; code default softmax): the
+  # straight-through unit weight of an executed slot differentiates the executed unit's score alone
+  unit_credit: executed
+  # P2.2 routing controls: the straight-through gate, no soft warm-up, the others at their defaults
+  gate_mode: ste
+  soft_until_step: 0
+  temperature_start: 1.0
+  temperature_end: 1.0
+  temperature_steps: 0
+  epsilon_start: 0.0
+  epsilon_end: 0.0
+  epsilon_steps: 0
+  p_dense: 0.0
+  reinforce_baseline_decay: 0.9

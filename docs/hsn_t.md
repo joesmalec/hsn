@@ -25,6 +25,10 @@ adopted; first runs in progress.**
   (`model.reader_position`, `model.reader_positions`, `model.reader_rotary_pairs`,
   `model.reader_rotary_dtype`, `model.reader_rotary_base`; "The reader's positions" below). At their defaults the reader
   is the one described here, bit for bit, and they are left out of the hash the same way.
+- One more opt-in key of 21 Nov 2026, `model.reader_qk_norm`
+  (`docs/amendments/reader_qk_norm.md`): in the blocks it enables the attention's queries and
+  keys are normalised per head before the rotation, which bounds the logits. At its default `false` the reader is unchanged, bit for
+  bit, and the key is left out of the hash.
 - The memory's opt-in keys (fast cells, address n-grams, the address gate and its inputs, the
   write decision, the feedback cuts) mean the same in both families; the cell arithmetic is
   shared code.
@@ -366,6 +370,9 @@ recipe has the attention read on (`H = 4`), the best measured text setup of HSN-
 (seed 0, with the two speed keys of `docs/perbyte_speed.md` in its CUDA arm's lines) against
 0.7337 without either. The word-event carry recipe leaves it off: with word events and the carry
 it was measured once.
+Since 21 Nov 2026 `hsn_t_memory_words_carry_bal.yaml` is the word-event carry recipe with the
+paper's balance loss (`train.aux_enabled=[balance]`, `train.lambda_b=0.02`; the user's decision
+of 21 Nov 2026, evidence in its header).
 
 ## Reach dropout (`train.reach_dropout`)
 
@@ -389,6 +396,22 @@ no later byte; gradients reach the reader and the new columns under the candidat
 is the only other way in; bf16 autocast; fast cells beside the reader; the compiled window
 equals the eager one; thirty trainer steps fall. The rotary table has its own file,
 `tests/test_reader_rotary_table.py`.
+
+## Unseen keys: the byte-content options (`docs/key_content.md`)
+
+Two opt-in keys of 15 Nov 2026 for HSN-T and the HSN, built after the finding that runs lose
+unseen keys through the never-trained rows of the reader's embedding table and of the byte
+embedding, not through the address codes: `train.content_dropout` (in training a random
+share of positions reads a zero row in both tables) and `model.zero_unseen_bytes` (a byte no
+training window has held reads a zero row in both tables, in every mode; it changes what the
+model reads at an untrained byte, which may be decided as an amendment). Both are off by
+default, and with them off nothing in this document changes. Not available with
+`model.memory: false` or for the reader alone. No run of them exists yet.
+Two more opt-in keys put a learned "unknown" row in place of the zero row:
+`train.content_dropout_target: unknown` (the dropped positions read it; one row per table,
+`byte_emb.unknown` and `reader.emb_unknown`, which exist only with the key) and
+`model.unseen_bytes_as: unknown` (the never-trained bytes read it too; `zero` is
+`model.zero_unseen_bytes`).
 
 ## What it has to show (rung 1 of the design)
 

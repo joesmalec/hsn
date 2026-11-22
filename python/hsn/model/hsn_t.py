@@ -30,7 +30,7 @@ from torch import Tensor, nn
 from hsn.config import ModelConfig, RunConfig
 from hsn.model.embeddings import ByteEmbedding, ContextEmbedding
 from hsn.model.encoder import Decoder, Encoder, SharedTransform
-from hsn.model.hsn import HSN
+from hsn.model.hsn import CONTENT_STATE_KEYS, HSN
 from hsn.model.reader import Cache, Reader
 
 __all__ = ["MEMORY_OFF_MODULES", "HSNT", "HSNTNoMemory"]
@@ -129,7 +129,18 @@ class HSNTNoMemory(nn.Module):
         """Load the weights of an HSN-T with its memory (``HSNT.state_dict()``, or a
         checkpoint's ``model``): the tensors of the six modules this model has, which must all
         be there with their shapes. The memory's tensors (``predictor.*``, ``cell.*``,
-        ``router.*``, ``halting.*``) are left out."""
+        ``router.*``, ``halting.*``) are left out. A state with the byte-content options'
+        tensors (:data:`~hsn.model.hsn.CONTENT_STATE_KEYS`, ``docs/key_content.md``) is refused:
+        this model has none of them, and its tables would read every byte's own row where the
+        source read a zero or its learned unknown row."""
+        content = sorted(key for key in state if key in CONTENT_STATE_KEYS)
+        if content:
+            raise ValueError(
+                f"the state holds {content}, tensors of the byte-content options "
+                "(docs/key_content.md) of an HSN-T with its memory; model.memory=false has "
+                "none of them (the options are refused there), so the weights would not read "
+                "what the source model read"
+            )
         own = self.state_dict()
         self.load_state_dict({key: value for key, value in state.items() if key in own})
 
