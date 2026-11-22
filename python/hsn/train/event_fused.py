@@ -65,6 +65,7 @@ __all__ = [
     "event_weights",
     "forward_reference",
     "fused_event_block",
+    "live_slots",
     "local_backward",
     "round_reference",
     "scope_error",
@@ -479,27 +480,55 @@ def forward_reference(
     *,
     product_dtype: torch.dtype | None = None,
     cell_consts: CellConstants | None = None,
+    slots: int | None = None,
 ) -> dict[str, Tensor]:
     """The forward sweep of a block of ``E`` event slots in plain PyTorch
     (:func:`round_reference` at every slot): the tape (:data:`TAPE_KEYS`, stacked ``[B, E, …]``;
     the batch statistics ``[E]``) and the state after the block (``h``, ``q``, ``age``).
     ``z [B, E, d]``, ``ctx [B, E, d_ctx]``, ``scalars [B, E, N, 7 + A]``, ``reset`` and ``live``
     bool ``[B, E]``. ``cell_consts`` (the reverse sweep's constants, which the card's forward
-    sweep sizes its buffers from) is not read here."""
-    slots: list[dict[str, Tensor]] = []
-    for t in range(int(z.shape[1])):
+    sweep sizes its buffers from) is not read here.
+
+    ``slots``: run the first ``slots`` slots only (:func:`live_slots`: no row has an event
+    behind them, so the state after them is the state after the block); the tape then has
+    ``slots`` slots. ``None``: all ``E``."""
+    count = int(z.shape[1]) if slots is None else int(slots)
+    rounds: list[dict[str, Tensor]] = []
+    for t in range(count):
         slot = round_reference(
             model, w, spec, h, q, age, z[:, t], ctx[:, t], scalars[:, t], reset[:, t], live[:, t],
             product_dtype=product_dtype,
         )  # fmt: skip
         h, q, age = slot["h"], slot["q"], slot["age"]
-        slots.append(slot)
+        rounds.append(slot)
     tape = {
-        key: torch.stack([s[key] for s in slots], dim=1 if slots[0][key].ndim > 0 else 0)
+        key: torch.stack([s[key] for s in rounds], dim=1 if rounds[0][key].ndim > 0 else 0)
         for key in TAPE_KEYS
     }
-    tape.update(h=h, q=q, age=age, reset=reset)
+    tape.update(h=h, q=q, age=age, reset=reset[:, :count])
     return tape
+
+
+def live_slots(valid: Tensor) -> int:
+    """The leading event slots of a block that hold an event: the index of the last slot in
+    which some row is live, plus one (at least one). ``valid`` bool ``[B, E]``. One host read.
+    The slots behind them change no state (a padding row keeps its state), so a block may run
+    these alone (``trim`` of :func:`fused_event_block`)."""
+    index = torch.arange(1, int(valid.shape[1]) + 1, device=valid.device)
+    return max(int((valid.any(dim=0) * index).amax()), 1)
+
+
+def _pad_slots(x: Tensor, total: int, last: Tensor | None = None) -> Tensor:
+    """``x [B, n, …]`` as ``[B, total, …]``: zeros behind the ``n`` slots, or ``last [B, …]``
+    repeated. ``x`` itself when ``n == total``."""
+    n = int(x.shape[1])
+    if n == total:
+        return x
+    if last is None:
+        fill = x.new_zeros((x.shape[0], total - n, *x.shape[2:]))
+    else:
+        fill = last[:, None].expand(x.shape[0], total - n, *x.shape[2:]).to(x.dtype)
+    return torch.cat([x, fill], dim=1)
 
 
 #: The cell norm's backward of a block on the card: ``(dv [P, n], row_of [P], tape, gain) ->
@@ -861,8 +890,13 @@ class EventRun:
         sweep: Sweep | None = None,
         product_dtype: torch.dtype | None = None,
         pairs: Pairs | None = None,
+        total: int | None = None,
     ) -> None:
         self.tape = tape
+        #: The slots the block ran (the tape's) and the slots of the window's layout (more
+        #: with ``trim``: the node's outputs are padded to them).
+        self.slots = int(tape["c"].shape[1])
+        self.total = self.slots if total is None else int(total)
         self.pairs = pairs
         self.weights = weights
         self.spec = spec
@@ -907,11 +941,23 @@ class EventRecurrence(torch.autograd.Function):
         ctx.has_gate = gate_w is not None  # type: ignore[attr-defined]
         ctx.set_materialize_grads(False)  # a read without a gradient arrives as None
         tape = run.tape
+        if run.slots == run.total:
+            return (
+                tape["q_pre"].clone(),
+                tape["q_post"].clone(),
+                tape["readout"].clone(),
+                tape["logits"].clone(),
+                tape["h"].clone(),
+                tape["q"].clone(),
+            )
+        # the slots behind the block's (no row has an event there): every row's summary stays
+        # the block's last, the read-outs and the logits are zeros
+        total = run.total
         return (
-            tape["q_pre"].clone(),
-            tape["q_post"].clone(),
-            tape["readout"].clone(),
-            tape["logits"].clone(),
+            _pad_slots(tape["q_pre"], total, tape["q"]),
+            _pad_slots(tape["q_post"], total, tape["q"]),
+            _pad_slots(tape["readout"], total),
+            _pad_slots(tape["logits"], total),
             tape["h"].clone(),
             tape["q"].clone(),
         )
@@ -931,6 +977,21 @@ class EventRecurrence(torch.autograd.Function):
         tape, spec = run.tape, run.spec
         valid = tape["valid"]
         dtype = tape["c"].dtype
+        n = run.slots
+        if n < run.total:
+            # the slots behind the block's: the summaries there are the block's last, so their
+            # cotangents join the final summary's; the read-outs and logits there are constants
+            behind: Tensor | None = None
+            for g in (d_q_pre, d_q_post):
+                if g is not None:
+                    part = g[:, n:].sum(dim=1)
+                    behind = part if behind is None else behind + part
+            if behind is not None:
+                d_q = behind if d_q is None else d_q + behind
+            d_q_pre = None if d_q_pre is None else d_q_pre[:, :n]
+            d_q_post = None if d_q_post is None else d_q_post[:, :n]
+            d_readout = None if d_readout is None else d_readout[:, :n]
+            d_logits = None if d_logits is None else d_logits[:, :n]
         d_h_sel: Tensor | None = None
         if d_readout is not None:
             n_valid = valid.sum(dim=-1, keepdim=True).clamp_min(1).to(dtype)
@@ -991,6 +1052,7 @@ def fused_event_block(
     pairs: Pairs | None = None,
     product_dtype: torch.dtype | None = None,
     runs: list[EventRun] | None = None,
+    trim: bool = False,
 ) -> dict[str, Tensor]:
     """:meth:`hsn.model.hsn.HSN._event_block` for a block of event slots, fused: the same
     arguments (the state before the block, the slots' inputs ``z_b`` / ``c_b`` / ``s_b`` ``[B,
@@ -1003,7 +1065,18 @@ def fused_event_block(
     norm's backward to run (``None``: the PyTorch references; on the card
     :class:`hsn.kernels.event.EventKernelSet`'s). ``product_dtype``: the
     dtype of the matrix products (``None``: the state's). ``runs`` receives the block's
-    :class:`EventRun` (tests and measurements)."""
+    :class:`EventRun` (tests and measurements).
+
+    ``trim``: run only the slots that hold an event (:func:`live_slots`; one host read). The
+    window lays its slots out in multiples of a block (:func:`hsn.model.hsn.event_block`), so
+    the last slots of most windows hold no event of any row: they change no state and no
+    gradient passes them except the summary's, which is carried here. The state, the
+    summaries, ``P``'s and ``S``'s outputs and every record of a slot that holds an event are
+    the untrimmed block's. What the model's loop computes on the padding rows of the slots
+    behind them and discards is not computed: their logits, selections, costs and refresh
+    counts are zeros (an objective must not read them; the trainer's terms read live slots
+    only: :func:`hsn.losses.auxiliary_terms`). Needs what :meth:`HSN._event_slots` gives: no
+    reset in a slot without an event."""
     controls = model._controls() if controls is None else controls
     reason = scope_error(model, controls)
     if reason is not None:
@@ -1014,24 +1087,26 @@ def fused_event_block(
     weights = event_weights(model, consts, dtype, product_dtype)
     run_forward = forward_reference if forward is None else forward
     sweep_consts = cell_constants(cell, dtype)  # the window's edge weights: in its grad mode
+    E = int(z_b.shape[1])
+    n = live_slots(v_b) if trim else E
     with torch.no_grad():
         tape = run_forward(
             model, weights, spec, h.detach(), q.detach(), age, z_b.detach(), c_b.detach(), s_b,
-            r_b, v_b, product_dtype=product_dtype, cell_consts=sweep_consts,
+            r_b, v_b, product_dtype=product_dtype, cell_consts=sweep_consts, slots=n,
         )  # fmt: skip
     run = EventRun(
-        tape, weights, spec, s_b, sweep_consts, sweep=sweep, product_dtype=product_dtype,
-        pairs=pairs,
+        tape, weights, spec, s_b[:, :n], sweep_consts, sweep=sweep, product_dtype=product_dtype,
+        pairs=pairs, total=E,
     )  # fmt: skip
     # S on the taped summary (a constant under the summary cut): the local half of u, with
     # its gradient into S, the encoder and the reader
-    u = model.shared(model._shared_input(z_b, tape["q_pre"], c_b, h))
+    u = model.shared(model._shared_input(z_b, _pad_slots(tape["q_pre"], E, tape["q"]), c_b, h))
     # the cell's and the scorer's read of the error: z keeps its gradient, the prediction none
-    eps_read = (z_b - tape["z_hat"].to(z_b.dtype)).to(dtype)
+    eps_read = (z_b[:, :n] - tape["z_hat"].to(z_b.dtype)).to(dtype)
     assert isinstance(scorer.net, nn.Linear)
     gate = scorer.address_gate
     q_pre, q_post, readouts, logits, h_end, q_end = EventRecurrence.apply(
-        u.to(dtype),
+        u[:, :n].to(dtype),
         eps_read,
         h,
         q,
@@ -1050,8 +1125,12 @@ def fused_event_block(
     )
     # P reads the carried summary with its gradient, behind the node
     z_hat = model.predictor(q_pre)
-    E = int(z_b.shape[1])
-    zeros = tape["cost"].new_zeros(E)
+    cost = _pad_slots(tape["cost"], E)
+    zeros = cost.new_zeros(E)
+    abs_max, refreshed = tape["abs_max"], tape["refreshed"]
+    if n < E:  # the state behind the block's slots is the block's last
+        abs_max = torch.cat([abs_max, abs_max[-1:].expand(E - n)])
+        refreshed = torch.cat([refreshed, refreshed.new_zeros(E - n)])
     if runs is not None:
         runs.append(run)
     return {
@@ -1062,18 +1141,18 @@ def fused_event_block(
         "eps": z_b - z_hat,
         "u": u,
         "qs": q_post,
-        "state_abs_max": tape["abs_max"],
-        "unit_logits_d": tape["logits"],
+        "state_abs_max": abs_max,
+        "unit_logits_d": tape["logits"] if n == E else logits.detach(),
         "readouts": readouts,
-        "sel_cell_idx": tape["sel_cells"],
-        "sel_unit_idx": tape["sel_units"],
-        "sel_valid": tape["sel_valid"],
+        "sel_cell_idx": _pad_slots(tape["sel_cells"], E),
+        "sel_unit_idx": _pad_slots(tape["sel_units"], E),
+        "sel_valid": _pad_slots(tape["sel_valid"], E),
         "sel_unit_logits": logits,
-        "sel_cost_per_row": tape["cost"],
-        "sel_expected_cost": tape["cost"].mean(dim=0),
-        "sel_route_log_prob": torch.zeros_like(tape["cost"]),
+        "sel_cost_per_row": cost,
+        "sel_expected_cost": cost.mean(dim=0),
+        "sel_route_log_prob": torch.zeros_like(cost),
         "sel_explored": zeros,
-        "sel_refreshed": tape["refreshed"],
+        "sel_refreshed": refreshed,
         "sel_dense_fallback": zeros,
     }
 
@@ -1091,11 +1170,12 @@ def forward_events(
     pairs: Pairs | None = None,
     product_dtype: torch.dtype | None = None,
     runs: list[EventRun] | None = None,
+    trim: bool = False,
 ) -> tuple[Tensor, Any, dict[str, Tensor]]:
     """:meth:`hsn.model.hsn.HSN.forward` for a window of ``model.write_events`` with the event
     loop fused: the model's own prologue, event slots and epilogue around one
-    :func:`fused_event_block` over all the window's slots. Returns ``(logits, state, info)`` as
-    the model does."""
+    :func:`fused_event_block` over all the window's slots (``trim``: over those that hold an
+    event). Returns ``(logits, state, info)`` as the model does."""
     from hsn.model.hsn import event_block
 
     mode = model._window_mode()
@@ -1109,6 +1189,6 @@ def forward_events(
         out = fused_event_block(
             model, state.h, state.q, state.age, ev.z, ev.context, ev.scalars, ev.reset, ev.valid,
             consts, controls, forward=forward, sweep=sweep, pairs=pairs,
-            product_dtype=product_dtype, runs=runs,
+            product_dtype=product_dtype, runs=runs, trim=trim,
         )  # fmt: skip
     return model._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])

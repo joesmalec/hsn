@@ -15,6 +15,7 @@ and a hand-written backward pass.
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import pytest
@@ -117,10 +118,42 @@ def _objective(logits: Tensor, final: CellGraphState, info: dict[str, Tensor]) -
     return loss + 0.3 * final.h.cos().sum() + 0.2 * final.q.sin().sum()
 
 
+def _objective_live(logits: Tensor, final: CellGraphState, info: dict[str, Tensor]) -> Tensor:
+    """:func:`_objective` with the balance term as a training step takes it under
+    ``model.write_events``, over the live event slots only
+    (:func:`hsn.losses.auxiliary_terms`), and a term that reads the prediction at every slot,
+    the padding ones included (through it the summary behind a row's last event carries a
+    gradient)."""
+    live = info["event_valid"]
+    loss = logits.sin().sum()
+    index = info["event_pos"][:, :, None].expand(-1, -1, info["z_hat"].shape[-1])
+    mask = live[:, :, None].to(logits.dtype)
+    loss = loss + ((info["z_hat"] - info["z_target"].gather(1, index)).square() * mask).sum()
+    loss = loss + 0.2 * info["z_hat"].cos().sum()
+    loss = loss + 5.0 * balance_loss(
+        info["unit_logits"][live], info["unit_idx"][live], info["valid"][live]
+    )
+    return loss + 0.3 * final.h.cos().sum() + 0.2 * final.q.sin().sum()
+
+
 Window = Callable[..., tuple[Tensor, CellGraphState, dict[str, Tensor]]]
+Objective = Callable[[Tensor, CellGraphState, dict[str, Tensor]], Tensor]
+
+#: ``info``'s records of what the model's loop computes on padding rows and discards, with
+#: the axis of their slots: with ``trim`` they are zeros in the slots that hold no event.
+PADDING_RECORDS: dict[str, int] = {
+    "unit_logits": 1,
+    "cell_idx": 1,
+    "unit_idx": 1,
+    "cost_per_row": 1,
+    "expected_cost": 0,
+    "refreshed": 0,
+}
 
 
-def _run(model: HSN, window: Window, inputs: tuple[Any, ...]) -> dict[str, Any]:
+def _run(
+    model: HSN, window: Window, inputs: tuple[Any, ...], objective: Objective = _objective
+) -> dict[str, Any]:
     tokens, ctx, state, reset = inputs
     model.zero_grad(set_to_none=True)
     start = CellGraphState._make(
@@ -130,7 +163,7 @@ def _run(model: HSN, window: Window, inputs: tuple[Any, ...]) -> dict[str, Any]:
         pos=state.pos,
     )
     logits, final, info = window(tokens, ctx, start, reset)
-    loss = _objective(logits, final, info)
+    loss = objective(logits, final, info)
     loss.backward()
     grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
     assert start.h.grad is not None and start.q.grad is not None
@@ -139,7 +172,17 @@ def _run(model: HSN, window: Window, inputs: tuple[Any, ...]) -> dict[str, Any]:
             "grads": grads}  # fmt: skip
 
 
-def _assert_same(ref: dict[str, Any], got: dict[str, Any], *, value: float, grad: float) -> None:
+def _assert_same(
+    ref: dict[str, Any],
+    got: dict[str, Any],
+    *,
+    value: float,
+    grad: float,
+    slots: int | None = None,
+) -> None:
+    """``got`` equals ``ref``: the logits, the final state, every entry of ``info``, every
+    gradient. ``slots`` (a trimmed block): the padding records (:data:`PADDING_RECORDS`) are
+    compared in the first ``slots`` slots, and are zeros behind them."""
     torch.testing.assert_close(got["logits"], ref["logits"], rtol=0.0, atol=value)
     for name in ("h", "q"):
         torch.testing.assert_close(
@@ -150,6 +193,11 @@ def _assert_same(ref: dict[str, Any], got: dict[str, Any], *, value: float, grad
     assert set(got["info"]) == set(ref["info"])
     for key, want in ref["info"].items():
         have = got["info"][key]
+        if slots is not None and key in PADDING_RECORDS:
+            axis = PADDING_RECORDS[key]
+            behind = have.narrow(axis, slots, have.shape[axis] - slots)
+            assert not bool(behind.any()), key
+            have, want = have.narrow(axis, 0, slots), want.narrow(axis, 0, slots)
         if want.dtype.is_floating_point:
             torch.testing.assert_close(
                 have.detach().to(want.dtype), want.detach(), rtol=0.0, atol=value, msg=key
@@ -208,6 +256,78 @@ def test_buffered_sweep_with_the_kept_dhid_equals_the_autograd_event_loop(name: 
     kept = runs[0].tape["d_hid"]
     assert float(kept.abs().max()) > 0.0
     assert float(kept[~runs[0].tape["valid"]].abs().max()) == 0.0  # zeros on padded slots
+
+
+@pytest.mark.parametrize("name", ["recipe", "gate_on_u", "no_gate", "every_cell", "more_units"])
+@pytest.mark.parametrize("buffered", [False, True])
+def test_trimmed_block_equals_the_autograd_event_loop(name: str, buffered: bool) -> None:
+    """``trim``: the block runs only the slots that hold an event. Under an objective that
+    reads the logits of live slots only (the trainer's balance term) the window equals the
+    autograd event loop in float64 as the untrimmed block does: the loss, the logits, the
+    final state, every gradient (the summary's behind the last event included), and every
+    entry of ``info`` except the padding records of the slots without an event, which are
+    zeros."""
+    model = _model(*VARIANTS[name])
+    inputs = _inputs(model)
+    ref = _run(model, model, inputs, _objective_live)
+    runs: list[ef.EventRun] = []
+    sweep = ef.sweep_buffered if buffered else None
+    got = _run(
+        model,
+        lambda *a: ef.forward_events(model, *a, sweep=sweep, runs=runs, trim=True),
+        inputs,
+        _objective_live,
+    )
+    live = ref["info"]["event_valid"]
+    slots = ef.live_slots(live)
+    assert slots < int(live.shape[1]), "the case needs slots without an event"
+    assert runs[0].slots == slots and runs[0].total == int(live.shape[1])
+    assert int(runs[0].tape["c"].shape[1]) == slots
+    _assert_same(ref, got, value=1e-11, grad=1e-9, slots=slots)
+    full = _run(model, lambda *a: ef.forward_events(model, *a), inputs, _objective_live)
+    _assert_same(full, got, value=1e-11, grad=1e-9, slots=slots)
+
+
+def test_trim_carries_the_summary_gradient_behind_the_last_event() -> None:
+    """The check above can fail: the objective reads the prediction of the slots without an
+    event, and without the summary's cotangent of those slots the gradients differ."""
+    model = _model()
+    inputs = _inputs(model)
+    kept = _run(model, lambda *a: ef.forward_events(model, *a, trim=True), inputs, _objective_live)
+
+    def masked(logits: Tensor, final: CellGraphState, info: dict[str, Tensor]) -> Tensor:
+        return _objective_live(logits, final, info) - 0.2 * info["z_hat"].cos().sum()
+
+    without = _run(model, lambda *a: ef.forward_events(model, *a, trim=True), inputs, masked)
+    with_all = kept["grads"]["predictor.fc1.weight"]
+    assert float((with_all - without["grads"]["predictor.fc1.weight"]).abs().max()) > 0.0
+    start = kept["grads"]["<start q>"] - without["grads"]["<start q>"]
+    assert float(start.abs().max()) > 1e-9 * float(kept["grads"]["<start q>"].abs().max())
+
+
+def test_trimmed_gradient_crosses_windows() -> None:
+    """``train.tbptt_windows > 1`` with ``trim``: two windows, the state carried attached."""
+    model = _model()
+    tokens, ctx, state, reset = _inputs(model, t=2 * T)
+    later = torch.zeros_like(reset[:, T:])
+    later[3, 4] = True
+
+    def two(window: Window) -> dict[str, Tensor]:
+        model.zero_grad(set_to_none=True)
+        logits_a, mid, info_a = window(tokens[:, :T], ctx[:, :T], state, reset[:, :T])
+        logits_b, final, info_b = window(
+            tokens[:, T:], ctx[:, T:], mid, later, info_a.get("address_carry")
+        )
+        loss = _objective_live(logits_b, final, info_b) + 0.1 * logits_a.cos().sum()
+        loss.backward()
+        return {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    ref = two(lambda *a: model(*a[:4], prev_tokens=a[4] if len(a) > 4 else None))
+    got = two(lambda *a: ef.forward_events(model, *a, trim=True))
+    assert set(got) == set(ref)
+    for key, want in ref.items():
+        scale = float(want.abs().max())
+        torch.testing.assert_close(got[key], want, rtol=0.0, atol=1e-9 * max(scale, 1e-30), msg=key)
 
 
 def test_the_cases_cover_probes_resets_and_padding_rows() -> None:
@@ -420,8 +540,16 @@ def _least_margin(tape: dict[str, Tensor], k: int) -> float:
     return float(torch.stack(gaps).amin(dim=0)[live].min())
 
 
+def _has_margins(model: HSNT, inputs: tuple[Any, ...]) -> bool:
+    runs: list[ef.EventRun] = []
+    with torch.no_grad():
+        ef.forward_events(model, *inputs, runs=runs)
+    return _least_margin(runs[0].tape, model.cfg.k_select) > MIN_MARGIN
+
+
 def _card_case(
     product: torch.dtype,
+    trim: bool = False,
 ) -> tuple[HSNT, tuple[Tensor, Tensor, CellGraphState, Tensor], Any]:
     from hsn.kernels import event as ek
 
@@ -430,17 +558,14 @@ def _card_case(
     # agree to fp32 rounding are chosen by the last bit of a sum, which is not the test
     for seed in range(3, 23):
         inputs = _inputs(model, seed=seed, b=6, t=32)
-        runs: list[ef.EventRun] = []
-        with torch.no_grad():
-            ef.forward_events(model, *inputs, runs=runs)
-        if _least_margin(runs[0].tape, model.cfg.k_select) > MIN_MARGIN:
+        if _has_margins(model, inputs):
             break
     else:
         raise AssertionError("no inputs with a margin at every decision")
     pd = None if product == torch.float32 else product
     kernels = ek.EventKernelSet()
 
-    def window(*a: Any) -> Any:
+    def window(*a: Any, trim: bool = trim) -> Any:
         return ef.forward_events(
             model,
             *a,
@@ -448,6 +573,7 @@ def _card_case(
             sweep=kernels.sweep,
             pairs=kernels.pairs,
             product_dtype=pd,
+            trim=trim,
         )
 
     return model, inputs, window
@@ -464,6 +590,86 @@ def test_kernels_equal_the_reference_fp32_cuda() -> None:
     scale = max(1.0, float(ref["logits"].abs().max()))
     for other in (ref, plain):
         _assert_same(other, got, value=1.5e-5 * scale, grad=2e-4)
+
+
+@needs_card
+def test_trimmed_kernels_equal_the_reference_fp32_cuda() -> None:
+    """``trim`` on the card, fp32 products: the kernels run only the slots that hold an event
+    (their buffers laid out for that many) and the window equals the trimmed PyTorch
+    reference's and the autograd event loop's, under the objective of a training step."""
+    model, inputs, window = _card_case(torch.float32, trim=True)
+    ref = _run(model, model, inputs, _objective_live)
+    plain = _run(model, lambda *a: ef.forward_events(model, *a, trim=True), inputs, _objective_live)
+    got = _run(model, window, inputs, _objective_live)
+    live = ref["info"]["event_valid"]
+    slots = ef.live_slots(live)
+    assert slots < int(live.shape[1]), "the case needs slots without an event"
+    scale = max(1.0, float(ref["logits"].abs().max()))
+    for other in (ref, plain):
+        _assert_same(other, got, value=1.5e-5 * scale, grad=2e-4, slots=slots)
+
+
+@needs_card
+def test_trimmed_kernels_share_their_buffers_cuda() -> None:
+    """Blocks of different numbers of slots run on one set of buffers, laid out for each
+    (``EventKernels.at``): windows of 16, of fewer and again of 16 and of the first number of
+    slots, trimmed and not, each equal to the PyTorch reference of its own window."""
+    model, inputs, window = _card_case(torch.float32, trim=True)
+    tokens, ctx, state, reset = inputs
+    for column in range(31, 8, -3):  # no word end behind `column`: fewer event slots
+        shorter = tokens.clone()
+        shorter[:, column:] = 97
+        other = (shorter, ctx, state, reset)
+        if _has_margins(model, other):
+            break
+    else:
+        raise AssertionError("no second window with a margin at every decision")
+    seen: set[int] = set()
+    for case, trim in (
+        (inputs, True),
+        (other, True),
+        (inputs, False),
+        (inputs, True),
+        (other, True),
+    ):
+        want = _run(model, partial(ef.forward_events, model, trim=trim), case, _objective_live)
+        got = _run(model, partial(window, trim=trim), case, _objective_live)
+        slots = ef.live_slots(want["info"]["event_valid"])
+        seen.add(slots)
+        scale = max(1.0, float(want["logits"].abs().max()))
+        _assert_same(want, got, value=1.5e-5 * scale, grad=2e-4)
+    assert len(seen) == 2, "the two windows must hold different numbers of event slots"
+
+
+@needs_card
+def test_trimmed_kernels_under_bf16_cuda() -> None:
+    """``trim`` under bf16 autocast: against the trimmed PyTorch reference with the same
+    rounding, the bounds of :func:`test_kernels_under_bf16_cuda`."""
+    model, inputs, window = _card_case(torch.bfloat16, trim=True)
+
+    def cast(fn: Window) -> Window:
+        def run(*a: Any) -> Any:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                logits, final, info = fn(*a)
+            return logits.float(), final, info
+
+        return run
+
+    plain = _run(
+        model,
+        cast(lambda *a: ef.forward_events(model, *a, product_dtype=torch.bfloat16, trim=True)),
+        inputs,
+        _objective_live,
+    )
+    got = _run(model, cast(window), inputs, _objective_live)
+    same = (got["info"]["cell_idx"] == plain["info"]["cell_idx"]).float().mean()
+    assert float(same) > 0.9
+    if float(same) == 1.0:
+        scale = float(plain["logits"].abs().max())
+        assert float((got["logits"] - plain["logits"]).abs().max()) < 0.02 * scale
+        num = sum(float((got["grads"][n] - g).square().sum()) for n, g in plain["grads"].items())
+        den = sum(float(g.square().sum()) for g in plain["grads"].values())
+        assert (num / den) ** 0.5 < 0.05
 
 
 @needs_card

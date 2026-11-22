@@ -95,7 +95,71 @@ class EventKernels:
     ``bias_in_product``: the two products add their bias (``addmm``; one rounding, as the
     compiled round's) instead of the kernels adding it to the columns they read (``mm``; under
     bf16 one more rounding). ``graph``: capture the reverse sweep's loop in a CUDA graph at
-    its first block."""
+    its first block. ``forward_graph``: capture the forward sweep's launches in a CUDA graph
+    at the first block.
+
+    ``share``: kernels of the same sizes and at least as many slots whose memory these use
+    (every buffer is the leading part of the other's): the blocks of fewer slots
+    (:meth:`at`) need no buffers of their own, only their own CUDA graphs."""
+
+    B: int
+    E: int
+    S: int
+    back: ReverseSweep
+    pad_src: Tensor
+    # the buffers (``sizes`` in ``__init__``)
+    h: Tensor
+    q: Tensor
+    age: Tensor
+    q_pre: Tensor
+    reset: Tensor
+    live: Tensor
+    z: Tensor
+    static: Tensor
+    scal: Tensor
+    u: Tensor
+    z_hat: Tensor
+    eps: Tensor
+    logits: Tensor
+    sel_cells: Tensor
+    sel_units: Tensor
+    theta: Tensor
+    soft: Tensor
+    prob: Tensor
+    ties: Tensor
+    cost: Tensor
+    refreshed: Tensor
+    m: Tensor
+    v: Tensor
+    readout: Tensor
+    abs_max: Tensor
+    first: Tensor
+    out: Tensor
+    act_f: Tensor
+    uz: Tensor
+    h_op: Tensor
+    vh: Tensor
+    act: Tensor
+    d_hid: Tensor
+    front_static: Tensor
+    front_b1: Tensor
+    front_q: Tensor
+    front_w2_p: Tensor
+    front_b2_p: Tensor
+    v_p: Tensor
+    score_w: Tensor
+    score_b: Tensor
+    gate_w: Tensor
+    edge: Tensor
+    norm_gain: Tensor
+    cand_gain: Tensor
+    cost_table: Tensor
+    w1: Tensor
+    b1: Tensor
+    b1_f: Tensor
+    w2: Tensor
+    b2: Tensor
+    b2_f: Tensor
 
     def __init__(
         self,
@@ -110,6 +174,8 @@ class EventKernels:
         product_dtype: torch.dtype = torch.float32,
         bias_in_product: bool = True,
         graph: bool = True,
+        forward_graph: bool = False,
+        share: EventKernels | None = None,
     ) -> None:
         front_hidden = int(weights.front_q.shape[0])
         reason = unsupported(spec, n_scalars)
@@ -121,6 +187,8 @@ class EventKernels:
             window_kernels.prepare(device.index or 0)
         if product_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("the products run in fp32 or bf16")
+        if share is not None and (share.B != B or share.E < E or share.S != n_scalars):
+            raise ValueError("the kernels to share with are of another shape or fewer slots")
         self.spec = spec
         self.B, self.E, self.S = B, E, n_scalars
         self.device = device
@@ -128,6 +196,7 @@ class EventKernels:
         self.half = product_dtype == torch.bfloat16
         self.bias_in_product = bias_in_product
         self.graph = graph
+        self.forward_graph = forward_graph
         N, M, K, d, H, n, D = spec.N, spec.M, spec.K, spec.d, spec.H, spec.in_dim, spec.D
         self.Hf = front_hidden
         self.Hs = spec.front_s  # S's block of the front's hidden layer
@@ -144,66 +213,126 @@ class EventKernels:
         self.back = ReverseSweep(
             shape, consts, device=device, state_dtype=torch.float32,
             product_dtype=product_dtype, kernels=True,
+            share=None if share is None else share.back,
         )  # fmt: skip
-
-        def f32(*size: int) -> Tensor:
-            return torch.zeros(*size, dtype=torch.float32, device=device)
-
-        def prod(*size: int) -> Tensor:
-            return torch.zeros(*size, dtype=product_dtype, device=device)
-
-        def i64(*size: int) -> Tensor:
-            return torch.zeros(*size, dtype=torch.int64, device=device)
-
-        def u8(*size: int) -> Tensor:
-            return torch.zeros(*size, dtype=torch.bool, device=device)
-
-        # the state, slot by slot (record t: what slot t reads; record E: after the block)
-        # (h slot-major: the block's states are one contiguous matrix for the scorer's gradient)
-        self.h, self.q, self.age = f32(E + 1, B, N, d), f32(B, E + 1, d), i64(B, E + 1, N)
-        self.q_pre = f32(B, E, d)
-        self.reset, self.live = u8(B, E), u8(B, E)
-        self.z, self.static, self.scal = f32(B, E, d), prod(B * E, self.Hf), f32(B, E, N, n_scalars)
-        # the tape beside the reverse sweep's record
-        self.u, self.z_hat, self.eps = f32(B, E, d), f32(B, E, d), f32(B, E, d)
-        self.logits = f32(B, E, N, M)
-        self.sel_cells, self.sel_units = i64(B, E, K), i64(B, E, K)
-        self.theta, self.soft, self.prob = f32(B, E), f32(B, E, K), f32(B, E, K)
-        self.ties = u8(B, E, K, M)
-        self.cost, self.refreshed = f32(B, E), f32(B, E)
-        self.m = f32(B, E, K, d)
-        self.v = prod(E, B, K, n)
-        self.readout, self.abs_max = f32(B, E, d), f32(B, E)
-        # the products' results and the second one's operand
-        self.first, self.out = prod(B * K, M * H + d), prod(B * K, M * d)
-        # the operands and results of a slot's two small products (the front's second layer, V h)
-        self.act_f, self.uz = prod(B, self.Hf), prod(B, 2 * d)
-        # (the state's product runs in fp32 on values rounded as the products read them: its
-        # V h is rounded where it is read, and the state's term of the logits stays a partial
-        # sum of the scorer's one product)
-        self.h_op, self.vh = f32(B * N, d), f32(B * N, d + M)
-        self.act = prod(E, B, K, H)  # the second product's operands, slot by slot (a tape)
-        self.d_hid = prod(B, E, K, H)  # the reverse sweep's dhid of every slot
+        Hf, S, A = self.Hf, n_scalars, max(M * spec.A, 1)
+        static_in = int(weights.front_static.shape[1])
+        width = int(weights.score_w.shape[1])
+        sizes: dict[str, tuple[str, tuple[int, ...]]] = {
+            # the state, slot by slot (record t: what slot t reads; record E: after the block)
+            # (h slot-major: the block's states are one contiguous matrix for the scorer's
+            # gradient)
+            "h": ("f32", (E + 1, B, N, d)),
+            "q": ("f32", (B, E + 1, d)),
+            "age": ("i64", (B, E + 1, N)),
+            "q_pre": ("f32", (B, E, d)),
+            "reset": ("u8", (B, E)),
+            "live": ("u8", (B, E)),
+            "z": ("f32", (B, E, d)),
+            "static": ("prod", (B * E, Hf)),
+            "scal": ("f32", (B, E, N, S)),
+            # the tape beside the reverse sweep's record
+            "u": ("f32", (B, E, d)),
+            "z_hat": ("f32", (B, E, d)),
+            "eps": ("f32", (B, E, d)),
+            "logits": ("f32", (B, E, N, M)),
+            "sel_cells": ("i64", (B, E, K)),
+            "sel_units": ("i64", (B, E, K)),
+            "theta": ("f32", (B, E)),
+            "soft": ("f32", (B, E, K)),
+            "prob": ("f32", (B, E, K)),
+            "ties": ("u8", (B, E, K, M)),
+            "cost": ("f32", (B, E)),
+            "refreshed": ("f32", (B, E)),
+            "m": ("f32", (B, E, K, d)),
+            "v": ("prod", (E, B, K, n)),
+            "readout": ("f32", (B, E, d)),
+            "abs_max": ("f32", (B, E)),
+            # the products' results and the second one's operand
+            "first": ("prod", (B * K, M * H + d)),
+            "out": ("prod", (B * K, M * d)),
+            # the operands and results of a slot's two small products (the front's second
+            # layer, V h)
+            "act_f": ("prod", (B, Hf)),
+            "uz": ("prod", (B, 2 * d)),
+            # (the state's product runs in fp32 on values rounded as the products read them:
+            # its V h is rounded where it is read, and the state's term of the logits stays a
+            # partial sum of the scorer's one product)
+            "h_op": ("f32", (B * N, d)),
+            "vh": ("f32", (B * N, d + M)),
+            "act": ("prod", (E, B, K, H)),  # the second product's operands, slot by slot
+            "d_hid": ("prod", (B, E, K, H)),  # the reverse sweep's dhid of every slot
+            # the weights, as the kernels and the products read them
+            "front_static": ("prod", (Hf, static_in)),
+            "front_b1": ("prod", (Hf,)),
+            # (transposed where a kernel's lane index is the weight's row: hsn_event.cu)
+            "front_q": ("f32", (d, Hf)),
+            "front_w2_p": ("prod", (Hf, 2 * d)),
+            "front_b2_p": ("prod", (2 * d,)),
+            "v_p": ("f32", (d, d + M)),  # [V' | W_h']: the state's product
+            "score_w": ("f32", (M, width)),
+            "score_b": ("f32", (M,)),
+            "gate_w": ("f32", (d, A)),
+            "edge": ("f32", (N, D)),
+            "norm_gain": ("f32", (n,)),
+            "cand_gain": ("f32", (d,)),
+            "cost_table": ("f32", (M,)),
+            "w1": ("prod", (n, M * H + d)),
+            "b1": ("prod", (M * H + d,)),
+            "b1_f": ("f32", (M * H + d,)),
+            "w2": ("prod", (H, M * d)),
+            "b2": ("prod", (M * d,)),
+            "b2_f": ("f32", (M * d,)),
+        }
+        kinds = {
+            "f32": torch.float32, "prod": product_dtype, "i64": torch.int64, "u8": torch.bool
+        }  # fmt: skip
+        for name, (kind, size) in sizes.items():
+            if share is None:
+                buffer = torch.zeros(*size, dtype=kinds[kind], device=device)
+            else:
+                whole = getattr(share, name).reshape(-1)
+                count = 1
+                for extent in size:
+                    count *= extent
+                buffer = whole[:count].view(*size)
+            setattr(self, name, buffer)
         self.back.d_hid = self.d_hid
-        # the weights, as the kernels and the products read them
-        self.front_static = prod(self.Hf, int(weights.front_static.shape[1]))
-        self.front_b1 = prod(self.Hf)
-        # (transposed where a kernel's lane index is the weight's row: hsn_event.cu)
-        self.front_q = f32(d, self.Hf)
-        self.front_w2_p, self.front_b2_p = prod(self.Hf, 2 * d), prod(2 * d)
-        self.v_p = f32(d, d + M)  # [V' | W_h']: the state's product
-        self.score_w, self.score_b = f32(M, int(weights.score_w.shape[1])), f32(M)
-        self.gate_w = f32(d, max(M * spec.A, 1))
-        self.edge = f32(N, D)
-        self.pad_src = spec.pad_src.to(device=device, dtype=torch.int32).contiguous()
-        self.norm_gain, self.cand_gain = f32(n), f32(d)
-        self.cost_table = f32(M)
-        self.w1, self.b1, self.b1_f = prod(n, M * H + d), prod(M * H + d), f32(M * H + d)
-        self.w2, self.b2, self.b2_f = prod(H, M * d), prod(M * d), f32(M * d)
+        self.pad_src = (
+            spec.pad_src.to(device=device, dtype=torch.int32).contiguous()
+            if share is None
+            else share.pad_src
+        )
+        self._consts = consts
+        self._weights = weights
+        self._children: dict[int, EventKernels] = {}
         self.calls = 0
         #: Measurements only: ``hsn_ev_decide`` returns after this phase (0: the whole kernel).
         self.stop_after = 0
         self._forward_graph: torch.cuda.CUDAGraph | None = None
+
+    def at(self, slots: int) -> EventKernels:
+        """The kernels of a block of ``slots`` slots on these buffers (``slots`` at most this
+        shape's): the same memory laid out for fewer slots, with its own CUDA graphs. A
+        block's tape is valid until the next forward sweep of any of them."""
+        if slots == self.E:
+            return self
+        if not 0 < slots < self.E:
+            raise ValueError(f"these buffers hold {self.E} slots, not {slots}")
+        child = self._children.get(slots)
+        if child is None:
+            child = EventKernels(
+                self.spec, self._weights, self._consts, B=self.B, E=slots, n_scalars=self.S,
+                device=self.device, product_dtype=self.product_dtype,
+                bias_in_product=self.bias_in_product, graph=self.graph,
+                forward_graph=self.forward_graph, share=self,
+            )  # fmt: skip
+            self._children[slots] = child
+        return child
+
+    def blocks(self) -> list[EventKernels]:
+        """These kernels and those of fewer slots on their buffers."""
+        return [self, *self._children.values()]
 
     # -- the weights of a window ------------------------------------------------------------------
 
@@ -329,7 +458,7 @@ class EventKernels:
 
     def capture_forward(self, warm_up: int = 2) -> None:
         """Capture the forward sweep's launches in a CUDA graph (the buffers must hold a
-        block's inputs and weights: call after one :meth:`forward`). Later sweeps replay it."""
+        block's inputs and weights). Later sweeps replay it."""
         for _ in range(warm_up):
             self._slots()
         torch.cuda.synchronize(self.device)
@@ -350,18 +479,18 @@ class EventKernels:
         reset: Tensor,
         live: Tensor,
     ) -> None:
-        """A block's inputs into the buffers, and the front's static part: ``[z; ctx] · W1'ᵀ +
-        b1'`` for all slots as one product."""
+        """A block's inputs into the buffers (the first ``E`` slots of what is given), and the
+        front's static part: ``[z; ctx] · W1'ᵀ + b1'`` for all slots as one product."""
         B, E = self.B, self.E
         self.h[0].copy_(h)
         self.q[:, 0].copy_(q)
         self.age[:, 0].copy_(age)
-        self.z.copy_(z)
-        self.scal.copy_(scalars)
-        self.reset.copy_(reset)
-        self.live.copy_(live)
+        self.z.copy_(z[:, :E])
+        self.scal.copy_(scalars[:, :E])
+        self.reset.copy_(reset[:, :E])
+        self.live.copy_(live[:, :E])
         pd = self.product_dtype
-        x = torch.cat([z.to(pd), ctx.to(pd)], dim=-1).reshape(B * E, -1)
+        x = torch.cat([z[:, :E].to(pd), ctx[:, :E].to(pd)], dim=-1).reshape(B * E, -1)
         torch.addmm(self.front_b1, x, self.front_static.t(), out=self.static)
 
     def forward(
@@ -380,15 +509,21 @@ class EventKernels:
         *,
         product_dtype: torch.dtype | None = None,
         cell_consts: CellConstants | None = None,
+        slots: int | None = None,
     ) -> dict[str, Tensor]:
-        """:func:`hsn.train.event_fused.forward_reference` on the card: the block's tape, as
-        views of the buffers."""
-        if tuple(z.shape[:2]) != (self.B, self.E) or int(scalars.shape[-1]) != self.S:
+        """:func:`hsn.train.event_fused.forward_reference` on the card: the tape of the first
+        ``E`` slots of the block (``slots``, when given, must be these kernels' ``E``:
+        :meth:`at`), as views of the buffers."""
+        if int(z.shape[0]) != self.B or int(z.shape[1]) < self.E:
+            raise ValueError("the block's shape is not the one these buffers were built for")
+        if int(scalars.shape[-1]) != self.S or (slots is not None and slots != self.E):
             raise ValueError("the block's shape is not the one these buffers were built for")
         if (product_dtype or torch.float32) != self.product_dtype:
             raise ValueError("the products' dtype is not the one these buffers were built for")
         self.load_weights(model, w)
         self.load_inputs(w, h, q, age, z, ctx, scalars, reset, live)
+        if self.forward_graph and self._forward_graph is None:
+            self.capture_forward()  # the block's inputs are loaded: record the launches
         if self._forward_graph is not None:
             self._forward_graph.replay()
         else:
@@ -436,7 +571,9 @@ class EventKernels:
             "abs_max": self.abs_max.amax(dim=0),
             "h": self.h[E],
             "q": self.q[:, E],
-            "age": self.age[:, E],
+            # (its own tensor: the state leaves the block, and the next block's buffers may
+            # be these laid out for another number of slots)
+            "age": self.age[:, E].clone(),
             "reset": self.reset,
         }
 
@@ -526,9 +663,11 @@ class EventKernels:
 
 class EventKernelSet:
     """The event kernels of a run: one :class:`EventKernels` per block shape (the number of
-    event slots follows the batch), built at a shape's first block. ``forward`` and ``sweep``
-    are what :func:`hsn.train.event_fused.fused_event_block` takes. ``forward_graph``: also
-    capture every shape's forward sweep in a CUDA graph at its first block."""
+    event slots follows the batch), built at a shape's first block, and on its buffers the
+    kernels of every smaller number of slots a block ran (:meth:`EventKernels.at`: the fused
+    block's ``trim``). ``forward``, ``sweep`` and ``pairs`` are what
+    :func:`hsn.train.event_fused.fused_event_block` takes. ``forward_graph``: also capture
+    every shape's forward sweep in a CUDA graph at its first block."""
 
     def __init__(
         self, *, bias_in_product: bool = True, graph: bool = True, forward_graph: bool = True
@@ -555,11 +694,11 @@ class EventKernelSet:
         *,
         product_dtype: torch.dtype | None = None,
         cell_consts: CellConstants | None = None,
+        slots: int | None = None,
     ) -> dict[str, Tensor]:
         product = h.dtype if product_dtype is None else product_dtype
         key = (int(z.shape[0]), int(z.shape[1]), int(scalars.shape[-1]), product, h.device, spec)
         kern = self.kernels.get(key)
-        fresh = kern is None
         if kern is None:
             if cell_consts is None:
                 raise ValueError("the first block of a shape needs the cell's constants")
@@ -574,20 +713,25 @@ class EventKernelSet:
                 product_dtype=product,
                 bias_in_product=self.bias_in_product,
                 graph=self.graph,
+                forward_graph=self.forward_graph,
             )
             self.kernels[key] = kern
+        if slots is not None:
+            kern = kern.at(slots)
         self.last = kern
-        tape = kern.forward(
+        return kern.forward(
             model, w, spec, h, q, age, z, ctx, scalars, reset, live, product_dtype=product_dtype
         )
-        if fresh and self.forward_graph:
-            # the block's inputs are loaded: record the launches, then run the block again
-            kern.capture_forward()
-            tape = kern.forward(
-                model, w, spec, h, q, age, z, ctx, scalars, reset, live,
-                product_dtype=product_dtype,
-            )  # fmt: skip
-        return tape
+
+    def _of(self, tape: dict[str, Tensor]) -> EventKernels | None:
+        """The kernels whose buffers hold ``tape``."""
+        if self.last is not None and tape["c"] is self.last.back.c:
+            return self.last
+        for shape in self.kernels.values():
+            for kern in shape.blocks():
+                if tape["c"] is kern.back.c:
+                    return kern
+        return None
 
     def sweep(
         self,
@@ -599,15 +743,13 @@ class EventKernelSet:
         d_h_sel: Tensor | None,
         initial: tuple[Tensor, Tensor] | None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        for kern in self.kernels.values():
-            if tape["c"] is kern.back.c:
-                return kern.sweep(tape, consts, n_cells, d_q_pre, d_q_post, d_h_sel, initial)
-        raise ValueError("this tape is not in any of the set's buffers")
+        kern = self._of(tape)
+        if kern is None:
+            raise ValueError("this tape is not in any of the set's buffers")
+        return kern.sweep(tape, consts, n_cells, d_q_pre, d_q_post, d_h_sel, initial)
 
     def pairs(
         self, dv: Tensor, row_of: Tensor, tape: dict[str, Tensor], gain: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
-        for kern in self.kernels.values():
-            if tape["c"] is kern.back.c:
-                return kern.pairs(dv, row_of, tape, gain)
-        return None
+        kern = self._of(tape)
+        return None if kern is None else kern.pairs(dv, row_of, tape, gain)

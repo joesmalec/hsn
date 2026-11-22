@@ -118,7 +118,10 @@ class ReverseSweep:
     (``None``: the kernels when the buffers are on a prepared CUDA device and the shape fits
     them, else PyTorch). ``state_dtype`` is the state's dtype, ``product_dtype`` the dtype of
     the two products and of their operands (bf16 under autocast, else the state's).
-    ``limits``: amendment A6's per-row limit on what a position passes back (``None``: none)."""
+    ``limits``: amendment A6's per-row limit on what a position passes back (``None``: none).
+    ``share``: a sweep of the same sizes and at least as many positions whose memory this one
+    uses (every buffer is a prefix of the other's: a window with fewer positions needs no
+    buffers of its own; the two must not hold a window at the same time)."""
 
     def __init__(
         self,
@@ -130,10 +133,13 @@ class ReverseSweep:
         product_dtype: torch.dtype,
         kernels: bool | None = None,
         limits: RowLimits | None = None,
+        share: ReverseSweep | None = None,
     ) -> None:
         self.shape = shape
         self.limits = limits
         self.device = device
+        # (with ``share`` the buffers below are shapes without memory until _adopt)
+        where = device if share is None else torch.device("meta")
         self.state_dtype = state_dtype
         self.product_dtype = product_dtype
         self.activation = consts.activation
@@ -147,13 +153,13 @@ class ReverseSweep:
         rows = B * self.routed
 
         def state(*size: int) -> Tensor:
-            return torch.zeros(*size, dtype=state_dtype, device=device)
+            return torch.zeros(*size, dtype=state_dtype, device=where)
 
         def product(*size: int) -> Tensor:
-            return torch.zeros(*size, dtype=product_dtype, device=device)
+            return torch.zeros(*size, dtype=product_dtype, device=where)
 
         def index(*size: int) -> Tensor:
-            return torch.zeros(*size, dtype=torch.int64, device=device)
+            return torch.zeros(*size, dtype=torch.int64, device=where)
 
         # the state's cotangent, and its rows' norms for the limit (of A's rows, of R's rows)
         self.A, self.R = state(B, N, d), state(B, d)
@@ -165,8 +171,8 @@ class ReverseSweep:
         self.rms = state(B, T, K)
         self.hidden = product(B, T, K, H)
         self.cells, self.units = index(B, T, K), index(B, T, K)
-        self.valid = torch.zeros(B, T, K, dtype=torch.bool, device=device)
-        self.reset = torch.zeros(B, T, dtype=torch.bool, device=device)
+        self.valid = torch.zeros(B, T, K, dtype=torch.bool, device=where)
+        self.reset = torch.zeros(B, T, dtype=torch.bool, device=where)
         # the cotangents of the node's outputs (zeros for a read that carried none)
         self.d_q_pre, self.d_q_post = state(B, T, d), state(B, T, d)
         self.d_h_sel = state(B, T, K, d)
@@ -178,7 +184,7 @@ class ReverseSweep:
         self.w2_t, self.w1_state_t = product(M * d, H), product(M * H + d, 2 * d)
         self.fast_w2_t = product(max(F, 1), d, H)
         self.fast_w1_state_t = product(max(F, 1), H + d, 2 * d)
-        self.out_tgt = torch.full((N, d_out), -1, dtype=torch.int32, device=device)
+        self.out_tgt = torch.full((N, d_out), -1, dtype=torch.int32, device=where)
         self.out_edge = index(N, d_out)
         self.out_w = state(N, d_out)
         self._graph_of: Tensor | None = None  # the pad_src the out-adjacency was built for
@@ -202,9 +208,21 @@ class ReverseSweep:
         #: (:func:`hsn.train.event_fused.local_backward`).
         self.d_hid: Tensor | None = None
         self._graph: torch.cuda.CUDAGraph | None = None
+        if share is not None:
+            self._adopt(share)
         self.kernels = self._kernels_fit() if kernels is None else kernels
         if self.kernels and not self._kernels_fit():
             raise ValueError("the reverse sweep's kernels do not take this shape or device")
+
+    def _adopt(self, parent: ReverseSweep) -> None:
+        """Every buffer becomes the leading part of ``parent``'s buffer of the same name."""
+        for name, mine in list(vars(self).items()):
+            if not isinstance(mine, Tensor):
+                continue
+            theirs = getattr(parent, name)
+            if theirs.dtype != mine.dtype or theirs.numel() < mine.numel():
+                raise ValueError(f"the sweep to share with holds no room for {name}")
+            setattr(self, name, theirs.reshape(-1)[: mine.numel()].view(mine.shape))
 
     # -- the kernels ------------------------------------------------------------------------------
 
