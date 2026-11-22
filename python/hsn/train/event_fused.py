@@ -34,6 +34,10 @@ This module is plain PyTorch: :func:`forward_reference` and :func:`local_backwar
 device and dtype and are the references the kernels (:mod:`hsn.kernels.event`) are tested
 against; in float64 the block equals the autograd event loop to rounding
 (``tests/test_wev_fused_event.py``).
+
+Phase 1b: the block can run only the slots that hold an event (``trim`` of
+:func:`fused_event_block`), and the parameters' part of the backward pass has a form on the
+card that the block takes as ``local`` (:meth:`hsn.kernels.event.EventKernels.local`).
 """
 
 from __future__ import annotations
@@ -781,6 +785,10 @@ def local_backward(
 #: dh0, dq0)``; the cotangents may be ``None``.
 Sweep = Callable[..., tuple[Tensor, Tensor, Tensor, Tensor]]
 
+#: The parameters' part of a block's backward pass: :func:`local_backward`'s arguments and
+#: result (on the card :meth:`hsn.kernels.event.EventKernelSet.local`).
+Local = Callable[..., "dict[str, Tensor | None]"]
+
 
 def sweep_reference(
     tape: dict[str, Tensor],
@@ -891,8 +899,10 @@ class EventRun:
         product_dtype: torch.dtype | None = None,
         pairs: Pairs | None = None,
         total: int | None = None,
+        local: Local | None = None,
     ) -> None:
         self.tape = tape
+        self.local = local
         #: The slots the block ran (the tape's) and the slots of the window's layout (more
         #: with ``trim``: the node's outputs are padded to them).
         self.slots = int(tape["c"].shape[1])
@@ -1006,7 +1016,8 @@ class EventRecurrence(torch.autograd.Function):
         sweep = sweep_reference if run.sweep is None else run.sweep
         dc, db, dh0, dq0 = sweep(tape, run.consts, spec.N, d_q_pre, d_q_post, d_h_sel, initial)
         run.dc, run.db = dc, db
-        grads = local_backward(
+        local = local_backward if run.local is None else run.local
+        grads = local(
             run.weights, spec, tape, dc, db, d_readout, d_logits, run.scalars,
             product_dtype=run.product_dtype, pairs=run.pairs,
         )  # fmt: skip
@@ -1053,6 +1064,7 @@ def fused_event_block(
     product_dtype: torch.dtype | None = None,
     runs: list[EventRun] | None = None,
     trim: bool = False,
+    local: Local | None = None,
 ) -> dict[str, Tensor]:
     """:meth:`hsn.model.hsn.HSN._event_block` for a block of event slots, fused: the same
     arguments (the state before the block, the slots' inputs ``z_b`` / ``c_b`` / ``s_b`` ``[B,
@@ -1063,7 +1075,9 @@ def fused_event_block(
 
     ``forward`` / ``sweep`` / ``pairs``: the forward sweep, the reverse sweep and the cell
     norm's backward to run (``None``: the PyTorch references; on the card
-    :class:`hsn.kernels.event.EventKernelSet`'s). ``product_dtype``: the
+    :class:`hsn.kernels.event.EventKernelSet`'s). ``local``: the parameters' part of the
+    backward pass (``None``: :func:`local_backward`; on the card the set's ``local``, with a
+    set built for it, and then ``pairs`` is not read). ``product_dtype``: the
     dtype of the matrix products (``None``: the state's). ``runs`` receives the block's
     :class:`EventRun` (tests and measurements).
 
@@ -1096,7 +1110,7 @@ def fused_event_block(
         )  # fmt: skip
     run = EventRun(
         tape, weights, spec, s_b[:, :n], sweep_consts, sweep=sweep, product_dtype=product_dtype,
-        pairs=pairs, total=E,
+        pairs=pairs, total=E, local=local,
     )  # fmt: skip
     # S on the taped summary (a constant under the summary cut): the local half of u, with
     # its gradient into S, the encoder and the reader
@@ -1171,6 +1185,7 @@ def forward_events(
     product_dtype: torch.dtype | None = None,
     runs: list[EventRun] | None = None,
     trim: bool = False,
+    local: Local | None = None,
 ) -> tuple[Tensor, Any, dict[str, Tensor]]:
     """:meth:`hsn.model.hsn.HSN.forward` for a window of ``model.write_events`` with the event
     loop fused: the model's own prologue, event slots and epilogue around one
@@ -1189,6 +1204,6 @@ def forward_events(
         out = fused_event_block(
             model, state.h, state.q, state.age, ev.z, ev.context, ev.scalars, ev.reset, ev.valid,
             consts, controls, forward=forward, sweep=sweep, pairs=pairs,
-            product_dtype=product_dtype, runs=runs, trim=trim,
+            product_dtype=product_dtype, runs=runs, trim=trim, local=local,
         )  # fmt: skip
     return model._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])

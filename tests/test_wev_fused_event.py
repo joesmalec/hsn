@@ -540,17 +540,22 @@ def _least_margin(tape: dict[str, Tensor], k: int) -> float:
     return float(torch.stack(gaps).amin(dim=0)[live].min())
 
 
-def _has_margins(model: HSNT, inputs: tuple[Any, ...]) -> bool:
+def _margins(model: HSNT, inputs: tuple[Any, ...]) -> tuple[bool, int]:
+    """Whether every decision of the window has a margin, and its slots that hold an event."""
     runs: list[ef.EventRun] = []
     with torch.no_grad():
-        ef.forward_events(model, *inputs, runs=runs)
-    return _least_margin(runs[0].tape, model.cfg.k_select) > MIN_MARGIN
+        _, _, info = ef.forward_events(model, *inputs, runs=runs)
+    wide = _least_margin(runs[0].tape, model.cfg.k_select) > MIN_MARGIN
+    return wide, ef.live_slots(info["event_valid"])
 
 
 def _card_case(
     product: torch.dtype,
     trim: bool = False,
+    local: bool = False,
 ) -> tuple[HSNT, tuple[Tensor, Tensor, CellGraphState, Tensor], Any]:
+    """A model of the card shape, inputs with a margin at every decision, and the window on
+    the kernels. ``local``: the parameters' backward on the card too."""
     from hsn.kernels import event as ek
 
     model = _model(*CARD_SHAPE, dtype=torch.float32, scale=0.15).to("cuda")
@@ -558,12 +563,12 @@ def _card_case(
     # agree to fp32 rounding are chosen by the last bit of a sum, which is not the test
     for seed in range(3, 23):
         inputs = _inputs(model, seed=seed, b=6, t=32)
-        if _has_margins(model, inputs):
+        if _margins(model, inputs)[0]:
             break
     else:
         raise AssertionError("no inputs with a margin at every decision")
     pd = None if product == torch.float32 else product
-    kernels = ek.EventKernelSet()
+    kernels = ek.EventKernelSet(local=local)
 
     def window(*a: Any, trim: bool = trim) -> Any:
         return ef.forward_events(
@@ -574,6 +579,7 @@ def _card_case(
             pairs=kernels.pairs,
             product_dtype=pd,
             trim=trim,
+            local=kernels.local if local else None,
         )
 
     return model, inputs, window
@@ -610,20 +616,52 @@ def test_trimmed_kernels_equal_the_reference_fp32_cuda() -> None:
 
 
 @needs_card
-def test_trimmed_kernels_share_their_buffers_cuda() -> None:
+@pytest.mark.parametrize("trim", [False, True])
+def test_local_kernels_equal_the_reference_fp32_cuda(trim: bool) -> None:
+    """The parameters' backward on the card (``EventKernels.local``: the block's rows in unit
+    order, the reverse sweep's kept ``dhid`` / ``dy`` / gate cotangent, the kernels of the
+    biases, the cell norm, the messages and the scorer), fp32 products: every gradient equals
+    the PyTorch reference's and the autograd event loop's, with identical decisions."""
+    model, inputs, window = _card_case(torch.float32, trim=trim, local=True)
+    ref = _run(model, model, inputs, _objective_live)
+    plain = _run(model, partial(ef.forward_events, model, trim=trim), inputs, _objective_live)
+    got = _run(model, window, inputs, _objective_live)
+    slots = ef.live_slots(ref["info"]["event_valid"]) if trim else None
+    scale = max(1.0, float(ref["logits"].abs().max()))
+    for other in (ref, plain):
+        _assert_same(other, got, value=1.5e-5 * scale, grad=2e-4, slots=slots)
+    again = _run(model, window, inputs, _objective_live)  # the replayed graphs
+    _assert_same(got, again, value=1.5e-5 * scale, grad=2e-4)
+
+
+@needs_card
+def test_local_kernels_read_every_logit_cotangent_cuda() -> None:
+    """An objective that reads the logits of every slot, padding rows included (the untrimmed
+    block): the scorer's kernel joins the logits' cotangent of all cells and rows."""
+    model, inputs, window = _card_case(torch.float32, local=True)
+    ref = _run(model, model, inputs)
+    got = _run(model, window, inputs)
+    _assert_same(ref, got, value=1.5e-5 * max(1.0, float(ref["logits"].abs().max())), grad=2e-4)
+
+
+@needs_card
+@pytest.mark.parametrize("local", [False, True])
+def test_trimmed_kernels_share_their_buffers_cuda(local: bool) -> None:
     """Blocks of different numbers of slots run on one set of buffers, laid out for each
     (``EventKernels.at``): windows of 16, of fewer and again of 16 and of the first number of
     slots, trimmed and not, each equal to the PyTorch reference of its own window."""
-    model, inputs, window = _card_case(torch.float32, trim=True)
+    model, inputs, window = _card_case(torch.float32, trim=True, local=local)
     tokens, ctx, state, reset = inputs
-    for column in range(31, 8, -3):  # no word end behind `column`: fewer event slots
+    slots = _margins(model, inputs)[1]
+    for column in range(28, 8, -3):  # no word end behind `column`: fewer event slots
         shorter = tokens.clone()
         shorter[:, column:] = 97
         other = (shorter, ctx, state, reset)
-        if _has_margins(model, other):
+        wide, fewer = _margins(model, other)
+        if wide and fewer < slots:
             break
     else:
-        raise AssertionError("no second window with a margin at every decision")
+        raise AssertionError("no second window with fewer slots and a margin at every decision")
     seen: set[int] = set()
     for case, trim in (
         (inputs, True),
@@ -642,10 +680,12 @@ def test_trimmed_kernels_share_their_buffers_cuda() -> None:
 
 
 @needs_card
-def test_trimmed_kernels_under_bf16_cuda() -> None:
-    """``trim`` under bf16 autocast: against the trimmed PyTorch reference with the same
-    rounding, the bounds of :func:`test_kernels_under_bf16_cuda`."""
-    model, inputs, window = _card_case(torch.bfloat16, trim=True)
+@pytest.mark.parametrize("local", [False, True])
+def test_trimmed_kernels_under_bf16_cuda(local: bool) -> None:
+    """``trim`` under bf16 autocast (``local``: with the parameters' backward on the card):
+    against the trimmed PyTorch reference with the same rounding, the bounds of
+    :func:`test_kernels_under_bf16_cuda`."""
+    model, inputs, window = _card_case(torch.bfloat16, trim=True, local=local)
 
     def cast(fn: Window) -> Window:
         def run(*a: Any) -> Any:

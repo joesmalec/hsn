@@ -19,6 +19,13 @@ or bf16.
 The tape is the buffers themselves: a block's tape is valid until the next forward sweep of a
 block of the same shape (one block per window and one backward pass per forward, as a training
 step runs them).
+
+Phase 1b. A block may run fewer slots than its shape's (the fused block's ``trim``: only the
+slots that hold an event): :meth:`EventKernels.at` lays the same buffers out for that many,
+with its own CUDA graphs. And the parameters' part of the backward pass can run on the card
+too (:meth:`EventKernels.local`, with ``local=True``): the block's written slots laid out in
+unit order, the unit bank's products on consecutive rows, and kernels for the biases, the
+messages and the scorer.
 """
 
 from __future__ import annotations
@@ -31,7 +38,13 @@ from torch import Tensor
 from hsn.kernels import window as window_kernels
 from hsn.model.router import BUDGET_SLACK
 from hsn.train.state_gradient import CellConstants
-from hsn.train.state_sweep import ACTIVATION_CODES, ReverseSweep, SweepShape, out_adjacency
+from hsn.train.state_sweep import (
+    ACTIVATION_CODES,
+    ReverseSweep,
+    SweepKeep,
+    SweepShape,
+    out_adjacency,
+)
 
 if TYPE_CHECKING:
     from hsn.model.hsn import HSN
@@ -44,6 +57,7 @@ __all__ = [
     "EventKernels",
     "decide_shared_words",
     "finish_shared_words",
+    "local_unsupported",
     "unsupported",
 ]
 
@@ -51,6 +65,13 @@ __all__ = [
 #: row) and in ``hsn_ev_pick``.
 HEAD_THREADS = 512
 PICK_THREADS = 512
+#: The parameters' backward (:meth:`EventKernels.local`): threads of a (row, slot)'s block in
+#: ``hsn_ev_sorted`` and ``hsn_ev_scores``, the most of ``hsn_ev_edges``, and the pieces a
+#: group's rows are summed in by ``hsn_ev_colsum``.
+SORT_THREADS = 256
+SCORE_THREADS = 512
+EDGE_THREADS = 256
+SUM_PIECES = 16
 
 
 def finish_shared_words(spec: EventSpec, threads: int = HEAD_THREADS) -> int:
@@ -89,6 +110,20 @@ def unsupported(spec: EventSpec, n_scalars: int, threads: int = HEAD_THREADS) ->
     return None
 
 
+def local_unsupported(spec: EventSpec, n_scalars: int) -> str | None:
+    """Why the kernels of the parameters' backward (:meth:`EventKernels.local`) do not take
+    this shape, or ``None``."""
+    if spec.K > 16:
+        return f"k_select={spec.K}: hsn_ev_pairs keeps a value per slot (16)"
+    if spec.in_dim > 1024 or spec.H > 1024:
+        return "the cell input and the hidden layer must fit a block's threads (1024)"
+    if ((spec.d + 31) // 32) * 32 > EDGE_THREADS:
+        return f"model.d={spec.d} does not fit hsn_ev_edges' {EDGE_THREADS} threads"
+    if 4 * spec.N * (spec.M + 1 + n_scalars) > window_kernels._MAX_SHARED_BYTES:
+        return "a slot's logits and scalars do not fit a block's shared memory"
+    return None
+
+
 class EventKernels:
     """The buffers and launches of the fused event block for one shape (module docstring).
 
@@ -100,7 +135,13 @@ class EventKernels:
 
     ``share``: kernels of the same sizes and at least as many slots whose memory these use
     (every buffer is the leading part of the other's): the blocks of fewer slots
-    (:meth:`at`) need no buffers of their own, only their own CUDA graphs."""
+    (:meth:`at`) need no buffers of their own, only their own CUDA graphs.
+
+    ``local``: the parameters' backward runs on the card (:meth:`local`): the forward sweep
+    then also lays the block's written slots out in unit order and the reverse sweep writes
+    ``dhid``, ``dy`` and the gate's cotangent at those rows
+    (:class:`hsn.train.state_sweep.SweepKeep`). Without it the reverse sweep keeps ``dhid`` by
+    record, for :func:`hsn.train.event_fused.local_backward`."""
 
     B: int
     E: int
@@ -160,6 +201,37 @@ class EventKernels:
     w2: Tensor
     b2: Tensor
     b2_f: Tensor
+    # the parameters' backward (``local``)
+    rank: Tensor
+    pos: Tensor
+    count: Tensor
+    start: Tensor
+    bounds: Tensor
+    span: Tensor
+    v_s: Tensor
+    act_s: Tensor
+    dv_s: Tensor
+    dy_s: Tensor
+    dgate_s: Tensor
+    alpha: Tensor
+    acc: Tensor
+    d_log: Tensor
+    per_row: Tensor
+    feat: Tensor
+    gate_rows: Tensor
+    dm: Tensor
+    through: Tensor
+    weighted: Tensor
+    per_edge: Tensor
+    edge_index: Tensor
+    sum_h: Tensor
+    sum_y: Tensor
+    sum_g: Tensor
+    w1_t: Tensor
+    gate_t: Tensor
+    v_f: Tensor
+    bounds_host: Tensor
+    _placed: torch.cuda.Event
 
     def __init__(
         self,
@@ -176,9 +248,12 @@ class EventKernels:
         graph: bool = True,
         forward_graph: bool = False,
         share: EventKernels | None = None,
+        local: bool = False,
     ) -> None:
         front_hidden = int(weights.front_q.shape[0])
         reason = unsupported(spec, n_scalars)
+        if reason is None and local:
+            reason = local_unsupported(spec, n_scalars)
         if reason is not None:
             raise ValueError(f"the event kernels do not take this shape: {reason}")
         if not window_kernels.available():
@@ -197,6 +272,7 @@ class EventKernels:
         self.bias_in_product = bias_in_product
         self.graph = graph
         self.forward_graph = forward_graph
+        self.local_kernels = local
         N, M, K, d, H, n, D = spec.N, spec.M, spec.K, spec.d, spec.H, spec.in_dim, spec.D
         self.Hf = front_hidden
         self.Hs = spec.front_s  # S's block of the front's hidden layer
@@ -284,9 +360,55 @@ class EventKernels:
             "b2": ("prod", (M * d,)),
             "b2_f": ("f32", (M * d,)),
         }
+        if local:
+            P, C = B * E * K, SUM_PIECES
+            sizes.update(
+                {
+                    # the block's written slots in unit order: a slot's rank among its row's
+                    # slots of its unit, the rows' counts, where a row's slots of a unit
+                    # start, the slot's row; the units' bounds and [0, rows]
+                    "rank": ("i32", (B, E, K)),
+                    "pos": ("i32", (B, E, K)),
+                    "count": ("i32", (B, M)),
+                    "start": ("i32", (B, M)),
+                    "bounds": ("i32", (M + 1,)),
+                    "span": ("i32", (2,)),
+                    # in unit order: the products' operands, and what the products return
+                    "v_s": ("prod", (P, n)),
+                    "act_s": ("prod", (P, H)),
+                    "dv_s": ("prod", (P, n)),
+                    "dy_s": ("prod", (P, d)),
+                    "dgate_s": ("prod", (P, d)),
+                    "alpha": ("f32", (B, E, K, 2)),
+                    "acc": ("f32", (B, d)),
+                    # the scorer's part
+                    "d_log": ("f32", (E, B, N, M)),
+                    "per_row": ("f32", (B * E, M)),
+                    "feat": ("f32", (B * E, M, 1 + S)),
+                    "gate_rows": ("f32", (B * E, A)),
+                    # the messages' part
+                    "dm": ("f32", (B, E, K, d)),
+                    "through": ("f32", (B, E, K, d)),
+                    "weighted": ("f32", (B, E, K, d)),
+                    "per_edge": ("f32", (B, E, K, D)),
+                    "edge_index": ("i64", (B, E, K, D)),
+                    # the bias gradients' pieces
+                    "sum_h": ("f32", (M, C, H)),
+                    "sum_y": ("f32", (M, C, d)),
+                    "sum_g": ("f32", (1, C, d)),
+                    # the first layer per unit, transposed, and the gate's columns; V
+                    "w1_t": ("prod", (M, H, n)),
+                    "gate_t": ("prod", (d, n)),
+                    "v_f": ("f32", (d, d)),
+                }
+            )
         kinds = {
-            "f32": torch.float32, "prod": product_dtype, "i64": torch.int64, "u8": torch.bool
-        }  # fmt: skip
+            "f32": torch.float32,
+            "prod": product_dtype,
+            "i64": torch.int64,
+            "i32": torch.int32,
+            "u8": torch.bool,
+        }
         for name, (kind, size) in sizes.items():
             if share is None:
                 buffer = torch.zeros(*size, dtype=kinds[kind], device=device)
@@ -297,7 +419,24 @@ class EventKernels:
                     count *= extent
                 buffer = whole[:count].view(*size)
             setattr(self, name, buffer)
-        self.back.d_hid = self.d_hid
+        if local:
+            self.back.keep = SweepKeep(
+                pos=self.pos,
+                dhid=self.d_hid.view(B * E * K, H),
+                dy=self.dy_s,
+                dgate=self.dgate_s,
+                alpha=self.alpha,
+                acc=self.acc,
+            )
+            # the units' bounds on the host: read once per block, in the backward pass
+            self.bounds_host = (
+                torch.zeros(M + 1, dtype=torch.int32).pin_memory()
+                if share is None
+                else share.bounds_host
+            )
+            self._placed = torch.cuda.Event()  # type: ignore[no-untyped-call]
+        else:
+            self.back.d_hid = self.d_hid
         self.pad_src = (
             spec.pad_src.to(device=device, dtype=torch.int32).contiguous()
             if share is None
@@ -325,7 +464,7 @@ class EventKernels:
                 self.spec, self._weights, self._consts, B=self.B, E=slots, n_scalars=self.S,
                 device=self.device, product_dtype=self.product_dtype,
                 bias_in_product=self.bias_in_product, graph=self.graph,
-                forward_graph=self.forward_graph, share=self,
+                forward_graph=self.forward_graph, share=self, local=self.local_kernels,
             )  # fmt: skip
             self._children[slots] = child
         return child
@@ -360,6 +499,11 @@ class EventKernels:
         self.w2.copy_(w.w2)
         self.b2.copy_(w.b2)
         self.b2_f.copy_(w.b2)
+        if self.local_kernels:
+            M, H, n = self.spec.M, self.spec.H, self.spec.in_dim
+            self.w1_t.copy_(w.w1[:, : M * H].reshape(n, M, H).permute(1, 2, 0))
+            self.gate_t.copy_(w.w1[:, M * H :].t())
+            self.v_f.copy_(w.v)
         self.cost_table.copy_(model.router.cost_table.float())
         router = model.router
         self._costs = (
@@ -395,6 +539,7 @@ class EventKernels:
         flags = (4 if self.half else 0) | (8 if spec.probes else 0)
         flags |= 16 if spec.gate_input == "summary" else 0
         flags |= 32 if spec.gate_input != "none" else 0
+        flags |= 64 if self.local_kernels else 0
         lam, overhead, shared_cost = self._costs
         tensors = [
             self.h, self.q_pre, self.age, self.live, self.z, self.uz, self.scal, self.score_w,
@@ -404,6 +549,8 @@ class EventKernels:
             self.prob, self.ties, self.cost, self.refreshed, back.h_old, self.m, back.rms,
             self.v,
         ]  # fmt: skip
+        if self.local_kernels:
+            tensors += [self.rank, self.count]
         ints = [
             self.B, self.E, spec.N, spec.M, spec.K, spec.d, spec.in_dim, spec.D, spec.A, self.S,
             t, flags, spec.age_max, self.stop_after,
@@ -455,6 +602,24 @@ class EventKernels:
             else:
                 torch.mm(act, self.w2, out=self.out)
         self._finish(self.E)
+        if self.local_kernels:
+            self._place()
+
+    def _place(self) -> None:
+        """After the sweep: the block's written slots in unit order (``hsn_ev_starts``), every
+        slot's row there and the two unit products' operands at those rows (``hsn_ev_sorted``)."""
+        spec = self.spec
+        launch = window_kernels._extension().launch
+        launch(
+            "hsn_ev_starts", 1, -(-spec.M // 32) * 32, 4 * spec.M,
+            [self.count, self.start, self.bounds, self.span], [self.B, spec.M], [],
+        )  # fmt: skip
+        launch(
+            "hsn_ev_sorted", self.B * self.E, SORT_THREADS, 4 * spec.K,
+            [self.rank, self.back.units, self.start, self.pos, self.v, self.act, self.v_s,
+             self.act_s],
+            [self.B, self.E, spec.K, spec.M, spec.in_dim, spec.H, int(self.half)], [],
+        )  # fmt: skip
 
     def capture_forward(self, warm_up: int = 2) -> None:
         """Capture the forward sweep's launches in a CUDA graph (the buffers must hold a
@@ -528,6 +693,9 @@ class EventKernels:
             self._forward_graph.replay()
         else:
             self._slots()
+        if self.local_kernels:  # the units' bounds to the host, without a wait here
+            self.bounds_host.copy_(self.bounds, non_blocking=True)
+            self._placed.record()
         self.calls += 1
         return self.tape()
 
@@ -548,7 +716,7 @@ class EventKernels:
             "v": self.v.permute(1, 0, 2, 3),
             "v_eb": self.v,
             "act_eb": self.act,
-            "d_hid": self.d_hid,
+            **({} if self.local_kernels else {"d_hid": self.d_hid}),
             "u": self.u,
             "eps": self.eps,
             "z_hat": self.z_hat,
@@ -649,6 +817,146 @@ class EventKernels:
         )  # fmt: skip
         return d_u, d_eps, dm, g_part.sum(dim=0)
 
+    def local(
+        self,
+        w: EventWeights,
+        spec: EventSpec,
+        tape: dict[str, Tensor],
+        dc: Tensor,
+        db: Tensor,
+        d_readout: Tensor | None,
+        d_logits: Tensor | None,
+        scalars: Tensor,
+        *,
+        product_dtype: torch.dtype | None = None,
+        pairs: Any = None,
+    ) -> dict[str, Tensor | None]:
+        """:func:`hsn.train.event_fused.local_backward` on the card, after :meth:`sweep` (its
+        arguments and result; ``dc``, ``db``, ``d_readout`` and ``scalars`` are not read: the
+        sweep's head took what they give, the scalars are in the buffers).
+
+        The block's written slots lie in unit order (``hsn_ev_starts``, ``hsn_ev_sorted``),
+        and the reverse sweep wrote ``dhid``, ``dy`` and the gate's cotangent at those rows.
+        So the unit bank's gradients are three products per unit on consecutive rows, written
+        where they are read, and the rows of padding are in none of them. The rest is five
+        kernels (the biases' column sums, the cell norm's backward, the messages, the scorer)
+        and the products they feed. One read from the host: the units' bounds, which the
+        forward sweep copied without a wait. The state's columns of the scorer's weight are an
+        fp32 product on the states as they are (the reference rounds them to the products'
+        dtype)."""
+        if not self.local_kernels or tape["c"] is not self.back.c:
+            raise ValueError("this tape is not the one in these buffers")
+        B, E, S, dev = self.B, self.E, self.S, self.device
+        N, M, K, d, H, n, D = spec.N, spec.M, spec.K, spec.d, spec.H, spec.in_dim, spec.D
+        P, C, half, pd = B * E * K, SUM_PIECES, int(self.half), self.product_dtype
+        back = self.back
+        ext = window_kernels._extension()
+        self._placed.synchronize()  # the forward sweep is long done when a backward pass runs
+        bounds = self.bounds_host.tolist()
+        rows = bounds[M]
+        dhid, dy, dg = self.d_hid.view(P, H), self.dy_s, self.dgate_s
+        v_s, act_s, dv_s = self.v_s, self.act_s, self.dv_s
+        # the unit bank, transposed layouts: a unit's block of rows is one product's result
+        g_w1_t = torch.empty(M * H + d, n, dtype=pd, device=dev)
+        g_w2_t = torch.empty(M * d, H, dtype=pd, device=dev)
+        for j in range(M):
+            lo, hi = bounds[j], bounds[j + 1]
+            if hi > lo:
+                torch.mm(dy[lo:hi].t(), act_s[lo:hi], out=g_w2_t[j * d : (j + 1) * d])
+                torch.mm(dhid[lo:hi].t(), v_s[lo:hi], out=g_w1_t[j * H : (j + 1) * H])
+                torch.mm(dhid[lo:hi], self.w1_t[j], out=dv_s[lo:hi])
+            else:  # a unit no slot ran: an exact zero
+                g_w2_t[j * d : (j + 1) * d].zero_()
+                g_w1_t[j * H : (j + 1) * H].zero_()
+        if rows > 0:  # the gate rides the first layer
+            torch.mm(dg[:rows].t(), v_s[:rows], out=g_w1_t[M * H :])
+            dv_s[:rows].addmm_(dg[:rows], self.gate_t)
+        else:
+            g_w1_t[M * H :].zero_()
+        # the biases: column sums by unit, in pieces
+        ext.launch(
+            "hsn_ev_colsum", M * C, -(-H // 32) * 32, 0, [dhid, self.bounds, self.sum_h],
+            [H, C, half], [],
+        )  # fmt: skip
+        ext.launch(
+            "hsn_ev_colsum", M * C, -(-d // 32) * 32, 0, [dy, self.bounds, self.sum_y],
+            [d, C, half], [],
+        )  # fmt: skip
+        ext.launch(
+            "hsn_ev_colsum", C, -(-d // 32) * 32, 0, [dg, self.span, self.sum_g], [d, C, half], []
+        )
+        g_b1 = torch.empty(M * H + d, dtype=torch.float32, device=dev)
+        torch.sum(self.sum_h, dim=1, out=g_b1[: M * H].view(M, H))
+        torch.sum(self.sum_g[0], dim=0, out=g_b1[M * H :])
+        g_b2 = torch.empty(M * d, dtype=torch.float32, device=dev)
+        torch.sum(self.sum_y, dim=1, out=g_b2.view(M, d))
+        # the cell norm: du and deps (a row's slots summed), dm, the gain's gradient
+        d_u = torch.empty(B, E, d, dtype=torch.float32, device=dev)
+        d_eps = torch.empty(B, E, d, dtype=torch.float32, device=dev)
+        g_part = torch.empty(B * E, n, dtype=torch.float32, device=dev)
+        threads = -(-n // 32) * 32
+        ext.launch(
+            "hsn_ev_pairs", B * E, threads, 4 * K * (1 + threads // 32),
+            [dv_s, self.pos, self.u, self.eps, back.h_old, self.m, back.rms, self.norm_gain,
+             d_u, d_eps, self.dm, g_part],
+            [K, d, n, half], [],
+        )  # fmt: skip
+        # the messages: V's gradient and the edge weights'
+        dm = self.dm.view(P, d)
+        torch.mm(dm, self.v_f, out=self.through.view(P, d))
+        lanes = -(-d // 32) * 32
+        groups = max(1, min(K, EDGE_THREADS // lanes))
+        ext.launch(
+            "hsn_ev_edges", B * E, lanes * groups, 4 * (K + 2 * K * D + K * D * (lanes // 32)),
+            [self.h, back.cells, back.valid, self.edge, self.pad_src, self.through,
+             self.weighted, self.per_edge, self.edge_index],
+            [B, E, N, K, d, D], [],
+        )  # fmt: skip
+        g_v = torch.mm(dm.t(), self.weighted.view(P, d))
+        g_edge = torch.zeros(N * D, dtype=torch.float32, device=dev)
+        g_edge.index_add_(0, self.edge_index.view(-1), self.per_edge.view(-1))
+        # the scorer: the straight-through path, the logits' cotangent, the weight's columns
+        given, stride = self.per_row, 0  # (a placeholder without the flag)
+        if d_logits is not None:
+            given = d_logits.float()
+            inner = (int(given.stride(1)), int(given.stride(2)), int(given.stride(3)))
+            if inner != (N * M, M, 1):
+                given = given.contiguous()
+            stride = int(given.stride(0))
+        flags = (1 if d_logits is not None else 0) | (4 if self.half else 0)
+        ext.launch_views(
+            "hsn_ev_scores", B * E, SCORE_THREADS, 4 * (N * M + N * (1 + S)),
+            [self.alpha, self.soft, self.prob, self.ties, back.cells, back.units, back.valid,
+             given, self.scal, self.age, self.d_log, self.per_row, self.feat, self.gate_rows],
+            [7],
+            [B, E, N, M, K, S, spec.A, flags, spec.age_max, stride], [spec.tau],
+        )  # fmt: skip
+        g_sw_t = torch.empty(3 * d + 1 + S, M, dtype=torch.float32, device=dev)
+        torch.mm(self.u.view(B * E, d).t(), self.per_row, out=g_sw_t[:d])
+        torch.mm(self.eps.view(B * E, d).t(), self.per_row, out=g_sw_t[d : 2 * d])
+        states = self.h[:E].view(E * B * N, d)
+        torch.mm(states.t(), self.d_log.view(E * B * N, M), out=g_sw_t[2 * d : 3 * d])
+        g_sw_t[3 * d :].copy_(self.feat.sum(dim=0).t())
+        g_gate: Tensor | None = None
+        if w.gate_w is not None:
+            read = self.q_pre if spec.gate_input == "summary" else self.u
+            g_gate = torch.mm(self.gate_rows.t(), read.view(B * E, d))
+        return {
+            "w1": (g_w1_t.float() if self.half else g_w1_t).t(),
+            "b1": g_b1,
+            "w2": (g_w2_t.float() if self.half else g_w2_t).t(),
+            "b2": g_b2,
+            "edge": g_edge.view(N, D),
+            "norm_gain": g_part.sum(dim=0),
+            "cand_gain": self.acc.sum(dim=0),
+            "v": g_v,
+            "score_w": g_sw_t.t(),
+            "score_b": self.per_row.sum(dim=0),
+            "gate_w": g_gate,
+            "u": d_u,
+            "eps": d_eps,
+        }
+
     def describe(self) -> dict[str, Any]:
         return {
             "B": self.B,
@@ -670,11 +978,18 @@ class EventKernelSet:
     every shape's forward sweep in a CUDA graph at its first block."""
 
     def __init__(
-        self, *, bias_in_product: bool = True, graph: bool = True, forward_graph: bool = True
+        self,
+        *,
+        bias_in_product: bool = True,
+        graph: bool = True,
+        forward_graph: bool = True,
+        local: bool = False,
     ) -> None:
         self.bias_in_product = bias_in_product
         self.graph = graph
         self.forward_graph = forward_graph
+        #: The parameters' backward on the card: hand :meth:`local` to the block.
+        self.local_kernels = local
         self.kernels: dict[tuple[object, ...], EventKernels] = {}
         self.last: EventKernels | None = None
 
@@ -714,6 +1029,7 @@ class EventKernelSet:
                 bias_in_product=self.bias_in_product,
                 graph=self.graph,
                 forward_graph=self.forward_graph,
+                local=self.local_kernels,
             )
             self.kernels[key] = kern
         if slots is not None:
@@ -753,3 +1069,24 @@ class EventKernelSet:
     ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         kern = self._of(tape)
         return None if kern is None else kern.pairs(dv, row_of, tape, gain)
+
+    def local(
+        self,
+        w: EventWeights,
+        spec: EventSpec,
+        tape: dict[str, Tensor],
+        dc: Tensor,
+        db: Tensor,
+        d_readout: Tensor | None,
+        d_logits: Tensor | None,
+        scalars: Tensor,
+        *,
+        product_dtype: torch.dtype | None = None,
+        pairs: Any = None,
+    ) -> dict[str, Tensor | None]:
+        kern = self._of(tape)
+        if kern is None:
+            raise ValueError("this tape is not in any of the set's buffers")
+        return kern.local(
+            w, spec, tape, dc, db, d_readout, d_logits, scalars, product_dtype=product_dtype
+        )

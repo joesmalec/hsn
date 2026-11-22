@@ -1007,15 +1007,24 @@ __device__ __forceinline__ float activation_grad(float x, int code) {
  *      10 d_h_sel [B,T,K,d], 11 d_h_fast [B,T,max(n_read,1),d]; 12 cand_gain [d];
  *      13 gate_pre, 14 gate_bias [d]; 15 dc, 16 db [B,T,K,d]; 17 op1, 18 op1_fast, 19 op2,
  *      20 op2_fast; 21 sigma [B,K].
- *   i: 0 B, 1 T, 2 K, 3 d, 4 N, 5 M, 6 H, 7 F, 8 t, 9 n_read, 10 cand_norm, 11 operands are bf16.
+ *      With i[12] (the fused word-event block, hsn_event.cu: a backward pass that takes the
+ *      parameters' gradients from all positions at once):
+ *      22 pos [B,T,K] i32: a slot's row in the block's rows in unit order (-1: none, a slot
+ *         that was not written); 23 dy [P,d], 24 dg [P,d] (the operands' dtype, out: at row
+ *         pos); 25 alpha [B,T,K,2] f32 (out: dL/dalpha = sum_x dz y rho gain of the slot, and
+ *         with the read-out's weight added, sum_x d_h_sel h', the cell mask's cotangent);
+ *         26 acc [B,d] f32 (in/out: the row's sum over positions of sum_k dz y rho, the
+ *         candidate gain's gradient; restarted at the sweep's first position T - 1).
+ *   i: 0 B, 1 T, 2 K, 3 d, 4 N, 5 M, 6 H, 7 F, 8 t, 9 n_read, 10 cand_norm, 11 operands are bf16,
+ *      12 keep (p22 .. p26).
  *   f: 0 cand_eps.
- * Shared: (2 d + 5 K + 2 K d + 3 ceil(K d / 32)) words.
+ * Shared: (2 d + 6 K + 2 K d + 4 ceil(K d / 32)) words.
  */
 extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
     extern __shared__ float shared[];
     const int B = a.i[0], T = a.i[1], K = a.i[2], d = a.i[3], N = a.i[4], M = a.i[5], H = a.i[6];
     const int F = a.i[7], t = a.i[8], n_read = a.i[9];
-    const bool cand_norm = a.i[10] != 0, half = a.i[11] != 0;
+    const bool cand_norm = a.i[10] != 0, half = a.i[11] != 0, keep = a.i[12] != 0;
     const float cand_eps = a.f[0];
     const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     const int Kr = K - F;
@@ -1044,11 +1053,12 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
     int* cell_of = reinterpret_cast<int*>(gain + d);         // [K] the slot's cell, -1 if padded
     int* unit_now = cell_of + K;                             // [K] the slot's unit
     int* unit_before = unit_now + K;                         // [K] its unit at t + 1, -1 if none
-    float* rho = reinterpret_cast<float*>(unit_before + K);  // [K]
+    int* pos_of = unit_before + K;                           // [K] its kept row, -1 if none
+    float* rho = reinterpret_cast<float*>(pos_of + K);       // [K]
     float* dot = rho + K;                                    // [K] mean(y gain dz)
     float* dz = dot + K;                                     // [K, d]
     float* ys = dz + K * d;                                  // [K, d]
-    float* part = ys + K * d;                                // [3, groups] a warp's sums
+    float* part = ys + K * d;                                // [4, groups] a warp's sums
     const int d_shift = log2_or_minus1(d);
     for (int x = tid; x < d; x += nt) {
         const float r = R[x] + post[x];
@@ -1060,6 +1070,7 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
         cell_of[k] = valid[k] ? static_cast<int>(cells[k]) : -1;
         unit_now[k] = static_cast<int>(units[k]);
         unit_before[k] = t + 1 < T ? static_cast<int>(units[K + k]) : -1;
+        pos_of[k] = keep ? static_cast<const int32_t*>(a.p[22])[rt * K + k] : -1;
     }
     __syncthreads();
     const float inv_n = 1.0f / static_cast<float>(N);
@@ -1067,7 +1078,7 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
     // warps fold their 32 elements when a slot is a whole number of warps; else a thread per slot
     const bool lanes = (d & 31) == 0 && (nt & 31) == 0;
     for (int e = tid; e < groups * 32; e += nt) {
-        float sq = 0.0f, dt = 0.0f, sg = 0.0f;
+        float sq = 0.0f, dt = 0.0f, sg = 0.0f, sr = 0.0f;
         if (e < K * d) {
             const int k = quot(e, d, d_shift), x = rem(e, d, d_shift);
             const int n = cell_of[k], at = n >= 0 ? n : 0;
@@ -1090,6 +1101,7 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
                 sq = yv * yv;
                 dt = yv * (gain[x] * dzv);
                 sg = dgv * (gp - gb);
+                sr = s0 * ((1.0f - gate) * h0 + gate * cv);  // the read-out's weight on the mask
             }
             dc[e] = dcv;
             db[e] = dbv;
@@ -1100,17 +1112,21 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
                     half, dgv);
             else
                 store_value(a.p[20], (static_cast<int64_t>(k) * B + row) * (H + d) + H + x, half, dgv);
+            if (pos_of[k] >= 0)
+                store_value(a.p[24], static_cast<int64_t>(pos_of[k]) * d + x, half, dgv);
         }
         if (lanes) {
             for (int w = 16; w > 0; w >>= 1) {
                 sq += __shfl_xor_sync(0xffffffff, sq, w);
                 dt += __shfl_xor_sync(0xffffffff, dt, w);
                 sg += __shfl_xor_sync(0xffffffff, sg, w);
+                sr += __shfl_xor_sync(0xffffffff, sr, w);
             }
             if ((tid & 31) == 0) {
                 part[e >> 5] = sq;
                 part[groups + (e >> 5)] = dt;
                 part[2 * groups + (e >> 5)] = sg;
+                part[3 * groups + (e >> 5)] = sr;
             }
         }
     }
@@ -1123,13 +1139,14 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
     }
     __syncthreads();
     if (tid < K) {  // per slot: the candidate norm's two means, and the gate's part of sigma
-        float sq = 0.0f, dt = 0.0f, sg = 0.0f;
+        float sq = 0.0f, dt = 0.0f, sg = 0.0f, sr = 0.0f;
         if (lanes) {
             const int first = (tid * d) >> 5, count = d >> 5;
             for (int w = 0; w < count; ++w) {
                 sq += part[first + w];
                 dt += part[groups + first + w];
                 sg += part[2 * groups + first + w];
+                sr += part[3 * groups + first + w];
             }
         } else {
             for (int x = 0; x < d; ++x) {
@@ -1140,12 +1157,20 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
                     const float gate = b[tid * d + x];
                     const float dgv = db[tid * d + x] * gate * (1.0f - gate);
                     sg += dgv * (gate_pre[tid * d + x] - gate_bias[x]);
+                    sr += sel[tid * d + x]
+                        * ((1.0f - gate) * h_old[tid * d + x] + gate * c[tid * d + x]);
                 }
             }
         }
         rho[tid] = rsqrtf(sq / static_cast<float>(d) + cand_eps);
         dot[tid] = dt / static_cast<float>(d);
         sigma[tid] = sg;
+        if (keep) {  // dL/dalpha of the slot (alpha = 1 on a written slot), and the cell mask's
+            float* alpha = fout(a, 25) + (rt * K + tid) * 2;
+            const float da = cell_of[tid] >= 0 ? rho[tid] * dt : 0.0f;
+            alpha[0] = da;
+            alpha[1] = da + sr;
+        }
     }
     __syncthreads();
     for (int e = tid; e < K * d; e += nt) {  // dy, into the slot's unit block
@@ -1164,6 +1189,16 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
         } else {
             store_value(a.p[18], (static_cast<int64_t>(k) * B + row) * d + x, half, value);
         }
+        if (pos_of[k] >= 0)
+            store_value(a.p[23], static_cast<int64_t>(pos_of[k]) * d + x, half, value);
+    }
+    if (keep) {  // the candidate gain's gradient: the row's sum of dz (.) y rho, over positions
+        float* acc = fout(a, 26) + static_cast<int64_t>(row) * d;
+        for (int x = tid; x < d; x += nt) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) sum += dz[k * d + x] * (ys[k * d + x] * rho[k]);
+            acc[x] = t + 1 < T ? acc[x] + sum : sum;
+        }
     }
 }
 
@@ -1176,10 +1211,13 @@ extern "C" __global__ void hsn_win_back_head(HsnWinArgs a) {
  *      3 units, 4 valid; 5 b1 [M,H] f32; 6 op2, 7 op2_fast; 8 sigma [B,K] f32;
  *      9 dhid [B,T,K,H] (the operands' dtype; with i[11]): record t receives dhid of every slot
  *        (zeros on padded slots), for a backward pass that takes the weights' gradients from
- *        all positions at once (the fused word-event block, hsn_event.cu).
+ *        all positions at once (the fused word-event block, hsn_event.cu). With i[11] = 2 it
+ *        is [P,H] and a slot's dhid goes to its row 10 pos [B,T,K] i32 of the block's rows in
+ *        unit order (-1: a slot that was not written, nothing is stored).
  *   i: 0 B, 1 T, 2 K, 3 d, 4 M, 5 H, 6 F, 7 t, 8 the products and operands are bf16,
- *      9 hidden is bf16, 10 the activation's code, 11 write p9 (0: as before).
- * Shared: (3 K + K blockDim / 32) words. K <= 32 (a thread keeps one partial sum per slot).
+ *      9 hidden is bf16, 10 the activation's code, 11 write p9 (0: as before; 1: by record;
+ *      2: by p10's row).
+ * Shared: (4 K + K blockDim / 32) words. K <= 32 (a thread keeps one partial sum per slot).
  * With bf16 buffers, H a multiple of 128 dividing 4 blockDim and d a multiple of 4, a thread
  * reads and stores four values at a time (the same values; sigma's sum in another order).
  */
@@ -1189,6 +1227,7 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
     const int F = a.i[6], t = a.i[7], code = a.i[10];
     const bool half = a.i[8] != 0, hid_half = a.i[9] != 0;
     const bool keep = a.i[11] != 0;  // write dhid to the tape p9
+    const bool by_row = a.i[11] == 2;  // ... at the slot's row p10
     const int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     const int Kr = K - F, warps = nt / 32;
     const int64_t rt = static_cast<int64_t>(row) * T + t;
@@ -1199,11 +1238,13 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
     int* ok = reinterpret_cast<int*>(shared);             // [K]
     int* unit_now = ok + K;                               // [K]
     int* unit_before = unit_now + K;                      // [K]
-    float* part = reinterpret_cast<float*>(unit_before + K);  // [K, warps]
+    int* kept = unit_before + K;                          // [K] where the slot's dhid is kept
+    float* part = reinterpret_cast<float*>(kept + K);     // [K, warps]
     for (int k = tid; k < K; k += nt) {
         ok[k] = valid[k];
         unit_now[k] = static_cast<int>(units[k]);
         unit_before[k] = t + 1 < T ? static_cast<int>(units[K + k]) : -1;
+        kept[k] = by_row ? static_cast<const int32_t*>(a.p[10])[rt * K + k] : 0;
     }
     __syncthreads();
     const int wide = M * H + d;
@@ -1261,9 +1302,11 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
                 *reinterpret_cast<uint64_t*>(
                     op_fast + (static_cast<int64_t>(k) * B + row) * (H + d) + h0) = out;
             }
-            if (keep)
-                *reinterpret_cast<uint64_t*>(static_cast<uint16_t*>(a.p[9]) + hid_row
-                    + static_cast<int64_t>(k) * H + h0) = out;
+            if (keep && kept[k] >= 0) {
+                const int64_t at = by_row ? static_cast<int64_t>(kept[k]) * H
+                    : hid_row + static_cast<int64_t>(k) * H;
+                *reinterpret_cast<uint64_t*>(static_cast<uint16_t*>(a.p[9]) + at + h0) = out;
+            }
             for (int w = 16; w > 0; w >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, w);
             if ((tid & 31) == 0) part[k * warps + (tid >> 5) % group_warps] = sum;
         }
@@ -1308,7 +1351,9 @@ extern "C" __global__ void hsn_win_back_mid(HsnWinArgs a) {
                 } else {
                     store_value(a.p[7], (static_cast<int64_t>(k) * B + row) * (H + d) + h, half, dh);
                 }
-                if (keep) store_value(a.p[9], hid_row + static_cast<int64_t>(k) * H + h, half, dh);
+                if (keep && kept[k] >= 0)
+                    store_value(a.p[9], (by_row ? static_cast<int64_t>(kept[k]) * H
+                        : hid_row + static_cast<int64_t>(k) * H) + h, half, dh);
             }
         }
     }

@@ -61,7 +61,7 @@ from torch import Tensor
 from hsn.model.gradclip import limit_row_grad, row_norm
 from hsn.train.state_gradient import CellConstants, RowLimits, activation_grad, sweep_layouts
 
-__all__ = ["ReverseSweep", "SweepRunner", "SweepShape", "out_adjacency", "sweep_shape"]
+__all__ = ["ReverseSweep", "SweepKeep", "SweepRunner", "SweepShape", "out_adjacency", "sweep_shape"]
 
 #: ``model.activation`` as the kernels' code.
 ACTIVATION_CODES: dict[str, int] = {"gelu": 0, "relu": 1, "silu": 2, "tanh": 3}
@@ -84,6 +84,26 @@ class SweepShape(NamedTuple):
     n_read: int
     in_dim: int
     d_out: int
+
+
+class SweepKeep(NamedTuple):
+    """What a sweep on the card also writes, by its kernels only (``hsn_win_back_head`` and
+    ``_mid``), for a backward pass that takes the parameters' gradients from all positions at
+    once (the fused word-event block: :meth:`hsn.kernels.event.EventKernels.local`).
+
+    ``pos [B, T, K]`` (int32) is a slot's row among the window's written slots laid out in
+    unit order (−1: a slot that was not written). At that row ``dhid [P, H]``, ``dy [P, d]``
+    and ``dgate [P, d]`` (the products' dtype) receive the slot's ``dhid``, its candidate's
+    cotangent at the unit's output and its gate's cotangent. ``alpha [B, T, K, 2]`` receives
+    ``dL/dα`` of the slot and, with the read-out's weight added, the cell mask's cotangent;
+    ``acc [B, d]`` the candidate gain's gradient by batch row."""
+
+    pos: Tensor
+    dhid: Tensor
+    dy: Tensor
+    dgate: Tensor
+    alpha: Tensor
+    acc: Tensor
 
 
 def out_adjacency(pad_src: Tensor, pad_mask: Tensor) -> tuple[Tensor, Tensor]:
@@ -207,6 +227,8 @@ class ReverseSweep:
         #: backward pass that takes the weights' gradients from all positions at once
         #: (:func:`hsn.train.event_fused.local_backward`).
         self.d_hid: Tensor | None = None
+        #: What the kernels also write (:class:`SweepKeep`; ``None``, the default: nothing).
+        self.keep: SweepKeep | None = None
         self._graph: torch.cuda.CUDAGraph | None = None
         if share is not None:
             self._adopt(share)
@@ -462,6 +484,8 @@ class ReverseSweep:
             fast[:, :, :width] = values[:, :F].transpose(0, 1).to(fast.dtype)
 
     def head_reference(self, t: int) -> None:
+        if self.keep is not None:
+            raise NotImplementedError("ReverseSweep.keep is written by the sweep's kernels only")
         s = self.shape
         N, d, F = s.N, s.d, s.n_fast
         ok, index, _ = self._slots(t)

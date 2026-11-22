@@ -1,4 +1,4 @@
-# A fused word-event block: phase 1 (design, reference, kernels, measurement)
+# A fused word-event block: phase 1 (design, reference, kernels, measurement) and phase 1b (the missing milliseconds)
 
 21 November 2026. Branch `claude/wev-fused-event`, from main `d3626df`. Measured on the RTX 3060
 (`profile:rtx3060`), alone on the card in a plain CUDA context, torch 2.15.0+cu132. The
@@ -21,8 +21,26 @@ place of those, removes at least half of the 27.8 ms that the scorer, the messag
 selected cells take of a 56.1 ms step, and set the bar: **go on only if the step projects at
 least 14 ms faster.**
 
-**Result: not yet.** One training window's forward and backward pass, the compiled autograd
-window (the current path) against the same window with the fused block, at the run's
+**Result after phase 1b: the bar is cleared, 15.6 ms at the data's mix.** Phase 1 ended at
+11.9 ms (11.6 measured again without the profiler, see "Phase 1b"); the decision of 21
+November was to push for the missing milliseconds before any integration. Two changes did it:
+
+| One window, forward and backward | Compiled window | Phase 1 block | + only the slots that hold an event | + the parameters' backward on the card |
+| --- | ---: | ---: | ---: | ---: |
+| A 48-slot window (45 slots hold an event) | 51.1 ms | 41.4 ms, saved 9.7 | 40.8 ms, saved 10.3 | **38.5 ms, saved 12.5** |
+| A 64-slot window (50 slots hold an event) | 59.2 ms | 45.7 ms, saved 13.5 | 42.2 ms, saved 17.0 | **39.8 ms, saved 19.4** |
+| **The data's mix** (400 windows) | 55.1 ms | saved 11.6 | saved 13.1 | **39.5 ms, saved 15.6** |
+
+- The step projects from 56.1 to **about 40.5 ms: 15.6 ms faster, 56 % of the 27.8 ms.** By
+  slot layout: 12.4 ms on windows laid out in 48 slots (51 % of them), 18.9 ms on 64 (49 %).
+- Equality holds as in phase 1 ("Phase 1b: equality"): float64 exact on the CPU, fp32 on the
+  card with identical decisions and gradients within 3e-7, bf16 as far from the compiled
+  window as phase 1's block was.
+- The details, each item's estimate beside what it measured, and what was not built are in
+  "Phase 1b" below. The rest of this document is phase 1 as written, with its numbers.
+
+**Phase 1's result: not yet.** One training window's forward and backward pass, the compiled
+autograd window (the current path) against the same window with the fused block, at the run's
 step-27,000 weights on real bio prose windows:
 
 | Event slots in the window | Compiled window | Fused block | Saved | Share of bio prose windows |
@@ -47,7 +65,13 @@ step-27,000 weights on real bio prose windows:
   - bf16: the block is as far from the eager loop and from the compiled window as those two
     are from each other.
 - What would move it, with what each rests on, is in "What phase 2 would take": the listed
-  trims add up to an estimated 4 to 6 ms more. None of them is built or measured.
+  trims add up to an estimated 4 to 6 ms more. (Phase 1b built two of them and measured
+  4.1 ms: "Phase 1b" below.)
+- A correction to this table, found in phase 1b: the 64-slot row was timed after a
+  `torch.profiler` session in the same process, which makes every later window about 2 ms
+  slower, the compiled one more than the fused. Without it the 64-slot window is 59.4
+  against 45.9 ms, saved 13.5 (not 14.0), and the mix 11.5 to 11.7 ms over three runs (not
+  11.9).
 
 ## The design
 
@@ -308,6 +332,193 @@ takes 4.5 ms to issue them, nearly as long as the card takes to run them.
 (The compiled window's split between forward and backward is `docs/word_event_speed.md`'s,
 scaled to today's 511 µs a slot; the fused block's is measured here.)
 
+## Phase 1b: the missing milliseconds
+
+21 November, after the decision "push for the missing ms first". Two changes, measured one
+after the other, then stopped: the bar was cleared. Two holds of the card (18:08 to 18:17 and
+18:27 to 18:37, 19 minutes; host load 0.4 to 1.3, once 2.8 at a script's start).
+
+### How it was measured
+
+Phase 1's way (`card3.py --trained`: the compiled window against the fused one, same model
+object and inputs, bf16, the run's step-27,000 weights, real windows of the bio prose stream
+with what the stream carries into them, medians of 80 passes alternated in tens), in
+`~/hsn-experiments/wev-fused/p1b/abt2.py`, with three changes:
+
+1. **No profiler in the timing process.** After one `torch.profiler` session every later
+   window of the process is about 2 ms slower (the compiled window +2.1 ms, phase 1's block
+   +1.5 ms). Phase 1 profiled the 48-slot window before it timed the 64-slot one. Kernel
+   counts now come from a separate process.
+2. **The objective of a training step:** the balance term over the live event slots only, as
+   `hsn.losses.auxiliary_terms` takes it under `model.write_events`. Phase 1's objective read
+   the logits of every slot, padding rows included. The two cost the same in both forms:
+   under phase 1's conditions (with the profiler) phase 1's block saves 9.83 and 14.07 ms
+   with this objective, against 9.9 and 14.0 with phase 1's.
+3. **The mix by each window's own event count.** With trim the fused window's time follows
+   the batch's largest event count, not its layout. Each variant was timed on 22 consecutive
+   windows of the stream (20 passes each, two runs). Per layout the compiled window is a
+   constant (51.1 ms at 48 slots, 59.2 ms at 64; within 0.3 ms over a run's windows) and a fused
+   variant a line in the event count (about 0.2 ms a slot; worst residual 0.4 ms). The lines
+   are applied to the first 400 training windows (`p1b/slots3.json`: every window's layout
+   and largest count; `p1b/mix.py`). A layout of 80 slots (2 windows of 400) is extrapolated,
+   as in phase 1.
+
+| Saved at the data's mix (two runs in brackets) | Phase 1 block | + trim | + parameters' backward on the card |
+| --- | ---: | ---: | ---: |
+| All 400 windows | 11.55 ms (11.60, 11.51) | 13.14 ms (13.22, 13.07) | **15.65 ms (15.71, 15.58)** |
+| Laid out in 48 slots (203 windows; 46.3 slots hold an event) | 9.75 | 10.01 | 12.42 |
+| Laid out in 64 slots (195; 52.2) | 13.38 | 16.32 | 18.92 |
+| Laid out in 80 slots (2; 65), extrapolated | 17.0 | 20.8 | 24.0 |
+| Kernels a window, 48 / 64 slots (compiled: 6,240 / 7,969) | 2,167 / 2,400 | 2,153 / 2,231 | 1,968 / 2,047 |
+
+The two windows phase 1 timed (the stream's first of each layout; 80 passes, two runs):
+
+| Window | Compiled | Phase 1 block | + trim | + parameters' backward |
+| --- | ---: | ---: | ---: | ---: |
+| 48 slots, 45 hold an event | 51.15, 50.99 | 41.45, 41.31 | 40.76, 40.84 | 38.59, 38.45 |
+| saved | | 9.70, 9.68 | 10.39, 10.15 | 12.56, 12.53 |
+| 64 slots, 50 hold an event | 59.48, 58.91 | 46.06, 45.42 | 42.52, 41.93 | 40.06, 39.50 |
+| saved | | 13.42, 13.49 | 16.96, 16.98 | 19.42, 19.40 |
+
+p10 to p90 of a run: within 0.5 ms of its median.
+
+### The items, estimate against measurement
+
+In the order worked: by expected gain for the effort, measured after each.
+
+| Item (phase 1's list) | Estimate | Measured at the mix | Kept |
+| --- | ---: | --- | --- |
+| 2, first half. Only the slots that hold an event (`trim`) | 1.2 to 1.8 ms for item 2 | **+1.6 ms** (11.55 → 13.14): +0.3 on the 48-slot layouts, +2.9 on the 64-slot ones | yes |
+| 1. The rest of the parameter backward as kernels (`local`) | 1.5 to 2 ms | **+2.5 ms** (13.14 → 15.65): +2.4 at 48, +2.6 at 64. The parameters' backward itself: 4.29 → 1.82 ms at 45 slots, 4.67 → 1.98 ms at 50 | yes |
+| 2, second half. Only a slot's live rows | (in item 2's estimate) | not built. Rows sorted by event count would give the products fewer rows in 28 % of the slots; the first product measured at 384 rows 43.3 µs, 256 rows 33.4, 192 rows 24.6: by those times about 0.5 ms at most, and every slot would have its own shapes, so no CUDA graph | no |
+| 3. The first product split on the shared `u` / `ε` columns | 0.7 ms | not built. The shapes measured: 43.3 µs → 27.7 + 10.3 = 38.0 µs, 5.3 µs a slot, **0.26 ms at the mix** before what `hsn_ev_pick` would add to read two results. No rounding was changed for it | no |
+| 4. The fixed per-window part | 0.5 to 1 ms | not built. Its sections measured (below): merged constants 0.53 ms, event weights and cell constants 0.54, the sweeps' loads about 0.9, the node, `P` and the records 0.53 | no |
+| 5. Two small kernels | 0.5 to 0.8 ms | not built | no |
+
+Both built items measured at or above their estimates. A slot of the fused block costs about
+0.2 ms; the 6.7 slots a window that trim leaves out give 1.6 ms.
+
+### Only the slots that hold an event (`trim`)
+
+A window lays its event slots out in multiples of 16 (`hsn.model.hsn.event_block`), the
+batch's largest event count rounded up: on bio prose 56.0 slots a window against a largest
+count of 49.2 (46.3 of 48, 52.2 of 64). No row has an event in the slots behind the largest
+count. They change no state and pass no gradient except the summary's, and both the compiled
+window and phase 1's block computed them.
+
+`fused_event_block(trim=True)`:
+
+- reads how many leading slots hold an event (`live_slots`, one host read, 0.08 ms) and runs
+  the forward sweep, the reverse sweep and the parameters' backward on those alone;
+- pads the node's outputs to the window's layout: the summaries behind the block's slots are
+  the block's last (their cotangents join the final summary's in the backward pass), the
+  read-outs and the logits there are zeros;
+- runs `P` and `S` on every slot as before, so the predictions and `u` of every slot are the
+  untrimmed block's.
+
+**What is not computed.** The model's loop runs its round on the padding rows of those slots
+too and discards the result. With trim their records are zeros in `info`: `unit_logits`,
+`cell_idx`, `unit_idx`, `cost_per_row`, `expected_cost` and `refreshed` of a slot in which no
+row has an event. Nothing a training step reads with a gradient: the prediction term and the
+balance term take live slots only. One logged number moves: the refresh rate is a mean over
+all slots of the layout, and the trimmed slots now count as zero in it.
+
+**Needs** what `HSN._event_slots` gives: no reset in a slot without an event.
+
+**On the card** the buffers of a layout are shared by the blocks of fewer slots
+(`EventKernels.at`, `ReverseSweep(share=...)`): the same memory laid out for the block's own
+number of slots, so every tape tensor is contiguous and has no stale tail, with one pair of
+CUDA graphs per number of slots a run meets (bio prose: 21 different counts in 400 windows;
+a capture is two eager sweeps). No more memory than phase 1.
+
+### The parameters' backward on the card (`EventKernelSet(local=True)`)
+
+Phase 1's `local_backward` is about 235 tensor operations at these sizes; nearly all its
+time was the card running small kernels one after the other. It stays as the reference (any
+device and dtype; the float64 equality rests on it). On the card `EventKernels.local` does
+the same work in 26 products of the unit bank, 6 other products, 8 kernels (two of them in
+the forward sweep's graph) and about a dozen small tensor operations:
+
+| What | How |
+| --- | --- |
+| The block's written slots in unit order | `hsn_ev_decide` counts a row's written slots per unit and gives each its rank; after the sweep `hsn_ev_starts` (one block) turns the counts into where a row's slots of a unit start, and `hsn_ev_sorted` copies the two unit products' operands to those rows. In the forward sweep's graph. The units' bounds go to the host without a wait and are read in the backward pass |
+| `dy`, the gate's cotangent, `dhid` | the reverse sweep's head and middle already compute them at every slot; they now also write them at the slot's row (`ReverseSweep.keep`, off by default). The head also gives `dL/dα` and the cell mask's cotangent of every slot, and the candidate gain's gradient |
+| The unit bank's weights | per unit three products on consecutive rows, written where they are read (`∂W2'_j`, `∂W1_j`, `dv`); the gate's two. Only written slots have a row: 72 % of the (row, slot) pairs of the slots that hold an event |
+| The biases | `hsn_ev_colsum`: column sums by unit, in pieces |
+| The cell norm | `hsn_ev_pairs`, as in phase 1 |
+| `V` and the edge weights | `hsn_ev_edges` (a block per row and slot) between two small products |
+| The scorer | `hsn_ev_scores` (a block per row and slot): the straight-through path, the logits' cotangent, the sums over a slot's cells; then four products for the weight's columns and the address gate |
+
+No sort, no gather and no read from the card in the backward pass. The buffers it adds (the
+two operands and `dv` in unit order, the scorer's and the messages' terms) are about 80 MB
+at a 64-slot layout.
+
+One window in sections, a wait for the card after each (so a section's time holds its device
+work; `p1b/parts2.py`), trim on:
+
+| Section | 48 slots, 45 run | 64 slots, 50 run |
+| --- | ---: | ---: |
+| Prologue (the reader; the compiled window's too) | 8.66 ms | 8.65 ms |
+| Event slots; merged constants | 0.54; 0.53 | 0.55; 0.53 |
+| Event weights and cell constants; the read of the live slots | 0.54; 0.08 | 0.54; 0.08 |
+| Forward sweep with its loads | 6.46 (6.11 without placing the rows) | 7.09 (6.81) |
+| `S`; the node, `P`, the records | 0.23; 0.53 | 0.23; 0.53 |
+| Epilogue (the decoder); the objective | 1.40; 0.70 | 1.42; 0.70 |
+| Backward outside the node (the compiled window's too) | 14.9 | 15.0 |
+| Reverse sweep with its loads | 3.53 | 3.87 |
+| **Parameters' backward** | **1.82** (4.29 as tensor operations) | **1.98** (4.67) |
+
+Of the parameters' backward at 45 slots: `hsn_ev_pairs` 0.32 ms, `hsn_ev_scores` 0.20, the
+three `hsn_ev_colsum` 0.14; `hsn_ev_sorted` (in the forward sweep) 0.13.
+
+### Phase 1b: equality
+
+**float64, CPU.** The trimmed window equals the autograd event loop under the objective of a
+training step: values 1e-11, every parameter gradient and the start state's 1e-9, the
+summary's gradient behind the last event included (the check fails without it), every entry
+of `info` except the six padding records, which are zeros behind the block's slots; five
+cases, each with the reference sweep and the buffered one; two windows with the state
+carried. The kernels of the parameters' backward have no CPU form: the PyTorch
+`local_backward` is their reference, and they are tested on the card.
+
+**fp32, on the card** (`p1b/eq2.py`; the run's step-27,000 weights, the stream's first
+windows of 64 and of 48 slots; trim and the parameters' backward on the card):
+
+| | 64 slots, 50 run | 48 slots, 45 run |
+| --- | ---: | ---: |
+| Decisions on the slots that hold an event, kernels against the autograd loop | identical (19,200 entries) | identical (17,280) |
+| Parameter gradients against the autograd loop (relative L2, all) | 2.6e-7 | 3.1e-7 |
+| Worst tensor (edge logits) | 1.2e-6 | 9.6e-7 |
+| The same window again (replayed graphs, used buffers) | 1.1e-7 | 1.1e-7 |
+
+The kernels' parameter backward against `local_backward` on the same tape and cotangents
+(`p1b/dbg_local.py`): every tensor within 3.3e-7 (relative L2) in fp32.
+
+**bf16, on the card** (ten consecutive windows of the stream, as in phase 1; the decisions
+are now counted on the slots that hold an event):
+
+| Pair | Slot entries that differ | All parameters | `W1` | `W2` | Scorer | Decoder | Logits |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Eager loop against compiled window (the two existing forms) | 39.7 % | 1.16 % (0.77 to 2.15) | 11.5 % | 8.3 % | 3.0 % | 0.72 % | 1.21 % |
+| Eager loop against fused block | 40.1 % | 1.53 % (0.67 to 3.18) | 11.6 % | 8.3 % | 3.0 % | 0.77 % | 1.22 % |
+| Compiled window against fused block | 42.8 % | 1.35 % (0.54 to 2.85) | 11.8 % | 8.5 % | 3.0 % | 0.75 % | 1.28 % |
+
+- These are phase 1's distances (1.2 %, 1.5 %, 1.4 %): trim and the kernels of the
+  parameters' backward moved none of them.
+- **Read strictly, the fused block is a little farther from the compiled window than the
+  eager loop is:** 1.35 % against 1.16 % over all parameters, and by a few hundredths per
+  tensor. The ranges of the ten windows overlap, and ten windows do not say whether the
+  difference is real. It was there in phase 1; it is not from phase 1b.
+- **Rounding of the parameters' backward under bf16**, against `local_backward` on the same
+  tape: `W1` 0.21 %, `W2` 0.19 %, `V` 0.19 %, the scorer's weight 0.13 %, `b1` 0.02 %, every
+  other tensor under 0.003 %. Where it rounds differently: a unit's rows enter its products
+  in another order (unit, batch row, slot); `V`'s gradient and the state's columns of the
+  scorer's weight are fp32 products on the values as they are (the reference rounds the
+  operands to bf16 and the result once more); the scorer's other columns are fp32 sums of
+  operands rounded to bf16, not rounded again; the gate's bias sums the cotangents its
+  product reads (rounded), the reference the unrounded ones. Item 3, which would have
+  changed the forward pass's rounding, was not built.
+
 ## What phase 2 would take
 
 ### To train with it (the integration)
@@ -316,13 +527,18 @@ scaled to today's 511 µs a slot; the fused block's is measured here.)
 | --- | --- | --- |
 | The key `hardware.event_kernel = autograd \| fused` (off by default, out of the hash at its default, a scope function with the refusals above) | `python/hsn/config.py`, `python/hsn/experiments/spec.py` | about 120 lines |
 | The call site: `CompiledWindow._run_events` runs `fused_event_block` on a training step with the straight-through gate; evaluation, the soft warm-up and the statistics steps' term passes keep the compiled window | `python/hsn/train/compile.py`, `python/hsn/train/tbptt.py` | about 150 lines |
-| One set of buffers per window of a segment (`train.tbptt_windows > 1`: a window's tape must outlive the next window's forward pass) | `python/hsn/kernels/event.py` | about 60 lines |
+| One set of buffers per window of a segment (`train.tbptt_windows > 1`: a window's tape must outlive the next window's forward pass; since phase 1b the layouts of every number of slots share one set, so two windows of a segment need two sets whatever their slots) | `python/hsn/kernels/event.py` | about 60 lines |
 | Tests: the trainer in float64 on the CPU against the autograd window over some steps; the card tests of the key; a compile check (graphs per number of slots) | `tests/` | about 500 lines |
 | Timing and accuracy runs: the recipe on bio prose at 9,000 steps, fused against the current path, two seeds each; then one 27,000-step run | the card | about 2 hours |
 
-About 800 lines beyond this branch.
+About 800 lines beyond this branch. Phase 1b changes what the call site passes
+(`trim=True`, a kernel set with `local=True`) and adds two things to settle there, a few
+lines each: the refresh rate the trainer logs counts the trimmed slots as zero, and no loss
+term may read the logits of slots without an event (today's do not: the prediction and the
+balance term take live slots only). The step time is a projection until the timing runs:
+56.1 → about 40.5 ms.
 
-### To reach the bar (kernel work; estimates, each resting on a number measured here)
+### To reach the bar: phase 1's list (what was built and measured: "Phase 1b")
 
 | Trim | Estimate at the data's mix | Rests on |
 | --- | ---: | --- |
@@ -337,23 +553,40 @@ these is built, and my estimates for this work have been high twice (the per-byt
 window, and this block's forward pass, which I put at 70 to 100 µs a slot and measured at
 129).
 
+(Phase 1b: the first row and the first half of the second are built and measured 4.1 ms
+together, where 2.7 to 3.8 were estimated. The other rows are not built; the third measured
+0.26 ms at most on its products' times.)
+
 ### Risks
 
 1. **bf16 trajectories.** The block rounds differently from the compiled window, as any
    other compile does; one window says it is no further away than the compiled window is
    from the eager loop. Only runs say whether scores hold.
-2. **The reverse sweep's kernel changed** (`hsn_win_back_mid` writes `dhid` when asked). Off
-   by default; the HSN's split and fused windows' card tests pass with it (123 tests).
-3. **The tape is the buffers.** One block's tape is valid until the next forward sweep of
-   the same shape; the trainer's statistics steps (one extra pass per loss term) and
-   `tbptt_windows` need their own handling.
+2. **The reverse sweep's kernels changed** (`hsn_win_back_mid` writes `dhid` when asked;
+   since phase 1b it and `hsn_win_back_head` also write what `ReverseSweep.keep` names). Off
+   by default; the HSN's split and fused windows' card tests pass with them (275 tests with
+   this block's).
+3. **The tape is the buffers.** One block's tape is valid until the next forward sweep (of
+   any number of slots on the same layout, since phase 1b); the trainer's statistics steps
+   (one extra pass per loss term) and `tbptt_windows` need their own handling.
 4. **Scope.** Exploration, dense-fallback rows, the cost term and the per-row gradient limit
    are refused, not built; a recipe that turns one on trains on the compiled window.
 5. **A second hand-written derivative of the cell** beside the reverse sweep's. It is tested
    against autograd in float64 for every key in the scope, and a key added to the round
    later has to be added in both.
+6. **A third form of the parameters' backward** (phase 1b): the kernels of
+   `EventKernels.local` and what the reverse sweep keeps for them have no CPU form. They are
+   tested on the card only, against `local_backward` and the autograd loop in fp32
+   (gradients within 3e-7). A key added to the round has to be added there too.
+7. **Trim changes what `info` holds** in the slots without an event (zeros where the model's
+   loop leaves what it computed on padding rows) and the logged refresh rate. No gradient
+   reads them today; a later loss term that read every slot would see zeros there.
 
 ## Tests
+
+| What | Result |
+| --- | --- |
+Phase 1:
 
 | What | Result |
 | --- | --- |
@@ -361,6 +594,17 @@ window, and this block's forward pass, which I put at 70 to 100 µs a slot and m
 | The same file with `tests/test_p2_10c_state_sweep.py` and `tests/test_p2_10c_state_gradient.py` on the card (the reverse sweep whose middle kernel changed) | 132 passed |
 | The window kernels' other card tests (`test_p2_10c_fast_slots`, `test_p2_10b_folded_sweep`, `test_p2_10b_trainer_kernels`, `test_p2_10_split_window`) | 123 passed |
 | The whole suite on the CPU (GPU hidden, `-n 8`, thread caps) | 2,791 passed, 529 skipped (CUDA, MPS and kernel-build tests), 118 subtests passed |
+| `ruff check`, `ruff format --check`, `mypy --strict` on the changed modules | clean |
+
+Phase 1b (12 float64 tests of trim; 10 card tests: trim, the shared buffers, the parameters'
+backward on the card in fp32 and bf16):
+
+| What | Result |
+| --- | --- |
+| `tests/test_wev_fused_event.py` on the CPU (GPU hidden) | 50 passed, 10 skipped (the card tests) |
+| The same file on the card | 60 passed |
+| With the reverse sweep's and the window kernels' card tests (the six files above: the head and middle kernels changed) | 275 passed |
+| The whole suite on the CPU (GPU hidden, `-n 8`, thread caps) | 2,803 passed, 537 skipped (CUDA, MPS and kernel-build tests), 118 subtests passed |
 | `ruff check`, `ruff format --check`, `mypy --strict` on the changed modules | clean |
 
 The card tests of this file take inputs whose every decision has a margin of 1e-3 (checked):
@@ -374,13 +618,27 @@ tolerance (values 1.5e-5, gradients 2e-4, identical decisions), and bf16 under a
   `sweep_reference`, `sweep_buffered`, `local_backward`), the node (`EventRecurrence`), the block
   (`fused_event_block`) and the window around it (`forward_events`), the scope.
 - `kernels/cuda/hsn_event.cu` (in the window fatbin, `scripts/build_window_kernels.py`):
-  `hsn_ev_finish`, `hsn_ev_decide`, `hsn_ev_pick`, `hsn_ev_pairs`.
-- `python/hsn/kernels/event.py`: `EventKernels` (the buffers and launches of one block shape),
-  `EventKernelSet` (one per number of slots).
+  `hsn_ev_finish`, `hsn_ev_decide`, `hsn_ev_pick`, `hsn_ev_pairs`; phase 1b:
+  `hsn_ev_starts`, `hsn_ev_sorted`, `hsn_ev_colsum`, `hsn_ev_edges`, `hsn_ev_scores`.
+- `python/hsn/kernels/event.py`: `EventKernels` (the buffers and launches of one block shape;
+  phase 1b: `at` for the layouts of fewer slots on the same buffers, `local` the parameters'
+  backward), `EventKernelSet` (one per slot layout).
 - `kernels/cuda/hsn_window.cu`, `python/hsn/kernels/window.py`,
   `python/hsn/train/state_sweep.py`: `hsn_win_back_mid` optionally keeps `dhid` of every
-  position (`ReverseSweep.d_hid`; off by default, the sweep's results unchanged).
+  position (`ReverseSweep.d_hid`; off by default, the sweep's results unchanged); phase 1b:
+  the head and the middle optionally write `dy`, the gate's cotangent, `dhid` and the slots'
+  `α` terms for `EventKernels.local` (`ReverseSweep.keep`), and a sweep can use another's
+  buffers (`share`).
 - `tests/test_wev_fused_event.py`.
+- Phase 1b, outside the repository, `~/hsn-experiments/wev-fused/p1b/`: `abt2.py` (the
+  window against the compiled window, per variant), `mix.py` and `slots3.py` /
+  `slots3.json` (the saving over the 400 windows), `eq2.py` (fp32 equality), `dbg_local.py`
+  (the kernels' parameter backward against the reference, tensor by tensor), `parts2.py`
+  (sections, the first product's shapes), `hold_open.sh` / `run.sh` / `cpu_gate.sh` (the card
+  and CPU rules); results `h1np_abt.json` (base, trim), `h2_abt.json` and `h2b_abt.json`
+  (all three, two runs), `mix_h2.json`, `h2p_abt.json` (kernel counts), `h2_eq.json`,
+  `h2_dbg.json`, `h1_parts2.json` and `h2_parts2.json`, the tests' logs. `snap1/` is the
+  tree as the first hold ran it.
 - Outside the repository, `~/hsn-experiments/wev-fused/card/`: the card scripts
   (`card1.py` equality, `card2.py` the parts' timing, `card3.py` the window against the
   compiled window and the three forms' distances, `card_phase.py` a kernel's phases,

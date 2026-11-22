@@ -1150,11 +1150,11 @@ def update_fold(
 
 def _back_head_shared(shape: SweepShape) -> int:
     K, d = shape.K, shape.d
-    return 4 * (2 * d + 5 * K + 2 * K * d + 3 * ((K * d + 31) // 32))
+    return 4 * (2 * d + 6 * K + 2 * K * d + 4 * ((K * d + 31) // 32))
 
 
 def _back_mid_shared(shape: SweepShape) -> int:
-    return 4 * (3 * shape.K + shape.K * (_BACK_THREADS // 32))
+    return 4 * (4 * shape.K + shape.K * (_BACK_THREADS // 32))
 
 
 def _back_tail_shared(shape: SweepShape) -> int:
@@ -1183,6 +1183,9 @@ def back_head(sweep: ReverseSweep, t: int) -> None:
     """The head of position ``t`` of a :class:`~hsn.train.state_sweep.ReverseSweep` on its
     buffers (``hsn_win_back_head``; :meth:`ReverseSweep.head_reference` is its contract)."""
     s = sweep.shape
+    keep = sweep.keep
+    # (the fused word-event block: dy, dg, the slot's alpha terms and the candidate gain's sum)
+    kept = [] if keep is None else [keep.pos, keep.dy, keep.dgate, keep.alpha, keep.acc]
     _extension().launch(
         "hsn_win_back_head",
         s.B,
@@ -1211,9 +1214,10 @@ def back_head(sweep: ReverseSweep, t: int) -> None:
             sweep.op2,
             sweep.op2_fast,
             sweep.sigma,
+            *kept,
         ],
         [s.B, s.T, s.K, s.d, s.N, s.M, s.H, s.n_fast, t, s.n_read, int(sweep.cand_norm)]
-        + [_half(sweep.op1)],
+        + [_half(sweep.op1), 0 if keep is None else 1],
         [sweep.cand_eps],
     )
 
@@ -1224,6 +1228,15 @@ def back_mid(sweep: ReverseSweep, t: int) -> None:
     from hsn.train.state_sweep import ACTIVATION_CODES
 
     s = sweep.shape
+    keep = sweep.keep
+    # the fused word-event block keeps dhid of every position: by record (ReverseSweep.d_hid)
+    # or at the slot's row of the block in unit order (ReverseSweep.keep)
+    if keep is not None:
+        kept, mode = [keep.dhid, keep.pos], 2
+    elif sweep.d_hid is not None:
+        kept, mode = [sweep.d_hid], 1
+    else:
+        kept, mode = [sweep.sigma], 0
     _extension().launch(
         "hsn_win_back_mid",
         s.B,
@@ -1239,11 +1252,10 @@ def back_mid(sweep: ReverseSweep, t: int) -> None:
             sweep.op2,
             sweep.op2_fast,
             sweep.sigma,
-            # the fused word-event block keeps dhid of every position (ReverseSweep.d_hid)
-            sweep.sigma if sweep.d_hid is None else sweep.d_hid,
+            *kept,
         ],
         [s.B, s.T, s.K, s.d, s.M, s.H, s.n_fast, t, _half(sweep.act_r), _half(sweep.hidden)]
-        + [ACTIVATION_CODES[sweep.activation], 0 if sweep.d_hid is None else 1],
+        + [ACTIVATION_CODES[sweep.activation], mode],
         [],
     )
 
