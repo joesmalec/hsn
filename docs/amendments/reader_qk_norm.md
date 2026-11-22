@@ -181,10 +181,36 @@ left out of the hash (`tests/test_p1_16_config.py`) extended by this key.
 
 ## Results
 
-Pending card runs by joe-3e. The arm to run first: code native, word events, the word-event
-carry recipe with the top block normalised,
-`model.reader_qk_norm=[false,false,false,true]`, against the same arm without it; then the
-same on prose, where the top block's copying must survive.
+Card runs of 21 Nov 2026 by joe-3e: tree 9aeb660, the local RTX 3060 alone, 27,000 steps, batch 32 x 256,
+seed 0, spec `fields_27k_qk` (folder `~/hsn-experiments/qknorm-runs`). The references are the same arms without
+the key, on tree 3c85c2a (main's model code; the specs `fields_27k*`). Dev bits per byte / next-byte accuracy %
+at the last step (lower bits, higher accuracy are better); ms per step alone.
+
+| Reader (160 x 4, carry 256) | Code native | Bio prose | Sum of bits |
+| --- | --- | --- | --- |
+| Memory-off, top block unrotated (top0) | 1.148 / 77.77 | 1.356 / 71.82 | 2.504 |
+| Memory-off, top block rotated | 1.058 / 79.41 | 1.442 / 69.80 | 2.500 |
+| **Memory-off, top0 + `reader_qk_norm=[false,false,false,true]`** | **1.041 / 79.67** | **1.345 / 72.08** | **2.386** |
+| Memory-off, top0 + `reader_qk_norm=true` (every block) | 1.054 / 79.46 | 1.368 / 71.63 | 2.422 |
+| Word events + balance (lambda_b 0.02), top0 | 1.172 / 77.38 | 1.291 / 73.20 | 2.463 |
+| Word events + balance, top block rotated | 1.025 / 79.94 | 1.357 / 71.71 | 2.382 |
+| **Word events + balance, top0 + the key on the top block** | **1.023 / 80.00** | **1.280 / 73.43** | **2.303** |
+
+- With the key on the top block, one reader beats choosing the reader per field (rotated on code, top0 on prose:
+  2.414 memory-off, 2.316 with word events) on both fields, with the memory on and off, in bits and accuracy.
+- On every block it is worse than on the top block alone.
+- The prose copy survives: the accuracy of a rare word at a repeat minus at its first mention, bio prose,
+  points at < 64 / 64-255 / 256-1023 bytes: memory-off top0 +25.1 / +25.0 / -2.7, top0 + key +25.1 / +25.2 / -2.6,
+  rotated +1.6 / +2.9 / -3.0; word events + balance top0 +24.2 / +24.0 / -2.7, top0 + key +24.1 / +23.9 / -2.8.
+  On code native the key changes these by at most 0.8 points.
+- Step time: memory-off 16.1 ms (top0 15.9 to 16.0); word events + balance 62.3 ms on code and 62.7 on prose,
+  against 57.3 to 58.2 without the key. With the memory on, the reader runs in the window's eager prologue
+  (outside the compiled window), so the norm's kernels are launched one by one; memory-off compiles it.
+- The weights still grow, more slowly. The top block's norm_attn.weight and qkv.weight norms at 9k / 18k / 27k, word
+  events + balance on code native: 18.3 / 22.5 / 24.8 and 40.1 / 56.0 / 62.0 (top0 without the key: 41 to 69 and 84
+  to 115 from 9k to 27k). But the bound itself rises: max|g_q| * max|g_k| goes 19.2 / 40.8 / 58.6 (bio prose 7.0 /
+  32.0 / 57.7; memory-off 12 to 29). The 80 gains carry no weight decay, so the logit bound is not fixed; at 27k
+  no run slid, and longer runs are untested.
 
 ## Where the code is
 
