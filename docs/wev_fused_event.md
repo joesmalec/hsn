@@ -1,4 +1,4 @@
-# A fused word-event block: phase 1 (design, reference, kernels, measurement) and phase 1b (the missing milliseconds)
+# A fused word-event block: phase 1 (design, reference, kernels, measurement), phase 1b (the missing milliseconds) and phase 2 (the key in training)
 
 21 November 2026. Branch `claude/wev-fused-event`, from main `d3626df`. Measured on the RTX 3060
 (`profile:rtx3060`), alone on the card in a plain CUDA context, torch 2.15.0+cu132. The
@@ -7,10 +7,13 @@ word events, exact word address, top0 reader 160 × 4 with carry 256) with its C
 (`hardware.compile_mode=reduce-overhead`, `graph_alias_index`, `message_gradients=state`,
 `round_products=merged`), bio prose, B 32, T 256, bf16.
 
-**Nothing here reaches a training run.** There is no configuration key and no call site in the
-trainer: the block is a function (`hsn.train.event_fused.forward_events`) that tests and the
-measurement scripts call. Phase 2 (the key `hardware.event_kernel=fused`, the trainer, runs)
-waits for a decision.
+**Phase 2 (21 November): the block trains behind an opt-in key, `hardware.event_kernel=fused`.**
+The default is `compiled`, the path as it was. With the key the trainer's step on bio prose
+measures **60.9 → 45.1 ms (15.8 ms faster)**, alone on the card; no accuracy run has been made
+with it. What the key does, its scope and refusals, the tests and the measured step are in
+"Phase 2" below. Phases 1 and 1b follow as they were written, when nothing reached a training
+run: the block was a function (`hsn.train.event_fused.forward_events`) that tests and the
+measurement scripts called.
 
 ## What this is
 
@@ -33,6 +36,11 @@ November was to push for the missing milliseconds before any integration. Two ch
 
 - The step projects from 56.1 to **about 40.5 ms: 15.6 ms faster, 56 % of the 27.8 ms.** By
   slot layout: 12.4 ms on windows laid out in 48 slots (51 % of them), 18.9 ms on 64 (49 %).
+  (Phase 2 measured the trainer's step: 12.5 and 18.9 ms by layout, 15.7 ms at this mix, as
+  projected. The two step times of this line are not of one kind, though: 56.1 ms is a run's
+  median, which lies on the 48-slot windows, and 15.6 ms is a mean over both layouts. As
+  means the step is 60.6 → 44.9 ms; as a run's median about 56.6 → 44.8 ms. "Phase 2", "The
+  measured step".)
 - Equality holds as in phase 1 ("Phase 1b: equality"): float64 exact on the CPU, fp32 on the
   card with identical decisions and gradients within 3e-7, bf16 as far from the compiled
   window as phase 1's block was.
@@ -519,7 +527,253 @@ are now counted on the slots that hold an event):
   product reads (rounded), the reference the unrounded ones. Item 3, which would have
   changed the forward pass's rounding, was not built.
 
-## What phase 2 would take
+## Phase 2: the key in training (`hardware.event_kernel=fused`)
+
+21 November, after the decision to integrate (phase 1b cleared the bar). The same branch with
+main merged (`dcdec29`: PRs #107 to #109, the recipe with the balance loss among them). No
+kernel changed in this phase. No training run for accuracy was made: the runs are the
+harness's.
+
+### What the key does
+
+`hardware.event_kernel`: `compiled` (default) or `fused`.
+
+- **With `fused`, a training window of the event loop** (`model.write_events`) runs the model's
+  own prologue and event slots, then **the slots that hold an event as one fused block**, then
+  the model's own epilogue. The block is phase 1b's: `trim`, the kernels with their CUDA
+  graphs, the parameters' backward on the card (`EventKernelSet(local=True)`). The call site is
+  `CompiledWindow._run_events` (`python/hsn/train/compile.py`), which hands the slots to
+  `hsn.train.event_fused.FusedEvents`.
+- **Which windows:** a training step with the straight-through gate and a gradient.
+- **Which windows stay on the compiled blocks, as without the key:** evaluation, the steps of
+  a soft warm-up (`train.soft_until_step`: every cell with autograd), and a statistics step's
+  term passes (one retained backward pass per loss term; `TBPTTTrainer._compiled_term_norms`
+  runs them with the block paused). So a run with the key still compiles the event block,
+  at its first statistics step and its first evaluation instead of at step 1.
+- **At its default the key changes nothing and is nowhere:** out of the configuration hash
+  (`HASH_OMIT_AT_DEFAULT`), out of an arm's identity and out of the sweep's memory key
+  (`hsn.experiments.spec.memory_key`). Set, it is hashed, and the arm is another arm with its
+  own step-time and memory estimates.
+- **A spec's line:** `hardware.event_kernel=fused`, beside the CUDA arm's lines. The run's
+  tree needs the window kernels of this branch built (`scripts/build_window_kernels.py
+  --arch 86`: the fatbin holds `hsn_event.cu`); without them the trainer raises at
+  construction.
+- **What a run records:** `measured["fused_event_windows"]` (the windows whose event loop
+  ran fused) and `measured["fused_event_captures"]` (those that met a number of event slots
+  for the first time), only with the key. A capture step is a compile step: its time goes to
+  `compile_seconds`, not to `train_seconds`.
+- **The profile** (`hsn.runner.profile_run`) runs its training pass with the block too.
+
+### Scope and refusals
+
+The key is checked when the configuration loads (`hsn.config.event_kernel_scope_error`) and
+again on the built model when the trainer is constructed
+(`hsn.train.event_fused.training_scope_error`, and the kernels' shape checks). A refusal is an
+error with its reason; nothing falls back to the compiled window without a word.
+
+| Refused | Reason given |
+| --- | --- |
+| `hardware.device` other than `cuda` (the CPU, MPS) | the kernels are CUDA only |
+| `hardware.compile_mode=none` | evaluation, a soft warm-up and the term passes run on the compiled window |
+| `hardware.window` other than `autograd` | the block is the autograd window's |
+| fp64 master dtype; `train.precision` other than `bf16` or `fp32` | the kernels keep the state in fp32 and multiply in fp32 or bf16 |
+| a model without the memory; `model.write_events=byte` | no event loop |
+| `train.epsilon_*` > 0 | exploration is not built (phase 1) |
+| `train.p_dense` > 0 | dense-fallback rows are not built (phase 1) |
+| `cost` in `train.aux_enabled`, `train.lambda_c` | the expected cost leaves the block without a gradient (phase 1; the event loop refuses the term itself) |
+| `train.state_grad_clip`, `train.state_grad_ratio` | the per-row gradient limit is not built into the reverse sweep (phase 1) |
+| `train.gate_mode` other than `ste`; `train.ste_scope=all` | the block is the hard-gate sparse round |
+| a temperature ramp | not built (the compiled window refuses it too) |
+| `train.unit_credit=softmax` | the block needs executed credit |
+| `train.feedback_detach` other than `[summary, eps, router]` | the state gradient with the other three reads cut |
+| `train.lambda_u`, `train.lambda_w` | per byte position |
+| `model.cell_norm` or `model.cand_norm` not `rms`; `model.ablate_shared_u`; `model.disabled_cells` | not built |
+| `model.r_max` > 1; fast cells (A8); `model.write_gate` (A10); `model.cell_units=fixed` | not built |
+| `model.selected_readout=false`; `model.cell_attention_heads` > 0 | A5's read-out is in the block; the attention read is not built |
+| `model.scorer=mlp`; excluded scorer features; `model.address_gate_input` other than `u` or `summary` | the linear scorer and the gate on `u` or on the summary only |
+| `model.n_units` not a power of two or above 32; `n_cells · n_units` above 512; `model.k_select` above 16; an in-degree above 8; `model.d` above 256; a hidden width above 1,024 | the kernels' shapes |
+
+Inside the scope: a soft warm-up, `train.tbptt_windows > 1`, `train.grad_accum > 1` where
+the compiled window takes it (`hardware.compile_mode=default`), `model.address_gate_input` `u`
+or `summary` or no gate, one or two address bytes, the word address or none, every reader
+key (the reader runs in the prologue).
+
+### `train.tbptt_windows > 1`
+
+A block's tape is the buffers, and a segment's one backward pass reads every window's tape
+after the last window's forward sweep. So **each window of a segment has a set of buffers of
+its own** (`FusedEvents`: one `EventKernelSet` per place in the segment; the trainer sets the
+place before each window, `window_index mod tbptt_windows`). A place beyond the segment is
+an error. The block is handed the window's start state as it is, attached inside a segment,
+and returns the gradient of that state (phase 1), so a later window's loss reaches the window
+before. The key then needs `hardware.compile_mode=default`, as `train.tbptt_windows` does
+(`docs/tbptt_windows.md`); the block's own CUDA graphs are not the compiled window's and
+stay. Memory: one more set of buffers per window of a segment (below).
+
+### The refresh rate
+
+Trim does not run the slots behind a window's last event. The compiled blocks run them (on
+padding rows only) and discard the result, except for one number: their refresh probes were
+counted in the logged `refreshed` rate, a mean over every slot of the layout.
+
+**Settled:** in an event window the rates the trainer logs (`refreshed`, and `explored` and
+`dense_fallback` by the same rule) are **means over the slots in which some row has an
+event**, with and without the key (`TBPTTTrainer._window_statistics`). The slots behind them
+count in neither, so the number means the same on both paths, and a test holds the two equal.
+
+- **This moves the logged `refreshed` of every word-event run, the default path included:**
+  by the layout's slots over the slots that hold an event, 56.6 / 49.5 = 1.14 on bio prose,
+  less what the padding rows' probes behind the last event added. A `refreshed` logged before
+  this change is not comparable with one logged after it.
+- Padding rows inside the slots that hold an event are still counted, on both paths (both
+  run them).
+- The other statistics of an event window (`route_cost`, `eps_mean`, `alpha_entropy`) were
+  already means over live rows, a slot without one counting zero: they are unchanged.
+- Nothing else of the default path changes: see "The default path".
+
+### The measured step
+
+The repository's own trainer (`TBPTTTrainer.fit`: the loader, the window, the objective with
+the balance term, lazy AdamW, the update limit, the weight average, the route guard, a
+statistics step every 100), `configs/experiments/hsn_t_memory_words_carry_bal.yaml` on bio
+prose with the CUDA arm's lines (`profile=rtx3060`, `hardware.compile_mode=reduce-overhead`,
+`hardware.graph_alias_index=true`, `hardware.message_gradients=state`,
+`hardware.round_products=merged`), B 32, T 256, bf16, seed 0. 600 steps from scratch in a
+process of its own, the key off and on, twice, alternated; alone on the card under
+`BUSY_fused` (one hold for this and the card tests, 19:28:55 to 20:04:08). Not the
+experiment harness (`~/hsn-experiments/wev-fused/p2/step_time.py`).
+
+A step's time is `StepRecord.seconds`. Counted: steps 101 to 600 without the statistics steps
+and without the steps that compiled or captured (495 steps a run). Means, in ms; the second
+pair is the quiet one (host load 1.2 to 1.7; during the first pair another session's job put
+it at 4.9 for a while).
+
+| Windows | Key off | Key on | Saved | Phase 1b projected |
+| --- | ---: | ---: | ---: | ---: |
+| Laid out in 48 slots (230 of the 495) | 56.6 (57.0) | 44.1 (44.3) | **12.5** (12.7) | 12.4 |
+| Laid out in 64 slots (262) | 64.6 (65.0) | 45.7 (46.0) | **18.9** (19.0) | 18.9 |
+| Laid out in 80 slots (3; medians) | 72.4 (73.1) | 48.3 (48.3) | 24.0 (24.8) | 24.0 |
+| **All 495 steps** | **60.9** (61.3) | **45.1** (45.3) | **15.8** (16.0) | |
+| At the mix of the first 400 windows (203 / 195 / 2) | 60.6 | 44.9 | 15.7 | 15.65 |
+
+(First pair in brackets.)
+
+- **The step is 15.8 ms faster: 26 % less time, 1.35 times the steps per second.** The bar
+  was 14 ms.
+- **Read as a run's median the gain is smaller, about 12 ms.** Without the key the step has
+  two modes, 56.6 and 64.6 ms by layout, and a run's median lies on one of them: on the
+  48-slot one where those windows are the majority (the harness's 56.1 ms run median; 51 %
+  of the first 400 windows) and on the 64-slot one in these 495 steps (53 % of them: median
+  64.2 ms). With the key the modes are 1.6 ms apart: median 44.8 ms, p10 to p90 43.8 to
+  46.1 ms. So a harness run should read about 56 → 45 ms as medians, and 15 to 16 ms
+  less per step in wall time.
+- **A statistics step** (every 100): 247 ms without the key, 228 ms with it (three term
+  passes on the compiled window either way).
+- **Capture steps.** The 600 windows met 22 numbers of event slots (42 to 65 without 62 and
+  64). Each first meeting captures two CUDA graphs: about 45 ms more for that step, counted
+  as a compile step. A run meets a few more later, rarely.
+- **Start-up.** With the key, step 1 takes 17.6 s (the kernels' module, the first capture)
+  and the first statistics step 31.9 s (the event block compiles there), the second 1.7 s
+  (its graphs are recorded). Without it, steps 1 to 3 take 43.1, 1.7 and 2.7 s.
+- **Memory** (PyTorch's counters, the peak over the 600 steps): allocated 1,055 → 1,691 MB,
+  reserved 1,220 → 3,058 MB. The buffers of three layouts (48, 64, 80 slots) are about
+  0.6 GB; the rest of the reserved memory is the allocator's cache, which the eager node and
+  the padded outputs of 22 slot counts fill with more sizes than the compiled window's
+  graphs do. With `train.tbptt_windows = K` the buffers are K times as many.
+- **The losses** of the 600 steps are those of a run that learns (5.546 → 1.74 and 1.77
+  without the key, 1.73 and 1.77 with it; the mean over steps 251 to 300 is 2.16 and 2.14
+  without, 2.14 and 2.15 with). The first step's loss is 5.545694 without the key and
+  5.545691 with it. This says the block trains; it is no accuracy result.
+- **Two runs of one configuration are not bit-identical on the card:** the two runs without
+  the key have the same losses for four steps and part at the fifth (their gradient norms
+  differ from step 1), and so do the two with it (from step 20). A comparison of the paths
+  bit for bit is the CPU's ("The default path").
+
+**With `train.tbptt_windows=3`** (three windows a step in one segment, `train.grad_accum=3`,
+`hardware.compile_mode=default`: the `fields_xw_text` runs' settings), one short run each,
+90 steps, steps 21 to 89 counted (`xoff.json`, `xon.json`):
+
+| | Key off | Key on |
+| --- | ---: | ---: |
+| Step, median | 265.2 ms | **128.0 ms** |
+| Step, mean | 277.2 ms | 142.1 ms |
+| Peak allocated memory | 2,390 MB | 3,804 MB |
+
+- Without CUDA graphs the compiled blocks cost far more per window than under
+  `reduce-overhead` (88 against 61 ms), and the block's kernels keep their own graphs: the
+  step is about half.
+- The mean with the key still holds capture steps: three sets of buffers, 17 to 19 numbers
+  of slots each, 53 captures in these 270 windows (p90 187 ms). They thin out over a run.
+- Three sets of buffers: 1.4 GB more than without the key.
+- The first step's loss is 5.544821 on both paths; after 90 steps it is 2.6108 without the
+  key and 2.6103 with it.
+- One run each, not alternated, and short: a first reading, not a measurement of the kind
+  above.
+
+### Equality at the trainer
+
+`tests/test_wev_fused_trainer.py`. The block itself is tested in
+`tests/test_wev_fused_event.py` (phases 1 and 1b); these tests are the trainer's wiring.
+
+| Comparison | Result |
+| --- | --- |
+| **float64, CPU.** The trainer whose training windows run the block (its PyTorch reference, `trim` on; the configuration refuses the key on the CPU, so the test hands the trainer the block) against the eager trainer: four optimiser steps, lazy AdamW, the balance term, a statistics step every second step, documents that run across windows, refresh probes, an evaluation | losses, totals and loss parts within 1e-9; every step's raw gradient within 1e-8 of its largest entry; the parameters after every step within 1e-9; the statistics within 1e-8 (the term gradient norms 1e-5: they are reduced in fp32); the same selections at every window; the evaluation within 1e-9. Trim left slots out in the run |
+| The same with a soft warm-up of two steps | the same bounds; the block ran in the two hard-gate steps only |
+| The same with `train.tbptt_windows=2`, two segments a step, three steps | the same bounds; the windows took places 0, 1, 0, 1 and the second of each segment started from an attached state |
+| The gradient of joined windows minus that of the same windows detached (`tbptt_windows` 2 against 1), block against eager | the same difference (within 4e-8 of the gradient's largest entry), and it is a visible share of the gradient |
+| **fp32, on the card.** The trainer with the key (the kernels) against without it (`aot_eager` compiled blocks): three optimiser steps from a start whose every decision has a margin of 1e-4 (checked on both runs) | identical selections at every window; losses within 1e-5; raw gradients within 2e-4 of each tensor's largest entry (the compiled window's CUDA tolerance); parameters within 1e-3 (learning rate 1e-5: Adam turns an entry at the rounding level into a full step either way); statistics within 2e-4 |
+| The same with `train.tbptt_windows=2` (two steps, four windows each) | the same bounds; two sets of buffers, each with its own graphs |
+| **bf16, on the card:** three steps with and without the key | finite, every window fused, losses within 5 % (the two round differently) |
+| The logged refresh rate, block against eager, six steps (float64) | equal; equal to the mean over the slots that hold an event; in some windows the slots behind them hold padding rows' probes, which the old mean counted |
+
+### The default path
+
+- **In the code:** without the key the trainer builds no fused object
+  (`TBPTTTrainer._fused_events is None`, `CompiledWindow.fused_events is None`), and the
+  compiled window's only new step is one test of that `None` per window. `measured` has no
+  new key.
+- **Bit for bit, on the CPU** (`~/hsn-experiments/wev-fused/p2/default_path.py` on the tree
+  before this phase, the merge commit `9e066b2`, and on this one): five cases of the tiny
+  trainer over six steps in fp32 (eager and compiled, word events and per-byte, with and
+  without segments). **Identical in all five:** the final weights (their hash), every step's
+  loss, total, gradient norm, loss parts, active units and statistics, the evaluations and
+  the keys of `measured`. The one difference is the `refreshed` rate in the three
+  word-event cases, in 10 of their 18 steps (for example 0.0156 → 0.0500, and 0.0586 →
+  0.0208 where the old mean counted padding rows' probes behind the last event). The
+  per-byte cases are identical in everything.
+- **On the card** a bit comparison is not possible (above). The run of the tree before this
+  phase has the losses of this tree's runs without the key for four steps, as those two have
+  among themselves. (Its step time is not comparable: that checkout has no built trainer
+  kernels.)
+
+### Decisions made in this phase
+
+1. **The values are `compiled` and `fused`** (the plan below wrote `autograd`; the default path
+   is the compiled blocks, and `hardware.window` already uses `autograd` for another choice).
+2. **The rates' meaning** ("The refresh rate"): the default path's logged `refreshed` moves
+   with it.
+3. **The key needs a compiled window** (`hardware.compile_mode` not `none`), because the
+   term passes and the evaluation run there. An eager run is refused.
+4. **The buffers of the layouts are not shared.** Each layout (48, 64, 80 slots) has its own
+   buffers, as phase 1b measured it; a block could run any number of slots on the largest
+   layout's buffers and save about 0.4 GB. Not built.
+5. **What leaves the block is its own tensor:** the five selection records that were views of
+   the buffers when a window ran every slot of its layout are copied (a few small copies in
+   those windows only), so nothing a caller keeps is overwritten by the next window.
+6. **`configs/_example.yaml` is unchanged:** it lists no hardware key (they live in
+   `configs/hardware/<profile>.yaml`, where the opt-in ones are not listed either).
+
+### Phase 2: tests
+
+| What | Result |
+| --- | --- |
+| `tests/test_wev_fused_trainer.py` on the CPU (GPU hidden) | 38 passed, 3 skipped (the card tests) |
+| The same file and `tests/test_wev_fused_event.py` on the card | 101 passed (41 and 60) |
+| The reverse sweep's and the window kernels' card tests (six files; the kernels did not change) | 215 passed |
+| The whole suite on the CPU (GPU hidden, `-n 8`, thread caps) | 3,087 passed, 550 skipped (CUDA, MPS and kernel-build tests), 118 subtests passed |
+| `ruff check`, `ruff format --check`, `mypy --strict` on the changed modules | clean |
+
+## What phase 2 would take (as written before it)
 
 ### To train with it (the integration)
 
@@ -568,7 +822,9 @@ together, where 2.7 to 3.8 were estimated. The other rows are not built; the thi
    this block's).
 3. **The tape is the buffers.** One block's tape is valid until the next forward sweep (of
    any number of slots on the same layout, since phase 1b); the trainer's statistics steps
-   (one extra pass per loss term) and `tbptt_windows` need their own handling.
+   (one extra pass per loss term) and `tbptt_windows` need their own handling. (Phase 2:
+   the term passes run on the compiled window, and a segment's windows have a set of
+   buffers each.)
 4. **Scope.** Exploration, dense-fallback rows, the cost term and the per-row gradient limit
    are refused, not built; a recipe that turns one on trains on the compiled window.
 5. **A second hand-written derivative of the cell** beside the reverse sweep's. It is tested
@@ -580,7 +836,12 @@ together, where 2.7 to 3.8 were estimated. The other rows are not built; the thi
    (gradients within 3e-7). A key added to the round has to be added there too.
 7. **Trim changes what `info` holds** in the slots without an event (zeros where the model's
    loop leaves what it computed on padding rows) and the logged refresh rate. No gradient
-   reads them today; a later loss term that read every slot would see zeros there.
+   reads them today; a later loss term that read every slot would see zeros there. (Phase 2:
+   the logged rates no longer read those slots, on either path.)
+8. **Phase 2: a run with the key runs two forms of the event loop**, the block in its
+   training windows and the compiled blocks in its statistics steps and evaluations. Under
+   bf16 the two round differently, so a statistics step's term gradient norms are the
+   compiled window's, not the block's (within the distances of "bf16, on the card").
 
 ## Tests
 
@@ -630,6 +891,16 @@ tolerance (values 1.5e-5, gradients 2e-4, identical decisions), and bf16 under a
   `α` terms for `EventKernels.local` (`ReverseSweep.keep`), and a sweep can use another's
   buffers (`share`).
 - `tests/test_wev_fused_event.py`.
+- Phase 2: `python/hsn/config.py` (the key, `event_kernel_scope_error`, the hash),
+  `python/hsn/train/event_fused.py` (`FusedEvents`, `training_scope_error`),
+  `python/hsn/train/compile.py` (`CompiledWindow._run_events`, `fused_events_of`),
+  `python/hsn/train/tbptt.py` (the trainer: the block's place in a segment, the term passes,
+  the rates, `measured`), `python/hsn/runner.py` (the profile),
+  `python/hsn/experiments/spec.py` (the memory key), `tests/test_wev_fused_trainer.py`.
+  Outside the repository, `~/hsn-experiments/wev-fused/p2/`: `step_time.py` (the step) with
+  `off1.json`, `on1.json`, `off2.json`, `on2.json` and `base1.json` (the tree before this
+  phase), `default_path.py` and `compare_default.py` (the default path on the CPU),
+  `gate.py` / `cpu.sh` / `hold_open.sh` / `run.sh` (the CPU and card rules), the tests' logs.
 - Phase 1b, outside the repository, `~/hsn-experiments/wev-fused/p1b/`: `abt2.py` (the
   window against the compiled window, per variant), `mix.py` and `slots3.py` /
   `slots3.json` (the saving over the 400 windows), `eq2.py` (fp32 equality), `dbg_local.py`
