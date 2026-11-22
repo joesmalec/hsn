@@ -49,6 +49,14 @@ per layer (:meth:`HSN.front_layout`). 21 matrix products per position where ``se
 default, the round as it was) has 33, forward and backward together. The same dot products in
 other matmul shapes: equal to rounding, like the compiled window against the eager one.
 
+``hardware.event_kernel = fused`` (opt-in, 21 Nov 2026, ``docs/wev_fused_event.md``): on a
+training step with the straight-through gate the event loop of ``model.write_events`` runs as
+one fused block over the slots that hold an event (:class:`hsn.train.event_fused.FusedEvents`:
+a forward sweep of CUDA kernels without autograd, one autograd node, a backward pass by hand)
+in place of the compiled blocks (:meth:`CompiledWindow._run_events`); the prologue and the
+epilogue around it are the same eager code. Evaluation, a soft warm-up's steps and a statistics
+step's term passes run the compiled blocks as without the key.
+
 The compiled window matches eager ``HSN.forward`` to rounding (fused kernels round differently),
 not bit for bit; ``hardware.compile_mode = none`` leaves every path eager and unchanged.
 ``profile:rtx3060`` compiles by default (``reduce-overhead``, the user's decision of 7 Nov 2026);
@@ -124,6 +132,7 @@ from hsn.model.hsn import (
 )
 from hsn.model.router import BUDGET_SLACK, Scorer
 from hsn.model.state import CellGraphState
+from hsn.train.event_fused import FusedEvents
 
 __all__ = [
     "MAX_BLOCK",
@@ -136,6 +145,7 @@ __all__ = [
     "check_compile_scope",
     "compile_step",
     "compile_window",
+    "fused_events_of",
     "mps_inductor_options",
 ]
 
@@ -1385,6 +1395,7 @@ class CompiledWindow:
         backend: Backend,
         *,
         merged: bool = False,
+        fused_events: FusedEvents | None = None,
     ) -> None:
         self.model = model
         self.ctx = ctx
@@ -1393,6 +1404,9 @@ class CompiledWindow:
         #: ``hardware.round_products=merged``: the autograd window's blocks take the sparse
         #: round's matrix products merged (:meth:`_consts`); False: one product per map.
         self.merged = merged
+        #: ``hardware.event_kernel=fused``: what runs the event loop of a training step with
+        #: the straight-through gate (:meth:`_run_events`); ``None``: the compiled blocks.
+        self.fused_events = fused_events
         self.cuda_graphs = _uses_cuda_graphs(ctx, mode, backend)
         self._block = _compiler(mode, backend, ctx.device.type)(_block)
         self._bucket_blocks: dict[int, Any] = {0: self._block}
@@ -1472,7 +1486,11 @@ class CompiledWindow:
         dense_bucket = 0 if dense_indices is None else int(dense_indices.numel())
         controls = model._controls()
         key = self.variant(B, T, dense_bucket, capture)
-        new = self.is_new_variant(B, T, dense_bucket, capture)
+        # hardware.event_kernel=fused: a window whose event loop is the fused block runs no
+        # compiled graph, so it is no variant of one (the compiled blocks of the same key, a
+        # statistics step's term passes, still count their compile when they first run)
+        fused = self._fuses(controls)
+        new = not fused and self.is_new_variant(B, T, dense_bucket, capture)
         started = time.perf_counter()
         out = self._run(
             tokens,
@@ -1492,7 +1510,17 @@ class CompiledWindow:
                 torch.cuda.synchronize(self.ctx.device)
             self.compile_seconds += time.perf_counter() - started
             self._variants.add((*key, "warm") if key in self._variants else key)
+        elif fused and self.fused_events is not None and self.fused_events.captured:
+            # a number of event slots met for the first time: the kernels' CUDA graphs are
+            # captured in this step, which is then a compile step like any other
+            self.compile_seconds += time.perf_counter() - started
         return out
+
+    def _fuses(self, controls: _Controls) -> bool:
+        """``hardware.event_kernel=fused``: whether a window with these controls runs its
+        event loop as the fused block (:meth:`hsn.train.event_fused.FusedEvents.takes`)."""
+        fused = self.fused_events
+        return fused is not None and self.model.cfg.write_events != "byte" and fused.takes(controls)
 
     def release(self) -> None:
         """Drop the recorded CUDA graphs of every compiled variant and return their memory pools
@@ -1721,11 +1749,24 @@ class CompiledWindow:
         largest event count); the loop over blocks is eager, and every block's inputs are
         dense copies of its slots (:func:`_block_columns`: strides without ``E``), so no new
         graph is compiled for another number of slots. The per-byte reads run after the loop
-        (:meth:`HSN._event_epilogue`)."""
+        (:meth:`HSN._event_epilogue`).
+
+        With ``hardware.event_kernel=fused`` a training step with the straight-through gate
+        runs the slots as one fused block instead (:attr:`fused_events`), between the same
+        slots and the same epilogue."""
         model = self.model
         T = int(reset.shape[1])
         blk = block_size(T)
         ev = model._event_slots(pro, reset, blk)
+        if self._fuses(controls):
+            # hardware.event_kernel=fused (docs/wev_fused_event.md): the slots that hold an
+            # event as one fused block; the state it returns is its own (no graph memory)
+            assert self.fused_events is not None
+            with model.cell.window():
+                out = self.fused_events.block(
+                    state.h, state.q, state.age, ev, model.merged_consts(), controls
+                )
+            return model._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age = state.h, state.q, state.age
@@ -1878,6 +1919,7 @@ def compile_window(
     backend: Backend = "inductor",
     grad_accum: int = 1,
     merged: bool = False,
+    fused_events: FusedEvents | None = None,
 ) -> Callable[..., WindowOut]:
     """The training window of ``model`` at compile level ``mode`` (module docstring): ``none``
     returns the eager ``model.forward``; otherwise a :class:`CompiledWindow` (after
@@ -1885,9 +1927,16 @@ def compile_window(
     logged notice. ``backend`` is ``inductor`` (what ``hardware.compile_mode`` means); tests pass
     ``aot_eager`` where inductor's C++ toolchain is absent. ``merged``
     (``hardware.round_products=merged``): the blocks take the sparse round's matrix products
-    merged (:meth:`CompiledWindow._consts`, ``docs/word_event_speed.md``)."""
+    merged (:meth:`CompiledWindow._consts`, ``docs/word_event_speed.md``). ``fused_events``
+    (``hardware.event_kernel=fused``): what runs a training step's event loop
+    (:func:`fused_events_of`); it needs a compiled window, so ``none`` refuses it."""
     mode = _check_mode(mode)
     if mode == "none":
+        if fused_events is not None:
+            raise ValueError(
+                "hardware.event_kernel=fused needs a compiled window (hardware.compile_mode): "
+                "evaluation and the statistics steps' term passes run on it"
+            )
         return _eager_window(model)
     check_compile_scope(model, grad_accum=grad_accum, mode=mode)
     if ctx.device.type == "mps":
@@ -1901,8 +1950,27 @@ def compile_window(
                 ctx.device,
                 reason,
             )
+            if fused_events is not None:
+                raise ValueError(
+                    "hardware.event_kernel=fused needs a compiled window, and this device "
+                    f"does not compile ({reason})"
+                )
             return _eager_window(model)
-    return CompiledWindow(model, ctx, mode, backend, merged=merged)
+    return CompiledWindow(model, ctx, mode, backend, merged=merged, fused_events=fused_events)
+
+
+def fused_events_of(
+    model: HSN, event_kernel: str, *, segment_windows: int = 1
+) -> FusedEvents | None:
+    """``hardware.event_kernel`` as what :func:`compile_window` takes: ``None`` for
+    ``compiled``, and for ``fused`` the :class:`hsn.train.event_fused.FusedEvents` of
+    ``model`` on its device (``segment_windows``: ``train.tbptt_windows``). Raises with the
+    reason when the model, its device or the built kernels do not take the fused block."""
+    if event_kernel == "compiled":
+        return None
+    if event_kernel != "fused":
+        raise ValueError(f"hardware.event_kernel must be compiled or fused, got {event_kernel!r}")
+    return FusedEvents(model, segment_windows=segment_windows)
 
 
 # --------------------------------------------------------------------------------------------------

@@ -38,11 +38,19 @@ against; in float64 the block equals the autograd event loop to rounding
 Phase 1b: the block can run only the slots that hold an event (``trim`` of
 :func:`fused_event_block`), and the parameters' part of the backward pass has a form on the
 card that the block takes as ``local`` (:meth:`hsn.kernels.event.EventKernels.local`).
+
+Phase 2 (``hardware.event_kernel=fused``): :class:`FusedEvents` is what the trainer's compiled
+window (:meth:`hsn.train.compile.CompiledWindow._run_events`) runs in place of its compiled
+blocks on a training step with the straight-through gate: the block with ``trim`` on the
+card's kernels with the parameters' backward there too, one set of buffers per window of a
+gradient segment (``train.tbptt_windows``). Evaluation, a soft warm-up's steps and a
+statistics step's term passes keep the compiled blocks.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, NamedTuple
 
 import torch
@@ -51,7 +59,7 @@ from torch import Tensor, nn
 from torch.autograd.function import FunctionCtx, once_differentiable
 
 from hsn.model.cell import WindowConsts
-from hsn.model.hsn import HSN, _Controls
+from hsn.model.hsn import HSN, _Controls, _Events
 from hsn.train.state_gradient import (
     CellConstants,
     activation_grad,
@@ -65,6 +73,7 @@ __all__ = [
     "EventRun",
     "EventSpec",
     "EventWeights",
+    "FusedEvents",
     "event_spec",
     "event_weights",
     "forward_reference",
@@ -75,6 +84,7 @@ __all__ = [
     "scope_error",
     "sweep_buffered",
     "sweep_reference",
+    "training_scope_error",
 ]
 
 #: What a forward sweep writes for a block of ``E`` slots, ``[B, E, …]`` (``P`` is the products'
@@ -167,6 +177,8 @@ def scope_error(model: HSN, controls: _Controls | None = None) -> str | None:
         return f"model.routing={cfg.routing!r}: the fused event block needs topk"
     if controls.gate != "ste":
         return f"the gate of this step is {controls.gate!r}: the fused event block needs ste"
+    if model.ste_scope != "selected":
+        return f"train.ste_scope={model.ste_scope!r}: the masked round runs every cell"
     if controls.epsilon > 0.0:
         return "exploration (train.epsilon_*) is not built into the fused event block"
     if router.unit_credit != "executed":
@@ -195,9 +207,26 @@ def scope_error(model: HSN, controls: _Controls | None = None) -> str | None:
         return "model.cell_units=fixed is not built"
     if model.front_layout() is None:
         return "P and S do not share an activation: the merged front is not available"
-    if model.training and model.schedule.p_dense(model.train_step) > 0.0:
+    if model.schedule.p_dense_value > 0.0:
         return "train.p_dense > 0: dense-fallback rows are not built"
     return None
+
+
+def training_scope_error(model: HSN) -> str | None:
+    """:func:`scope_error` for the hard-gate training steps of ``model``'s schedule, whatever
+    mode and step the model is in now: what a trainer asks once, before its first window
+    (``hardware.event_kernel=fused``; :func:`hsn.config.event_kernel_scope_error` asks the
+    configuration the same). A soft warm-up is inside the scope: its steps are not the
+    block's."""
+    schedule = model.schedule
+    if schedule.gate_mode != "ste":
+        return f"train.gate_mode={schedule.gate_mode!r}: the fused event block needs ste"
+    if schedule.temperature_start != schedule.temperature_end:
+        return "a temperature ramp (train.temperature_start != temperature_end) is not built"
+    if schedule.epsilon_start > 0.0 or schedule.epsilon_end > 0.0:
+        return "exploration (train.epsilon_*) is not built into the fused event block"
+    controls = _Controls(gate="ste", tau=schedule.temperature_end, epsilon=0.0, probes=True)
+    return scope_error(model, controls)
 
 
 def event_spec(model: HSN, controls: _Controls | None = None) -> EventSpec:
@@ -1207,3 +1236,180 @@ def forward_events(
             product_dtype=product_dtype, runs=runs, trim=trim, local=local,
         )  # fmt: skip
     return model._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
+
+
+#: The records of :func:`fused_event_block` that are views of the card's buffers when the block
+#: ran every slot of its layout (with fewer slots they are padded copies).
+BUFFER_RECORDS: tuple[str, ...] = (
+    "unit_logits_d",
+    "sel_cell_idx",
+    "sel_unit_idx",
+    "sel_valid",
+    "sel_cost_per_row",
+)
+
+
+class FusedEvents:
+    """``hardware.event_kernel=fused`` (module docstring, phase 2): the event loop of a
+    training window as one :func:`fused_event_block` over the slots that hold an event
+    (``trim``), on the card's kernels with the parameters' backward there too
+    (:class:`hsn.kernels.event.EventKernelSet` with ``local``), as phase 1b measured it.
+
+    ``kernels=False``: the PyTorch references in the state's dtype (any device; the trainer
+    tests in float64). ``segment_windows``: the windows of a gradient segment
+    (``train.tbptt_windows``). A block's tape is the buffers, and a segment's one backward
+    pass reads every window's tape after the last window's forward pass, so each window of a
+    segment has a set of buffers of its own: :attr:`position` is the window's place in its
+    segment, set by the trainer before the window (0 without segments).
+
+    :meth:`takes` says whether a window's event loop is the block's: a training step with the
+    straight-through gate and a gradient. Evaluation and a soft warm-up's steps are not, and
+    a statistics step's term passes are taken out with :meth:`paused` (a retained backward
+    pass per loss term is the compiled window's work).
+
+    Raises ``ValueError`` for a model outside the scope (:func:`training_scope_error`) or a
+    shape the kernels do not take, and ``RuntimeError`` without the built kernels."""
+
+    def __init__(self, model: HSN, *, kernels: bool = True, segment_windows: int = 1) -> None:
+        reason = training_scope_error(model)
+        if reason is not None:
+            raise ValueError(f"hardware.event_kernel=fused does not take this model: {reason}")
+        if isinstance(segment_windows, bool) or segment_windows < 1:
+            raise ValueError(f"segment_windows must be an int >= 1, got {segment_windows!r}")
+        self.model = model
+        self.kernels = kernels
+        self.segment_windows = int(segment_windows)
+        #: The next window's place in its gradient segment: which set of buffers it takes.
+        self.position = 0
+        self.enabled = True
+        #: Windows whose event loop ran fused, and those of them that met a number of event
+        #: slots for the first time (their kernels' CUDA graphs are captured in that step).
+        self.calls = 0
+        self.captures = 0
+        #: Whether the last window captured, and its (slots run, slots of the layout).
+        self.captured = False
+        self.slots: tuple[int, int] = (0, 0)
+        self._sets: list[Any] = []
+        if kernels:
+            from hsn.kernels import event as event_kernels
+            from hsn.kernels import window as window_kernels
+
+            if model.device.type != "cuda":
+                raise ValueError(
+                    f"hardware.event_kernel=fused: the kernels are CUDA only, the model is on "
+                    f"{model.device}"
+                )
+            if model.dtype != torch.float32:
+                raise ValueError("hardware.event_kernel=fused: the kernels keep an fp32 state")
+            if not window_kernels.available():
+                raise RuntimeError(
+                    "hardware.event_kernel=fused: the window kernels are not built; run "
+                    "scripts/build_window_kernels.py"
+                )
+            spec = event_spec(model, _Controls("ste", model.schedule.temperature_end, 0.0, True))
+            n_scalars = model.scorer.in_features - 3 * spec.d - 1
+            shape = event_kernels.unsupported(spec, n_scalars)
+            if shape is None:
+                shape = event_kernels.local_unsupported(spec, n_scalars)
+            if shape is not None:
+                raise ValueError(f"hardware.event_kernel=fused: the kernels do not take {shape}")
+
+    def takes(self, controls: _Controls) -> bool:
+        """Whether a window with these controls runs its event loop as the fused block."""
+        return (
+            self.enabled
+            and self.model.training
+            and torch.is_grad_enabled()
+            and controls.gate == "ste"
+        )
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """Windows inside run the compiled blocks (a statistics step's term passes)."""
+        before, self.enabled = self.enabled, False
+        try:
+            yield
+        finally:
+            self.enabled = before
+
+    def _set(self) -> Any:
+        """The kernels of the window's place in its segment (``None``: the references)."""
+        if not self.kernels:
+            return None
+        if not 0 <= self.position < self.segment_windows:
+            raise ValueError(
+                f"window {self.position} of a gradient segment of {self.segment_windows}: the "
+                "fused event block has a set of buffers per window of a segment "
+                "(train.tbptt_windows)"
+            )
+        from hsn.kernels.event import EventKernelSet
+
+        while len(self._sets) <= self.position:
+            self._sets.append(EventKernelSet(forward_graph=True, local=True))
+        return self._sets[self.position]
+
+    def block(
+        self,
+        h: Tensor,
+        q: Tensor,
+        age: Tensor,
+        ev: _Events,
+        consts: WindowConsts,
+        controls: _Controls,
+    ) -> dict[str, Tensor]:
+        """A window's event loop: :func:`fused_event_block` with ``trim`` over the slots
+        ``ev`` (:meth:`HSN._event_slots`) from the state ``h``, ``q``, ``age``, inside the
+        cell's window with its merged constants. The products run in the autocast dtype
+        (bf16) under autocast and in the state's otherwise. What it returns is its own
+        tensors: nothing a caller keeps is a view of the buffers."""
+        kernel_set = self._set()
+        kind = h.device.type
+        product = torch.get_autocast_dtype(kind) if torch.is_autocast_enabled(kind) else None
+        if kernel_set is not None and product not in (None, torch.float32, torch.bfloat16):
+            raise ValueError(f"the fused event block's products run in fp32 or bf16, not {product}")
+        runs: list[EventRun] = []
+        fns: dict[str, Any] = {}
+        if kernel_set is not None:
+            fns = {
+                "forward": kernel_set.forward,
+                "sweep": kernel_set.sweep,
+                "pairs": kernel_set.pairs,
+                "local": kernel_set.local,
+            }
+        out = fused_event_block(
+            self.model, h, q, age, ev.z, ev.context, ev.scalars, ev.reset, ev.valid, consts,
+            controls, product_dtype=product, runs=runs, trim=True, **fns,
+        )  # fmt: skip
+        run = runs[0]
+        self.slots = (run.slots, run.total)
+        self.captured = False
+        if kernel_set is not None:
+            # a number of slots these buffers meet for the first time: its two CUDA graphs are
+            # captured in this step (the forward sweep's above, the reverse sweep's in the
+            # backward pass)
+            self.captured = kernel_set.last is not None and kernel_set.last.calls == 1
+            if run.slots == run.total:  # the block's own layout: views of the buffers
+                for key in BUFFER_RECORDS:
+                    out[key] = out[key].clone()
+        self.calls += 1
+        self.captures += int(self.captured)
+        return out
+
+    def describe(self) -> dict[str, Any]:
+        """Counts for the run's record: the fused windows, the captures, the buffer sets and
+        the slot counts each set has graphs for."""
+        counts = [
+            sorted(
+                kern.E
+                for shape in kernel_set.kernels.values()
+                for kern in shape.blocks()
+                if kern.calls
+            )
+            for kernel_set in self._sets
+        ]
+        return {
+            "windows": self.calls,
+            "captures": self.captures,
+            "buffer_sets": len(self._sets),
+            "slot_counts": counts,
+        }

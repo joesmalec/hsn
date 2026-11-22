@@ -668,6 +668,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
     if dump["hardware"]["message_gradients"] == "autocast":
         # likewise (18 Nov 2026): the messages' gradient dtype at its default stays out
         del dump["hardware"]["message_gradients"]
+    if dump["hardware"]["event_kernel"] == "compiled":
+        # likewise (21 Nov 2026): the event loop's kernel at its default stays out; with the
+        # fused block the step time and the memory change, and the arm has a key of its own
+        del dump["hardware"]["event_kernel"]
     if dump["model"]["memory"] is True:
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates

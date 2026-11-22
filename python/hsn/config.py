@@ -165,6 +165,12 @@ RoundProducts = Literal["separate", "merged"]
 #: ``V h``'s). ``autocast``: in the autocast dtype, as before. ``state``: in the state's dtype
 #: (fp32 under bf16 autocast). The forward values are the same bit for bit.
 MessageGradients = Literal["autocast", "state"]
+#: Opt-in (``hardware.event_kernel``, ``docs/wev_fused_event.md``): how a training window of the
+#: event loop (``model.write_events``) runs its event slots. ``compiled``: the compiled autograd
+#: window's blocks, as before. ``fused``: the slots that hold an event as one forward sweep of
+#: CUDA kernels without autograd, one autograd node and a backward pass written by hand
+#: (:mod:`hsn.train.event_fused`). The same equations; equal to rounding, not bit for bit.
+EventKernel = Literal["compiled", "fused"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal[
     "hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet", "moe"
@@ -1822,6 +1828,15 @@ class HardwareConfig(_StrictModel):
     # fp32 instead of bf16 (equal to rounding, not bit for bit). Needs the memory's cells
     # and a routed round on the autograd window.
     message_gradients: MessageGradients = "autocast"
+    # Opt-in (21 Nov 2026, docs/wev_fused_event.md): how a training window of the event loop
+    # (model.write_events) runs its event slots. compiled (default): the compiled autograd
+    # window's blocks, as before. fused: the slots that hold an event run as one fused block
+    # (hsn.train.event_fused): a forward sweep of CUDA kernels without autograd, one autograd
+    # node, the state's reverse sweep and the parameters' backward by hand. Evaluation, a soft
+    # warm-up's steps and a statistics step's term passes stay on the compiled window. The
+    # same equations, rounded differently (as any other compile of the window). CUDA only,
+    # and only the word-event recipe's round (event_kernel_scope_error names what is refused).
+    event_kernel: EventKernel = "compiled"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -1935,6 +1950,13 @@ class RunConfig(_StrictModel):
                 raise ValueError(
                     f"hardware.message_gradients={self.hardware.message_gradients} is not "
                     f"available for this configuration: {reason}"
+                )
+        if self.hardware.event_kernel != "compiled":
+            reason = event_kernel_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.event_kernel={self.hardware.event_kernel} is not available for "
+                    f"this configuration: {reason}"
                 )
         if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
@@ -2607,6 +2629,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.content_dropout_target",
     "model.unseen_bytes_as",
     "model.reader_qk_norm",
+    "hardware.event_kernel",
 )
 
 #: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
@@ -2738,6 +2761,137 @@ def message_gradients_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"hardware.window={cfg.hardware.window}: the split and fused windows take the "
             "messages in their own sweep and replay (not measured with the key)"
+        )
+    return None
+
+
+#: ``hardware.event_kernel=fused``: the limits of the kernels' shapes that a configuration
+#: shows (``kernels/cuda/hsn_event.cu``; :func:`hsn.kernels.event.unsupported` and
+#: :func:`hsn.kernels.event.local_unsupported` check the built model again, with the widths
+#: only it knows).
+EVENT_KERNEL_MAX_UNITS = 32
+EVENT_KERNEL_THREADS = 512
+EVENT_KERNEL_MAX_K = 16
+EVENT_KERNEL_MAX_IN_DEGREE = 8
+EVENT_KERNEL_MAX_WIDTH = 1024
+
+
+def event_kernel_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot train with ``hardware.event_kernel=fused``
+    (``docs/wev_fused_event.md``, :mod:`hsn.train.event_fused`), or ``None`` when it can. The
+    fused block is the word-event recipe's round on CUDA and nothing else: a configuration it
+    does not cover is refused here, with what it does not cover, instead of training on the
+    compiled window without a word. (:func:`hsn.train.event_fused.scope_error` checks the
+    built model against the same list.)
+
+    A soft warm-up (``train.soft_until_step``) is inside the scope: its steps run every cell
+    with autograd, on the compiled window, and the fused block takes over at the first
+    hard-gate step. So are ``train.tbptt_windows > 1`` (the block returns the gradient of the
+    state it started from; a set of buffers per window of a segment) and ``train.grad_accum``
+    where the compiled window takes them."""
+    model, train, hardware = cfg.model, cfg.train, cfg.hardware
+    if cfg.model_name not in HSN_MODEL_NAMES or not model.memory:
+        return f"model_name={cfg.model_name!r} without the memory's cells has no event loop"
+    if model.write_events == "byte":
+        return "model.write_events=byte: the memory runs at every byte, there is no event loop"
+    if hardware.device != "cuda":
+        return (
+            f"hardware.device={hardware.device}: the fused block's kernels are CUDA only "
+            "(kernels/cuda/hsn_event.cu)"
+        )
+    if hardware.compile_mode == "none":
+        return (
+            "hardware.compile_mode=none: evaluation, a soft warm-up and a statistics step's "
+            "term passes run on the compiled window, which this configuration does not build"
+        )
+    if hardware.window != "autograd":
+        return f"hardware.window={hardware.window}: the fused block is the autograd window's"
+    if hardware.master_dtype != "fp32" or train.precision not in ("bf16", "fp32"):
+        return (
+            f"hardware.master_dtype={hardware.master_dtype} with train.precision="
+            f"{train.precision}: the kernels keep the state in fp32 and multiply in fp32 or bf16"
+        )
+    if model.routing != "topk":
+        return f"model.routing={model.routing!r}: the fused block needs topk"
+    if train.gate_mode != "ste":
+        return f"train.gate_mode={train.gate_mode!r}: the fused block needs ste"
+    if train.ste_scope != "selected":
+        return f"train.ste_scope={train.ste_scope!r}: the masked round runs every cell"
+    if train.epsilon_start > 0.0 or train.epsilon_end > 0.0:
+        return "train.epsilon_*: exploration is not built into the fused block"
+    if train.p_dense > 0.0:
+        return f"train.p_dense={train.p_dense}: dense-fallback rows are not built"
+    if "cost" in train.aux_enabled or train.lambda_c > 0.0:
+        return (
+            "the cost term (train.aux_enabled / train.lambda_c): the expected cost leaves the "
+            "fused block without a gradient"
+        )
+    if train.state_grad_clip is not None or train.state_grad_ratio is not None:
+        return (
+            "train.state_grad_clip / state_grad_ratio: the per-row gradient limit is not built "
+            "into the block's reverse sweep"
+        )
+    if train.temperature_start != train.temperature_end:
+        return "a temperature ramp (train.temperature_start != temperature_end) is not built"
+    if train.unit_credit != "executed":
+        return f"train.unit_credit={train.unit_credit!r}: the fused block needs executed"
+    missing = [name for name in FEEDBACK_PATHS if name not in train.feedback_detach]
+    if missing != ["state"]:
+        return (
+            f"train.feedback_detach={list(train.feedback_detach)}: the fused block needs "
+            "[summary, eps, router] (the state gradient: the cell's read of the state carries "
+            "gradient, the other three reads are cut)"
+        )
+    if train.lambda_u > 0.0 or train.lambda_w > 0.0:
+        return "train.lambda_u / lambda_w: the probes and the write cost are per byte position"
+    if model.cell_norm != "rms" or model.cand_norm != "rms":
+        return (
+            f"model.cell_norm={model.cell_norm} / model.cand_norm={model.cand_norm}: both must "
+            "be rms"
+        )
+    if model.ablate_shared_u or model.disabled_cells:
+        return "model.ablate_shared_u and model.disabled_cells are not built"
+    if model.r_max != 1:
+        return f"model.r_max={model.r_max}: one round per event only"
+    if model.fast_cells or model.fast_readout:
+        return "fast cells (A8: model.fast_cells / fast_readout) are not built"
+    if model.write_gate:
+        return "model.write_gate (A10): the write decision is not built"
+    if model.cell_units != "routed":
+        return f"model.cell_units={model.cell_units!r}: the fused block needs routed units"
+    if not model.selected_readout:
+        return "model.selected_readout=false is not built (A5's read-out is in the block)"
+    if model.cell_attention_heads:
+        return (
+            f"model.cell_attention_heads={model.cell_attention_heads}: the attention read of "
+            "the cells is not built"
+        )
+    if model.scorer != "linear" or model.scorer_features.exclude:
+        return "the fused block needs the linear scorer without excluded features"
+    if model.address_gate and model.address_gate_input not in ("u", "summary"):
+        return (
+            f"model.address_gate_input={model.address_gate_input!r}: the gate on u or on the "
+            "summary only"
+        )
+    M, N, K, d = model.n_units, model.n_cells, model.k_select, model.d
+    if M & (M - 1) or M > EVENT_KERNEL_MAX_UNITS:
+        return f"model.n_units={M}: the kernels need a power of two <= {EVENT_KERNEL_MAX_UNITS}"
+    if N * M > EVENT_KERNEL_THREADS:
+        return (
+            f"model.n_cells * model.n_units = {N * M}: the kernels keep a thread per logit "
+            f"(<= {EVENT_KERNEL_THREADS})"
+        )
+    if K > EVENT_KERNEL_MAX_K:
+        return f"model.k_select={K}: the kernels take at most {EVENT_KERNEL_MAX_K} cells a slot"
+    if model.in_degree + model.random_edges > EVENT_KERNEL_MAX_IN_DEGREE:
+        return (
+            f"model.in_degree + model.random_edges = {model.in_degree + model.random_edges}: "
+            f"the kernels take an in-degree of at most {EVENT_KERNEL_MAX_IN_DEGREE}"
+        )
+    if 4 * d > EVENT_KERNEL_MAX_WIDTH or model.hidden > EVENT_KERNEL_MAX_WIDTH or d > 256:
+        return (
+            f"model.d={d} / model.hidden={model.hidden}: the kernels take d <= 256 and a "
+            f"hidden width <= {EVENT_KERNEL_MAX_WIDTH}"
         )
     return None
 

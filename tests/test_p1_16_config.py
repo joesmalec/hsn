@@ -147,6 +147,7 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "train.content_dropout_target",  # the learned unknown rows (opt-in)
         "model.unseen_bytes_as",
         "model.reader_qk_norm",  # the reader's normalised queries and keys (opt-in, 21 Nov)
+        "hardware.event_kernel",  # the fused word-event block (opt-in, 21 Nov 2026)
     )
     # evaluation-only sections are never hashed, whatever they hold (eval.*, 18 Nov 2026)
     assert HASH_EXCLUDED == ("eval",)

@@ -84,7 +84,7 @@ from hsn.profiler import (
 from hsn.train.amp import autocast_ctx
 from hsn.train.baseline_compile import compile_baseline
 from hsn.train.checkpoint import load_checkpoint
-from hsn.train.compile import apply_message_gradients, compile_window
+from hsn.train.compile import apply_message_gradients, compile_window, fused_events_of
 from hsn.train.loop import Batch, History, SequenceModel, StreamLoader, Trainer, detach_state
 from hsn.train.probes import choose_probe_position, probe_window, window_split
 from hsn.train.tbptt import TBPTTTrainer
@@ -496,6 +496,9 @@ def profile_run(
             cfg.hardware.compile_mode,
             grad_accum=cfg.train.grad_accum,
             merged=cfg.hardware.round_products == "merged",
+            # hardware.event_kernel=fused: the training pass runs the fused block, as the
+            # trainer's windows do (a new number of event slots captures its graphs once)
+            fused_events=fused_events_of(replica, cfg.hardware.event_kernel),
         )
         warm_windows = 2  # compile, then (CUDA Graphs) record
     elif not isinstance(replica, HSN):  # hardware.baseline_compile: the trainer's windows
