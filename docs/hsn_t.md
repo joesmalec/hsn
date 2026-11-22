@@ -25,6 +25,10 @@ adopted; first runs in progress.**
   (`model.reader_position`, `model.reader_positions`, `model.reader_rotary_pairs`,
   `model.reader_rotary_dtype`, `model.reader_rotary_base`; "The reader's positions" below). At their defaults the reader
   is the one described here, bit for bit, and they are left out of the hash the same way.
+- One more opt-in key of 21 Nov 2026, `model.reader_qk_norm`
+  (`docs/amendments/reader_qk_norm.md`): in the blocks it enables the attention's queries and
+  keys are normalised per head before the rotation, which bounds the logits. At its default `false` the reader is unchanged, bit for
+  bit, and the key is left out of the hash.
 - The memory's opt-in keys (fast cells, address n-grams, the address gate and its inputs, the
   write decision, the feedback cuts) mean the same in both families; the cell arithmetic is
   shared code.
