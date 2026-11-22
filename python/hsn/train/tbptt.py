@@ -168,6 +168,17 @@ window loop::
   first evaluation; ``measured["window_compile_seconds"]`` is every variant's compile and
   recording time, evaluation included); the probes and ``capture=True`` stay eager.
 
+* **The fused word-event block** (``hardware.event_kernel=fused``, opt-in,
+  ``docs/wev_fused_event.md``): the event loop (``model.write_events``) of a training step with
+  the straight-through gate runs as one fused block of CUDA kernels over the slots that hold an
+  event (:class:`hsn.train.event_fused.FusedEvents`, inside the compiled window), with a set
+  of buffers per window of a gradient segment. Evaluation, a soft warm-up's steps and a
+  statistics step's term passes run the compiled blocks. A step that meets a number of event
+  slots for the first time captures the kernels' CUDA graphs and is a compile step.
+  ``measured["fused_event_windows"]`` and ``["fused_event_captures"]`` count them (only with
+  the key). In an event window the ``explored``, ``refreshed`` and ``dense_fallback`` rates are
+  means over the slots that hold an event, with and without the key.
+
 * **Gradient spikes (P1.15).** With ``train.spike_factor`` set, a step whose finite global gradient
   norm exceeds that factor times the running median of the applied norms is skipped exactly like a
   non-finite one (:meth:`~hsn.train.loop.Trainer._guard_spike`): the same host float, read after
@@ -204,6 +215,7 @@ import logging
 import math
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -251,8 +263,10 @@ from hsn.train.compile import (
     CompiledWindow,
     apply_message_gradients,
     compile_window,
+    fused_events_of,
     install_graph_alias_index,
 )
+from hsn.train.event_fused import FusedEvents
 from hsn.train.grad_norm import clip_grad_norm_, norm_float64
 from hsn.train.lazy_adam import LazyAdamW, active_units_from_indices, active_units_packed
 from hsn.train.loop import FitCallback, History, StepRecord, StreamLoader, Trainer
@@ -546,15 +560,29 @@ class TBPTTTrainer(Trainer):
         self._compiled: CompiledWindow | None = None
         # opt-in (hardware.message_gradients): the dtype of the messages' gradient sums
         apply_message_gradients(model, cfg.hardware.message_gradients)
+        # opt-in (hardware.event_kernel=fused, docs/wev_fused_event.md): the event loop of a
+        # training step with the straight-through gate runs as one fused block of kernels,
+        # inside the compiled window (CompiledWindow._run_events); None: its compiled blocks
+        self._fused_events: FusedEvents | None = None
+        if cfg.hardware.event_kernel != "compiled" and not ctx.compile_enabled:
+            raise ValueError(  # the configuration refuses it; a hand-built one may not
+                f"hardware.event_kernel={cfg.hardware.event_kernel} needs a compiled window "
+                "(hardware.compile_mode): evaluation and the statistics steps' term passes "
+                "run on it"
+            )
         if ctx.compile_enabled:
             if cfg.hardware.graph_alias_index:  # opt-in: PyTorch's alias check by index
                 install_graph_alias_index()
+            self._fused_events = fused_events_of(
+                model, cfg.hardware.event_kernel, segment_windows=cfg.train.tbptt_windows
+            )
             window = compile_window(
                 model,
                 ctx,
                 cfg.hardware.compile_mode,
                 grad_accum=cfg.train.grad_accum,
                 merged=cfg.hardware.round_products == "merged",
+                fused_events=self._fused_events,
             )
             if isinstance(window, CompiledWindow):  # MPS without compile support: eager
                 self._compiled = window
@@ -706,13 +734,17 @@ class TBPTTTrainer(Trainer):
 
         def objective() -> dict[str, Tensor]:
             torch.set_rng_state(rng)
-            logits, _, info = self._forward(
-                dict(fwd),
-                state,
-                window=self._compiled,
-                reset_columns=reset_columns,
-                **self._address_kwargs(),
-            )
+            # hardware.event_kernel=fused: a term pass is the compiled blocks' (one retained
+            # backward pass per term is not the fused block's work)
+            fused = self._fused_events
+            with fused.paused() if fused is not None else nullcontext():
+                logits, _, info = self._forward(
+                    dict(fwd),
+                    state,
+                    window=self._compiled,
+                    reset_columns=reset_columns,
+                    **self._address_kwargs(),
+                )
             extras = auxiliary_terms(info, cfg, graph, reference_cost=reference_cost)
             terms = assemble_terms({"logits": logits, **info}, fwd, cfg, extras)
             terms = self._routing_terms(terms, info, int(fwd["loss_mask"].sum()))
@@ -931,7 +963,16 @@ class TBPTTTrainer(Trainer):
         floats.append(info["alpha_entropy"].float().mean())
         floats.append(info["cost"].float().mean())
         rates = tuple(key for key in ("explored", "refreshed", "dense_fallback") if key in info)
-        floats.extend(info[key].float().mean() for key in rates)
+        if "event_valid" in info:
+            # model.write_events: a rate is the mean over the slots in which some row has an
+            # event. The slots behind them (the layout is a multiple of the block) hold padding
+            # rows only: the compiled blocks run them and discard the result, the fused block
+            # (hardware.event_kernel=fused) does not run them, so they count in neither
+            held = info["event_valid"].any(dim=0)
+            n_held = held.sum().clamp_min(1)
+            floats.extend((info[key].float() * held).sum() / n_held for key in rates)
+        else:
+            floats.extend(info[key].float().mean() for key in rates)
         ints: list[Tensor] = []
         if count > 0:
             # the correct predictions at the loss positions. The argmax of every position and
@@ -1247,6 +1288,11 @@ class TBPTTTrainer(Trainer):
                     term_norms = self._compiled_term_norms(
                         fwd, state, reset_columns, probe, reference_cost, task_weight
                     )  # P2.8: before the window's own forward pass, from the same start state
+                if self._fused_events is not None:
+                    # hardware.event_kernel=fused: the window's place in its gradient segment
+                    # (a set of buffers per window: the segment's one backward pass reads
+                    # every window's tape)
+                    self._fused_events.position = window_index % per_segment
                 logits, state, info = self._forward(
                     fwd,
                     state,
@@ -1555,6 +1601,16 @@ class TBPTTTrainer(Trainer):
             "compiled_windows": float(self._compiled.calls if self._compiled is not None else 0),
             "window_compile_seconds": (
                 self._compiled.compile_seconds if self._compiled is not None else 0.0
+            ),
+            # hardware.event_kernel=fused: the windows whose event loop ran as the fused
+            # block, and those that captured the kernels' graphs for a new number of slots
+            **(
+                {
+                    "fused_event_windows": float(self._fused_events.calls),
+                    "fused_event_captures": float(self._fused_events.captures),
+                }
+                if self._fused_events is not None
+                else {}
             ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12
             **(
