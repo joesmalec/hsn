@@ -1,6 +1,6 @@
 """The word-event carry recipe with the balance loss and the reader's unrotated top block
-normalised (``configs/experiments/hsn_t_memory_words_carry_bal_qk.yaml``; proposed, adoption
-pending the user's decision).
+normalised (``configs/experiments/hsn_t_memory_words_carry_bal_qk.yaml``, the user's decision
+of 22 Nov 2026).
 
 It is ``hsn_t_memory_words_carry_bal.yaml`` (unchanged) with one key changed,
 ``model.reader_qk_norm=[false,false,false,true]`` (``docs/amendments/reader_qk_norm.md``, the

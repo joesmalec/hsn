@@ -1,5 +1,5 @@
 # hsn_t_memory_words_carry_bal_qk: the word-event carry recipe with the balance loss and the queries and keys of the
-# reader's unrotated top block normalised (QK norm). Proposed; adoption pending the user's decision.
+# reader's unrotated top block normalised (QK norm) (the user's decision of 22 Nov 2026).
 #
 # hsn_t_memory_words_carry_bal.yaml is unchanged (past runs and specs use it).
 # This file is hsn_t_memory_words_carry_bal.yaml with one key changed, written out:

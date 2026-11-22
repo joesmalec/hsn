@@ -355,8 +355,8 @@ forward plus backward.
 - The same with the paper's balance loss: `configs/experiments/hsn_t_memory_words_carry_bal.yaml`
   (21 Nov 2026: `train.aux_enabled=[balance]`, `train.lambda_b=0.02`; evidence in its header).
 - The same with the reader's unrotated top block normalised:
-  `configs/experiments/hsn_t_memory_words_carry_bal_qk.yaml` (22 Nov 2026, proposed, adoption
-  pending the user's decision: `model.reader_qk_norm=[false,false,false,true]`,
+  `configs/experiments/hsn_t_memory_words_carry_bal_qk.yaml` (the user's decision of
+  22 Nov 2026: `model.reader_qk_norm=[false,false,false,true]`,
   `docs/amendments/reader_qk_norm.md`; its CUDA arm adds `hardware.event_kernel=fused`; evidence
   in its header).
 - Spec, not queued: `~/hsn-experiments/remote/specs/mem_events.yaml`.
