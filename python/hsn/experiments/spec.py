@@ -647,6 +647,7 @@ _READER_POSITION_DEFAULTS: dict[str, Any] = {
     "reader_carry": 0,  # the reader's carried context (15 Nov 2026), likewise
     "reader_top_words": 0,
     "reader_mask": "document",  # the reader's attention mask (17 Nov 2026), likewise
+    "reader_qk_norm": False,  # the reader's normalised queries and keys (21 Nov 2026), likewise
 }
 #: The Transformer baseline's Transformer-XL keys (``baseline.transformer.*``, 17 Nov 2026) and
 #: their defaults: :func:`memory_key` leaves them out at these.
@@ -695,6 +696,14 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # out, so the arms from before the family keep their memory key (a gated_deltanet arm
         # of the default size is told apart by its model_name)
         del dump["baseline"]["gated_deltanet"]
+    if dump["model"]["zero_unseen_bytes"] is False:
+        # model.zero_unseen_bytes (docs/key_content.md) at its default stays out, for the same
+        # reason; train.content_dropout is a train.* key and so never in the memory key
+        del dump["model"]["zero_unseen_bytes"]
+    if dump["model"]["unseen_bytes_as"] == "own":
+        # model.unseen_bytes_as at its default stays out too; train.content_dropout_target is a
+        # train.* key (the unknown rows it adds are d + reader_width parameters)
+        del dump["model"]["unseen_bytes_as"]
     return digest(
         {
             "model_name": cfg.model_name,

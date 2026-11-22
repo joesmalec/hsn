@@ -466,6 +466,16 @@ class ModelConfig(_StrictModel):
     # with reader_span null, reader_carry 0 and data.align_docs true (RunConfig), and the reader
     # asserts on the device, without a host read, that no window has such a reset.
     reader_mask: Literal["document", "causal"] = "document"
+    # reader_qk_norm (docs/amendments/reader_qk_norm.md; opt-in, 21 Nov 2026): in an enabled
+    # block the attention's queries and keys are normalised per head after the projection and
+    # before the rotation: RMSNorm over a head's reader_width / reader_heads channels, with a
+    # learned weight of that width shared by the heads (one for the queries, one for the keys,
+    # initialised to 1) and the eps of the reader's LayerNorms. A logit is then at most
+    # max|g_q| * max|g_k| * sqrt(width / heads), whatever the qkv and norm_attn weights. The
+    # values are not normalised and the softmax scale stays 1 / sqrt(width / heads). true: every
+    # block; a list: one entry for each block, first to last (as reader_rotary_pairs). false
+    # (default): the reader as it was, the same parameters and outputs.
+    reader_qk_norm: bool | list[bool] = False
     # memory (docs/hsn_t_no_memory.md; opt-in, HSN-T only): false builds HSN-T without its
     # memory, a stateless model that is parallel over the window: the byte and context
     # embeddings, E, the reader, S and D, with no cells, router, units, graph, predictor or
@@ -520,7 +530,36 @@ class ModelConfig(_StrictModel):
     # 6). Read only with word_address; every other context keeps one word per byte.
     word_contexts: list[int] = [6]
     # --- end HSN-T ---
+    # --- Never-trained bytes (docs/key_content.md; opt-in, 15 Nov 2026; HSN and HSN-T) ---
+    # zero_unseen_bytes: a byte that no training window has held as an input has never received
+    # a gradient in its rows of the two byte-content tables (the byte embedding that feeds E
+    # and, in HSN-T, the reader's embedding): the rows are still their random start values,
+    # shrunk by the weight decay. With true, E and the reader read a zero row at such a byte,
+    # in training, at evaluation and at inference. The model keeps the bytes it has seen (a
+    # bool buffer of length vocab_size, in the state dict only with the key on) and the window
+    # trainer marks every training window's input bytes before the window runs. The fixed
+    # byte codes and the address features (A5, A9) are not read from these tables and are
+    # unchanged, as are the cells, the router and every equation. It changes what the model
+    # reads at a byte it was never trained on, which the user may decide as an amendment.
+    # false (default): both tables are read as they are, bit for bit.
+    zero_unseen_bytes: bool = False
+    # unseen_bytes_as (opt-in, 15 Nov 2026, docs/key_content.md): what E and the reader read at
+    # a never-trained byte, the same bytes as zero_unseen_bytes (the bytes no training window
+    # has held as an input, marked the same way), in every mode. "own" (default): the byte's own
+    # rows, bit for bit. "zero": a zero row; zero_unseen_bytes=true is its older spelling, and
+    # the two are refused together. "unknown": the learned "unknown" row of each table, the row
+    # that train.content_dropout_target=unknown trains at the dropped positions (needs it: the
+    # row is trained nowhere else).
+    unseen_bytes_as: Literal["own", "zero", "unknown"] = "own"
+    # --- end never-trained bytes ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
+
+    @property
+    def unseen_bytes_mode(self) -> Literal["own", "zero", "unknown"]:
+        """What a never-trained byte reads (``docs/key_content.md``): ``model.unseen_bytes_as``,
+        or ``"zero"`` with its older spelling ``model.zero_unseen_bytes = true``. Derived, not a
+        configuration key (it is not dumped or hashed)."""
+        return "zero" if self.zero_unseen_bytes else self.unseen_bytes_as
 
     @property
     def cell_input_width(self) -> int:
@@ -680,6 +719,12 @@ class ModelConfig(_StrictModel):
                     f"model.reader_mask={self.reader_mask} is the mask of model.reader's "
                     "attention; set model.reader=transformer or leave it at document"
                 )
+            if self.reader_qk_norm is not False:
+                raise ValueError(
+                    f"model.reader_qk_norm={self.reader_qk_norm} normalises the queries and "
+                    "keys of model.reader's attention; set model.reader=transformer or leave "
+                    "it false"
+                )
         else:
             if self.address_gate_input == "reader_prev" and self.reader_width != self.d:
                 raise ValueError(
@@ -709,6 +754,13 @@ class ModelConfig(_StrictModel):
                     f"model.reader_rotary_pairs={pairs} names {len(pairs)} blocks and the "
                     f"reader has model.reader_layers={self.reader_layers}: one count for each "
                     "block, or one number for all of them"
+                )
+            qk_norm = self.reader_qk_norm
+            if isinstance(qk_norm, list) and len(qk_norm) != self.reader_layers:
+                raise ValueError(
+                    f"model.reader_qk_norm={qk_norm} names {len(qk_norm)} blocks and the reader "
+                    f"has model.reader_layers={self.reader_layers}: one entry for each block, "
+                    "or one value for all of them"
                 )
             counts = pairs if isinstance(pairs, list) else [] if pairs is None else [pairs]
             if any(n < 0 or n > per_head // 2 for n in counts):
@@ -778,6 +830,20 @@ class ModelConfig(_StrictModel):
                     "model.memory=false: model.decoder_shortcut_dropout drops q and u so that "
                     "the decoder reads the selected cells, and there are none; leave it at 0"
                 )
+            if self.zero_unseen_bytes:
+                raise ValueError(
+                    "model.memory=false: model.zero_unseen_bytes is built into the window "
+                    "trainer of the model with its memory, which marks the bytes it trains on; "
+                    "the generic trainer of this model marks none, so every byte would read "
+                    "as zero. Leave it at false"
+                )
+            if self.unseen_bytes_as != "own":
+                raise ValueError(
+                    f"model.memory=false: model.unseen_bytes_as={self.unseen_bytes_as!r} is "
+                    "built into the window trainer of the model with its memory, which marks "
+                    "the bytes it trains on; the generic trainer of this model marks none, so "
+                    "every byte would be unseen. Leave it at 'own'"
+                )
         if self.cell_attention_heads:
             key = f"model.cell_attention_heads={self.cell_attention_heads}"
             if self.reader == "none":
@@ -845,6 +911,12 @@ class ModelConfig(_StrictModel):
                     f"ids below model.n_context={self.n_context}"
                 )
         # --- end HSN-T ---
+        if self.zero_unseen_bytes and self.unseen_bytes_as != "own":
+            raise ValueError(
+                f"model.zero_unseen_bytes=true with model.unseen_bytes_as="
+                f"{self.unseen_bytes_as!r}: zero_unseen_bytes=true is the older spelling of "
+                "unseen_bytes_as=zero (docs/key_content.md); set one of the two"
+            )
         return self
 
 
@@ -1203,6 +1275,27 @@ class TrainConfig(_StrictModel):
     # unseen keys against 85.8 % with its own. null (default): off, bit for bit. Hashed when
     # set.
     address_gate_hold_step: int | None = Field(default=None, ge=0)
+    # Opt-in (15 Nov 2026, docs/key_content.md), training only, HSN and HSN-T: byte-content
+    # dropout. In every training window each position is drawn with this probability, and at a
+    # drawn position the encoder E and, in HSN-T, the reader read a zero row in place of the
+    # byte's row of their content tables: the same positions for both, so the byte's content
+    # is gone there. The fixed byte codes and the address features (A5, A9) still see the
+    # byte, the prediction loss keeps its target, and no cell, router or gate equation
+    # changes. The positions come from a generator of their own, seeded with the run seed and
+    # the optimiser step, so a resumed or replayed step draws them again and the global random
+    # stream is never read. Evaluation and inference are unchanged. 0.0 (default): off, bit
+    # for bit. Hashed when set.
+    content_dropout: float = Field(default=0.0, ge=0.0, lt=1.0, allow_inf_nan=False)
+    # Opt-in (15 Nov 2026, docs/key_content.md): what a position drawn by train.content_dropout
+    # reads in place of its byte's content. "zero" (default): a zero row, as above, bit for
+    # bit. "unknown": a learned "unknown" row, one per content table (the byte embedding and,
+    # in HSN-T, the reader's embedding): a parameter of its own that exists only with this
+    # value, drawn as that table's rows are from a generator of its own, and trained by the
+    # dropped positions alone. So a missing content reads as "a byte whose content is not
+    # known" and not as a blank; model.unseen_bytes_as=unknown gives never-trained bytes the
+    # same row. Needs train.content_dropout > 0 (without a drawn position the row is never
+    # trained). Hashed when set.
+    content_dropout_target: Literal["zero", "unknown"] = "zero"
     # Opt-in, forward values unchanged (docs/a6_takeover_followup.md): which cells and units the
     # straight-through gradient of a routed training window can reach. "selected" (the default):
     # the sparse round computes the selected cells with their chosen unit only, so a cell or a
@@ -2000,6 +2093,72 @@ class RunConfig(_StrictModel):
                     "train.host_sync / train.fused_adamw (docs/trainer_host_sync.md): "
                     + "; ".join(refused)
                 )
+        # --- the byte-content options (docs/key_content.md) are built into the HSN's window ---
+        content = [
+            f"{key}={value}"
+            for key, value, on in (
+                ("train.content_dropout", self.train.content_dropout, self.train.content_dropout),
+                (
+                    "train.content_dropout_target",
+                    self.train.content_dropout_target,
+                    self.train.content_dropout_target != "zero",
+                ),
+                ("model.zero_unseen_bytes", "true", self.model.zero_unseen_bytes),
+                (
+                    "model.unseen_bytes_as",
+                    self.model.unseen_bytes_as,
+                    self.model.unseen_bytes_as != "own",
+                ),
+            )
+            if on
+        ]
+        if content:
+            if self.model_name not in HSN_MODEL_NAMES or not self.model.memory:
+                raise ValueError(
+                    f"{', '.join(content)}: the byte-content options act where the HSN's window "
+                    "reads a byte's content (the inputs of its encoder E and of HSN-T's reader) "
+                    "and are built into its window trainer, which draws the positions and marks "
+                    f"the bytes; model_name={self.model_name!r}"
+                    + ("" if self.model.memory else " with model.memory=false")
+                    + " is trained by the generic trainer: leave them at their defaults"
+                )
+            if self.hardware.window == "fused":
+                raise ValueError(
+                    f"{', '.join(content)} with hardware.window=fused is untested (the fused "
+                    "sweep runs on the card only); use hardware.window=split or autograd"
+                )
+        if self.train.content_dropout_target == "unknown" and self.train.content_dropout == 0.0:
+            raise ValueError(
+                "train.content_dropout_target=unknown names what a dropped position reads, and "
+                "with train.content_dropout=0.0 no position is dropped: the learned unknown "
+                "rows would never be trained. Set train.content_dropout > 0"
+            )
+        if (
+            self.model.unseen_bytes_as == "unknown"
+            and self.train.content_dropout_target != "unknown"
+        ):
+            raise ValueError(
+                "model.unseen_bytes_as=unknown reads the learned unknown rows, which only "
+                "train.content_dropout_target=unknown builds and trains (at the dropped "
+                "positions); got train.content_dropout_target="
+                f"{self.train.content_dropout_target!r}"
+            )
+        if self.train.content_dropout > 0.0 and self.train.lambda_u > 0.0:
+            raise ValueError(
+                f"train.content_dropout={self.train.content_dropout} with train.lambda_u > 0 is "
+                "untested: the counterfactual probes replay parts of a window, whose positions "
+                "would be drawn anew"
+            )
+        if self.train.content_dropout > 0.0 and self.train.tbptt_windows > 1:
+            raise ValueError(
+                f"train.content_dropout={self.train.content_dropout} with train.tbptt_windows="
+                f"{self.train.tbptt_windows}: the positions are drawn once per optimiser step "
+                "(from the run seed and the step), so every window of a gradient segment would "
+                "drop the same columns, and the segment's one backward pass would read a mask "
+                "that repeats every train.unroll positions instead of independent positions "
+                "(docs/key_content.md); leave train.tbptt_windows at 1"
+            )
+        # --- end byte-content options ---
         # --- P1.13: the cell group and the candidate norm act on the HSN cell only ---
         if self.model_name not in HSN_MODEL_NAMES:
             ignored = []
@@ -2443,6 +2602,11 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "train.reach_dropout_span",
     "baseline.gated_deltanet",
     "hardware.message_gradients",
+    "train.content_dropout",
+    "model.zero_unseen_bytes",
+    "train.content_dropout_target",
+    "model.unseen_bytes_as",
+    "model.reader_qk_norm",
 )
 
 #: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id

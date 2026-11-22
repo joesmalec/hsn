@@ -116,6 +116,19 @@ on the device, with no host read (no synchronisation; under ``torch.compile`` a 
 fused into the graph, CUDA graphs included); a reset after column 0 stops the run (on CUDA a
 device-side assert, which ends the process). At ``document`` (the default) nothing of this
 runs and the reader is the one above, bit for bit.
+
+Normalised queries and keys (``docs/amendments/reader_qk_norm.md``; opt-in, 21 Nov 2026).
+``model.reader_qk_norm`` (true for every block, or a list with one entry for each): in an
+enabled block the queries and the keys are normalised per head after the projection and before
+the rotation, ``q ← g_q ⊙ q / sqrt(mean(q²) + eps)`` over a head's ``w / H`` channels, and so
+for ``k`` with ``g_k`` (:func:`_head_norm`). ``g_q`` and ``g_k`` are parameters of width
+``w / H`` shared by the heads, initialised to 1, made without a random draw (every other
+parameter starts as it would without the key); ``eps`` is that of the block's LayerNorms. The
+values are not normalised and the softmax scale stays ``1 / sqrt(w / H)``, so a logit is at most
+``max|g_q| · max|g_k| · sqrt(w / H)`` (the rotation keeps a pair's length), whatever the qkv
+and LayerNorm weights. With ``model.reader_carry`` the cache holds the normalised keys, the
+keys the same positions have in a pass without the cache. At false (the default) a block has
+no such parameter and runs the code it ran, bit for bit.
 """
 
 from __future__ import annotations
@@ -128,6 +141,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import ModelConfig
+from hsn.model.embeddings import replace_content
 
 __all__ = ["Cache", "Reader", "word_bytes", "word_ends"]
 
@@ -196,6 +210,16 @@ def _rotate(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat([first * cos - second * sin, first * sin + second * cos], dim=-1)
 
 
+def _head_norm(x: Tensor, norm: nn.RMSNorm) -> Tensor:
+    """``model.reader_qk_norm``: ``x [B, H, T, w / H]`` (queries or keys) normalised over each
+    head's channels with ``norm``'s weight ``[w / H]`` (shared by the heads) and eps. Computed
+    in float32 at least (under bf16 autocast the projection's output is bf16) and returned in
+    ``x``'s dtype, the attention's working dtype."""
+    wide = x if x.dtype in (torch.float32, torch.float64) else x.float()
+    normed = F.rms_norm(wide, norm.normalized_shape, norm.weight.to(wide.dtype), norm.eps)
+    return normed.to(x.dtype)
+
+
 def _attention_bias(mask: Tensor, x: Tensor) -> Tensor:
     """Share SDPA's bool-to-additive conversion across the blocks of one window.
 
@@ -244,7 +268,14 @@ class _ReaderBlock(nn.Module):
     """One pre-norm block: causal multi-head self-attention with rotary positions and a GELU
     MLP, both residual."""
 
-    def __init__(self, width: int, heads: int, *, rotate_in: str = "working") -> None:
+    #: ``model.reader_qk_norm``: the queries' and the keys' RMSNorm over a head's channels
+    #: (:func:`_head_norm`); None in a block without it (no parameter, no state-dict entry)
+    q_norm: nn.RMSNorm | None
+    k_norm: nn.RMSNorm | None
+
+    def __init__(
+        self, width: int, heads: int, *, rotate_in: str = "working", qk_norm: bool = False
+    ) -> None:
         super().__init__()
         self.heads = heads
         #: ``model.reader_rotary_dtype``: "working" rotates in the dtype of the queries and keys,
@@ -256,6 +287,24 @@ class _ReaderBlock(nn.Module):
         self.norm_mlp = nn.LayerNorm(width)
         self.fc_in = nn.Linear(width, 4 * width)
         self.fc_out = nn.Linear(4 * width, width)
+        if qk_norm:  # made last and without a draw: the other parameters start as without it
+            per_head = width // heads
+            self.q_norm = nn.RMSNorm(per_head, eps=self.norm_attn.eps)
+            self.k_norm = nn.RMSNorm(per_head, eps=self.norm_attn.eps)
+        else:
+            self.q_norm = self.k_norm = None
+
+    def _project(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """The queries, keys and values ``[B, H, T, w / H]`` of ``x [B, T, w]``, not rotated;
+        with ``model.reader_qk_norm`` the queries and keys normalised per head."""
+        B, T, w = x.shape
+        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
+        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
+        k = k.view(B, T, self.heads, -1).transpose(1, 2)
+        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        if self.q_norm is not None and self.k_norm is not None:
+            q, k = _head_norm(q, self.q_norm), _head_norm(k, self.k_norm)
+        return q, k, v
 
     def forward(
         self, x: Tensor, mask: Tensor | None, cos: Tensor | None, sin: Tensor | None
@@ -264,10 +313,7 @@ class _ReaderBlock(nn.Module):
         ``None`` for no rotation (``model.reader_position = learned``). ``mask`` None: the
         causal mask (``model.reader_mask = causal``), SDPA's ``is_causal``."""
         B, T, w = x.shape
-        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
-        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
-        k = k.view(B, T, self.heads, -1).transpose(1, 2)
-        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        q, k, v = self._project(x)
         if cos is not None and sin is not None:
             if self.rotate_in == "parameters":  # in the cos / sin's dtype, then cast back
                 working = q.dtype
@@ -303,13 +349,10 @@ class _ReaderBlock(nn.Module):
         [B, H, N, w / H]`` (``model.reader_top_words``, the top block, which rotates nothing):
         ``N`` more columns after them, the mask ``[B, 1, T, C + T + N]``. Returns the output
         and the window's un-rotated keys and its values ``[B, H, T, w / H]`` (the next
-        cache's)."""
+        cache's; with ``model.reader_qk_norm`` the keys normalised, as the cached ones are)."""
         B, T, w = x.shape
         C = keys.shape[2]
-        q, k, v = self.qkv(self.norm_attn(x)).split(w, dim=-1)
-        q = q.view(B, T, self.heads, -1).transpose(1, 2)  # [B, H, T, w / H]
-        k = k.view(B, T, self.heads, -1).transpose(1, 2)
-        v = v.view(B, T, self.heads, -1).transpose(1, 2)
+        q, k, v = self._project(x)
         all_k = torch.cat([keys.to(k.dtype), k], dim=2)  # [B, H, C + T, w / H]
         all_v = torch.cat([values.to(v.dtype), v], dim=2)
         if cos is not None and sin is not None:
@@ -382,6 +425,16 @@ class Reader(nn.Module):
                 "model.reader_mask=causal is the document mask only without model.reader_span "
                 "and model.reader_carry"
             )
+        qk_norm = cfg.reader_qk_norm
+        #: ``model.reader_qk_norm`` for each block, first to last (module docstring)
+        self.qk_norm: list[bool] = (
+            list(qk_norm) if isinstance(qk_norm, list) else [qk_norm] * cfg.reader_layers
+        )
+        if len(self.qk_norm) != cfg.reader_layers:
+            raise ValueError(
+                f"model.reader_qk_norm={qk_norm} names {len(self.qk_norm)} blocks and the reader "
+                f"has {cfg.reader_layers}"
+            )
         half = width // heads // 2
         counts = (
             list(self.rotary_pairs)
@@ -402,8 +455,8 @@ class Reader(nn.Module):
             torch.set_rng_state(generator.get_state())
             self.emb = nn.Embedding(cfg.vocab_size, width)
             self.blocks = nn.ModuleList(
-                _ReaderBlock(width, heads, rotate_in=cfg.reader_rotary_dtype)
-                for _ in range(cfg.reader_layers)
+                _ReaderBlock(width, heads, rotate_in=cfg.reader_rotary_dtype, qk_norm=on)
+                for on in self.qk_norm
             )
             self.norm = nn.LayerNorm(width)
             for module in self.modules():
@@ -504,11 +557,60 @@ class Reader(nn.Module):
             mask = mask & ((distance < n) | ~rows[:, None, None])
         return mask[:, None]
 
+    def add_unknown_row(self, generator: torch.Generator) -> nn.Parameter:
+        """``train.content_dropout_target = unknown`` (``docs/key_content.md``): register and
+        return the learned "unknown" row ``emb_unknown`` ``[1, w]`` of the embedding table,
+        drawn as the table's rows are (normal, std 0.02) from ``generator``: the global random
+        stream is not read and no other parameter's start value changes. :meth:`forward` and
+        :meth:`read` read it at the positions they are told to (``unknown``). Without this call
+        the reader has no such parameter."""
+        if "emb_unknown" in self._parameters:
+            raise ValueError("this reader already has its unknown row")
+        weight = self.emb.weight
+        row = torch.empty(1, self.width, dtype=weight.dtype, device=weight.device)
+        nn.init.normal_(row, std=_INIT_STD, generator=generator)
+        self.emb_unknown = nn.Parameter(row)
+        return self.emb_unknown
+
+    def _embed(self, tokens: Tensor, blank: Tensor | None, unknown: Tensor | None) -> Tensor:
+        """The embedding rows of ``tokens [B, T]``, with the byte-content options of
+        ``docs/key_content.md``: a zero row where ``blank`` (bool ``[B, T]``) is True and the
+        learned unknown row (:meth:`add_unknown_row`) where ``unknown`` (bool ``[B, T]``, never
+        True where ``blank`` is) is. Only the content changes: the attention mask, the rotary
+        positions, the learned position table (added after this), the word ends of
+        ``model.reader_top_words`` and the cache's validity are those of the bytes as they are.
+        Both ``None`` (the default): the lookup as it was."""
+        x: Tensor = self.emb(tokens)
+        if blank is None and unknown is None:
+            return x
+        for name, mask in (("blank", blank), ("unknown", unknown)):
+            if mask is not None and (mask.shape != tokens.shape or mask.dtype is not torch.bool):
+                raise ValueError(
+                    f"{name} must be a bool tensor of the tokens' shape {tuple(tokens.shape)}, "
+                    f"got {mask.dtype} {tuple(mask.shape)}"
+                )
+        if unknown is not None and "emb_unknown" not in self._parameters:
+            raise ValueError(
+                "positions read the reader's unknown row, but it has none (add_unknown_row)"
+            )
+        row = self.emb_unknown if unknown is not None else None
+        return replace_content(x, blank, unknown, row)
+
     def forward(
-        self, tokens: Tensor, reset: Tensor, short: tuple[Tensor, int] | None = None
+        self,
+        tokens: Tensor,
+        reset: Tensor,
+        short: tuple[Tensor, int] | None = None,
+        *,
+        blank: Tensor | None = None,
+        unknown: Tensor | None = None,
     ) -> Tensor:
         """``c [B, T, w]``; ``short``: :meth:`attention_mask`'s, the rows that read with a
-        short span (``train.reach_dropout``; None, the default: every row as configured)."""
+        short span (``train.reach_dropout``; None, the default: every row as configured).
+        ``blank`` / ``unknown`` (bool ``[B, T]``; the byte-content options of
+        ``docs/key_content.md``): the positions at which the reader reads a zero row, and its
+        learned unknown row, in place of the byte's row of its embedding table (:meth:`_embed`;
+        None, the default: every row is read, the lookup unchanged)."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
@@ -533,7 +635,7 @@ class Reader(nn.Module):
                     "reader has model.reader_mask=causal (no mask)"
                 )
             _check_short(short, int(tokens.shape[0]))
-        x = self.emb(tokens)
+        x = self._embed(tokens, blank, unknown)
         T = int(tokens.shape[1])
         cos: Tensor | None
         sin: Tensor | None
@@ -711,6 +813,9 @@ class Reader(nn.Module):
         reset: Tensor,
         cache: Cache,
         short: tuple[Tensor, int] | None = None,
+        *,
+        blank: Tensor | None = None,
+        unknown: Tensor | None = None,
     ) -> tuple[Tensor, Cache]:
         """``model.reader_carry``: ``(c, cache)`` for the window ``tokens`` after the windows
         ``cache`` holds (module docstring, "Reading past the window"). ``c [B, T, w]`` is the
@@ -723,7 +828,14 @@ class Reader(nn.Module):
         in the cache was computed under the short span, so the caller keeps a document short
         or whole from its start to its end (the trainer holds a row's draw until its next
         document start, ``docs/reach_dropout.md``): such a document is read, cached positions
-        included, exactly as the reader with ``model.reader_carry = n − 1`` reads it."""
+        included, exactly as the reader with ``model.reader_carry = n − 1`` reads it.
+
+        ``blank`` / ``unknown``: :meth:`forward`'s (the byte-content options of
+        ``docs/key_content.md``), for the window's own positions. The cache holds the keys and
+        values of the positions of the windows before as they were computed when those
+        positions were the window: with the content those windows read (a position dropped in
+        its training window stays read without its content in the cache), never embedded
+        again."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
@@ -742,7 +854,7 @@ class Reader(nn.Module):
                     f"word slots (model.reader_top_words={N}) reach beyond any span"
                 )
             _check_short(short, B, T)
-        x = self.emb(tokens)
+        x = self._embed(tokens, blank, unknown)
         # the angles of the positions −C … T − 1: the window's as forward's, the cached ones
         # those of 1 … C with the sine's sign turned (cos is even, sin odd)
         cos_all, sin_all = self._rotation(max(T, C + 1), x)
@@ -825,4 +937,6 @@ class Reader(nn.Module):
             text += f", top_words={self.top_words}"
         if self.causal:
             text += ", mask=causal"
+        if any(self.qk_norm):
+            text += f", qk_norm={True if all(self.qk_norm) else self.qk_norm}"
         return text
