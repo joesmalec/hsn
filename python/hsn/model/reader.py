@@ -141,6 +141,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from hsn.config import ModelConfig
+from hsn.model.embeddings import replace_content
 
 __all__ = ["Cache", "Reader", "word_bytes", "word_ends"]
 
@@ -556,11 +557,60 @@ class Reader(nn.Module):
             mask = mask & ((distance < n) | ~rows[:, None, None])
         return mask[:, None]
 
+    def add_unknown_row(self, generator: torch.Generator) -> nn.Parameter:
+        """``train.content_dropout_target = unknown`` (``docs/key_content.md``): register and
+        return the learned "unknown" row ``emb_unknown`` ``[1, w]`` of the embedding table,
+        drawn as the table's rows are (normal, std 0.02) from ``generator``: the global random
+        stream is not read and no other parameter's start value changes. :meth:`forward` and
+        :meth:`read` read it at the positions they are told to (``unknown``). Without this call
+        the reader has no such parameter."""
+        if "emb_unknown" in self._parameters:
+            raise ValueError("this reader already has its unknown row")
+        weight = self.emb.weight
+        row = torch.empty(1, self.width, dtype=weight.dtype, device=weight.device)
+        nn.init.normal_(row, std=_INIT_STD, generator=generator)
+        self.emb_unknown = nn.Parameter(row)
+        return self.emb_unknown
+
+    def _embed(self, tokens: Tensor, blank: Tensor | None, unknown: Tensor | None) -> Tensor:
+        """The embedding rows of ``tokens [B, T]``, with the byte-content options of
+        ``docs/key_content.md``: a zero row where ``blank`` (bool ``[B, T]``) is True and the
+        learned unknown row (:meth:`add_unknown_row`) where ``unknown`` (bool ``[B, T]``, never
+        True where ``blank`` is) is. Only the content changes: the attention mask, the rotary
+        positions, the learned position table (added after this), the word ends of
+        ``model.reader_top_words`` and the cache's validity are those of the bytes as they are.
+        Both ``None`` (the default): the lookup as it was."""
+        x: Tensor = self.emb(tokens)
+        if blank is None and unknown is None:
+            return x
+        for name, mask in (("blank", blank), ("unknown", unknown)):
+            if mask is not None and (mask.shape != tokens.shape or mask.dtype is not torch.bool):
+                raise ValueError(
+                    f"{name} must be a bool tensor of the tokens' shape {tuple(tokens.shape)}, "
+                    f"got {mask.dtype} {tuple(mask.shape)}"
+                )
+        if unknown is not None and "emb_unknown" not in self._parameters:
+            raise ValueError(
+                "positions read the reader's unknown row, but it has none (add_unknown_row)"
+            )
+        row = self.emb_unknown if unknown is not None else None
+        return replace_content(x, blank, unknown, row)
+
     def forward(
-        self, tokens: Tensor, reset: Tensor, short: tuple[Tensor, int] | None = None
+        self,
+        tokens: Tensor,
+        reset: Tensor,
+        short: tuple[Tensor, int] | None = None,
+        *,
+        blank: Tensor | None = None,
+        unknown: Tensor | None = None,
     ) -> Tensor:
         """``c [B, T, w]``; ``short``: :meth:`attention_mask`'s, the rows that read with a
-        short span (``train.reach_dropout``; None, the default: every row as configured)."""
+        short span (``train.reach_dropout``; None, the default: every row as configured).
+        ``blank`` / ``unknown`` (bool ``[B, T]``; the byte-content options of
+        ``docs/key_content.md``): the positions at which the reader reads a zero row, and its
+        learned unknown row, in place of the byte's row of its embedding table (:meth:`_embed`;
+        None, the default: every row is read, the lookup unchanged)."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
@@ -585,7 +635,7 @@ class Reader(nn.Module):
                     "reader has model.reader_mask=causal (no mask)"
                 )
             _check_short(short, int(tokens.shape[0]))
-        x = self.emb(tokens)
+        x = self._embed(tokens, blank, unknown)
         T = int(tokens.shape[1])
         cos: Tensor | None
         sin: Tensor | None
@@ -763,6 +813,9 @@ class Reader(nn.Module):
         reset: Tensor,
         cache: Cache,
         short: tuple[Tensor, int] | None = None,
+        *,
+        blank: Tensor | None = None,
+        unknown: Tensor | None = None,
     ) -> tuple[Tensor, Cache]:
         """``model.reader_carry``: ``(c, cache)`` for the window ``tokens`` after the windows
         ``cache`` holds (module docstring, "Reading past the window"). ``c [B, T, w]`` is the
@@ -775,7 +828,14 @@ class Reader(nn.Module):
         in the cache was computed under the short span, so the caller keeps a document short
         or whole from its start to its end (the trainer holds a row's draw until its next
         document start, ``docs/reach_dropout.md``): such a document is read, cached positions
-        included, exactly as the reader with ``model.reader_carry = n − 1`` reads it."""
+        included, exactly as the reader with ``model.reader_carry = n − 1`` reads it.
+
+        ``blank`` / ``unknown``: :meth:`forward`'s (the byte-content options of
+        ``docs/key_content.md``), for the window's own positions. The cache holds the keys and
+        values of the positions of the windows before as they were computed when those
+        positions were the window: with the content those windows read (a position dropped in
+        its training window stays read without its content in the cache), never embedded
+        again."""
         if tokens.ndim != 2 or reset.shape != tokens.shape or reset.dtype is not torch.bool:
             raise ValueError(
                 f"Reader needs tokens [B, T] and a bool reset of the same shape, got "
@@ -794,7 +854,7 @@ class Reader(nn.Module):
                     f"word slots (model.reader_top_words={N}) reach beyond any span"
                 )
             _check_short(short, B, T)
-        x = self.emb(tokens)
+        x = self._embed(tokens, blank, unknown)
         # the angles of the positions −C … T − 1: the window's as forward's, the cached ones
         # those of 1 … C with the sine's sign turned (cos is even, sin odd)
         cos_all, sin_all = self._rotation(max(T, C + 1), x)
