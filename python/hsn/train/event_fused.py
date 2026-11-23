@@ -1408,8 +1408,9 @@ class FusedEvents:
         return out
 
     def describe(self) -> dict[str, Any]:
-        """Counts for the run's record: the fused windows, the captures, the buffer sets and
-        the slot counts each set has graphs for."""
+        """Counts for the run's record: the fused windows, the captures, the buffer sets, the
+        slot counts each set has graphs for, the slots each set's buffers are laid out for and
+        the times a set's buffers grew (:class:`hsn.kernels.event.EventKernelSet`)."""
         counts = [
             sorted(
                 kern.E
@@ -1424,4 +1425,6 @@ class FusedEvents:
             "captures": self.captures,
             "buffer_sets": len(self._sets),
             "slot_counts": counts,
+            "buffer_slots": [[s.E for s in k.kernels.values()] for k in self._sets],
+            "buffers_grown": [k.grown for k in self._sets],
         }

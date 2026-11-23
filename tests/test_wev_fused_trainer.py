@@ -744,6 +744,8 @@ def test_segments_on_two_sets_of_buffers_fp32_cuda(tmp_path: Path, eager_kernels
     assert fused is not None and fused.calls == 4 * steps
     described = fused.describe()
     assert described["buffer_sets"] == 2 and all(described["slot_counts"])
+    # one memory pool for the graphs of both sets (their replays take turns on one stream)
+    assert fused._sets[0].pool is fused._sets[1].pool is fused._pool is not None
     assert [w["position"] for w in got["windows"]] == [0, 1, 0, 1] * steps
     assert [w["start_grad"] for w in got["windows"]] == [False, True, False, True] * steps
     _assert_same_run(got, ref, loss=1e-5, grad=2e-4, param=1e-3, stats=2e-4)

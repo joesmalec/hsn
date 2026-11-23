@@ -14,6 +14,7 @@ and a hand-written backward pass.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -677,6 +678,83 @@ def test_trimmed_kernels_share_their_buffers_cuda(local: bool) -> None:
         scale = max(1.0, float(want["logits"].abs().max()))
         _assert_same(want, got, value=1.5e-5 * scale, grad=2e-4)
     assert len(seen) == 2, "the two windows must hold different numbers of event slots"
+
+
+def _identical(ref: dict[str, Any], got: dict[str, Any]) -> None:
+    """``got`` is ``ref`` bit for bit: the loss, the logits, the final state, every entry of
+    ``info`` and every gradient."""
+    assert torch.equal(got["loss"], ref["loss"])
+    assert torch.equal(got["logits"], ref["logits"])
+    for name in ("h", "q", "age", "pos"):
+        assert torch.equal(getattr(got["final"], name), getattr(ref["final"], name)), name
+    assert set(got["info"]) == set(ref["info"])
+    for key, want in ref["info"].items():
+        assert torch.equal(got["info"][key].detach(), want.detach()), key
+    assert set(got["grads"]) == set(ref["grads"])
+    for name, want in ref["grads"].items():
+        assert torch.equal(got["grads"][name], want), name
+
+
+@pytest.fixture
+def deterministic(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Deterministic algorithms for a bit-for-bit comparison (the parameters' backward sums
+    the edge weights' gradient with ``index_add_``, whose CUDA kernel adds atomically
+    otherwise)."""
+    monkeypatch.setenv(
+        "CUBLAS_WORKSPACE_CONFIG", os.environ.get("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    )
+    before = (torch.are_deterministic_algorithms_enabled(),
+              torch.is_deterministic_algorithms_warn_only_enabled())  # fmt: skip
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    yield
+    torch.use_deterministic_algorithms(before[0], warn_only=before[1])
+
+
+@needs_card
+@pytest.mark.parametrize("product", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("local", [False, True])
+def test_layouts_share_the_largest_buffers_and_one_pool_cuda(
+    product: torch.dtype, local: bool, deterministic: None
+) -> None:
+    """Windows of two layouts (16 and 32 event slots) on one set of kernels, the smaller
+    first: the larger replaces the set's buffers once (``grown``), and the smaller then runs on
+    the larger's (``EventKernels.at``), trimmed and not. Every window equals, bit for bit, the
+    same window on a set of its own (the same launches on other memory), and every CUDA graph
+    of the set was captured into the set's one memory pool."""
+    from hsn.kernels import event as ek
+
+    model, small, _ = _card_case(torch.float32)
+    pd = None if product == torch.float32 else product
+    # a word end every second byte and a document start at column 0: 17 event slots (no
+    # margin needed: both sides run the same kernels, so they take the same decisions)
+    tokens, ctx, state, reset = _inputs(model, seed=4, b=6, t=32)
+    tokens[1:, 0::2] = tokens[1:, 0::2].clamp(min=97)
+    tokens[1:, 1::2] = 32
+    large = (tokens, ctx, state, reset)
+    assert _margins(model, small)[1] <= 16 < _margins(model, large)[1]
+
+    def on(kernels: Any, trim: bool) -> Window:
+        def window(*a: Any) -> Any:
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=pd is not None):
+                logits, final, info = ef.forward_events(
+                    model, *a, forward=kernels.forward, sweep=kernels.sweep,
+                    pairs=kernels.pairs, product_dtype=pd, trim=trim,
+                    local=kernels.local if local else None,
+                )  # fmt: skip
+            return logits.float(), final, info
+
+        return window
+
+    shared = ek.EventKernelSet(local=local)
+    for case, trim in ((small, True), (large, True), (small, True), (small, False), (large, False)):
+        got = _run(model, on(shared, trim), case, _objective_live)
+        alone = _run(model, on(ek.EventKernelSet(local=local), trim), case, _objective_live)
+        _identical(alone, got)
+    assert shared.grown == 1 and len(shared.kernels) == 1
+    (root,) = shared.kernels.values()
+    assert root.E == 32
+    graphs = [g for k in root.blocks() for g in (k._forward_graph, k.back._graph) if g is not None]
+    assert len(graphs) >= 4 and {tuple(g.pool()) for g in graphs} == {tuple(shared.pool)}
 
 
 @needs_card
