@@ -1,7 +1,10 @@
-# Keyed word cells (HSN-T; opt-in key, 22 Nov 2026; stage 1: the by-rule table)
+# Keyed word cells (HSN-T; opt-in key, 22 Nov 2026; stage 1: the by-rule table; stage 2: the HSN's write)
 
-Status: **stage 1 of a staged build, built on 22 Nov 2026 as an opt-in key; no training run
-yet beyond two 220-step timing runs.** Branch `claude/word-cells` (on main 30bb802). The design is
+Status: **both stages built on 22 Nov 2026 as opt-in keys. Stage 1 (the by-rule table) has its
+9k screens (below). Stage 2 (the HSN's own write, `word` and `cell`, and candidate 2,
+`address`) is built and untrained: its only runs are test steps and timing runs.** Stage 2 is
+described in ["Stage 2"](#stage-2-the-hsns-write-and-candidate-2) at the end; the sections
+before it are stage 1's, as written. Branch `claude/word-cells` (on main 30bb802). The design is
 `~/hsn-handoff/MEMORY-REDESIGN-2026-11-22.md` (candidate 1), which answers the diagnosis of
 `~/hsn-experiments/qknorm-runs/links_probe/RESULTS.md`. The user approved it on 22 Nov 2026 with
 two decisions: the identity question is accepted (below), and the build is staged.
@@ -10,15 +13,18 @@ two decisions: the identity question is accepted (below), and the build is stage
   machinery with the value written by rule (`model.word_cells_value=bytes`). No unit, gate or
   message of the HSN writes these cells. The arm answers one question: does the decoder learn
   to use a store that is right by rule beyond the reader's sight? The HSN's write (`word`,
-  `cell`) and candidate 2 (`address`) are stage 2 and are built only if this arm is used.
+  `cell`) and candidate 2 (`address`) are stage 2 and are built only if this arm is used. It
+  was (9k steps, seed 0: swap Delta past 256 bytes +0.748 code native, +0.912 bio prose, all of
+  it in the transplanted keyed cells), so stage 2 is built.
 - `model.word_cells: off | hash` (default `off`), `model.word_cells_value: bytes`,
   `model.word_cells_n` (1024), `model.word_cells_ways` (2), `model.word_cells_levels` (3),
   `model.word_cells_min_len` (1). A spec arm: `model.word_cells=hash` on
   `hsn_t_memory_words_carry_bal_qk.yaml` (spell `model.word_cells_value=bytes` too if the arm
   should say so; it is the default and hashes the same).
 - At the default nothing changes: no module, no state, no decoder column, no `info` entry; the
-  six keys are left out of the configuration hash, the arm's view and the memory key, so every
-  arm id stays. A model built without the key gives main's outputs bit for bit.
+  six keys (eight with stage 2's) are left out of the configuration hash, the arm's view and
+  the memory key, so every arm id stays. A model built without the key gives main's outputs
+  bit for bit.
 
 ## The rule
 
@@ -184,3 +190,210 @@ the eager window; gradients; statistics; refusals; two CUDA tests on the recipe'
 - `python/hsn/config.py`: the keys, the refusals, `HASH_OMIT_AT_DEFAULT`;
   `python/hsn/experiments/spec.py`: the memory key; `python/hsn/train/memory_plan.py`:
   `word_cells_param_count`; `python/hsn/train/tbptt.py`: the resume and the statistics.
+
+## Stage 2: the HSN's write and candidate 2
+
+Built on 22 Nov 2026 after stage 1's table was used; **untrained**. The question it is built to
+answer: can the HSN's own write fill these cells as usefully as the rule does? If only `bytes`
+works, the part that helps is a table and not the HSN, which is a decision for the user. So
+the write below is the cell update of the identity with nothing tuned toward the table.
+
+Keys (all opt-in; at their defaults every stage 1 arm keeps its outputs, bit for bit, and its
+hash, arm view and memory key):
+
+- `model.word_cells_value: bytes | word | cell` (default `bytes`);
+  `model.word_cells_gate_bias` (3.0; where `beta_K` starts; read only with `word | cell`).
+- `model.word_cells: off | hash | address`; `model.word_cells_kappa` (4.0; read only with
+  `address`).
+- Spec arms on `hsn_t_memory_words_carry_bal_qk.yaml`:
+  - `model.word_cells=hash`, `model.word_cells_value=word` (or `cell`);
+  - `model.word_cells=address`, `model.word_cells_n=256`, `model.word_cells_value=word` (or
+    `cell`); the default of `word_cells_n` stays 1,024, so the arm spells the memo's 256;
+  - the cross-window gradient: `train.tbptt_windows=3`, `train.grad_accum=3`,
+    `hardware.compile_mode=default` (a segment cannot run under CUDA graphs); its detached
+    twin is `train.grad_accum=3` alone.
+
+### The write (`word`, `cell`)
+
+Deferred as in stage 1: once per key per window, after the event loop, with the model's values
+at the key's last word end `e` of the window (`u_e`, the error `eps_e` as the cell reads it,
+the scorer's scalars at `e`, the routed cells as event `e` left them).
+
+```
+1. kappa_i = k for a cell i of C(k):   the key writes there                        (by rule)
+2. else: i* = the scorer's best cell of C(k) among the cells no write of this window has taken:
+   max_j of its logits on [u_e ; eps_e ; h^K_i ; age_i ; the event's scalars], ties to the lower
+   way. Several keys on one cell: the latest word end takes it (the longer prefix)
+3. a key that lost in 2 asks once more, as in 2; what loses again is not written
+then, for the cell i* of key k = (l, ..) of word w:
+   h      = h^K_i*, or 0 when kappa_i* != k                         (the clear on a new key)
+   m      = sum_{j in N(i*)} a_{i*j} V h_{j,e}                       D_g fixed in-edges from routed cells
+   v      = RMSNorm([u_e + V_s s_l(w) ; eps_e ; h ; m])              cell: without V_s s_l(w)
+   cand   = tanh(alpha * RMSNorm_g(W_out F_j*(v)))                   j* = argmax_j of the cell's logits
+   b      = sigmoid(B v + beta + beta_K)
+   h^K_i* <- (1 - b) * h + b * cand ;   kappa_i* <- k ;   tau_i* <- pos_e
+```
+
+- `RMSNorm`, the units `F`, `W_out`, `RMSNorm_g`, `V`, the gate `B` with its bias `beta` and the
+  scorer are the routed cells' own modules. New parameters: the in-edge logits (`N_s x D_g`,
+  zero at the start, normalised as `model.edge_norm`), `beta_K` (`d`, starts at 3) and, for
+  `word`, `V_s` (`d x d`, `model.state_init`): 4,160 (`cell`) and 8,256 (`word`) at the
+  recipe's sizes, 3,401,593 and 3,405,689 trainable parameters in all.
+- `alpha` is 1 forward and carries the straight-through gradient of the choice, as in a
+  routed slot (`train.unit_credit` for the unit; the cell against the midpoint to the best free
+  candidate it was preferred to, when there was one). In evaluation it is the constant 1.
+- The scorer's features of a keyed cell: the two running averages and the address features
+  are zero, and the age is `log(1 + min(age, 4096) / 256)` with the age in bytes since the
+  cell's last write (a cell that holds nothing: 4,096). `train.feedback_detach`'s `router` cut
+  applies as it does to a routed cell (the features are constants in the backward pass).
+- The read is stage 1's (the tag match, `U`, the two age inputs). The cells stay in `[-1, 1]`.
+
+### The gradient into the write
+
+A write is read from the next window on, so with every window detached (the default) no loss
+reaches it: `V_s`, `beta_K` and the in-edge logits then stay at their start for the whole run,
+and the write runs on the shared units as the routed path trains them. With
+`train.tbptt_windows = K > 1` the trainer carries the cells with their gradient inside a
+segment (`address_history(..., attached=True)`; the last window of a segment hands them on
+detached), and the later windows' reads train the write's own parameters, the units, the gate,
+`W_out`, `V`, the scorer (through `alpha`) and, through `u_e`, `S` and the reader. The units a
+keyed write ran count as active for lazy AdamW in the windows whose cells stay attached.
+
+### Candidate 2 (`model.word_cells=address`)
+
+No hash and no tag. Every cell has a fixed address `A_i` (drawn as A5's cell addresses), and
+`W_l(k)` is the exact word code (`model.word_address=exact`: A-Z folded, one byte reads A5's
+byte code) of the prefix `w_1 .. w_l`.
+
+```
+rank_i = max_j logit_ij + kappa * sqrt(d) * <W_l(k), A_i>           logit: the scorer's, as above
+write:  the best-ranked cell of all N_s (K_s = 1 per level), by the turns 2 and 3 above;
+        the cell is updated as above, without a clear
+read:   at every byte inside a word, the K_r = 2 best-ranked cells by the values at that byte
+        and the code of the prefix so far (level min(j, L)); nothing is written
+p_t   = [U_min(j,16) (h_1 + h_2) / 2 ; the means of 1[age >= 256] and log(1 + age / 256)
+         over the read cells that hold a write]
+```
+
+The read's selection carries the straight-through weight of its rank in training. `eps` at a
+byte that is not an event is `z_t` less the prediction of the summary before `t`.
+
+### Paths
+
+All three arms run on the eager, the compiled and the fused event loop
+(`hardware.event_kernel=fused`), and with `train.tbptt_windows > 1` on each. The write and the
+reads are eager code behind the loop on every path. The event loop and the kernel are not
+edited: the compiled blocks hand on the cells of every slot (the output the attention read of
+the cells already had), and the fused block's Python wrapper takes them from its tape (the
+state the next slot read).
+
+### Differences from the design memo
+
+- **The messages read the routed cells as values.** No gradient passes from a keyed cell into
+  the routed cells through `m` (`V` and the in-edge weights are trained by it). The fused
+  block's reverse sweep takes a cotangent at a slot's read-out and at the block's last state
+  only, so giving `m` that gradient needs a kernel change; the unfused paths cut it too, so
+  that the three paths are one model. The keyed cells reach the routed core's training
+  through the shared units, gate, `W_out`, `V` and scorer, and through `u_e`.
+- **`beta_K` starts at 3, as the memo writes it, on top of the cell's own gate bias.** With the
+  recipe's `model.gate_bias_init = -3` a keyed gate therefore starts near `sigmoid(0) = 0.5`,
+  not near 0.95. The memo's "a keyed write takes the cell" needs a start of 6 there, which
+  `model.word_cells_gate_bias=6` gives (a key the memo does not have; the default is the
+  memo's 3). Without the cross-window gradient `beta_K` never moves, and the keyed gate
+  follows the routed cells' bias. `word_cells_gate` in the step statistics is the mean keyed
+  gate.
+- **The choice among the candidates** is by the scorer in steps 2 and 3 only; a key that a
+  cell holds goes there by rule (the memo's rule). `alpha` carries the cell's straight-through
+  weight beside the unit's, which the memo does not spell out.
+- **The age feature** of the scorer is defined here (the memo: "age among them").
+- **Candidate 2:** the age inputs of `p_t` are means over the read cells that hold a write; a
+  cell is never cleared (there is no tag to compare); the prior's code folds the case, as the
+  word address does, where the hashed keys are the bytes as written; one write per key per
+  window and the conflict rule are stage 1's (the key as an integer is used for that and
+  nowhere else). `model.word_cells=address` needs a learned value: with `bytes` it is refused.
+- Not built: level 0 (the previous word's key), two cells an entry.
+
+### Refusals (stage 2)
+
+`word | cell` need `model.scorer=linear` and `model.routing=topk` (the write splits the scorer's
+linear map by feature) and no `model.ablate_shared_u`. `address` needs
+`model.word_address=exact` and `word | cell`, and refuses a moved `model.word_cells_ways`;
+`hash` refuses a moved `model.word_cells_kappa`, and `bytes` a moved
+`model.word_cells_gate_bias`.
+
+### Statistics (stage 2)
+
+Beside `word_cells_hit` and `word_cells_old`: `word_cells_gate` (the mean gate of the window's
+keyed writes) and, with `address`, `word_cells_prior` (the share of the keyed writes that took
+the cell the address prior alone ranks first: 1.0 means the selection is the soft hash).
+
+### Tests (stage 2)
+
+`tests/test_word_cells_write.py` (its docstring lists them) and stage 1's tests with the arm as
+a parameter: `bytes` against d3537f4 (`tests/fixtures/word_cells_bytes_d3537f4.pt`: names,
+weights, four carried windows, gradients, the recipe's ids); the write and candidate 2's read
+against a reference in plain Python that scores with the scorer's own map; the gradient
+through the carried cells, attached and detached; the trainer's segments; the compiled window
+and the fused block's reference against the eager trainer (also across a segment); a resume;
+on the card bf16 steps of the recipe's arm on both event loops with and without segments, and
+the kernels against the compiled blocks in fp32.
+
+Run on 22 Nov 2026 at the stage 2 commit: the CPU suite with the card hidden (3,163 passed,
+560 skipped); on the card the ten CUDA tests of `tests/test_word_cells.py` and 45 existing CUDA
+tests around what stage 2 touches (the fused block and its trainer, the compiled window, the
+carried reader, the round products, the per-byte speed keys, reach dropout), all passed.
+
+### Measured (stage 2, 22 Nov 2026)
+
+Timing runs only: the recipe's CUDA arm with the fused event block on code native, batch 32 x
+256, bf16, the local RTX 3060 alone, seed 0; the median over the steps after the first 40,
+statistics steps left out (`~/hsn-experiments/wcells-stage2/`: `step_time.py`, `time_*.json`).
+
+| Arm | Step | Peak memory |
+|---|---|---|
+| no key (stage 1's measurement) | 44.7 - 45.0 ms | 1,443 MiB |
+| `hash`, `bytes` (220 steps; stage 1: 47.6 - 47.7) | 47.9 ms | 1,501 MiB |
+| `hash`, `cell` (220 steps) | 52.1 ms | 1,578 MiB |
+| `hash`, `word` (eight runs of 150 to 220 steps; one of 1,500: 52.7) | 51.9 - 52.5 ms | 1,577 MiB (2,715 after 1,500 steps) |
+| `address`, `word`, 256 cells (220 steps; 1,500 steps: 59.6) | 59.3 ms | 1,688 MiB (2,917 after 1,500 steps) |
+| `hash`, `word`, `train.tbptt_windows=3` (130 steps of three windows, compile default) | 160.1 ms a step, 53.4 a window | 3,281 MiB |
+| `address`, `word`, 256 cells, `train.tbptt_windows=3` (130 steps) | 181.7 ms a step, 60.6 a window | 3,594 MiB |
+
+- The HSN's write costs 4.4 ms over the table (7.5 over no key; the memo's estimate was 3 to
+  6), candidate 2 another 7 (its read scores 256 cells at every byte). With the fused block
+  the three-window step is 160 ms, against the 250 to 280 the memo took from the unfused
+  recipe.
+- **The keyed gate starts half open**, as the note on `beta_K` says: `word_cells_gate` is
+  0.51 at the first step. It rises to 0.75 to 0.78 within 130 to 220 steps in every arm, with
+  and without the cross-window gradient (the routed cells' gate moves it).
+- `address`: 0.91 to 0.97 of the bytes inside a word read a cell that holds a write, 0.80 of
+  those reads are 256 bytes old or more (the two cells are read whatever was written there:
+  there is no tag), and 0.79 to 0.83 of the writes take the cell the address prior alone ranks
+  first, from the first step on (a cell already taken in the window sends a key elsewhere).
+- **The first steps are no result**, but they differ from the table's: the mean training loss
+  over steps 201 to 220 is 1.96 nats with `bytes` (stage 1: 2.41 without the key, 1.97 with
+  it) and 2.33 to 2.35 with `word`, `cell` and `address` without the cross-window gradient.
+  The decoder reads the table at once; what the HSN's write stores is of little use to it
+  this early. One seed, 220 steps.
+- `beta_K` stays at 3.0 without the cross-window gradient and has moved to 3.02 after 130
+  steps with it; the cells stay within [-1, 1]; after 220 steps 26 % of the 1,024 hashed
+  cells of a row hold a write, and 60 to 64 % of the 256 addressed ones.
+- **One timing run failed and the failure was not reproduced.** The first `word` run (CUDA
+  graphs, fused block, started right after the `bytes` run) stopped after 146 s with
+  `cudaErrorStreamCaptureInvalidated` at the end of a CUDA graph capture. My job script kept
+  only the last lines, so which capture it was (the compiled blocks' or the kernels') is not
+  known. Eight further `word` runs (one with an empty compile cache, as that run partly had;
+  one of 1,500 steps, with 15 statistics steps and 45 captures of the kernels) and the `cell`
+  and `address` runs finished. Whether stage 2 can cause it is open.
+- Not run: any training beyond those steps, a swap test, a run resumed on the card.
+
+### For a swap test of these arms
+
+- `swap_eval.py` and `transplant_wc.py --what keyed` read the carry, whose layout is stage
+  1's (`word`, `table`, `key`, `when`), so they run as they are on a tree at this commit. With
+  `address` the keys are all empty (-1) and the exchange of `table` and `when` is the whole
+  store.
+- A transplant of the keyed cells exchanges what earlier writes left. With `word | cell` a
+  later write to a held key also reads the transplanted cell (the convex update), which the
+  by-rule arm's does not.
+- `--what hsn` (the routed cells) now also changes what later keyed writes read, through `m`.

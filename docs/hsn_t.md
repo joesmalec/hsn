@@ -33,7 +33,10 @@ adopted; first runs in progress.**
   stage 1 of the memory redesign, the by-rule table control): keyed cells beside the routed
   ones, written at word ends under the word's first one to three bytes and read at every byte
   inside a word, the read being one more decoder input, `D([q; u; r; c; p])`. At its default
-  `off` nothing is built and the key and its five sizes are left out of the hash.
+  `off` nothing is built and the key and its sizes are left out of the hash. Stage 2 (built,
+  untrained): `model.word_cells_value=word | cell` writes those cells with the HSN's own cell
+  update, and `model.word_cells=address` selects them through the router's scorer with a fixed
+  address prior (`model.word_cells_kappa`) in place of the hash and the tag.
 - The memory's opt-in keys (fast cells, address n-grams, the address gate and its inputs, the
   write decision, the feedback cuts) mean the same in both families; the cell arithmetic is
   shared code.
