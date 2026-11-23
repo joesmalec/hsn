@@ -154,6 +154,8 @@ def test_p1_16_rollback_keys_defaults_off() -> None:
         "model.word_cells_ways",
         "model.word_cells_levels",
         "model.word_cells_min_len",
+        "model.word_cells_gate_bias",  # stage 2: where the keyed gate's bias starts
+        "model.word_cells_kappa",  # the address prior of model.word_cells=address (stage 2)
     )
     # evaluation-only sections are never hashed, whatever they hold (eval.*, 18 Nov 2026)
     assert HASH_EXCLUDED == ("eval",)

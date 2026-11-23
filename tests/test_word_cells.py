@@ -61,6 +61,12 @@ ON = "model.word_cells=hash"
 #: the tests' tiny word-event carry HSN-T (window 12, carry 5), and with 16 keyed cells
 BASE = (CARRY, STE, CUT_C, *NGRAM, *WORD)
 CELLS = (*BASE, ON, "model.word_cells_n=16")
+#: stage 2's arms beside the by-rule table: the overrides behind a configuration with the key
+ARM = {
+    "bytes": (),
+    "word": ("model.word_cells_value=word",),
+    "address": ("model.word_cells=address", "model.word_cells_value=cell"),
+}
 Stream = tuple[Tensor, Tensor, Tensor]
 
 
@@ -360,7 +366,7 @@ def test_the_default_keeps_every_configuration_of_main() -> None:
         names = {f"configs/{folder}/{p.name}" for p in (REPO / "configs" / folder).glob("*.yaml")}
         assert names <= set(recorded)
     keys = [k for k in HASH_OMIT_AT_DEFAULT if k.startswith("model.word_cells")]
-    assert len(keys) == 6 and all(k.split(".")[1] in type(cfg.model).model_fields for k in keys)
+    assert len(keys) == 8 and all(k.split(".")[1] in type(cfg.model).model_fields for k in keys)
     base, named = load_config(RECIPE), load_config(RECIPE, ["model.word_cells=off"])
     on = load_config(RECIPE, [ON])
     assert base.model.word_cells == "off" and chash(named) == chash(base) != chash(on)
@@ -411,6 +417,54 @@ def test_the_default_model_is_mains_bit_for_bit() -> None:
             assert _gap(got, ref) <= 1e-12 * max(1.0, float(ref[1])), name
 
 
+def test_the_bytes_arm_is_stage_ones_bit_for_bit() -> None:
+    """``model.word_cells=hash`` with the by-rule value (``bytes``, named or not) against stage
+    1's code (the fixture, written at d3537f4 in float64 on x86-64 Linux): the same parameter
+    and buffer names, and on those weights (main's fixture and the key's own), over four carried
+    windows of prose, its logits, statistics, final state, cells, address carry and gradients
+    (each as its sum and its sum of magnitudes); and the recipe's hash, arm view and memory
+    key with the key on. Bit for bit where the fixture was written."""
+    want = torch.load(FIXTURES / "word_cells_bytes_d3537f4.pt", weights_only=True)
+    base = torch.load(FIXTURES / "word_cells_off_30bb802.pt", weights_only=True)["weights"]
+    tokens, ctx, reset = want["stream"]
+    for extra in ((), ("model.word_cells_value=bytes",)):
+        cfg = _reader_cfg(*CELLS, *extra)
+        model = _model(cfg)
+        assert list(model.state_dict()) == want["names"]
+        model.load_state_dict(
+            {name: want["weights"].get(name, base.get(name)) for name in want["names"]}
+        )
+        T = cfg.train.unroll
+        state, prev, sums = model.init_state(3), None, []
+        for lo in range(0, tokens.shape[1], T):
+            window = (tokens[:, lo : lo + T], ctx[:, lo : lo + T], state, reset[:, lo : lo + T])
+            logits, state, info = model(*window, prev_tokens=prev)
+            prev = address_history(cfg.model, window[0], prev, info)
+            state = state.detach()
+            rates = (info["word_cells_hit"].double(), info["word_cells_old"].double())
+            sums.append(torch.stack([logits.detach().sum(), logits.detach().abs().sum(), *rates]))
+        logits.square().mean().backward()
+        assert isinstance(prev, WindowCarry) and prev.cells is not None
+        found = [logits, torch.stack(sums), state.h, state.q, prev.cells.table]
+        refs = [want["logits"], want["sums"], *want["final"][:2], want["cells"][1]]
+        for got, ref in zip(found, refs, strict=True):
+            assert got.shape == ref.shape and _gap(got, ref) <= 1e-12
+        exact = (state.age, state.pos, prev.address, *prev.cells[0::2], prev.cells.when)
+        refs = (*want["final"][2:], want["address"], *want["cells"][0::2], want["cells"][3])
+        _assert_equal(exact, refs, "integers")
+        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+        assert list(grads) == list(want["grads"])
+        for name, ref in want["grads"].items():
+            got = torch.stack([grads[name].sum(), grads[name].abs().sum()])
+            assert _gap(got, ref) <= 1e-12 * max(1.0, float(ref[1])), name
+    arms = {"on": [ON], "named": [ON, "model.word_cells_value=bytes"]}
+    arms["sized"] = [ON, "model.word_cells_n=256", "model.word_cells_ways=1"]
+    for name, overrides in arms.items():
+        cfg = load_config(RECIPE, overrides)
+        got = [chash(cfg), digest(config_view(cfg)), memory_key(cfg, "none", PROTOCOL)]
+        assert got == want["ids"][name], name
+
+
 def test_the_key_adds_the_read_maps_and_the_decoder_columns_only() -> None:
     cfg, on = _reader_cfg(*BASE), _reader_cfg(*CELLS)
     seed_everything(0)
@@ -443,8 +497,8 @@ REFUSED: list[tuple[str, list[str], str]] = [
     ("", ["model.word_contexts=[]"], "word_contexts is empty"),
     ("", ["model.word_cells_ways=3", "model.word_cells_n=2"], "candidate cells per key"),
     ("", ["model.word_cells=off", "model.word_cells_n=64"], "model.word_cells is off"),
-    ("", ["model.word_cells_value=word"], "word_cells_value"),
-    ("", ["model.word_cells=address"], "word_cells"),
+    ("", ["model.word_cells_value=sum"], "word_cells_value"),
+    ("", ["model.word_cells=address"], "word_cells_value=word"),
     ("", ["model.word_cells_levels=4"], "word_cells_levels"),
     # the baselines, the reader alone, the HSN, HSN-T without its memory and with per-byte writes
     ("baselines/gru_2m.yaml", [], "word_cells"),
@@ -588,11 +642,15 @@ def test_gradients_reach_the_read_maps_and_the_decoder_columns_only() -> None:
 
 
 @pytest.mark.usefixtures("small_blocks")
-def test_compiled_window_equals_eager_and_compiles_once(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("arm", list(ARM))
+def test_compiled_window_equals_eager_and_compiles_once(
+    arm: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The keys, the read and the write run in the eager prologue and epilogue, so the key
     changes no graph: over six consecutive windows the compiled window equals the eager one
     (values, the next cells and their tags exactly, the gradients, ``U``'s among them),
-    compiles one graph and keeps it."""
+    compiles one graph and keeps it. Stage 2's arms: the compiled blocks hand on the cells
+    of every slot, and the HSN's write on them equals the eager window's."""
     from torch._dynamo.utils import counters
 
     monkeypatch.setattr("hsn.model.hsn.EVENT_BLOCK", p28.compile_mod.MAX_BLOCK)  # small_blocks
@@ -600,7 +658,7 @@ def test_compiled_window_equals_eager_and_compiles_once(monkeypatch: pytest.Monk
     reader = ("model_name=hsn_t", "model.reader=transformer", "model.reader_width=8")
     routed = ("model.routing=topk", "model.key_address=true", "model.selected_readout=true")
     gate = ("model.address_gate=true", "model.address_gate_input=summary")
-    cfg = p28._cfg(*routed, *reader, "model.reader_heads=2", *gate, *CELLS)
+    cfg = p28._cfg(*routed, *reader, "model.reader_heads=2", *gate, *CELLS, *ARM[arm])
     seed_everything(0)
     model = HSNT.from_config(cfg)
     generator = torch.Generator(device="cpu").manual_seed(7)
@@ -658,16 +716,21 @@ reference_block = fused_tests.reference_block  # the fused block on its PyTorch 
 #: the trainer tests' tiny HSN-T with word events (lazy AdamW, balance), the carry, 32 cells
 KEYS = ("model.word_contexts=[0,6]", "model.reader_carry=8", ON, "model.word_cells_n=32")
 TRAINED = (*fused_tests.EVENTS, *KEYS)
+#: (windows a gradient segment, arm): stage 2's arms with the cells attached inside a segment
+SEGMENTS = [(1, "bytes"), (2, "bytes"), (1, "word"), (2, "word"), (2, "address")]
 
 
-@pytest.mark.parametrize("segments", [1, 2])
-def test_training_carries_logs_and_resumes_bit_for_bit(segments: int, tmp_path: Path) -> None:
+@pytest.mark.parametrize(("segments", "arm"), SEGMENTS)
+def test_training_carries_logs_and_resumes_bit_for_bit(
+    segments: int, arm: str, tmp_path: Path
+) -> None:
     """Four steps of the tiny recipe on text: the statistics hold the read's hit rate and the
     share of old entries; ``U`` trains; the checkpoint holds the cells on the CPU; and a run
     resumed from step 2 (other initial weights) continues bit for bit, the cells among what
-    it carries (also with two windows a gradient segment)."""
+    it carries (also with two windows a gradient segment, and with the HSN's write)."""
     accumulate = (f"train.grad_accum={2 * segments}", f"train.tbptt_windows={segments}")
-    cfg = _trainer_cfg(4, *TRAINED, *accumulate, "train.ckpt_every=2", "train.stats_every=1")
+    keys = (*TRAINED, *ARM[arm], *accumulate)
+    cfg = _trainer_cfg(4, *keys, "train.ckpt_every=2", "train.stats_every=1")
     train_ds, dev_ds = _text_datasets()
     trainer_a = _trainer(cfg, tmp_path / "a")
     start = trainer_a.model.word_cells.U.detach().clone()
@@ -683,7 +746,8 @@ def test_training_carries_logs_and_resumes_bit_for_bit(segments: int, tmp_path: 
     assert set(payload) == {"address", "reader", "word_cells"}
     _, table, key, when = payload["word_cells"]
     assert table.device.type == "cpu" and table.shape == (cfg.train.batch, 32, cfg.model.d)
-    assert bool((key >= 0).any()) and bool((when[key >= 0] >= 0).all())
+    assert bool((key >= 0).any()) == (arm != "address") and bool((when[key >= 0] >= 0).all())
+    assert bool((when > EMPTY).any()) and float(table.abs().max()) > 0
     trainer_b = _trainer(cfg, tmp_path / "b", seed=1)
     assert trainer_b.resume(checkpoint) == 2
     history_b = trainer_b.fit(train_ds, dev_ds, 4)
@@ -701,22 +765,34 @@ def test_training_carries_logs_and_resumes_bit_for_bit(segments: int, tmp_path: 
 
 
 @pytest.mark.usefixtures("reference_block")
+@pytest.mark.parametrize(("segments", "arm"), [SEGMENTS[0], *SEGMENTS[2:]])
 def test_the_fused_block_reference_equals_the_eager_trainer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    segments: int, arm: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``hardware.event_kernel=fused`` beside the key (the block's PyTorch reference in
     float64, as the fused trainer tests run it on the CPU): four optimiser steps equal the
-    eager trainer's, the read's statistics included. The key does not touch the block."""
+    eager trainer's, the read's statistics included. The by-rule arm does not touch the
+    block. Stage 2's arms read the routed cells of every slot from the block's tape; their
+    write then equals the eager loop's, and so do the gradients it gets through the cells
+    inside a segment of two windows (the write's own parameters among them)."""
     monkeypatch.setattr(fused_tests, "_long_datasets", _text_datasets)
+    accumulate = (f"train.grad_accum={segments}", f"train.tbptt_windows={segments}")
     runs = {}
     for mode in ("none", "default"):
-        cfg = fused_tests._small(*KEYS, *fused_tests.FP64, f"hardware.compile_mode={mode}")
+        keys = (*KEYS, *ARM[arm], *accumulate, *fused_tests.FP64)
+        cfg = fused_tests._small(*keys, f"hardware.compile_mode={mode}")
         runs[mode] = fused_tests._fit(cfg, tmp_path / mode, 4)
     got, ref = runs["default"], runs["none"]
     fused = got["trainer"]._fused_events
-    assert fused is not None and fused.calls == 4 and ref["trainer"]._fused_events is None
+    assert fused is not None and fused.calls == 4 * segments
+    assert ref["trainer"]._fused_events is None
     fused_tests._assert_same_run(got, ref, loss=1e-9, grad=1e-8, param=1e-9, stats=1e-8)
     assert got["history"].steps[-1].stats["word_cells_hit"] > 0.2
+    names = [n for n, _ in got["trainer"].model.named_parameters()]
+    own = [i for i, n in enumerate(names) if n in ("word_cells.beta_K", "word_cells.edge_logit")]
+    grads = got["grads"][-1]
+    assert len(own) == 2 * (arm != "bytes")
+    assert all((grads[i] is not None and bool(grads[i].any())) == (segments > 1) for i in own)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -734,22 +810,39 @@ CARD_STEPS = ("train.steps=4", "train.batch=8", "train.micro_batch=8", "train.wa
 QUIET = ("train.eval_every=1000", "train.ckpt_every=1000", "train.stats_every=1")
 
 
+#: (the event loop, the arm, windows a gradient segment) of the card test below
+ON_THE_CARD = [(kernel, "bytes", 1) for kernel in ("compiled", "fused")]
+ON_THE_CARD += [(kernel, "word", n) for n in (1, 3) for kernel in ("compiled", "fused")]
+ON_THE_CARD += [("fused", "address", 3)]
+
+
 @pytest.mark.cuda
-@pytest.mark.parametrize("kernel", ["compiled", "fused"])
-def test_bf16_steps_of_the_recipe_with_the_key_on_the_card(kernel: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize(("kernel", "arm", "segments"), ON_THE_CARD)
+def test_bf16_steps_of_the_recipe_with_the_key_on_the_card(
+    kernel: str, arm: str, segments: int, tmp_path: Path
+) -> None:
     """hsn_t_memory_words_carry_bal_qk.yaml's CUDA arm with ``model.word_cells=hash``, on the
     compiled event blocks and on the fused event block: four bf16 steps under CUDA graphs on
     text; finite losses, ``U`` trained, a hit rate in the statistics, and the cells on the
     card (float32) equal to the rule run on the CPU over the same windows (keys, write
-    positions and the word in progress exactly, the values to float32 rounding)."""
+    positions and the word in progress exactly, the values to float32 rounding).
+
+    Stage 2's arms (``word``; ``address`` with the memo's 256 cells): the same steps, and with
+    three windows a gradient segment (``hardware.compile_mode=default``, as a segment needs)
+    the write's own parameters train; with every window detached they stay. The cells are
+    the HSN's, in ``[-1, 1]``; the word in progress is still the rule's."""
     from cards import CUDA_PROFILE
     from hsn.kernels import window as window_kernels
 
     p28._cuda_ctx()
     if kernel == "fused" and not window_kernels.available():
         pytest.skip("needs the window kernels (scripts/build_window_kernels.py)")
-    card = (f"profile={CUDA_PROFILE}", *CARD_ARM, f"hardware.event_kernel={kernel}")
-    cfg = load_config(RECIPE, [ON, *card, *CARD_STEPS, *QUIET])
+    card = [f"profile={CUDA_PROFILE}", *CARD_ARM, f"hardware.event_kernel={kernel}"]
+    card += ["model.word_cells_n=256"] * (arm == "address")
+    if segments > 1:
+        card += ["hardware.compile_mode=default", f"train.grad_accum={segments}"]
+        card += [f"train.tbptt_windows={segments}"]
+    cfg = load_config(RECIPE, [ON, *ARM[arm], *card, *CARD_STEPS, *QUIET])
     seed_everything(0)
     model = build_model(cfg)
     trainer = TBPTTTrainer(model, cfg, resolve(cfg.hardware), run_dir=tmp_path / "run")
@@ -765,6 +858,7 @@ def test_bf16_steps_of_the_recipe_with_the_key_on_the_card(kernel: str, tmp_path
         return out
 
     trainer._forward = spy  # type: ignore[method-assign]
+    start = {n: p.detach().clone() for n, p in model.word_cells.named_parameters()}
     history = trainer.fit(*_text_datasets(64, 900), cfg.train.steps)
     assert len(history.steps) == 4 and all(math.isfinite(s.loss) for s in history.steps)
     assert history.steps[-1].stats["word_cells_hit"] > 0.3
@@ -772,14 +866,60 @@ def test_bf16_steps_of_the_recipe_with_the_key_on_the_card(kernel: str, tmp_path
     carry = trainer._prev_tokens
     assert isinstance(carry, WindowCarry) and carry.cells is not None
     assert carry.cells.table.device.type == "cuda" and carry.cells.table.dtype == torch.float32
-    mod = WordCells(cfg.model, seed=cfg.seed)
+    mod = WordCells(cfg.model.model_copy(update={"word_cells": "hash"}), seed=cfg.seed)
     cells, pos = mod.init_carry(8, "cpu"), torch.zeros(8, dtype=torch.int64)
-    assert len(windows) == 4
+    assert len(windows) == 4 * segments
     for batch in windows:
         positions = _window_positions(pos, batch["reset"])
         inputs = (batch["tokens"], batch["context"], batch["reset"], positions, cells)
-        cells, pos = mod.write(mod.window(*inputs)), positions[:, -1] + 1
-    assert bool((cells.key >= 0).sum() > 100)
+        win = mod.window(*inputs)
+        cells = cells._replace(word=win.word) if mod.learned else mod.write(win)
+        pos = positions[:, -1] + 1
     word, table, key, when = (t.cpu() for t in carry.cells)
-    _assert_equal((word, key, when), (cells.word, cells.key, cells.when), "the cells on the card")
-    assert _gap(table, cells.table) <= 1e-6  # (the card rounds a value's last bit otherwise)
+    if arm == "bytes":
+        assert bool((cells.key >= 0).sum() > 100)
+        compared = (cells.word, cells.key, cells.when)
+        _assert_equal((word, key, when), compared, "the cells on the card")
+        assert _gap(table, cells.table) <= 1e-6  # (the card rounds a value's last bit otherwise)
+        return
+    assert torch.equal(word, cells.word) and bool((when > EMPTY).sum() > 100)
+    assert bool(torch.isfinite(table).all()) and 0.1 < float(table.abs().max()) <= 1.0
+    stats = history.steps[-1].stats
+    assert 0.0 < stats["word_cells_gate"] < 1.0 and ("word_cells_prior" in stats) == (arm != "word")
+    moved = {n: not torch.equal(p, start[n]) for n, p in model.word_cells.named_parameters()}
+    assert moved.pop("U") and set(moved.values()) == {segments > 1}, moved
+    fused = trainer._fused_events
+    assert (fused is not None) == (kernel == "fused")
+    if fused is not None:
+        assert fused.calls == 4 * segments and fused.describe()["buffer_sets"] == segments
+
+
+eager_kernels = fused_tests.eager_kernels  # the compiled window without inductor (aot_eager)
+
+
+@fused_tests.needs_card
+@pytest.mark.cuda
+@pytest.mark.usefixtures("eager_kernels")
+@pytest.mark.parametrize(("segments", "arm"), SEGMENTS[2:])
+def test_the_hsn_write_with_the_kernels_equals_without_fp32_cuda(
+    segments: int, arm: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fp32 on the card, the fused trainer tests' tiny model with stage 2's arms: the trainer
+    on the block's kernels (the routed cells of every slot from the tape on the card) against
+    the trainer on the compiled blocks, two steps from a start with a margin at every routed
+    decision: the same losses, raw gradients, parameters and statistics to the compiled
+    window's CUDA tolerance, with two windows a segment the gradients of the write's own
+    parameters among them."""
+    monkeypatch.setattr(fused_tests, "_long_datasets", _text_datasets)
+    accumulate = (f"train.grad_accum={2 * segments}", f"train.tbptt_windows={segments}")
+    keys = (*KEYS, *ARM[arm], *accumulate, *fused_tests.FP32)
+    ref, got = fused_tests._card_pair(tmp_path, 2, *keys)
+    fused = got["trainer"]._fused_events
+    assert fused is not None and fused.kernels and fused.calls == 4 * segments
+    assert ref["trainer"]._fused_events is None
+    fused_tests._assert_same_run(got, ref, loss=1e-5, grad=2e-4, param=1e-3, stats=2e-4)
+    names = [n for n, _ in got["trainer"].model.named_parameters()]
+    own = [i for i, n in enumerate(names) if n in ("word_cells.beta_K", "word_cells.edge_logit")]
+    grads = got["grads"][-1]
+    assert len(own) == 2
+    assert all((grads[i] is not None and bool(grads[i].any())) == (segments > 1) for i in own)

@@ -966,7 +966,8 @@ class TBPTTTrainer(Trainer):
         rates = tuple(key for key in ("explored", "refreshed", "dense_fallback") if key in info)
         # model.word_cells: the window's hit rate of the keyed cells' read and the share of old
         # entries among the hits (0-dim; read behind the rates, with them)
-        cells = tuple(key for key in ("word_cells_hit", "word_cells_old") if key in info)
+        names = ("word_cells_hit", "word_cells_old", "word_cells_gate", "word_cells_prior")
+        cells = tuple(key for key in names if key in info)
         if "event_valid" in info:
             # model.write_events: a rate is the mean over the slots in which some row has an
             # event. The slots behind them (the layout is a multiple of the block) hold padding
@@ -998,6 +999,10 @@ class TBPTTTrainer(Trainer):
                 packed = active_units_packed(
                     info["unit_idx"], info["valid"], units, dense_rows=info["dense_fallback"] > 0
                 )
+                if "word_cells_units" in info:
+                    # model.word_cells_value=word | cell: the units the keyed writes ran, in a
+                    # window whose cells a later window of its segment reads with a gradient
+                    packed = torch.cat([packed[:units] | info["word_cells_units"], packed[units:]])
                 # the range check is read with the rest, after these indices were used: what
                 # indexes the device meanwhile stays inside the bank (the same indices unless
                 # the check fails, and then the read raises before anything is kept)
@@ -1308,9 +1313,15 @@ class TBPTTTrainer(Trainer):
                 )
                 if reach is not None:
                     self.hsn.set_reach_rows(None)
+                # the keyed word cells stay attached for the segment's later windows (the
+                # HSN's keyed write is trained through them); the segment's last window hands
+                # them on detached, and its writes get no gradient
+                attached = (window_index + 1) % per_segment != 0
+                if not attached:
+                    info.pop("word_cells_units", None)
                 if self.cfg.model.key_address:
                     self._prev_tokens = address_history(
-                        self.cfg.model, fwd["tokens"], self._prev_tokens, info
+                        self.cfg.model, fwd["tokens"], self._prev_tokens, info, attached=attached
                     )
                 extras = auxiliary_terms(info, self.cfg, graph, reference_cost=reference_cost)
                 terms = assemble_terms({"logits": logits, **info}, fwd, self.cfg, extras)

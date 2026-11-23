@@ -182,10 +182,17 @@ def word_cells_param_count(m: ModelConfig) -> int:
     (:class:`hsn.model.word_cells.WordCells`), outside Appendix C like the reader; 0 without
     the key. The read maps ``U_j``, one ``d x d`` map for each of the 16 offsets: 65,536 at
     ``d`` 64. The ``d + 2`` decoder columns that read ``p_t`` are counted in the ``decoder``
-    row; the cells themselves are state, not parameters."""
+    row; the cells themselves are state, not parameters. The HSN's keyed write
+    (``model.word_cells_value = word | cell``) adds the logits of the keyed cells' in-edges
+    (``word_cells_n * in_degree``), the gate bias ``beta_K`` (``d``) and, for ``word``, ``V_s``
+    (``d * d``): 4,160 and 8,256 at the recipe's sizes."""
     if m.word_cells == "off":
         return 0
-    return 16 * m.d * m.d
+    count = 16 * m.d * m.d
+    if m.word_cells_value != "bytes":
+        count += m.word_cells_n * m.in_degree + m.d
+        count += m.d * m.d if m.word_cells_value == "word" else 0
+    return count
 
 
 def memory_off_param_count(m: ModelConfig) -> dict[str, int]:

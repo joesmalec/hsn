@@ -227,7 +227,13 @@ from hsn.model.reader import Cache, Reader
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.model.word_address import state_width
-from hsn.model.word_cells import WORD_CELLS_KEYS, WordCells, WordCellsCarry, WordCellsWindow
+from hsn.model.word_cells import (
+    WORD_CELLS_KEYS,
+    KeyedFeed,
+    WordCells,
+    WordCellsCarry,
+    WordCellsWindow,
+)
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
@@ -624,6 +630,8 @@ def address_history(
     tokens: Tensor,
     previous: Tensor | WindowCarry | None = None,
     info: dict[str, Tensor] | None = None,
+    *,
+    attached: bool = False,
 ) -> Tensor | WindowCarry:
     """What a caller carries from the window ``tokens [B, T]`` to the next window of the same
     rows, as that window's ``prev_tokens`` (A5 / A9's address features).
@@ -645,7 +653,10 @@ def address_history(
     which only the window's forward pass has (``info``, :data:`READER_CACHE_KEYS`), so ``info``
     is required; ``previous`` is then the :class:`WindowCarry` carried into the window. With
     ``model.word_cells`` it also holds the keyed word cells after the window (``info``,
-    :data:`hsn.model.word_cells.WORD_CELLS_KEYS`)."""
+    :data:`hsn.model.word_cells.WORD_CELLS_KEYS`). ``attached`` (the trainer, inside a gradient
+    segment of ``train.tbptt_windows``): the cells keep their gradient, so that the next
+    window's reads train the HSN's keyed write (``model.word_cells_value = word | cell``);
+    everything else, and the cells by default, is carried detached."""
     reader: Cache | None = None
     if reader_carried(cfg):
         if info is None or any(key not in info for key in READER_CACHE_KEYS):
@@ -663,7 +674,10 @@ def address_history(
                 f"model.word_cells={cfg.word_cells}: the carry holds the keyed word cells after "
                 "the window; pass the info of the window's forward pass to address_history"
             )
-        cells = WordCellsCarry(*(info[key].detach() for key in WORD_CELLS_KEYS))
+        table = WORD_CELLS_KEYS[1]
+        cells = WordCellsCarry(
+            *(info[k] if attached and k == table else info[k].detach() for k in WORD_CELLS_KEYS)
+        )
     if isinstance(previous, WindowCarry):
         previous = previous.address
     address: Tensor
@@ -2081,7 +2095,12 @@ class HSN(nn.Module):
             # model.word_cells: the prefix keys, the read of the cells as the window before left
             # them and the write plan, all by rule; the write is taken after the event loop
             assert cells_carry is not None
-            word_cells = self.word_cells.window(tokens, ctx, reset, positions, cells_carry)
+            tables = (
+                (self.scorer.get_buffer("word_exact"), self.scorer.byte_codes)
+                if self.word_cells.addressed
+                else None
+            )
+            word_cells = self.word_cells.window(tokens, ctx, reset, positions, cells_carry, tables)
         if cfg.write_events != "byte" and events is None:
             # the byte before each position is A5's (BOS at a reset, which is an event anyway)
             assert previous_window is not None  # the configuration requires model.key_address
@@ -2299,6 +2318,7 @@ class HSN(nn.Module):
         written: Tensor | None,
         readouts: Tensor | None = None,
         live: Tensor | None = None,
+        keyed: Tensor | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """The work after the loop (P1.10a): the decoder over the stacked ``[q_t ; u_t]``, the
         statistics from the stacks and ``info`` (:meth:`forward`). Every argument is stacked over
@@ -2306,7 +2326,8 @@ class HSN(nn.Module):
         :meth:`_selection_record`). ``state_abs_max`` is already reduced to ``[T]``;
         ``hs`` is materialized only for an explicit diagnostic capture. ``live`` (the event
         loop, bool ``[B, E]``): the memory's stacks are per event slot and the statistics are
-        means over each slot's valid rows."""
+        means over each slot's valid rows. ``keyed``: the keyed word cells' read ``p_t`` of
+        the learned arms (``None``: the by-rule read, taken here)."""
         T = int(z_hats.shape[1])
         if pro.counters is not None:
             positions_after = pro.counters[3]
@@ -2326,7 +2347,7 @@ class HSN(nn.Module):
         if pro.word_cells is not None:
             # model.word_cells: the keyed cells' read p_t last, D([q; u; r; c; p])
             assert self.word_cells is not None and readouts is not None
-            p = self.word_cells.read(pro.word_cells)
+            p = self.word_cells.read(pro.word_cells) if keyed is None else keyed
             readouts = torch.cat([readouts, p.to(readouts.dtype)], dim=-1)
         logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
@@ -2540,9 +2561,43 @@ class HSN(nn.Module):
                 controls,
                 dense_rows,
                 dense_indices=dense_indices,
-                keep_cells=self.cell_read is not None,
+                keep_cells=self.event_cells,
             )
         return self._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
+
+    @property
+    def event_cells(self) -> bool:
+        """Whether the event loop hands on the cells as every slot left them (``cells [B, E, N,
+        d]``): the attention read of the cells reads them, and so do the messages of the
+        HSN's keyed write (``model.word_cells_value = word | cell``)."""
+        return self.cell_read is not None or (
+            self.word_cells is not None and self.word_cells.learned
+        )
+
+    def _keyed_feed(
+        self, pro: _Prologue, ev: _Events, us: Tensor, q_before: Tensor, routed: Tensor
+    ) -> KeyedFeed:
+        """What the learned keyed arms read of the window (:class:`KeyedFeed`), per byte: ``u``,
+        the error as the cell reads it (``z_t`` less the prediction of the summary before
+        ``t``, which at an event is the event slot's), the scorer's scalars and the routed
+        cells of every event slot, as values."""
+        z_hat = self.predictor(q_before)
+        dtype = routed.dtype
+        scalars = pro.scalars[:, :, 0, :7].clone()  # the seven scalars behind the age
+        scalars[..., 3:5] = 0.0  # the two running averages are a routed cell's
+        controls = self._controls()
+        return KeyedFeed(
+            u=us.to(dtype),
+            eps=self._eps_read(pro.z, z_hat, pro.z - z_hat).to(dtype),
+            scalars=scalars,
+            routed=routed.detach(),
+            slot=ev.at,
+            cell=self.cell,
+            router=self.router,
+            gate=controls.gate,
+            tau=controls.tau,
+            cut=self._cut_router,
+        )
 
     @staticmethod
     def _refuse_event_capture(capture: bool) -> None:
@@ -2595,6 +2650,14 @@ class HSN(nn.Module):
         slot_u = _take_rows(joined("u"), (ev.at - 1).clamp_min(0))  # an event's own slot
         us = torch.where(events[:, :, None], slot_u, u_between.to(slot_u.dtype))
         readouts = latest(torch.zeros_like(slot_r[:, 0]), slot_r, ev.at)
+        feed: KeyedFeed | None = None
+        keyed: tuple[Tensor, Tensor, Tensor] | None = None
+        if self.word_cells is not None and self.word_cells.learned:
+            # model.word_cells_value=word | cell: the read with the carried cells' gradient
+            # (address: the scored read), from the values the HSN's keyed write reads too
+            assert pro.word_cells is not None
+            feed = self._keyed_feed(pro, ev, us, q_before, joined("cells"))
+            keyed = self.word_cells.read_learned(pro.word_cells, feed)
         if self.cell_read is not None:
             assert pro.reader is not None
             stages = torch.cat([start.h[:, None], joined("cells")], dim=1)  # [B, 1 + E, N, d]
@@ -2622,6 +2685,7 @@ class HSN(nn.Module):
             written=None,
             readouts=readouts,
             live=ev.valid,
+            keyed=None if keyed is None else keyed[0],
         )
         # what the per-slot stacks of info (z_hat, eps, the selections) are aligned to
         info["event_valid"] = ev.valid
@@ -2632,8 +2696,15 @@ class HSN(nn.Module):
             # model.word_cells: the deferred write, after the event loop and the reads: the
             # next window's cells (address_history), and how much of the window read an entry
             assert self.word_cells is not None
-            info.update(zip(WORD_CELLS_KEYS, self.word_cells.write(pro.word_cells), strict=True))
-            info["word_cells_hit"], info["word_cells_old"] = self.word_cells.rates(pro.word_cells)
+            if feed is None or keyed is None:
+                carry = self.word_cells.write(pro.word_cells)
+                rates = self.word_cells.rates(pro.word_cells)
+            else:  # the HSN's keyed write, on the values of each key's last event
+                carry, records = self.word_cells.write_learned(pro.word_cells, feed)
+                info.update(records)
+                rates = keyed[1:]
+            info.update(zip(WORD_CELLS_KEYS, carry, strict=True))
+            info["word_cells_hit"], info["word_cells_old"] = rates
         return logits, final, info
 
     def _previous_tokens(self, tokens: Tensor, previous: Tensor | None) -> Tensor:

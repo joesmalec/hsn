@@ -1176,7 +1176,15 @@ def fused_event_block(
         refreshed = torch.cat([refreshed, refreshed.new_zeros(E - n)])
     if runs is not None:
         runs.append(run)
+    kept: dict[str, Tensor] = {}
+    if model.event_cells:
+        # model.word_cells_value=word | cell: the routed cells as every slot left them, for the
+        # messages of the keyed write (hsn.model.word_cells), from the tape: the state the
+        # next slot read, and the block's last state. Values only: the block's reverse sweep
+        # takes no cotangent at a slot's state (a copy: nothing here is a view of the buffers)
+        kept["cells"] = torch.cat([tape["h_pre"][:, 1:n], h_end.detach()[:, None]], dim=1)
     return {
+        **kept,
         "h": h_end,
         "q": q_end,
         "age": tape["age"],

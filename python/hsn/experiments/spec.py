@@ -695,6 +695,14 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # with them) an arm keeps its memory key
         for key in [name for name in dump["model"] if name.startswith("word_cells")]:
             del dump["model"][key]
+    else:
+        # stage 2's two numbers stay out where they are not read or at their defaults (the
+        # address prior's weight: model.word_cells=address only; the keyed gate's start), so
+        # the hash arms keep the memory key they had before the keys existed
+        if dump["model"]["word_cells"] == "hash":
+            del dump["model"]["word_cells_kappa"]
+        if dump["model"]["word_cells_gate_bias"] == 3.0:
+            del dump["model"]["word_cells_gate_bias"]
     for key, default in _TRANSFORMER_XL_DEFAULTS.items():
         # the Transformer baseline's positions and cache (17 Nov 2026) at their defaults stay
         # out: every arm, of every family, keeps its memory key
