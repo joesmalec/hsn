@@ -740,7 +740,8 @@ def test_bf16_steps_of_the_recipe_with_the_key_on_the_card(kernel: str, tmp_path
     """hsn_t_memory_words_carry_bal_qk.yaml's CUDA arm with ``model.word_cells=hash``, on the
     compiled event blocks and on the fused event block: four bf16 steps under CUDA graphs on
     text; finite losses, ``U`` trained, a hit rate in the statistics, and the cells on the
-    card (float32) equal to the rule run on the CPU over the same windows."""
+    card (float32) equal to the rule run on the CPU over the same windows (keys, write
+    positions and the word in progress exactly, the values to float32 rounding)."""
     from cards import CUDA_PROFILE
     from hsn.kernels import window as window_kernels
 
@@ -779,4 +780,6 @@ def test_bf16_steps_of_the_recipe_with_the_key_on_the_card(kernel: str, tmp_path
         inputs = (batch["tokens"], batch["context"], batch["reset"], positions, cells)
         cells, pos = mod.write(mod.window(*inputs)), positions[:, -1] + 1
     assert bool((cells.key >= 0).sum() > 100)
-    _assert_equal(tuple(t.cpu() for t in carry.cells), tuple(cells), "the cells on the card")
+    word, table, key, when = (t.cpu() for t in carry.cells)
+    _assert_equal((word, key, when), (cells.word, cells.key, cells.when), "the cells on the card")
+    assert _gap(table, cells.table) <= 1e-6  # (the card rounds a value's last bit otherwise)

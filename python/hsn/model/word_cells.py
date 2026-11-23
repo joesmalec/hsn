@@ -131,7 +131,6 @@ class WordCells(nn.Module):
                 f"{cfg.word_cells_value!r} is not built (stage 1: hash with bytes)"
             )
         self.d = cfg.d
-        self.vocab = cfg.vocab_size
         self.n_cells = cfg.word_cells_n
         self.ways = cfg.word_cells_ways
         self.levels = cfg.word_cells_levels
@@ -294,11 +293,14 @@ class WordCells(nn.Module):
         scaled = age.to(value.dtype) / self.sight
         age_features = torch.stack([old.to(value.dtype), torch.log1p(scaled)], dim=-1)
 
+        # the word as it stands after byte t at index t + 1; index 0: as the window before left it
+        len_x = torch.cat([len0[:, None], index * word], dim=1)
+        sum_x = torch.cat([sums0[:, None], sums], dim=1)
+        first_x = torch.cat([first0[:, None], prefix], dim=1)
+
         # the write plan: the word a column closes, as it stood after its last byte
         at = torch.where(close_late, (steps - 1).clamp_min(0), steps)
-        length = torch.cat([len0[:, None], index * word], dim=1)[rows, at]
-        closed_sum = torch.cat([sums0[:, None], sums], dim=1)[rows, at]  # [B, T, d]
-        closed_first = torch.cat([first0[:, None], prefix], dim=1)[rows, at]  # [B, T, L]
+        length, closed_sum, closed_first = len_x[rows, at], sum_x[rows, at], first_x[rows, at]
         levels = torch.arange(1, L + 1, device=device)
         head = self.place_code[:L] * self.byte_code[closed_first]  # [B, T, L, d]
         rest = closed_sum[:, :, None] - head.to(torch.int64).cumsum(dim=2)
@@ -314,14 +316,14 @@ class WordCells(nn.Module):
         alive = hanging | base[:, -1]
         end = torch.where(hanging, T - 1, T)[:, None]
         tail = [
-            torch.cat([len0[:, None], index * word], dim=1)[rows, end][:, 0] * alive,
+            len_x[rows, end][:, 0] * alive,
             torch.cat([letter0[:, None] > 0, letter], dim=1)[rows, end][:, 0] & alive,
             hanging,
         ]
         next_word = torch.cat(
             [
-                torch.cat([sums0[:, None], sums], dim=1)[rows, end][:, 0] * alive[:, None],
-                torch.cat([first0[:, None], prefix], dim=1)[rows, end][:, 0] * alive[:, None],
+                sum_x[rows, end][:, 0] * alive[:, None],
+                first_x[rows, end][:, 0] * alive[:, None],
                 torch.stack([t.to(torch.int64) for t in tail], dim=1),
             ],
             dim=1,

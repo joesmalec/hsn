@@ -29,6 +29,11 @@ adopted; first runs in progress.**
   (`docs/amendments/reader_qk_norm.md`): in the blocks it enables the attention's queries and
   keys are normalised per head before the rotation, which bounds the logits. At its default `false` the reader is unchanged, bit for
   bit, and the key is left out of the hash.
+- One more opt-in key of 22 Nov 2026, `model.word_cells` (`docs/amendments/word_cells.md`;
+  stage 1 of the memory redesign, the by-rule table control): keyed cells beside the routed
+  ones, written at word ends under the word's first one to three bytes and read at every byte
+  inside a word, the read being one more decoder input, `D([q; u; r; c; p])`. At its default
+  `off` nothing is built and the key and its five sizes are left out of the hash.
 - The memory's opt-in keys (fast cells, address n-grams, the address gate and its inputs, the
   write decision, the feedback cuts) mean the same in both families; the cell arithmetic is
   shared code.
