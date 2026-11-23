@@ -1298,6 +1298,8 @@ class FusedEvents:
         self.captured = False
         self.slots: tuple[int, int] = (0, 0)
         self._sets: list[Any] = []
+        #: The memory pool of every CUDA graph the sets capture (made at the first window).
+        self._pool: Any = None
         if kernels:
             from hsn.kernels import event as event_kernels
             from hsn.kernels import window as window_kernels
@@ -1352,8 +1354,10 @@ class FusedEvents:
             )
         from hsn.kernels.event import EventKernelSet
 
+        if self._pool is None:  # one graph memory pool for every set: their replays take turns
+            self._pool = torch.cuda.graph_pool_handle()
         while len(self._sets) <= self.position:
-            self._sets.append(EventKernelSet(forward_graph=True, local=True))
+            self._sets.append(EventKernelSet(forward_graph=True, local=True, pool=self._pool))
         return self._sets[self.position]
 
     def block(

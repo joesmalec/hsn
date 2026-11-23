@@ -53,7 +53,7 @@ window's scope does not offer a training run the limit
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor
@@ -374,11 +374,12 @@ class ReverseSweep:
                 self.step(t)
         return self.dc, self.db
 
-    def capture(self, warm_up: int = 2) -> None:
+    def capture(self, warm_up: int = 2, pool: Any = None) -> None:
         """Capture the loop over the positions in a CUDA graph (CUDA only). The buffers must
         hold a window (:meth:`load`): its sweep runs ``warm_up`` times eagerly, then the loop
         is recorded (a capture records the work, it does not run it), and the buffers are put
-        back as loaded. Later calls of :meth:`run` replay the graph."""
+        back as loaded. Later calls of :meth:`run` replay the graph. ``pool``: the graph
+        memory pool to capture into (``torch.cuda.graph``'s; ``None``: a pool of its own)."""
         if self.device.type != "cuda":
             raise RuntimeError("a CUDA graph needs the buffers on a CUDA device")
         keep = (self.A.clone(), self.R.clone())
@@ -389,7 +390,7 @@ class ReverseSweep:
         self._restart(keep)
         torch.cuda.synchronize(self.device)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, pool=pool):
             for t in range(self.shape.T - 1, -1, -1):
                 self.step(t)
         self._graph = graph
