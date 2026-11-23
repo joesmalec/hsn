@@ -44,6 +44,7 @@ __all__ = [
     "memory_plan",
     "reader_param_count",
     "cell_read_param_count",
+    "word_cells_param_count",
     "value_bytes_for",
 ]
 
@@ -118,6 +119,7 @@ def expected_param_count(m: ModelConfig) -> dict[str, int]:
     v_in = m.cell_input_width  # 4d: [u; eps; h_i; m_i]; 3d with model.ablate_shared_u
     c = m.reader_width if m.reader != "none" else 0  # HSN-T: S and D read the reader's output
     a = m.d if m.cell_attention_heads else 0  # HSN-T: D reads the attention read of the cells
+    a += m.d + 2 if m.word_cells != "off" else 0  # HSN-T: D reads the keyed word cells' p_t
     rows = {
         "byte_emb": v * d,
         "ctx_emb": m.n_context * m.context_dim,
@@ -173,6 +175,17 @@ def cell_read_param_count(m: ModelConfig) -> int:
     if not m.cell_attention_heads:
         return 0
     return m.d * (m.reader_width + 4 * m.d + 4)
+
+
+def word_cells_param_count(m: ModelConfig) -> int:
+    """HSN-T with ``model.word_cells``: the parameters of the keyed word cells
+    (:class:`hsn.model.word_cells.WordCells`), outside Appendix C like the reader; 0 without
+    the key. The read maps ``U_j``, one ``d x d`` map for each of the 16 offsets: 65,536 at
+    ``d`` 64. The ``d + 2`` decoder columns that read ``p_t`` are counted in the ``decoder``
+    row; the cells themselves are state, not parameters."""
+    if m.word_cells == "off":
+        return 0
+    return 16 * m.d * m.d
 
 
 def memory_off_param_count(m: ModelConfig) -> dict[str, int]:

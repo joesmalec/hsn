@@ -176,7 +176,8 @@ class Decoder(MLP2):
     """``D``: ``D([q_t; u_t])``, ``2d -> H -> V`` (C.1 row ``decoder``), or ``3d`` with A5 and
     ``4d`` with A8's ``model.fast_readout`` (``[q; u; r; f]``); HSN-T reads the reader's
     ``c_t`` after them and, with ``model.cell_attention_heads``, the attention read ``m_t`` of
-    the cells last (``[q; u; r; c; m]``)."""
+    the cells last (``[q; u; r; c; m]``); with ``model.word_cells`` the keyed cells' read
+    ``p_t`` (``d + 2`` columns) stands last (``[q; u; r; c; p]``)."""
 
     def __init__(self, cfg: ModelConfig, *, seed: int = 0) -> None:
         super().__init__(2 * cfg.d, cfg.hidden, cfg.vocab_size, cfg.activation, init=cfg.init)
@@ -202,6 +203,9 @@ class Decoder(MLP2):
             _widen_first_layer(self, cfg.reader_width, cfg.init, seed + 0xA14DEC0)
         if cfg.cell_attention_heads:  # the attention read of the cells: m_t after c_t
             _widen_first_layer(self, cfg.d, cfg.init, seed + 0xCA77DEC)
+        if cfg.word_cells != "off":
+            # model.word_cells: the keyed cells' read p_t (d + 2 columns) last, [q; u; r; c; p]
+            _widen_first_layer(self, cfg.d + 2, cfg.init, seed + 0x57C0DEC)
 
 
 class EMATarget(nn.Module):

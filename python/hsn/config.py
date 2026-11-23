@@ -535,6 +535,40 @@ class ModelConfig(_StrictModel):
     # word_contexts: the context ids whose bytes are text for word_address (TinyStories is
     # 6). Read only with word_address; every other context keeps one word per byte.
     word_contexts: list[int] = [6]
+    # --- keyed word cells (docs/amendments/word_cells.md; opt-in, 22 Nov 2026; stage 1: the
+    # by-rule table, the control arm, not an HSN memory to adopt) ---
+    # word_cells: off (default) | hash. hash adds word_cells_n keyed cells of width d beside the
+    # routed cells, written and read by a fixed rule (nothing in the store is trained):
+    # - keys: a word (word_address's rule: letters, digits, an apostrophe between two letters,
+    #   under a text context) has the keys (l, its first l bytes as written, no case fold) for
+    #   l = 1 .. min(word_cells_levels, its length), when it has word_cells_min_len bytes or more;
+    # - candidates: a key's cells are word_cells_ways fixed hashes of it (drawn from the run
+    #   seed) into the word_cells_n cells;
+    # - the write is deferred: after a window's event loop, once per key, with the key's last
+    #   word end of the window: into the candidate that holds the key, else the candidate
+    #   written longest ago (an empty one first); the cell takes the key and the event's byte
+    #   position as its tags and the value of word_cells_value;
+    # - the read: at every byte inside a word, the candidate that holds the key of the prefix
+    #   so far (its first min(j, levels) bytes, j bytes so far) as the window before left it,
+    #   so only entries written in an earlier window; p_t = [U_min(j,16) h ; 1[age >= 256] ;
+    #   log(1 + age / 256)] (age: the byte's position minus the entry's write position; zeros
+    #   without a match) is one more decoder input, D([q; u; r; c; p]); U_j is a learned d x d
+    #   map per offset, zero at the start.
+    # A document start clears a row's cells. The cells ride with the window carry
+    # (hsn.model.hsn.WindowCarry) and are saved with it. Needs model_name hsn_t with its memory,
+    # write_events=word, word_address exact | bag, reader_carry > 0 and no
+    # cell_attention_heads. The event loop and the fused event block are untouched.
+    word_cells: Literal["off", "hash"] = "off"
+    # word_cells_value: what a write puts into the cell. bytes: the fixed code of the word's
+    # bytes after the key's l, sum_m P_m * T[w_m] / sqrt(n - l) (fixed +-1 tables from the run
+    # seed; byte positions past 16 reuse the 16th), by rule: a table. Stage 1 builds this value
+    # only (the cell update of the HSN, `word` and `cell` in the design, is stage 2).
+    word_cells_value: Literal["bytes"] = "bytes"
+    word_cells_n: int = Field(default=1024, ge=2)  # N_s: the keyed cells of a row
+    word_cells_ways: int = Field(default=2, ge=1, le=4)  # A: candidate cells per key
+    word_cells_levels: int = Field(default=3, ge=1, le=3)  # L: prefix lengths 1 .. L are keys
+    word_cells_min_len: int = Field(default=1, ge=1)  # words shorter than this are not written
+    # --- end keyed word cells ---
     # --- end HSN-T ---
     # --- Never-trained bytes (docs/key_content.md; opt-in, 15 Nov 2026; HSN and HSN-T) ---
     # zero_unseen_bytes: a byte that no training window has held as an input has never received
@@ -559,6 +593,12 @@ class ModelConfig(_StrictModel):
     unseen_bytes_as: Literal["own", "zero", "unknown"] = "own"
     # --- end never-trained bytes ---
     state_schema_version: int = Field(default=1, ge=1)  # bumped on any state layout change
+
+    @field_validator("word_cells", mode="before")
+    @classmethod
+    def _word_cells_off(cls, value: Any) -> Any:
+        """A YAML file reads a bare ``off`` as the boolean false: take it as ``"off"``."""
+        return "off" if value is False else value
 
     @property
     def unseen_bytes_mode(self) -> Literal["own", "zero", "unknown"]:
@@ -915,6 +955,66 @@ class ModelConfig(_StrictModel):
                 raise ValueError(
                     f"{key}: model.word_contexts={self.word_contexts} must be distinct context "
                     f"ids below model.n_context={self.n_context}"
+                )
+        cells_defaults = {
+            name: type(self).model_fields[name].default
+            for name in (
+                "word_cells_value",
+                "word_cells_n",
+                "word_cells_ways",
+                "word_cells_levels",
+                "word_cells_min_len",
+            )
+        }
+        if self.word_cells == "off":
+            moved = [name for name, value in cells_defaults.items() if getattr(self, name) != value]
+            if moved:
+                raise ValueError(
+                    f"model.{moved[0]}={getattr(self, moved[0])} describes the keyed word cells "
+                    "(docs/amendments/word_cells.md), and model.word_cells is off: set "
+                    "model.word_cells=hash or leave the model.word_cells_* keys at their defaults"
+                )
+        else:
+            key = f"model.word_cells={self.word_cells}"
+            if self.reader == "none":
+                raise ValueError(
+                    f"{key}: the keyed word cells are HSN-T's (model_name: hsn_t), read by its "
+                    "decoder beside the reader's output; set model.reader=transformer. The HSN "
+                    "and the baselines have no such cells"
+                )
+            if not self.memory:
+                raise ValueError(
+                    f"{key}: the keyed cells are cells of the memory, written at its word "
+                    "events, and model.memory=false has none; leave it off"
+                )
+            if self.write_events != "word" or self.word_address == "none":
+                raise ValueError(
+                    f"{key} needs model.write_events=word and model.word_address=exact | bag "
+                    f"(got {self.write_events} and {self.word_address}): a key is the prefix of "
+                    "a word of the word address's rule, and the write is taken at its word end"
+                )
+            if not self.word_contexts:
+                raise ValueError(
+                    f"{key}: model.word_contexts is empty, so no byte is text and nothing would "
+                    "be written or read; name the text contexts of the run's data"
+                )
+            if not self.reader_carry:
+                raise ValueError(
+                    f"{key} needs model.reader_carry > 0: the cells ride with the window carry "
+                    "of the carried reader (hsn.model.hsn.WindowCarry), and a write becomes "
+                    "readable in the next window, so until then the word must lie in the "
+                    "reader's sight (not built without the carry)"
+                )
+            if self.cell_attention_heads:
+                raise ValueError(
+                    f"{key}: model.cell_attention_heads={self.cell_attention_heads} (the "
+                    "attention read m_t) is not built beside the keyed cells' read in stage 1; "
+                    "leave it at 0"
+                )
+            if self.word_cells_ways > self.word_cells_n:
+                raise ValueError(
+                    f"{key}: model.word_cells_ways={self.word_cells_ways} candidate cells per "
+                    f"key and only model.word_cells_n={self.word_cells_n} cells"
                 )
         # --- end HSN-T ---
         if self.zero_unseen_bytes and self.unseen_bytes_as != "own":
@@ -2090,6 +2190,12 @@ class RunConfig(_StrictModel):
                     f"{key}: the memory's records are per event slot, not per byte, and "
                     "these settings read them per byte: " + "; ".join(refused)
                 )
+        if self.model.word_cells != "off" and self.model_name != "hsn_t":
+            raise ValueError(
+                f"model.word_cells={self.model.word_cells} (docs/amendments/word_cells.md) is "
+                f"built for HSN-T with its memory (model_name: hsn_t); model_name="
+                f"{self.model_name!r} has no keyed cells: leave it off"
+            )
         if not self.model.memory:
             if self.model_name != "hsn_t":
                 raise ValueError(
@@ -2630,6 +2736,12 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.unseen_bytes_as",
     "model.reader_qk_norm",
     "hardware.event_kernel",
+    "model.word_cells",
+    "model.word_cells_value",
+    "model.word_cells_n",
+    "model.word_cells_ways",
+    "model.word_cells_levels",
+    "model.word_cells_min_len",
 )
 
 #: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id

@@ -242,6 +242,7 @@ from hsn.model.hsn import (
     address_history,
     clone_carry,
     pack_carry,
+    packed_word_cells,
     reader_carried,
     split_packed_carry,
 )
@@ -963,6 +964,9 @@ class TBPTTTrainer(Trainer):
         floats.append(info["alpha_entropy"].float().mean())
         floats.append(info["cost"].float().mean())
         rates = tuple(key for key in ("explored", "refreshed", "dense_fallback") if key in info)
+        # model.word_cells: the window's hit rate of the keyed cells' read and the share of old
+        # entries among the hits (0-dim; read behind the rates, with them)
+        cells = tuple(key for key in ("word_cells_hit", "word_cells_old") if key in info)
         if "event_valid" in info:
             # model.write_events: a rate is the mean over the slots in which some row has an
             # event. The slots behind them (the layout is a multiple of the block) hold padding
@@ -973,6 +977,8 @@ class TBPTTTrainer(Trainer):
             floats.extend((info[key].float() * held).sum() / n_held for key in rates)
         else:
             floats.extend(info[key].float().mean() for key in rates)
+        floats.extend(info[key].float() for key in cells)
+        rates = rates + cells
         ints: list[Tensor] = []
         if count > 0:
             # the correct predictions at the loss positions. The argmax of every position and
@@ -1781,6 +1787,15 @@ class TBPTTTrainer(Trainer):
                 except ValueError as error:
                     raise ValueError(f"{path}: {error}") from error
                 previous = WindowCarry(previous, cache)
+                cells = packed_word_cells(self.cfg.model, extra["prev_tokens"], str(path))
+                if cells is not None:  # model.word_cells: the keyed word cells ride with it
+                    assert self.hsn.word_cells is not None
+                    moved = tuple(t.to(self.ctx.device).clone() for t in cells)
+                    try:
+                        held = self.hsn.word_cells.check_carry(moved, int(previous.address.shape[0]))
+                    except ValueError as error:
+                        raise ValueError(f"{path}: {error}") from error
+                    previous = WindowCarry(previous.address, previous.reader, held)
             self._prev_tokens = previous
         if self._reach_hold:  # train.reach_dropout on the carried reader: the held draws
             if "reach_held" not in extra:

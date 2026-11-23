@@ -690,6 +690,11 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # likewise: without the word address (and its contexts, read only with it)
         del dump["model"]["word_address"]
         del dump["model"]["word_contexts"]
+    if dump["model"]["word_cells"] == "off":
+        # likewise (22 Nov 2026): without the keyed word cells (and their sizes, read only
+        # with them) an arm keeps its memory key
+        for key in [name for name in dump["model"] if name.startswith("word_cells")]:
+            del dump["model"][key]
     for key, default in _TRANSFORMER_XL_DEFAULTS.items():
         # the Transformer baseline's positions and cache (17 Nov 2026) at their defaults stay
         # out: every arm, of every family, keeps its memory key
