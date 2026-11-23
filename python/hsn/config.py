@@ -538,31 +538,21 @@ class ModelConfig(_StrictModel):
     # --- keyed word cells (docs/amendments/word_cells.md; opt-in, 22 Nov 2026; stage 1: the
     # by-rule table, the control arm, not an HSN memory to adopt) ---
     # word_cells: off (default) | hash. hash adds word_cells_n keyed cells of width d beside the
-    # routed cells, written and read by a fixed rule (nothing in the store is trained):
-    # - keys: a word (word_address's rule: letters, digits, an apostrophe between two letters,
-    #   under a text context) has the keys (l, its first l bytes as written, no case fold) for
-    #   l = 1 .. min(word_cells_levels, its length), when it has word_cells_min_len bytes or more;
-    # - candidates: a key's cells are word_cells_ways fixed hashes of it (drawn from the run
-    #   seed) into the word_cells_n cells;
-    # - the write is deferred: after a window's event loop, once per key, with the key's last
-    #   word end of the window: into the candidate that holds the key, else the candidate
-    #   written longest ago (an empty one first); the cell takes the key and the event's byte
-    #   position as its tags and the value of word_cells_value;
-    # - the read: at every byte inside a word, the candidate that holds the key of the prefix
-    #   so far (its first min(j, levels) bytes, j bytes so far) as the window before left it,
-    #   so only entries written in an earlier window; p_t = [U_min(j,16) h ; 1[age >= 256] ;
-    #   log(1 + age / 256)] (age: the byte's position minus the entry's write position; zeros
-    #   without a match) is one more decoder input, D([q; u; r; c; p]); U_j is a learned d x d
-    #   map per offset, zero at the start.
-    # A document start clears a row's cells. The cells ride with the window carry
-    # (hsn.model.hsn.WindowCarry) and are saved with it. Needs model_name hsn_t with its memory,
-    # write_events=word, word_address exact | bag, reader_carry > 0 and no
-    # cell_attention_heads. The event loop and the fused event block are untouched.
+    # routed cells, written and read by a fixed rule (nothing in the store is trained). A word
+    # (word_address's rule, bytes as written) of word_cells_min_len bytes or more has the keys
+    # (l, its first l bytes), l = 1 .. word_cells_levels; a key's candidate cells are
+    # word_cells_ways fixed hashes of it. The write is deferred to the end of the window, once
+    # per key with its last word end there: into the candidate that holds the key, else the one
+    # written longest ago; the cell takes the key, the event's byte position and the value. At
+    # every byte inside a word the candidate that holds the key of the prefix so far is read as
+    # the window before left it: p_t = [U_min(j,16) h ; 1[age >= 256] ; log(1 + age / 256)]
+    # (zeros without a match) is one more decoder input, D([q; u; r; c; p]); U_j is a learned
+    # d x d map per offset, zero at the start. A document start clears a row's cells; they ride
+    # with the window carry (hsn.model.hsn.WindowCarry). Needs model_name hsn_t with its memory,
+    # write_events=word, word_address exact | bag, reader_carry > 0, no cell_attention_heads.
     word_cells: Literal["off", "hash"] = "off"
-    # word_cells_value: what a write puts into the cell. bytes: the fixed code of the word's
-    # bytes after the key's l, sum_m P_m * T[w_m] / sqrt(n - l) (fixed +-1 tables from the run
-    # seed; byte positions past 16 reuse the 16th), by rule: a table. Stage 1 builds this value
-    # only (the cell update of the HSN, `word` and `cell` in the design, is stage 2).
+    # word_cells_value: what a write stores. bytes: the fixed code of the word's bytes after the
+    # key's, a table by rule; the only value of stage 1 (the HSN's cell update is stage 2).
     word_cells_value: Literal["bytes"] = "bytes"
     word_cells_n: int = Field(default=1024, ge=2)  # N_s: the keyed cells of a row
     word_cells_ways: int = Field(default=2, ge=1, le=4)  # A: candidate cells per key

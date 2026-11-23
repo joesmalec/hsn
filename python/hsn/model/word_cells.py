@@ -1,60 +1,35 @@
 """Keyed word cells (``model.word_cells = hash``; HSN-T, opt-in; ``docs/amendments/word_cells.md``).
 
-Stage 1 of the memory redesign of 22 Nov 2026: the machinery of the keyed cells with the
-**by-rule table value** (``model.word_cells_value = bytes``), the control arm. Nothing in the
-store is trained and no gradient enters it; what is learned is how the decoder reads it
-(``U`` here and the decoder's new input columns).
+Stage 1 of the memory redesign of 22 Nov 2026: the keyed cells with the **by-rule table value**
+(``model.word_cells_value = bytes``), the control arm. Nothing in the store is trained and no
+gradient enters it; what is learned is how the decoder reads it (``U`` here and the decoder's new
+input columns). The document has the rule in full; in short:
 
-**Words** are the word address's (:mod:`hsn.model.word_address`): under a text context a word
-byte is an ASCII letter or digit, or an apostrophe directly between two letters; a word is a
-maximal run of word bytes within a document. A word ends, and its event is taken, at the byte
-after it (for a word followed by an apostrophe and then no letter: at the byte after that
-apostrophe). The rule is written out again here, with a carry of its own, because the keys read
-the bytes as written (the address folds the case) and need the word's first bytes.
-
-**Keys.** A word ``w`` of ``n >= model.word_cells_min_len`` bytes has the keys ``(l, w_1 .. w_l)``
-for ``l = 1 .. min(L, n)`` (``L = model.word_cells_levels``), as integers
-``l * 256^L + sum_m w_m * 256^(L - m)``. The candidate cells of a key ``k`` are
-``((a_i * k + b_i) mod (2^31 - 1)) mod N_s`` for the ``A = model.word_cells_ways`` pairs
-``(a_i, b_i)`` drawn from the run seed (two ways may name the same cell).
-
-**The value** of the key ``(l, ..)`` of ``w`` is the fixed code of the bytes after ``l``::
-
-    s_l(w) = (n - l)^(-1/2) * sum_{m = l + 1 .. n} P[min(m, 16)] * T[w_m]         (0 when n = l)
-
-with fixed tables of +-1, ``T [V, d]`` per byte as written and ``P [16, d]`` per byte position.
-
-**The write** is deferred: once per window, after its event loop (:meth:`WordCells.write`).
-Every key of every word end of the window (of the document going on at the window's end) asks
-for a cell, and of a key's word ends the latest counts:
-
-1. a key that a candidate cell holds (the cell's tag is the key) writes there;
-2. every other key asks for its candidate with the oldest write position among the cells that
-   no write of this window has taken (an empty cell is older than any; ties go to the lower
-   way). Where several keys ask for one cell, the latest word end takes it (at one word end the
-   longer prefix);
-3. a key that lost in 2 asks once more, the same way; what loses again, or has no candidate
-   left, is not written in this window.
-
-The cell that is taken holds the key, the byte position of the word end and ``s_l(w)``: the
-value replaces the cell, which is the clear on a new key. All of it is one batched update of
-fixed shape (``T * L`` slots per row), with gathers and ``amax`` scatters only.
-
-**The read** (:meth:`WordCells.window`, :meth:`WordCells.read`). Byte ``t`` is inside a word
-when it is a letter or digit, or an apostrophe directly after a letter (it cannot yet know
-whether the apostrophe joins; the prefix counts it). With ``j`` bytes of the word so far, the
-key is ``(min(j, L), the first min(j, L) bytes)``, and the read is the candidate cell whose tag
-is that key **as the window started**: every entry it can match was written in an earlier
-window of the same document (after a document start inside the window nothing is read)::
-
-    p_t = [U_min(j,16) h ; 1[age >= 256] ; log(1 + age / 256)]      age = pos_t - (write position)
-
-and zeros without a match. ``U [16, d, d]`` is learned and zero at the start.
-
-**The carry** (:class:`WordCellsCarry`) rides with the window carry
-(:class:`hsn.model.hsn.WindowCarry`): the word in progress (its code sum, first bytes and
-length, whether its last byte is a letter, and whether the window ended on an apostrophe not yet
-placed), the cells, their keys and their write positions. A document start clears a row.
+- **Words** are the word address's (:mod:`hsn.model.word_address`): letters and digits under a
+  text context, an apostrophe directly between two letters, within one document. The rule is
+  written out again here with a carry of its own, because the keys read the bytes as written
+  (the address folds the case) and need the word's first bytes.
+- **Keys.** A word ``w`` of ``n >= min_len`` bytes has the keys ``(l, w_1 .. w_l)``,
+  ``l = 1 .. min(L, n)``, as integers ``l * 256^L + sum_m w_m * 256^(L - m)``. A key's candidate
+  cells are ``((a_i * k + b_i) mod (2^31 - 1)) mod N_s`` for ``A`` pairs drawn from the run seed.
+- **The value** of ``(l, ..)``: ``s_l(w) = (n - l)^(-1/2) * sum_{m > l} P[min(m, 16)] * T[w_m]``
+  with fixed tables of +-1 (``T`` per byte as written, ``P`` per byte position); 0 when ``n = l``.
+- **The write** is deferred to the end of the window (:meth:`WordCells.write`), one batched
+  update of fixed shape (``T * L`` slots a row; gathers and ``amax`` scatters only). Of a key's
+  word ends in the window the latest counts. (1) A key that a candidate cell holds writes
+  there. (2) Every other key asks for its candidate with the oldest write position among the
+  cells no write of this window has taken (an empty cell first; ties to the lower way); where
+  several ask for one cell the latest word end takes it (at one word end the longer prefix).
+  (3) A key that lost in 2 asks once more; what loses again is not written in this window.
+  The value replaces the cell, which is the clear on a new key.
+- **The read** (:meth:`WordCells.window`, :meth:`WordCells.read`). Byte ``t`` is inside a word
+  when it is a letter or digit, or an apostrophe directly after a letter (it cannot yet know
+  whether that one joins; the prefix counts it). With ``j`` bytes of the word so far it reads the
+  candidate cell that holds ``(min(j, L), the first min(j, L) bytes)`` **as the window
+  started**, so only entries of earlier windows of its document:
+  ``p_t = [U_min(j,16) h ; 1[age >= 256] ; log(1 + age / 256)]``, zeros without a match.
+- **The carry** (:class:`WordCellsCarry`) rides with :class:`hsn.model.hsn.WindowCarry`. A
+  document start clears a row.
 """
 
 from __future__ import annotations
@@ -79,7 +54,6 @@ __all__ = [
     "WordCells",
     "WordCellsCarry",
     "WordCellsWindow",
-    "word_cells_decoder_columns",
 ]
 
 #: The read maps ``U_j``: one per number of bytes of the word so far, ``j = 1 .. 16``; longer
@@ -107,17 +81,12 @@ _SEED_TAG = 0x57434C4C  # b"WCLL"
 _HUGE = 1 << 60
 
 
-def word_cells_decoder_columns(cfg: ModelConfig) -> int:
-    """The decoder input columns that read ``p_t``: ``d + 2`` with the key on, else 0."""
-    return cfg.d + 2 if cfg.word_cells != "off" else 0
-
-
 class WordCellsCarry(NamedTuple):
-    """What a window hands to the next window of the same rows (module docstring): ``word``
-    (int64 ``[B, d + L + 3]``: the code sum of the word in progress, its first ``L`` bytes, its
-    length, whether its last byte is a letter, whether an apostrophe is waiting), ``table``
-    (``[B, N_s, d]``, the cells), ``key`` (int64 ``[B, N_s]``, :data:`NO_KEY` where empty) and
-    ``when`` (int64 ``[B, N_s]``, the byte position of the last write, :data:`EMPTY`)."""
+    """What a window hands to the next window of the same rows: ``word`` (int64
+    ``[B, d + L + 3]``: the code sum of the word in progress, its first ``L`` bytes, its length,
+    whether its last byte is a letter, whether an apostrophe is waiting), the cells ``table
+    [B, N_s, d]``, their keys ``key [B, N_s]`` (int64; :data:`NO_KEY`: empty) and the byte
+    positions of their last writes ``when [B, N_s]`` (int64; :data:`EMPTY`)."""
 
     word: Tensor
     table: Tensor
@@ -126,15 +95,13 @@ class WordCellsCarry(NamedTuple):
 
 
 class WordCellsWindow(NamedTuple):
-    """A window's by-rule record (:meth:`WordCells.window`), nothing in it with a gradient.
-
-    The read, per byte: ``value [B, T, d]`` (the matched cell, zeros without a match),
-    ``offset [B, T]`` (``min(j, 16) - 1``), ``age_features [B, T, 2]``, and the masks ``inside``,
-    ``hit`` and ``old`` (a match of age :data:`AGE_SCALE` or more). The write plan, per slot
-    (``W = T * L`` slots a row, slot ``t * L + l - 1``): ``slot_key``, ``slot_active``
-    ``[B, W]``, ``slot_when [B, W]`` and ``slot_value [B, W, d]``; ``cleared [B]`` (a document
-    started in the window) and the ``carry`` the window started from; ``word`` is the next
-    window's word state."""
+    """A window's by-rule record (:meth:`WordCells.window`), without a gradient. The read, per
+    byte: ``value [B, T, d]`` (the matched cell; zeros without a match), ``offset``
+    (``min(j, 16) - 1``), ``age_features [B, T, 2]`` and the masks ``inside``, ``hit``, ``old``
+    (a match :data:`AGE_SCALE` bytes old or more). The write plan, per slot ``t * L + l - 1``:
+    ``slot_key``, ``slot_active``, ``slot_when`` (``[B, T * L]``) and ``slot_value``; ``cleared
+    [B]`` (a document started in the window), the ``carry`` the window started from and the
+    next window's ``word`` state."""
 
     value: Tensor
     offset: Tensor
@@ -152,9 +119,9 @@ class WordCellsWindow(NamedTuple):
 
 
 class WordCells(nn.Module):
-    """The keyed word cells of an HSN-T (module docstring). Built after every other module and
-    from a generator of its own, without a draw from the global stream, so every other
-    parameter and buffer starts as it does without the key. ``U`` is the only parameter."""
+    """The keyed word cells of an HSN-T (module docstring). Built from a generator of its own,
+    without a draw from the global stream, so every other parameter and buffer starts as it
+    does without the key. ``U`` is the only parameter."""
 
     def __init__(self, cfg: ModelConfig, *, seed: int) -> None:
         super().__init__()
@@ -208,8 +175,7 @@ class WordCells(nn.Module):
         )
 
     def check_carry(self, carry: object, B: int) -> WordCellsCarry:
-        """``carry`` as a :class:`WordCellsCarry` of ``B`` rows of this module's shapes, or a
-        ``ValueError`` that says what it must be."""
+        """``carry`` as a :class:`WordCellsCarry` of ``B`` rows of this module's shapes."""
         N, d = self.n_cells, self.d
         shapes = ((B, self.word_width), (B, N, d), (B, N), (B, N))
         parts = tuple(carry) if isinstance(carry, list | tuple) else ()
@@ -248,11 +214,11 @@ class WordCells(nn.Module):
         positions: Tensor,
         carry: WordCellsCarry,
     ) -> WordCellsWindow:
-        """A window's keys, its read of the carried cells and its write plan (module docstring),
-        by rule. ``tokens``, ``ctx``, ``reset`` and ``positions`` (the byte position in its
-        document of every column) are ``[B, T]``. No column reads a later byte."""
+        """A window's keys, its read of the carried cells and its write plan, by rule.
+        ``tokens``, ``ctx``, ``reset`` and ``positions`` (every column's byte position in its
+        document) are ``[B, T]``. No column reads a later byte."""
         B, T = (int(n) for n in tokens.shape)
-        d, L, N = self.d, self.levels, self.n_cells
+        d, L = self.d, self.levels
         device = tokens.device
         x = tokens.to(torch.int64)
         text = torch.zeros_like(reset)
@@ -300,9 +266,8 @@ class WordCells(nn.Module):
         carried = start < 0  # the word began in a window before
         index = torch.where(carried, len0[:, None] + steps + 1, steps - start + 1)
         lead = torch.cat([first0, x], dim=1)  # [B, L + T]
-        column = (steps - index + 1)[..., None] + torch.arange(L, device=device)  # [B, T, L]
         places = torch.arange(L, device=device)
-        column = column.clamp(max=T - 1)  # (past the byte itself: masked below)
+        column = ((steps - index + 1)[..., None] + places).clamp(max=T - 1)  # [B, T, L]
         source = torch.where(column >= 0, column + L, places.expand_as(column))
         known = index[..., None] > places
         prefix = lead.gather(1, source.reshape(B, T * L)).view(B, T, L) * known
@@ -445,9 +410,8 @@ class WordCells(nn.Module):
 
     @torch.no_grad()
     def rates(self, win: WordCellsWindow) -> tuple[Tensor, Tensor]:
-        """A window's two statistics (0-dim): the share of its bytes inside a word that read a
-        matching entry, and the share of those matches that are :attr:`sight` bytes old or
-        more."""
+        """A window's two statistics (0-dim): the share of its bytes inside a word that read
+        an entry, and the share of those entries that are :attr:`sight` bytes old or more."""
         inside = win.inside.sum()
         hit = win.hit.sum()
         hit_rate = hit.to(torch.float32) / inside.clamp_min(1)
@@ -455,7 +419,4 @@ class WordCells(nn.Module):
         return hit_rate, old_rate
 
     def extra_repr(self) -> str:
-        return (
-            f"cells={self.n_cells}, ways={self.ways}, levels={self.levels}, "
-            f"min_len={self.min_len}, offsets={OFFSETS}"
-        )
+        return f"cells={self.n_cells}, ways={self.ways}, levels={self.levels}"

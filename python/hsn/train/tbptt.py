@@ -1791,8 +1791,9 @@ class TBPTTTrainer(Trainer):
                 if cells is not None:  # model.word_cells: the keyed word cells ride with it
                     assert self.hsn.word_cells is not None
                     moved = tuple(t.to(self.ctx.device).clone() for t in cells)
+                    rows = int(previous.address.shape[0])
                     try:
-                        held = self.hsn.word_cells.check_carry(moved, int(previous.address.shape[0]))
+                        held = self.hsn.word_cells.check_carry(moved, rows)
                     except ValueError as error:
                         raise ValueError(f"{path}: {error}") from error
                     previous = WindowCarry(previous.address, previous.reader, held)
