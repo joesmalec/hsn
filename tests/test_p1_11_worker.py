@@ -7,6 +7,7 @@ nvidia-smi, an idle CPU) and hides CUDA from every child; the scheduler's GPU ca
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import signal
@@ -20,6 +21,7 @@ from typing import Any
 import pytest
 from hsn.experiments import db as dbm
 from hsn.experiments import machine
+from hsn.experiments.machine import MIN_FOREIGN_MIB
 from hsn.experiments.report import build_report, format_markdown
 from hsn.experiments.scheduler import (
     MAX_BYPASS,
@@ -115,6 +117,73 @@ def test_p1_11_timing_arm_runs_alone() -> None:
     queue = [timing, q(2)]
     assert decide(queue, [r(9)], CARD, limits=LIMITS) == Launch(2, bypassed_head=True)
     assert isinstance(decide(queue, [r(9)], CARD, limits=LIMITS, head_bypassed=MAX_BYPASS), Wait)
+
+
+#: an empty 12 GB card as the worker reads it: 51 MiB of desktop contexts, 11213 MiB available
+EMPTY = Card(present=True, ok=True, total_mib=12288, used_mib=51, own_used_mib=0)
+
+
+def _shared(card: Card) -> Card:
+    """The card as the folder workers' wrapper passes it on: foreign processes hidden."""
+    return dataclasses.replace(card, foreign=())
+
+
+def test_scheduler_estimate_over_the_card_runs_alone_on_an_empty_card() -> None:
+    # the stall: an estimate from an old peak above the empty card waited for good; now it runs
+    # alone, like an arm with no estimate, and the launch says why
+    launch = decide([q(1, mem=12610)], [], EMPTY, limits=LIMITS)
+    assert isinstance(launch, Launch) and launch.exp_id == 1 and not launch.bypassed_head
+    assert launch.note is not None and "12610 MiB" in launch.note and "11213 MiB" in launch.note
+    assert "runs alone" in launch.note
+    assert decide([q(1, mem=3000)], [], EMPTY, limits=LIMITS) == Launch(1)  # fits: no note
+    # a CPU arm of ours does not hold the card (as for an arm with no estimate)
+    assert decide([q(2, mem=12610)], [r(1, device="cpu")], EMPTY, limits=LIMITS).note  # type: ignore[union-attr]
+    # it still waits while an arm of ours runs ...
+    for running in ([r(1, mem=3000)], [r(1, mem=None, used=40)]):
+        wait = decide([q(2, mem=12610)], running, EMPTY, limits=LIMITS)
+        assert isinstance(wait, Wait) and wait.reason.startswith("exp 2: needs 12610 MiB")
+    # ... while a foreign process is on the card, counted or hidden by the wrapper ...
+    trainer = Card(
+        present=True, ok=True, total_mib=12288, used_mib=6051, foreign=("77 python 6000 MiB",)
+    )
+    assert "foreign GPU process" in decide([q(3, mem=12610)], [], trainer, limits=LIMITS).reason  # type: ignore[union-attr]
+    hidden = decide([q(3, mem=12610)], [], _shared(trainer), limits=LIMITS)
+    assert isinstance(hidden, Wait) and "needs 12610 MiB, 5213 MiB available" in hidden.reason
+    # ... and while more than MIN_FOREIGN_MIB is in use besides ours (a finishing arm of ours, an
+    # uncounted context); at the limit the card counts as empty
+    for used in (51 + MIN_FOREIGN_MIB, 500, 3000):
+        busy = dataclasses.replace(EMPTY, used_mib=used)
+        assert isinstance(decide([q(4, mem=12610)], [], busy, limits=LIMITS), Wait)
+    edge = dataclasses.replace(EMPTY, used_mib=MIN_FOREIGN_MIB)
+    assert isinstance(decide([q(4, mem=12610)], [], edge, limits=LIMITS), Launch)
+    # through the wrapper the empty card is the same
+    assert decide([q(5, mem=12610)], [], _shared(EMPTY), limits=LIMITS).note  # type: ignore[union-attr]
+
+
+def test_scheduler_estimate_over_the_card_keeps_the_other_rules() -> None:
+    big, small = q(5, mem=12610), q(6, mem=1000)
+    # head bypass and its starvation guard, unchanged: a younger arm passes the waiting head
+    assert decide([big, small], [r(1)], EMPTY, limits=LIMITS) == Launch(6, bypassed_head=True)
+    starved = decide([big, small], [r(1)], EMPTY, limits=LIMITS, head_bypassed=MAX_BYPASS)
+    assert isinstance(starved, Wait) and "waited" in starved.reasons[6]
+    # with the card empty the head goes first, alone
+    first = decide([big, small], [], EMPTY, limits=LIMITS)
+    assert isinstance(first, Launch) and first.exp_id == 5 and first.note
+    # an estimate that fits still shares the card as before
+    assert decide([q(7, mem=3000)], [r(1, mem=3000)], EMPTY, limits=LIMITS) == Launch(7)
+    # a timing arm still needs the idle streak; then it runs alone too
+    timing = q(8, timing=True, mem=12610)
+    assert "idle card and CPU" in decide([timing], [], EMPTY, limits=LIMITS, now=100).reason  # type: ignore[union-attr]
+    ready = decide([timing], [], EMPTY, limits=LIMITS, idle_since=40, now=100)
+    assert isinstance(ready, Launch) and ready.note
+    # nothing launches beside a running timing arm, and pausing still wins
+    assert decide([big], [r(1, timing=True)], EMPTY, limits=LIMITS) == Wait(
+        "a timing arm is running"
+    )
+    assert decide([big], [], EMPTY, limits=LIMITS, paused=True) == Wait("paused")
+    # an unreadable or absent card still blocks it
+    assert isinstance(decide([big], [], Card(present=True, ok=False), limits=LIMITS), Wait)
+    assert isinstance(decide([big], [], Card(), limits=LIMITS), Wait)
 
 
 def _claim_all(db: dbm.Database) -> list[int]:
@@ -488,3 +557,75 @@ def test_p1_11_cpu_watch_counts_the_arms_process_group(tmp_path: Path) -> None:
     worker.observe()
     assert worker.cpu_hogs == [(3003, 95.0, "dracut")]
     assert set(worker.watch[a].cpu_foreign) == {"3003"}
+
+
+def _over_card_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, logs: list[str]
+) -> tuple[dbm.Database, Worker, list[int], list[int]]:
+    """Four CUDA arms of one memory key queued behind an attempt at commit ``old`` that peaked
+    at 11464 MiB (x 1.1 = 12610 MiB, above the 11213 MiB of an empty card); the worker runs at
+    commit ``new``. Returns the database, the worker, the queued ids and the spawned ids."""
+    db = dbm.Database(db_path())
+    enqueue_spec(db, dry_spec(tmp_path, n=5))
+    old, *queued = [int(row["exp_id"]) for row in db.queued()]
+    _set(db, old, status="failed", commit_sha="old", gpu_mem_peak_mib=11464.0)
+    worker = Worker(db, tmp_path / "runs", WorkerOptions(), log=logs.append)
+    worker.commit = "new"
+    for arm in db.rows("SELECT arm_id, memory_key FROM arms"):
+        worker.arms[arm["arm_id"]] = {"device": "cuda", "memory_key": arm["memory_key"]}
+    spawned: list[int] = []
+
+    def spawn(exp: dict[str, Any]) -> int:
+        spawned.append(int(exp["exp_id"]))
+        return int(exp["exp_id"])
+
+    monkeypatch.setattr(worker, "spawn", spawn)
+    return db, worker, queued, spawned
+
+
+def test_worker_runs_an_estimate_over_the_card_alone_then_prefers_its_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs: list[str] = []
+    db, worker, (a, b, c, d), spawned = _over_card_worker(tmp_path, monkeypatch, logs)
+    # the stall: the old peak's estimate exceeds the empty card; it runs alone and says why
+    assert worker.launch((EMPTY, {})) == a
+    assert logs == [
+        f"exp {a}: estimate 12610 MiB exceeds the 11213 MiB available on an otherwise empty card: "
+        "runs alone (estimate: the memory key's largest recorded peak 11464 MiB over all commits "
+        "x 1.1)"
+    ]
+    # the next arm waits while it runs (its own attempt at this commit has no full peak yet)
+    _set(db, a, commit_sha="new", gpu_mem_peak_mib=3000.0)
+    assert worker.launch((EMPTY, {})) is None
+    assert logs[-1].startswith(f"waiting: exp {b}: needs 12610 MiB")
+    # once it has ended at this commit, its peak sets the estimate: two arms now share the card
+    _set(db, a, status="done", gpu_mem_peak_mib=5000.0)
+    assert worker.launch((EMPTY, {})) == b
+    assert worker.launch((EMPTY, {})) == c
+    assert spawned == [a, b, c] and not any("runs alone" in m for m in logs[1:])
+    waiting = worker.launch((EMPTY, {}))
+    assert waiting is None and logs[-1].startswith(f"waiting: exp {d}: needs 5500 MiB")
+    # an explicit reservation still wins over every recorded peak
+    _set(db, d, mem_est_mib=100.0)
+    assert worker._estimate(db.experiment(d)) == (100.0, "the row's --mem-estimate-mib")
+
+
+def test_worker_estimate_over_the_card_through_the_sharing_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The folder workers hide foreign processes from ``decide`` (``foreign=()``); an arm whose
+    estimate exceeds the card must still not start beside another session's run."""
+
+    def shared(items: Any, running: Any, card: Card, **kw: Any) -> Launch | Wait:
+        return decide(items, running, _shared(card), **kw)  # as shared_worker.py does
+
+    monkeypatch.setattr("hsn.experiments.worker.decide", shared)
+    logs: list[str] = []
+    _db, worker, (a, *_rest), spawned = _over_card_worker(tmp_path, monkeypatch, logs)
+    trainer = Card(
+        present=True, ok=True, total_mib=12288, used_mib=6051, foreign=("77 python 6000 MiB",)
+    )
+    assert worker.launch((trainer, {})) is None and not spawned
+    assert logs == [f"waiting: exp {a}: needs 12610 MiB, 5213 MiB available"]
+    assert worker.launch((EMPTY, {})) == a and "runs alone" in logs[-1]

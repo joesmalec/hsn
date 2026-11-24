@@ -30,7 +30,11 @@ Every poll (default 5 s), in this order:
 
 The memory estimate of an arm is its row's reservation (``enqueue --mem-estimate-mib``), else the
 largest recorded peak of an arm with the same memory key times :data:`MEM_MARGIN`, else unknown (the
-arm runs alone, and its peak sets the estimate). Since the memory key covers what a compiled graph
+arm runs alone, and its peak sets the estimate). The peaks recorded at the worker's own commit come
+first, once one attempt there has run to the end (:meth:`hsn.experiments.db.Database.memory_peak`):
+a code change that cuts memory keeps the memory key. An estimate larger than the available memory
+of an otherwise empty card never waits forever: the arm runs alone, and the worker logs the
+estimate and where it came from. Since the memory key covers what a compiled graph
 depends on (shapes, widths, routing and gate, dtypes, compile mode), the first arm of each key also
 compiles alone and fills the shared inductor cache (``TORCHINDUCTOR_CACHE_DIR``, default
 ``<db dir>/inductor-cache``, persistent, unlike inductor's ``/tmp`` default) for the arms after it.
@@ -220,6 +224,7 @@ class Worker:
         self.log = log
         self.host = machine.host()
         self.id = f"{self.host}:{os.getpid()}"
+        self.commit: str | None = None  # the checked-out commit, read by run()
         self.children: dict[int, subprocess.Popen[bytes]] = {}
         self.watch: dict[int, _Watch] = {}
         # P1.14: process group -> experiment of every arm launched or adopted here, until no process
@@ -240,6 +245,7 @@ class Worker:
 
     def run(self) -> int:
         git = self.machine.git_state(REPO_ROOT)
+        self.commit = git["sha"]
         if git["dirty"]:
             if self.opt.require_clean:
                 self.log(
@@ -520,11 +526,18 @@ class Worker:
             }
         return self.arms[arm_id]
 
-    def _estimate(self, row: dict[str, Any]) -> float | None:
+    def _estimate(self, row: dict[str, Any]) -> tuple[float | None, str]:
+        """The row's memory estimate (MiB) and where it comes from (module docstring)."""
         if row["mem_est_mib"] is not None:
-            return float(row["mem_est_mib"])
-        peak = self.db.memory_estimate(self._arm(row["arm_id"])["memory_key"])
-        return None if peak is None else peak * MEM_MARGIN
+            return float(row["mem_est_mib"]), "the row's --mem-estimate-mib"
+        found = self.db.memory_peak(self._arm(row["arm_id"])["memory_key"], self.commit)
+        if found is None:
+            return None, "no recorded peak"
+        peak, commit = found
+        where = "over all commits" if commit is None else f"at this commit {commit[:8]}"
+        return peak * MEM_MARGIN, (
+            f"the memory key's largest recorded peak {peak:.0f} MiB {where} x {MEM_MARGIN}"
+        )
 
     def launch(self, observed: tuple[Card, dict[int, float]]) -> int | None:
         card, by_group = observed
@@ -541,12 +554,14 @@ class Worker:
             head = int(queue[0]["exp_id"])
             if head != self.head:
                 self.head, self.head_bypassed = head, 0
+            estimates = {int(q["exp_id"]): self._estimate(q) for q in queue}
+            decision_box["sources"] = {e: source for e, (_mib, source) in estimates.items()}
             items = [
                 QueueItem(
                     int(q["exp_id"]),
                     self._arm(q["arm_id"])["device"],
                     bool(q["timing"]),
-                    self._estimate(q),
+                    estimates[int(q["exp_id"])][0],
                 )
                 for q in queue
             ]
@@ -557,7 +572,7 @@ class Worker:
                     int(r["exp_id"]),
                     self._arm(r["arm_id"])["device"],
                     bool(r["timing"]),
-                    self._estimate(r),
+                    self._estimate(r)[0],
                     by_group.get(int(r["pgid"]), 0.0) if r["pgid"] is not None else 0.0,
                 )
                 for r in running
@@ -588,6 +603,9 @@ class Worker:
             return None
         if isinstance(decision, Launch) and decision.bypassed_head:
             self.head_bypassed += 1
+        if isinstance(decision, Launch) and decision.note:
+            source = decision_box.get("sources", {}).get(int(claimed["exp_id"]), "unknown")
+            self.log(f"exp {claimed['exp_id']}: {decision.note} (estimate: {source})")
         self.last_wait = ""
         self.idle_since = None  # a timing arm needs a fresh idle streak after any launch
         return self.spawn(claimed)

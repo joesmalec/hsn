@@ -887,7 +887,15 @@ Every attempt is a row; `requeue` adds a new one at the back of the queue. `enqu
 - no other session's process is on the card.
 
 **Memory estimate:** the row's `--mem-estimate-mib`, else the largest recorded peak of an arm with the same
-memory key times 1.1. An arm with no estimate runs alone the first time.
+memory key times 1.1. An arm with no estimate runs alone the first time. Peaks recorded at the worker's own
+commit come first, once one run of the key there has ended `done` or `stopped_early`; until then, peaks at any
+commit count. The reason: a code change that cuts memory keeps the memory key, so an old peak would hold the
+estimate up for good.
+
+**An arm whose estimate exceeds the free memory** still waits while an arm of ours or another process is on the
+card. Once the card is empty (no arm of ours, no other process, at most 200 MiB in use: desktop contexts), it
+runs alone, like an arm with no estimate. The worker logs one line with the estimate and where it came from.
+The memory check also holds for a worker that hides foreign processes to share the card on purpose.
 
 **Timing arms** (`timing: true`) wait until nothing of ours runs and the card and CPU are idle at two looks 60 s
 apart. Nothing else starts while one runs. Two rules count as idle:

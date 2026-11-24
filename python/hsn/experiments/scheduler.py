@@ -14,7 +14,13 @@ worker, from the database), the card and the idle state, and returns :class:`Lau
    * fewer than ``max_concurrent`` of ours run;
    * its memory estimate fits: ``total - reserve - foreign use - sum over our running arms of
      max(estimate, current use)``; an arm with no estimate yet runs alone, and its measured peak
-     becomes the estimate of the arms with its memory key;
+     becomes the estimate of the arms with its memory key. An arm whose estimate exceeds the
+     available memory also runs alone, rather than wait forever, when the card is otherwise
+     empty: no CUDA arm of ours runs, no foreign process is counted and the memory in use besides
+     ours is at most :data:`~hsn.experiments.machine.MIN_FOREIGN_MIB` (desktop contexts). The
+     memory test also holds when a caller hides the foreign processes (a worker that shares the
+     card on purpose passes ``foreign=()``): their memory still counts. The launch carries a
+     ``note`` for the worker's log;
    * a timing arm fits only when nothing of ours runs and the machine has been idle (no foreign
      GPU process, no foreign process above 50 % CPU) at two observations at least ``idle_gap_s``
      apart (the worker passes the start of the current idle streak).
@@ -26,6 +32,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+
+from hsn.experiments.machine import MIN_FOREIGN_MIB
 
 __all__ = ["MAX_BYPASS", "Card", "Launch", "Limits", "QueueItem", "RunningItem", "Wait", "decide"]
 
@@ -71,6 +79,7 @@ class Card:
 class Launch:
     exp_id: int
     bypassed_head: bool = False
+    note: str | None = None  # set when its estimate exceeds the available memory: it runs alone
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,32 @@ def _available(card: Card, running: Sequence[RunningItem], limits: Limits) -> fl
     foreign = max(0.0, card.used_mib - card.own_used_mib)
     ours = sum(max(r.mem_est_mib or 0.0, r.used_mib) for r in running if r.device == "cuda")
     return card.total_mib - limits.reserve_mib - foreign - ours
+
+
+def _card_empty(card: Card, running: Sequence[RunningItem]) -> bool:
+    """No CUDA arm of ours runs and nothing else holds the card: no counted foreign process and at
+    most ``MIN_FOREIGN_MIB`` in use besides ours (a finishing arm's memory counts here too)."""
+    return (
+        not any(r.device == "cuda" for r in running)
+        and not card.foreign
+        and card.used_mib - card.own_used_mib <= MIN_FOREIGN_MIB
+    )
+
+
+def _alone_note(
+    item: QueueItem, running: Sequence[RunningItem], card: Card, limits: Limits
+) -> str | None:
+    """Why ``item`` launches although its estimate exceeds the available memory (None: it fits,
+    has no estimate or is not a CUDA arm)."""
+    if item.device != "cuda" or item.mem_est_mib is None:
+        return None
+    available = _available(card, running, limits)
+    if item.mem_est_mib <= available:
+        return None
+    return (
+        f"estimate {item.mem_est_mib:.0f} MiB exceeds the {available:.0f} MiB available "
+        "on an otherwise empty card: runs alone"
+    )
 
 
 def _blocked(
@@ -115,9 +150,9 @@ def _blocked(
             return "no memory estimate yet: runs alone"
         return None
     available = _available(card, running, limits)
-    if item.mem_est_mib > available:
+    if item.mem_est_mib > available and not _card_empty(card, running):
         return f"needs {item.mem_est_mib:.0f} MiB, {available:.0f} MiB available"
-    return None
+    return None  # it fits, or it runs alone on the empty card (as an arm with no estimate)
 
 
 def decide(
@@ -145,7 +180,8 @@ def decide(
             break
         why = _blocked(item, running, card, limits, idle_since, now)
         if why is None:
-            return Launch(item.exp_id, bypassed_head=position > 0)
+            note = _alone_note(item, running, card, limits)
+            return Launch(item.exp_id, bypassed_head=position > 0, note=note)
         reasons[item.exp_id] = why
     head = queue[0].exp_id
     return Wait(f"exp {head}: {reasons[head]}", reasons)

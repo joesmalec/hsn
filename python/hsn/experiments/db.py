@@ -412,15 +412,39 @@ class Database:
         many runs it comes from (:func:`hsn.experiments.steptime.step_time_estimate`)."""
         return _step_time_estimate(self.conn, memory_key)
 
-    def memory_estimate(self, memory_key: str) -> float | None:
-        """The largest peak GPU memory (MiB) recorded for an arm with this memory key."""
+    def memory_estimate(self, memory_key: str, commit: str | None = None) -> float | None:
+        """The peak GPU memory (MiB) behind this memory key's estimate (:meth:`memory_peak`)."""
+        found = self.memory_peak(memory_key, commit)
+        return None if found is None else found[0]
+
+    def memory_peak(
+        self, memory_key: str, commit: str | None = None
+    ) -> tuple[float, str | None] | None:
+        """The peak GPU memory (MiB) behind the estimate of this memory key, and the commit it
+        comes from (None: every commit). Runs at ``commit`` count first: the largest peak of this
+        key's ended attempts there (failed ones included), once at least one of them ran to the
+        end (``done`` or ``stopped_early``); a running attempt's peak is still partial, and an
+        attempt that crashed early may never have reached its peak. Otherwise the largest peak
+        recorded for this key at any commit, as before (a change that cuts memory keeps the key,
+        so without the commit the old peak would hold forever). Imported runs never count."""
+        if commit is not None:
+            row = self.row(
+                "SELECT MAX(e.gpu_mem_peak_mib) AS peak, "
+                "MAX(e.status IN ('done', 'stopped_early')) AS completed "
+                "FROM experiments e JOIN arms a ON a.arm_id = e.arm_id WHERE a.memory_key = ? "
+                "AND e.commit_sha = ? AND e.gpu_mem_peak_mib IS NOT NULL AND e.imported = 0 "
+                "AND e.status <> 'running'",
+                (memory_key, commit),
+            )
+            if row is not None and row["peak"] is not None and row["completed"]:
+                return float(row["peak"]), commit
         row = self.row(
             "SELECT MAX(e.gpu_mem_peak_mib) AS peak FROM experiments e JOIN arms a "
             "ON a.arm_id = e.arm_id WHERE a.memory_key = ? AND e.gpu_mem_peak_mib IS NOT NULL "
             "AND e.imported = 0",
             (memory_key,),
         )
-        return None if row is None or row["peak"] is None else float(row["peak"])
+        return None if row is None or row["peak"] is None else (float(row["peak"]), None)
 
 
 # --------------------------------------------------------------------------------------------------
