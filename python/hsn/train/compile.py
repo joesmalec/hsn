@@ -1780,7 +1780,7 @@ class CompiledWindow:
                 _event_block
             )
         block = self._event_blocks[bucket]
-        keep_cells = model.cell_read is not None
+        keep_cells = model.event_cells  # the attention read, or the HSN's keyed write
         blocks: list[dict[str, Tensor]] = []
         with model.cell.window():
             consts = self._consts()

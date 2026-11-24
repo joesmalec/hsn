@@ -610,6 +610,33 @@ before. The key then needs `hardware.compile_mode=default`, as `train.tbptt_wind
 (`docs/tbptt_windows.md`); the block's own CUDA graphs are not the compiled window's and
 stay. Memory: one more set of buffers per window of a segment (below).
 
+**Memory under `train.tbptt_windows=3` on code text (23 Nov 2026, 2b886b3 and 89835a4).** A set
+first kept one full set of buffers per window layout (the event slots rounded up to 16) and
+every capture kept a CUDA graph pool of its own. Code text meets layouts of 48 to 112 slots,
+so each of a segment's three sets held 1.3 to 1.4 GB of buffers by step 650, beside 208 graph
+pools (4.6 GB), and the recipe ran out of memory at step 665 on the 12 GB card. Now:
+
+- **One graph pool.** `FusedEvents` makes one `torch.cuda.graph_pool_handle()` and every
+  capture of every set (the forward sweep's and the reverse sweep's, per slot count) uses it;
+  an `EventKernelSet` made alone makes its own. The replays take turns on one stream and write
+  their results into the buffers, so the launches and outputs are unchanged.
+- **One set of buffers per shape** (batch, scalars, products' dtype, device, spec), laid out
+  for the most slots a block of the set has met; every layout and trimmed count runs on it
+  through `EventKernels.at`. A block of more slots replaces it (the old kernels and graphs go;
+  counts met again capture again) and `EventKernelSet.grown` counts it. `describe()` adds the
+  sets' buffer slots and growths.
+- Measured on code native, the recipe with `train.tbptt_windows=3`, the RTX 3060 alone: 9,000
+  steps run (before: out of memory at 665); card memory at step 600 3.9 GB (10.8 before), at
+  most 5.72 GB over the run; one pool of 22 MB (208 pools, 4,576 MB before); 128.2 ms a
+  three-window step (127.4 before). With one window: 44.9 ms (45.1), 2.0 GB (4.3).
+- Still open: the captured graphs' executables sit outside PyTorch's allocator, about 4 to 5 MB
+  each; they grew to 2.2 GB by step 8,900 and are bounded (about 2.9 GB) by the slot counts a
+  run can meet.
+- Tests: the new card test runs windows of two layouts on one set, the smaller first, and each
+  equals the same window on a set of its own bit for bit (fp32 and bf16, with the parameters'
+  backward on the card and without), with every graph in the one pool; the trainer test checks
+  that a segment's sets share one pool.
+
 ### The refresh rate
 
 Trim does not run the slots behind a window's last event. The compiled blocks run them (on

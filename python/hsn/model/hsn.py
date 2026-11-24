@@ -227,6 +227,13 @@ from hsn.model.reader import Cache, Reader
 from hsn.model.router import SCORED_MODES, Router, Scorer, Selection
 from hsn.model.state import CellGraphState
 from hsn.model.word_address import state_width
+from hsn.model.word_cells import (
+    WORD_CELLS_KEYS,
+    KeyedFeed,
+    WordCells,
+    WordCellsCarry,
+    WordCellsWindow,
+)
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
 
@@ -241,6 +248,7 @@ __all__ = [
     "address_history",
     "clone_carry",
     "pack_carry",
+    "packed_word_cells",
     "reader_carried",
     "split_packed_carry",
 ]
@@ -424,6 +432,9 @@ class _Prologue(NamedTuple):
     #: (:meth:`hsn.model.reader.Reader.read`, detached), which ``info`` hands to
     #: :func:`address_history` (:data:`READER_CACHE_KEYS`); ``None`` without the key.
     reader_cache: Cache | None = None
+    #: ``model.word_cells``: the window's by-rule record of the keyed word cells (what it reads
+    #: of the carried cells, and its write plan); ``None`` without the key.
+    word_cells: WordCellsWindow | None = None
 
     def dense_counters(self, t: int) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         """The P1.10b dense window's ``(age, pos)`` before and after position ``t`` (``None``
@@ -518,10 +529,13 @@ class WindowCarry(NamedTuple):
     [B, C]``), detached. :func:`address_history` builds it from the window's ``info`` and
     :meth:`HSN.forward` takes it as ``prev_tokens``, so a caller that carries the address
     carries the reader's sight with it and :class:`~hsn.model.state.CellGraphState` keeps its
-    layout."""
+    layout. ``cells`` (``model.word_cells``, ``docs/amendments/word_cells.md``): the keyed word
+    cells after the window (:class:`hsn.model.word_cells.WordCellsCarry`), carried the same
+    way; ``None`` without the key."""
 
     address: Tensor
     reader: Cache
+    cells: WordCellsCarry | None = None
 
 
 def reader_carried(cfg: ModelConfig) -> bool:
@@ -535,8 +549,11 @@ def clone_carry(carry: Tensor | WindowCarry | None) -> Tensor | WindowCarry | No
     if carry is None:
         return None
     if isinstance(carry, WindowCarry):
+        cells = carry.cells
         return WindowCarry(
-            carry.address.detach().clone(), tuple(t.detach().clone() for t in carry.reader)
+            carry.address.detach().clone(),
+            tuple(t.detach().clone() for t in carry.reader),
+            None if cells is None else WordCellsCarry(*(t.detach().clone() for t in cells)),
         )
     return carry.detach().clone()
 
@@ -544,14 +561,18 @@ def clone_carry(carry: Tensor | WindowCarry | None) -> Tensor | WindowCarry | No
 def pack_carry(carry: Tensor | WindowCarry | None) -> Any:
     """A window's carry for a checkpoint: CPU copies in plain containers (``weights_only``
     loads them). A tensor stays a tensor; a :class:`WindowCarry` is ``{"address": ...,
-    "reader": [keys, values, valid]}``."""
+    "reader": [keys, values, valid]}``, with ``model.word_cells`` also ``"word_cells": [word,
+    table, key, when]``."""
     if carry is None:
         return None
     if isinstance(carry, WindowCarry):
-        return {
+        packed = {
             "address": carry.address.detach().to(device="cpu", copy=True),
             "reader": [t.detach().to(device="cpu", copy=True) for t in carry.reader],
         }
+        if carry.cells is not None:
+            packed["word_cells"] = [t.detach().to(device="cpu", copy=True) for t in carry.cells]
+        return packed
     return carry.detach().to(device="cpu", copy=True)
 
 
@@ -563,7 +584,14 @@ def split_packed_carry(
     ``model.reader_carry`` on the memory, or for ``None``). ``where`` names the file."""
     if not reader_carried(cfg) or packed is None:
         return packed, None
-    if not (isinstance(packed, dict) and set(packed) == {"address", "reader"}):
+    parts = {"address", "reader"} | ({"word_cells"} if cfg.word_cells != "off" else set())
+    held = set(packed) if isinstance(packed, dict) else set()
+    if held == {"address", "reader"} != parts:
+        raise ValueError(
+            f"{where}: with model.word_cells={cfg.word_cells}, prev_tokens must also hold the "
+            "keyed word cells ('word_cells'); the checkpoint was written without the key"
+        )
+    if held != parts:
         raise ValueError(
             f"{where}: with model.reader_carry={cfg.reader_carry} on the memory, prev_tokens "
             "must hold the address carry and the reader's cache ({'address', 'reader'}); the "
@@ -579,11 +607,31 @@ def split_packed_carry(
     return packed["address"], list(reader)
 
 
+def packed_word_cells(cfg: ModelConfig, packed: Any, where: str) -> list[Tensor] | None:
+    """``model.word_cells``: the keyed word cells of :func:`pack_carry`'s value (``word``,
+    ``table``, ``key``, ``when``), or ``None`` without the key or for ``None``. Call it after
+    :func:`split_packed_carry`, which checks the container."""
+    if cfg.word_cells == "off" or packed is None:
+        return None
+    cells = packed["word_cells"]
+    if not (
+        isinstance(cells, list | tuple)
+        and len(cells) == len(WORD_CELLS_KEYS)
+        and all(isinstance(t, Tensor) for t in cells)
+    ):
+        raise ValueError(
+            f"{where}: the keyed word cells must be four tensors (word, table, key, when)"
+        )
+    return list(cells)
+
+
 def address_history(
     cfg: ModelConfig,
     tokens: Tensor,
     previous: Tensor | WindowCarry | None = None,
     info: dict[str, Tensor] | None = None,
+    *,
+    attached: bool = False,
 ) -> Tensor | WindowCarry:
     """What a caller carries from the window ``tokens [B, T]`` to the next window of the same
     rows, as that window's ``prev_tokens`` (A5 / A9's address features).
@@ -603,7 +651,12 @@ def address_history(
     ``model.reader_carry`` with the memory on (:func:`reader_carried`): the carry is a
     :class:`WindowCarry`, the address carry above and the reader's cache after the window,
     which only the window's forward pass has (``info``, :data:`READER_CACHE_KEYS`), so ``info``
-    is required; ``previous`` is then the :class:`WindowCarry` carried into the window."""
+    is required; ``previous`` is then the :class:`WindowCarry` carried into the window. With
+    ``model.word_cells`` it also holds the keyed word cells after the window (``info``,
+    :data:`hsn.model.word_cells.WORD_CELLS_KEYS`). ``attached`` (the trainer, inside a gradient
+    segment of ``train.tbptt_windows``): the cells keep their gradient, so that the next
+    window's reads train the HSN's keyed write (``model.word_cells_value = word | cell``);
+    everything else, and the cells by default, is carried detached."""
     reader: Cache | None = None
     if reader_carried(cfg):
         if info is None or any(key not in info for key in READER_CACHE_KEYS):
@@ -613,6 +666,18 @@ def address_history(
                 "to address_history"
             )
         reader = tuple(info[key].detach() for key in READER_CACHE_KEYS)
+    cells: WordCellsCarry | None = None
+    if cfg.word_cells != "off":
+        # model.word_cells: the keyed cells after the window ride with the reader's cache
+        if info is None or any(key not in info for key in WORD_CELLS_KEYS):
+            raise ValueError(
+                f"model.word_cells={cfg.word_cells}: the carry holds the keyed word cells after "
+                "the window; pass the info of the window's forward pass to address_history"
+            )
+        table = WORD_CELLS_KEYS[1]
+        cells = WordCellsCarry(
+            *(info[k] if attached and k == table else info[k].detach() for k in WORD_CELLS_KEYS)
+        )
     if isinstance(previous, WindowCarry):
         previous = previous.address
     address: Tensor
@@ -625,7 +690,7 @@ def address_history(
         address = info["address_carry"].detach().clone()
     else:
         address = _byte_history(cfg, tokens, previous)
-    return address if reader is None else WindowCarry(address, reader)
+    return address if reader is None else WindowCarry(address, reader, cells)
 
 
 def _byte_history(cfg: ModelConfig, tokens: Tensor, previous: Tensor | None) -> Tensor:
@@ -852,6 +917,11 @@ class HSN(nn.Module):
         #: ``None``. Built after everything else and from its own generator, like the reader.
         self.cell_read: CellAttentionRead | None = (
             CellAttentionRead(cfg, seed=seed) if cfg.cell_attention_heads else None
+        )
+        #: ``model.word_cells`` (HSN-T, opt-in, ``docs/amendments/word_cells.md``): the keyed
+        #: word cells, or ``None``. Built last and from its own generator, like the reader.
+        self.word_cells: WordCells | None = (
+            WordCells(cfg, seed=seed) if cfg.word_cells != "off" else None
         )
         # The fixed route stays a host tensor: Router._check_fixed reads it on the host anyway.
         self._fixed_route: Tensor | None = (
@@ -1907,6 +1977,7 @@ class HSN(nn.Module):
         (``docs/perbyte_speed.md``); the fields are then empty."""
         cfg = self.cfg
         B, T = (int(n) for n in tokens.shape)
+        cells_carry = self._word_cells_carry(prev_tokens, B, tokens.device)
         reader_cache: Cache | None = None
         if self.reader is not None and self.reader.carry:
             prev_tokens, reader_cache = self._split_window_carry(prev_tokens, B, tokens.device)
@@ -2019,6 +2090,17 @@ class HSN(nn.Module):
             prev_tokens=previous_window,
             **older_window,
         )  # [B, T, N, 7] (9 with A5; 7 + 2n with A9)
+        word_cells: WordCellsWindow | None = None
+        if self.word_cells is not None:
+            # model.word_cells: the prefix keys, the read of the cells as the window before left
+            # them and the write plan, all by rule; the write is taken after the event loop
+            assert cells_carry is not None
+            tables = (
+                (self.scorer.get_buffer("word_exact"), self.scorer.byte_codes)
+                if self.word_cells.addressed
+                else None
+            )
+            word_cells = self.word_cells.window(tokens, ctx, reset, positions, cells_carry, tables)
         if cfg.write_events != "byte" and events is None:
             # the byte before each position is A5's (BOS at a reset, which is an event anyway)
             assert previous_window is not None  # the configuration requires model.key_address
@@ -2048,7 +2130,34 @@ class HSN(nn.Module):
             positions=positions if events is not None else None,
             address_carry=address_carry,
             reader_cache=reader_cache,
+            word_cells=word_cells,
         )
+
+    def _word_cells_carry(
+        self, carry: Tensor | WindowCarry | None, B: int, device: torch.device
+    ) -> WordCellsCarry | None:
+        """``model.word_cells``: the keyed word cells a window starts from. ``None`` as
+        ``prev_tokens`` is a stream's first window (every cell empty); a :class:`WindowCarry`
+        without them is refused, so a caller that drops them cannot read a later window with an
+        empty store without noticing. Without the key a carry that holds cells is refused."""
+        held = carry.cells if isinstance(carry, WindowCarry) else None
+        if self.word_cells is None:
+            if held is not None:
+                raise ValueError(
+                    "prev_tokens holds keyed word cells (WindowCarry.cells), but the model has "
+                    "none (model.word_cells=off)"
+                )
+            return None
+        if carry is None:
+            return self.word_cells.init_carry(B, device)
+        if held is None:
+            raise ValueError(
+                f"model.word_cells={self.cfg.word_cells}: prev_tokens must be the WindowCarry of "
+                "the window before with its keyed word cells (address_history(cfg, tokens, "
+                "previous, info), which needs the window's info), or None at a stream's first "
+                f"window; got {type(carry).__name__} without them"
+            )
+        return self.word_cells.check_carry(held, B)
 
     def _split_window_carry(
         self, carry: Tensor | WindowCarry | None, B: int, device: torch.device
@@ -2209,6 +2318,7 @@ class HSN(nn.Module):
         written: Tensor | None,
         readouts: Tensor | None = None,
         live: Tensor | None = None,
+        keyed: Tensor | None = None,
     ) -> tuple[Tensor, CellGraphState, dict[str, Tensor]]:
         """The work after the loop (P1.10a): the decoder over the stacked ``[q_t ; u_t]``, the
         statistics from the stacks and ``info`` (:meth:`forward`). Every argument is stacked over
@@ -2216,7 +2326,8 @@ class HSN(nn.Module):
         :meth:`_selection_record`). ``state_abs_max`` is already reduced to ``[T]``;
         ``hs`` is materialized only for an explicit diagnostic capture. ``live`` (the event
         loop, bool ``[B, E]``): the memory's stacks are per event slot and the statistics are
-        means over each slot's valid rows."""
+        means over each slot's valid rows. ``keyed``: the keyed word cells' read ``p_t`` of
+        the learned arms (``None``: the by-rule read, taken here)."""
         T = int(z_hats.shape[1])
         if pro.counters is not None:
             positions_after = pro.counters[3]
@@ -2233,6 +2344,11 @@ class HSN(nn.Module):
                 readouts = torch.cat([readouts[..., :-d], pro.reader, readouts[..., -d:]], dim=-1)
             else:
                 readouts = torch.cat([readouts, pro.reader], dim=-1)
+        if pro.word_cells is not None:
+            # model.word_cells: the keyed cells' read p_t last, D([q; u; r; c; p])
+            assert self.word_cells is not None and readouts is not None
+            p = self.word_cells.read(pro.word_cells) if keyed is None else keyed
+            readouts = torch.cat([readouts, p.to(readouts.dtype)], dim=-1)
         logits = self._decode(qs, us, readouts)
         info: dict[str, Tensor] = {
             "z": pro.z,
@@ -2445,9 +2561,43 @@ class HSN(nn.Module):
                 controls,
                 dense_rows,
                 dense_indices=dense_indices,
-                keep_cells=self.cell_read is not None,
+                keep_cells=self.event_cells,
             )
         return self._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
+
+    @property
+    def event_cells(self) -> bool:
+        """Whether the event loop hands on the cells as every slot left them (``cells [B, E, N,
+        d]``): the attention read of the cells reads them, and so do the messages of the
+        HSN's keyed write (``model.word_cells_value = word | cell``)."""
+        return self.cell_read is not None or (
+            self.word_cells is not None and self.word_cells.learned
+        )
+
+    def _keyed_feed(
+        self, pro: _Prologue, ev: _Events, us: Tensor, q_before: Tensor, routed: Tensor
+    ) -> KeyedFeed:
+        """What the learned keyed arms read of the window (:class:`KeyedFeed`), per byte: ``u``,
+        the error as the cell reads it (``z_t`` less the prediction of the summary before
+        ``t``, which at an event is the event slot's), the scorer's scalars and the routed
+        cells of every event slot, as values."""
+        z_hat = self.predictor(q_before)
+        dtype = routed.dtype
+        scalars = pro.scalars[:, :, 0, :7].clone()  # the seven scalars behind the age
+        scalars[..., 3:5] = 0.0  # the two running averages are a routed cell's
+        controls = self._controls()
+        return KeyedFeed(
+            u=us.to(dtype),
+            eps=self._eps_read(pro.z, z_hat, pro.z - z_hat).to(dtype),
+            scalars=scalars,
+            routed=routed.detach(),
+            slot=ev.at,
+            cell=self.cell,
+            router=self.router,
+            gate=controls.gate,
+            tau=controls.tau,
+            cut=self._cut_router,
+        )
 
     @staticmethod
     def _refuse_event_capture(capture: bool) -> None:
@@ -2500,6 +2650,14 @@ class HSN(nn.Module):
         slot_u = _take_rows(joined("u"), (ev.at - 1).clamp_min(0))  # an event's own slot
         us = torch.where(events[:, :, None], slot_u, u_between.to(slot_u.dtype))
         readouts = latest(torch.zeros_like(slot_r[:, 0]), slot_r, ev.at)
+        feed: KeyedFeed | None = None
+        keyed: tuple[Tensor, Tensor, Tensor] | None = None
+        if self.word_cells is not None and self.word_cells.learned:
+            # model.word_cells_value=word | cell: the read with the carried cells' gradient
+            # (address: the scored read), from the values the HSN's keyed write reads too
+            assert pro.word_cells is not None
+            feed = self._keyed_feed(pro, ev, us, q_before, joined("cells"))
+            keyed = self.word_cells.read_learned(pro.word_cells, feed)
         if self.cell_read is not None:
             assert pro.reader is not None
             stages = torch.cat([start.h[:, None], joined("cells")], dim=1)  # [B, 1 + E, N, d]
@@ -2527,12 +2685,26 @@ class HSN(nn.Module):
             written=None,
             readouts=readouts,
             live=ev.valid,
+            keyed=None if keyed is None else keyed[0],
         )
         # what the per-slot stacks of info (z_hat, eps, the selections) are aligned to
         info["event_valid"] = ev.valid
         info["event_pos"] = ev.where
         if pro.address_carry is not None:  # model.word_address: the next window's prev_tokens
             info["address_carry"] = pro.address_carry
+        if pro.word_cells is not None:
+            # model.word_cells: the deferred write, after the event loop and the reads: the
+            # next window's cells (address_history), and how much of the window read an entry
+            assert self.word_cells is not None
+            if feed is None or keyed is None:
+                carry = self.word_cells.write(pro.word_cells)
+                rates = self.word_cells.rates(pro.word_cells)
+            else:  # the HSN's keyed write, on the values of each key's last event
+                carry, records = self.word_cells.write_learned(pro.word_cells, feed)
+                info.update(records)
+                rates = keyed[1:]
+            info.update(zip(WORD_CELLS_KEYS, carry, strict=True))
+            info["word_cells_hit"], info["word_cells_old"] = rates
         return logits, final, info
 
     def _previous_tokens(self, tokens: Tensor, previous: Tensor | None) -> Tensor:
@@ -2653,8 +2825,10 @@ class HSN(nn.Module):
         (the P1.4 edge logits, outside Appendix C), with ``model.reader`` (HSN-T) ``reader``
         (:func:`hsn.train.memory_plan.reader_param_count`), with
         ``model.cell_attention_heads`` ``cell_read``
-        (:func:`hsn.train.memory_plan.cell_read_param_count`), and ``total_trainable`` (every
-        parameter of this module; the run manifest's ``param_count``)."""
+        (:func:`hsn.train.memory_plan.cell_read_param_count`), with ``model.word_cells``
+        ``word_cells`` (:func:`hsn.train.memory_plan.word_cells_param_count`), and
+        ``total_trainable`` (every parameter of this module; the run manifest's
+        ``param_count``)."""
         modules: dict[str, nn.Module] = {
             "byte_emb": self.byte_emb,
             "ctx_emb": self.ctx_emb,
@@ -2682,13 +2856,17 @@ class HSN(nn.Module):
         if self.cell_read is not None:  # the attention read of the cells: outside Appendix C too
             report["cell_read"] = sum(p.numel() for p in self.cell_read.parameters())
             accounted += report["cell_read"]
+        if self.word_cells is not None:  # the keyed word cells' read maps: outside Appendix C too
+            report["word_cells"] = sum(p.numel() for p in self.word_cells.parameters())
+            accounted += report["word_cells"]
         report["total_trainable"] = sum(p.numel() for p in self.parameters())
         if report["total_trainable"] != accounted:
             raise RuntimeError(
                 f"param_report: {report['total_trainable']} trainable parameters, but the Appendix "
                 f"C rows ({report['total']}), the edge logits ({report['edges']}) and HSN-T's "
-                f"reader ({report.get('reader', 0)}) and attention read "
-                f"({report.get('cell_read', 0)}) give {accounted}; a submodule carries "
+                f"reader ({report.get('reader', 0)}), attention read "
+                f"({report.get('cell_read', 0)}) and keyed word cells "
+                f"({report.get('word_cells', 0)}) give {accounted}; a submodule carries "
                 "unaccounted parameters"
             )
         return report

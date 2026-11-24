@@ -1176,7 +1176,15 @@ def fused_event_block(
         refreshed = torch.cat([refreshed, refreshed.new_zeros(E - n)])
     if runs is not None:
         runs.append(run)
+    kept: dict[str, Tensor] = {}
+    if model.event_cells:
+        # model.word_cells_value=word | cell: the routed cells as every slot left them, for the
+        # messages of the keyed write (hsn.model.word_cells), from the tape: the state the
+        # next slot read, and the block's last state. Values only: the block's reverse sweep
+        # takes no cotangent at a slot's state (a copy: nothing here is a view of the buffers)
+        kept["cells"] = torch.cat([tape["h_pre"][:, 1:n], h_end.detach()[:, None]], dim=1)
     return {
+        **kept,
         "h": h_end,
         "q": q_end,
         "age": tape["age"],
@@ -1290,6 +1298,8 @@ class FusedEvents:
         self.captured = False
         self.slots: tuple[int, int] = (0, 0)
         self._sets: list[Any] = []
+        #: The memory pool of every CUDA graph the sets capture (made at the first window).
+        self._pool: Any = None
         if kernels:
             from hsn.kernels import event as event_kernels
             from hsn.kernels import window as window_kernels
@@ -1344,8 +1354,10 @@ class FusedEvents:
             )
         from hsn.kernels.event import EventKernelSet
 
+        if self._pool is None:  # one graph memory pool for every set: their replays take turns
+            self._pool = torch.cuda.graph_pool_handle()
         while len(self._sets) <= self.position:
-            self._sets.append(EventKernelSet(forward_graph=True, local=True))
+            self._sets.append(EventKernelSet(forward_graph=True, local=True, pool=self._pool))
         return self._sets[self.position]
 
     def block(
@@ -1396,8 +1408,9 @@ class FusedEvents:
         return out
 
     def describe(self) -> dict[str, Any]:
-        """Counts for the run's record: the fused windows, the captures, the buffer sets and
-        the slot counts each set has graphs for."""
+        """Counts for the run's record: the fused windows, the captures, the buffer sets, the
+        slot counts each set has graphs for, the slots each set's buffers are laid out for and
+        the times a set's buffers grew (:class:`hsn.kernels.event.EventKernelSet`)."""
         counts = [
             sorted(
                 kern.E
@@ -1412,4 +1425,6 @@ class FusedEvents:
             "captures": self.captures,
             "buffer_sets": len(self._sets),
             "slot_counts": counts,
+            "buffer_slots": [[s.E for s in k.kernels.values()] for k in self._sets],
+            "buffers_grown": [k.grown for k in self._sets],
         }

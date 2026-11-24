@@ -12,9 +12,9 @@ cell input), the unit bank's first product, ``hsn_ev_pick``, the unit bank's sec
 :func:`hsn.train.event_fused.forward_reference` (the same arguments and tape), its
 :meth:`EventKernels.sweep` is :func:`hsn.train.event_fused.sweep_reference` and its
 :meth:`EventKernels.pairs` the cell norm's backward of :func:`hsn.train.event_fused.local_backward`;
-:class:`EventKernelSet` keeps one per number of event slots and is what
-:func:`hsn.train.event_fused.fused_event_block` is handed. fp32 state; the products run in fp32
-or bf16.
+:class:`EventKernelSet` keeps one per block shape, laid out for the most event slots met, runs
+every number of slots on it and is what :func:`hsn.train.event_fused.fused_event_block` is
+handed. fp32 state; the products run in fp32 or bf16.
 
 The tape is the buffers themselves: a block's tape is valid until the next forward sweep of a
 block of the same shape (one block per window and one backward pass per forward, as a training
@@ -137,6 +137,14 @@ class EventKernels:
     (every buffer is the leading part of the other's): the blocks of fewer slots
     (:meth:`at`) need no buffers of their own, only their own CUDA graphs.
 
+    ``pool``: the memory pool the CUDA graphs are captured into (a token of
+    ``torch.cuda.graph_pool_handle``; the kernels of :meth:`at` take it too). ``None``: each
+    graph its own pool. A capture's launches allocate only scratch (the products'
+    workspaces), none of it live after the capture, but a pool of its own keeps it for the
+    graph's life (22 MB a graph on the recipe's shape). Graphs that share a pool share the
+    scratch: they may, since their replays run one after another on one stream and every
+    result is written into the buffers.
+
     ``local``: the parameters' backward runs on the card (:meth:`local`): the forward sweep
     then also lays the block's written slots out in unit order and the reverse sweep writes
     ``dhid``, ``dy`` and the gate's cotangent at those rows
@@ -249,6 +257,7 @@ class EventKernels:
         forward_graph: bool = False,
         share: EventKernels | None = None,
         local: bool = False,
+        pool: Any = None,
     ) -> None:
         front_hidden = int(weights.front_q.shape[0])
         reason = unsupported(spec, n_scalars)
@@ -273,6 +282,7 @@ class EventKernels:
         self.graph = graph
         self.forward_graph = forward_graph
         self.local_kernels = local
+        self.pool = pool
         N, M, K, d, H, n, D = spec.N, spec.M, spec.K, spec.d, spec.H, spec.in_dim, spec.D
         self.Hf = front_hidden
         self.Hs = spec.front_s  # S's block of the front's hidden layer
@@ -465,6 +475,7 @@ class EventKernels:
                 device=self.device, product_dtype=self.product_dtype,
                 bias_in_product=self.bias_in_product, graph=self.graph,
                 forward_graph=self.forward_graph, share=self, local=self.local_kernels,
+                pool=self.pool,
             )  # fmt: skip
             self._children[slots] = child
         return child
@@ -628,7 +639,7 @@ class EventKernels:
             self._slots()
         torch.cuda.synchronize(self.device)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, pool=self.pool):
             self._slots()
         self._forward_graph = graph
 
@@ -786,7 +797,7 @@ class EventKernels:
         back.op1.zero_()
         back.op2.zero_()
         if self.graph and back._graph is None:
-            back.capture()
+            back.capture(pool=self.pool)
         dc, db = back.run()
         return dc, db, back.A.clone(), back.R.clone()
 
@@ -970,12 +981,23 @@ class EventKernels:
 
 
 class EventKernelSet:
-    """The event kernels of a run: one :class:`EventKernels` per block shape (the number of
-    event slots follows the batch), built at a shape's first block, and on its buffers the
-    kernels of every smaller number of slots a block ran (:meth:`EventKernels.at`: the fused
-    block's ``trim``). ``forward``, ``sweep`` and ``pairs`` are what
+    """The event kernels of a run: one set of buffers per block shape (the batch, the scalars,
+    the products' dtype, the device, the spec), laid out for the most event slots a block of
+    the shape has met (the window's layout, which follows the batch), and on them the kernels
+    of every number of slots a block ran (:meth:`EventKernels.at`: the layouts of fewer slots
+    and the fused block's ``trim``). A block of more slots than the buffers hold replaces them
+    with buffers laid out for its own: the kernels on the old ones go with them, graphs and all
+    (:attr:`grown`), and a number of slots met again captures again. So the set holds one
+    block's buffers, the largest, and not one per layout: one block's tape at a time, as
+    before (:meth:`EventKernels.at`). ``forward``, ``sweep`` and ``pairs`` are what
     :func:`hsn.train.event_fused.fused_event_block` takes. ``forward_graph``: also capture
-    every shape's forward sweep in a CUDA graph at its first block."""
+    every shape's forward sweep in a CUDA graph at its first block.
+
+    Every CUDA graph of the set is captured into one memory pool (:class:`EventKernels`'s
+    ``pool``): ``pool``, a token of ``torch.cuda.graph_pool_handle`` that other sets may share
+    (their graphs must not run concurrently with these), or ``None`` for a pool of the set's
+    own, made at its first shape. Without it every capture keeps a pool of its own, and a run
+    that meets many numbers of slots holds as many pools."""
 
     def __init__(
         self,
@@ -984,14 +1006,21 @@ class EventKernelSet:
         graph: bool = True,
         forward_graph: bool = True,
         local: bool = False,
+        pool: Any = None,
     ) -> None:
         self.bias_in_product = bias_in_product
         self.graph = graph
         self.forward_graph = forward_graph
         #: The parameters' backward on the card: hand :meth:`local` to the block.
         self.local_kernels = local
+        #: The graph memory pool of every capture of the set (made at the first shape).
+        self.pool = pool
+        #: The buffers of each shape (a block of their own number of slots runs on them as
+        #: they are, the others on :meth:`EventKernels.at`).
         self.kernels: dict[tuple[object, ...], EventKernels] = {}
         self.last: EventKernels | None = None
+        #: The times a block of more slots replaced a shape's buffers.
+        self.grown = 0
 
     def forward(
         self,
@@ -1012,17 +1041,25 @@ class EventKernelSet:
         slots: int | None = None,
     ) -> dict[str, Tensor]:
         product = h.dtype if product_dtype is None else product_dtype
-        key = (int(z.shape[0]), int(z.shape[1]), int(scalars.shape[-1]), product, h.device, spec)
-        kern = self.kernels.get(key)
-        if kern is None:
+        layout = int(z.shape[1])
+        need = layout if slots is None else slots
+        key = (int(z.shape[0]), int(scalars.shape[-1]), product, h.device, spec)
+        root = self.kernels.get(key)
+        if root is None or root.E < need:
             if cell_consts is None:
                 raise ValueError("the first block of a shape needs the cell's constants")
-            kern = EventKernels(
+            if root is not None:  # outgrown: dropped with its kernels and graphs first
+                del self.kernels[key]
+                self.last = root = None
+                self.grown += 1
+            if self.pool is None and (self.graph or self.forward_graph):
+                self.pool = torch.cuda.graph_pool_handle()
+            root = EventKernels(
                 spec,
                 w,
                 cell_consts,
                 B=int(z.shape[0]),
-                E=int(z.shape[1]),
+                E=layout,
                 n_scalars=int(scalars.shape[-1]),
                 device=h.device,
                 product_dtype=product,
@@ -1030,10 +1067,10 @@ class EventKernelSet:
                 graph=self.graph,
                 forward_graph=self.forward_graph,
                 local=self.local_kernels,
+                pool=self.pool,
             )
-            self.kernels[key] = kern
-        if slots is not None:
-            kern = kern.at(slots)
+            self.kernels[key] = root
+        kern = root.at(need)
         self.last = kern
         return kern.forward(
             model, w, spec, h, q, age, z, ctx, scalars, reset, live, product_dtype=product_dtype
