@@ -2,7 +2,9 @@
 
 Status: **both stages built on 22 Nov 2026 as opt-in keys. Stage 1 (the by-rule table) has its
 9k screens (below). Stage 2 (the HSN's own write, `word` and `cell`, and candidate 2,
-`address`) is built and untrained: its only runs are test steps and timing runs.** Stage 2 is
+`address`) was built untrained on 22 Nov; its screens and a 27k-window run followed on 23 Nov
+([Trained](#trained-23-nov-2026)): the HSN's own write (`word`) with `train.tbptt_windows=3`
+passes the 27k bar on both sets and ties the table.** Stage 2 is
 described in ["Stage 2"](#stage-2-the-hsns-write-and-candidate-2) at the end; the sections
 before it are stage 1's, as written. Branch `claude/word-cells` (on main 30bb802). The design is
 `~/hsn-handoff/MEMORY-REDESIGN-2026-11-22.md` (candidate 1), which answers the diagnosis of
@@ -397,3 +399,70 @@ statistics steps left out (`~/hsn-experiments/wcells-stage2/`: `step_time.py`, `
   later write to a held key also reads the transplanted cell (the convex update), which the
   by-rule arm's does not.
 - `--what hsn` (the routed cells) now also changes what later keyed writes read, through `m`.
+
+## Trained (23 Nov 2026)
+
+All runs: `hsn_t_memory_words_carry_bal_qk.yaml` with the field's data and word contexts, the
+local RTX 3060, seed 0, one run each. Bits are dev bits per byte, accuracy next-byte accuracy,
+step times alone on the card. **Swap Δ** (`links_probe/swap_eval.py`): the extra bits on the
+bytes after a target's first occurrence when the carry is exchanged with another document's,
+on targets 257 to 1,023 bytes back (400 targets), with a paired bootstrap of 4,000 draws;
+"share of table" is Δ over the same-schedule table's Δ. **Keyed transplant**
+(`transplant_wc.py --what keyed`): Δ when only the keyed cells are exchanged. The specs are
+`~/hsn-experiments/remote/specs/fields_9k_wcells_*.yaml` and `fields_27k_wcells_*.yaml`;
+results, logs and scoring under `~/hsn-experiments/wcells-runs/`.
+
+Schedules: **X3** = `hardware.compile_mode=default train.grad_accum=3
+train.tbptt_windows=3` (the cross-window gradient into the write); **G3** = the same with
+`train.tbptt_windows=1` (each window detached). The 27k bar is memory-off 160 x 8 at 27k steps
+(code native 0.994 / 80.52, bio prose 1.282 / 73.32).
+
+### Stage 2 screens (3,000 steps x 3 windows)
+
+Compare within this schedule only. The code native arms with X3 ran out of memory on the fused
+event block (fixed by 2b886b3 and 89835a4, `docs/wev_fused_event.md`) and ran on
+`hardware.event_kernel=compiled`; their step times are not the fused ones.
+
+| Set | Arm | Bits / acc | Swap Δ | Share of table | Keyed transplant | Step (3 windows) |
+|---|---|---|---|---|---|---|
+| bio prose | table (`bytes`), G3 | 1.397 / 71.20 | +0.953 | 1.00 | | 0.144 s |
+| bio prose | **`word`, X3** | 1.400 / 71.09 | +0.942 | 0.99 | 0.944 | 0.171 s |
+| bio prose | `word`, G3 | 1.438 / 70.34 | +0.254 | 0.27 | | 0.158 s |
+| bio prose | `address`, X3 | 1.422 / 70.63 | +0.529 | 0.56 | | 0.194 s |
+| bio prose | no key, X3 | 1.444 / 70.15 | +0.002 | | | 0.138 s |
+| code native | table (`bytes`), G3 | 1.121 / 78.54 | +0.784 | 1.00 | | 0.145 s |
+| code native | **`word`, X3** (compiled) | 1.108 / 78.75 | +0.684 | 0.87 | 0.685 | 0.316 s |
+| code native | `word`, G3 | 1.152 / 77.90 | +0.131 | 0.17 | | 0.160 s |
+| code native | `address`, X3 (compiled) | 1.142 / 78.11 | +0.274 | 0.35 | 0.274 | 0.322 s |
+| code native | no key, X3 (compiled) | 1.163 / 77.62 | +0.004 | | | 0.276 s |
+
+- The HSN's write reaches the table's recall only with the cross-window gradient (X3: 0.99 bio,
+  0.87 code; detached: 0.27, 0.17).
+- Candidate 2 (`address`) is weaker on both sets (0.56, 0.35) and in bits.
+- The cross-window gradient without keyed cells (candidate 3) gives no recall.
+
+### The 27k-window run (9,000 steps x 3 windows, fused event block)
+
+| Set | Arm | Bits / acc | Swap Δ | Share of table | Keyed transplant | Step (3 windows) |
+|---|---|---|---|---|---|---|
+| code native | **`word`, X3** | **0.971 / 80.98** | +0.734 | 1.07 | 0.727 | 0.190 s |
+| code native | table (`bytes`), G3 | 0.988 / 80.75 | +0.683 | 1.00 | 0.680 | 0.151 s |
+| code native | memory-off 160 x 8, `grad_accum=3` | 1.029 / 79.93 | 0.000 | | | 0.090 s |
+| code native | stage 1 table, 27k steps x 1 window | 0.976 / 81.00 | +0.665 | 0.97 | 0.669 | |
+| bio prose | **`word`, X3** | **1.244 / 74.17** | +0.908 | 1.09 | 0.904 | 0.172 s |
+| bio prose | table (`bytes`), G3 | 1.251 / 74.06 | +0.835 | 1.00 | 0.834 | 0.145 s |
+| bio prose | memory-off 160 x 8, `grad_accum=3` | 1.313 / 72.72 | 0.000 | | | 0.086 s |
+| bio prose | stage 1 table, 27k steps x 1 window | 1.244 / 74.20 | +0.846 | 1.01 | 0.844 | |
+
+- **The HSN's own write passes the 27k bar** on both sets: 0.023 bits better on code native,
+  0.038 on bio prose (accuracy +0.46 and +0.85 points), and beats memory-off on the same
+  schedule by 0.058 and 0.069 bits.
+- **It ties the table in bits** (0.017 and 0.007 better on one seed; the recipe is not
+  bit-reproducible from run to run, so no claim that it beats the table is made) and recalls
+  slightly more beyond 256 bytes (paired Δ minus the table's: +0.051 [+0.003, +0.096] code,
+  +0.072 [+0.025, +0.121] bio). The keyed cells carry the whole of it (transplant 0.727 of
+  0.734, 0.904 of 0.908).
+- **It costs 19 to 26 % a step over the table** (0.190 against 0.151 s, 0.172 against 0.145).
+- Memory-off 160 x 8 runs with `hardware.baseline_compile=default` under `train.grad_accum=3`
+  (reduce-overhead's CUDA graphs refuse it); its step is not comparable with the HSN-T arms'
+  (another speed class).
