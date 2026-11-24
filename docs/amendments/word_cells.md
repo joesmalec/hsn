@@ -26,7 +26,9 @@ two decisions: the identity question is accepted (below), and the build is stage
 - At the default nothing changes: no module, no state, no decoder column, no `info` entry; the
   six keys (eight with stage 2's) are left out of the configuration hash, the arm's view and
   the memory key, so every arm id stays. A model built without the key gives main's outputs
-  bit for bit.
+  bit for bit on the machine that wrote the test's fixture (`tests/fixtures`); on another CPU
+  the test checks the integers exactly, the floats to float64 rounding and the router's
+  gradients, which pass through its fp32 scores, to float32 rounding.
 
 ## The rule
 
@@ -200,8 +202,9 @@ answer: can the HSN's own write fill these cells as usefully as the rule does? I
 works, the part that helps is a table and not the HSN, which is a decision for the user. So
 the write below is the cell update of the identity with nothing tuned toward the table.
 
-Keys (all opt-in; at their defaults every stage 1 arm keeps its outputs, bit for bit, and its
-hash, arm view and memory key):
+Keys (all opt-in; at their defaults every stage 1 arm keeps its outputs, bit for bit on the
+machine that wrote the test's fixture and to rounding on another CPU as above, and its hash,
+arm view and memory key):
 
 - `model.word_cells_value: bytes | word | cell` (default `bytes`);
   `model.word_cells_gate_bias` (3.0; where `beta_K` starts; read only with `word | cell`).
