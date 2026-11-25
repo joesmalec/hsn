@@ -212,3 +212,41 @@ def test_p1_11_attempts_carry_their_own_execution_parameters(tmp_path: Path) -> 
     assert cfg["run_id"] == db.experiment(eb["exp_id"])["run_id"]
     (requeued,) = dbm.requeue(db, [eb["exp_id"]], ["queued"])
     assert db.experiment(requeued)["protocol_json"] == db.experiment(eb["exp_id"])["protocol_json"]
+
+
+def test_memory_peak_prefers_the_workers_commit(tmp_path: Path) -> None:
+    """A code change that cuts memory keeps the memory key: the peaks recorded at the worker's own
+    commit come first, once one attempt there has run to the end; else every commit's, as before."""
+    db = dbm.Database(db_path())
+    enqueue_spec(db, dry_spec(tmp_path, n=8))
+    (key,) = [row["memory_key"] for row in db.rows("SELECT DISTINCT memory_key FROM arms")]
+    ids = [int(row["exp_id"]) for row in db.queued()]
+
+    def attempt(exp_id: int, status: str, commit: str, peak: float, imported: int = 0) -> None:
+        with db.write() as conn:
+            conn.execute(
+                "UPDATE experiments SET status = ?, commit_sha = ?, gpu_mem_peak_mib = ?, "
+                "imported = ? WHERE exp_id = ?",
+                (status, commit, peak, imported, exp_id),
+            )
+
+    assert db.memory_peak(key, "new") is None and db.memory_estimate(key) is None
+    attempt(ids[0], "failed", "old", 11464.0)  # the OOM before the memory fix
+    attempt(ids[1], "done", "old", 10200.0)
+    assert db.memory_peak(key) == (11464.0, None)
+    assert db.memory_peak(key, "new") == (11464.0, None), "no attempt at this commit: fall back"
+    attempt(ids[2], "running", "new", 3000.0)  # a running attempt's peak is partial
+    assert db.memory_peak(key, "new") == (11464.0, None)
+    attempt(ids[3], "failed", "new", 300.0)  # a crash at the start: no full peak yet
+    assert db.memory_peak(key, "new") == (11464.0, None)
+    attempt(ids[4], "done", "new", 5200.0)
+    assert db.memory_peak(key, "new") == (5200.0, "new")
+    attempt(ids[3], "failed", "new", 5600.0)  # this commit's failures count once one has ended
+    assert db.memory_peak(key, "new") == (5600.0, "new")
+    attempt(ids[5], "done", "new", 9000.0, imported=1)  # imported runs never count
+    assert db.memory_peak(key, "new") == (5600.0, "new")
+    attempt(ids[6], "stopped_early", "other", 4000.0)  # an early stop ran to the end too
+    assert db.memory_peak(key, "other") == (4000.0, "other")
+    # the float view, and the commit-free estimate of every commit, as before
+    assert db.memory_estimate(key, "new") == 5600.0 and db.memory_estimate(key) == 11464.0
+    assert db.memory_peak("another key", "new") is None
