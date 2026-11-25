@@ -264,6 +264,11 @@ def _reference(mod: WordCells, stream: Stream, cuts: list[int]) -> tuple[list[An
 
 SMALL = ("model.word_cells_n=8", "model.word_cells_ways=1", "model.word_cells_levels=2")
 THREE = ("model.word_cells_n=24", "model.word_cells_ways=3", "model.word_cells_min_len=3")
+#: float64 rounding, for the reference's values: the rule's ``torch.sqrt`` is MKL's on the CPU
+#: (within an ulp of the true root, not always the nearest, and which one depends on the CPU
+#: MKL picks its kernel for), its ``torch.log1p`` PyTorch's vectorised one at AVX2 and above
+#: (within an ulp or two); the reference's ``math.sqrt`` and ``math.log1p`` are the C library's
+F64 = {"rel": 1e-12, "abs": 1e-12}
 
 
 @pytest.mark.parametrize(
@@ -278,10 +283,13 @@ THREE = ("model.word_cells_n=24", "model.word_cells_ways=3", "model.word_cells_m
 )
 def test_the_rule_against_a_per_row_reference(extra: tuple, window: int, branches: str) -> None:
     """Keys, deferred write and read over three rows of several documents each, window by
-    window (also one byte a window), equal the per-row reference exactly: the cells, their keys
-    and write positions after every window, and every byte's match, value, offset and age. The
-    streams make the write's branches happen (a key that holds its cell, a second ask, a key
-    not written, a cell taken from another key)."""
+    window (also one byte a window), equal the per-row reference: the cells, their keys and
+    write positions after every window, and every byte's match, value, offset and age. Keys,
+    positions, matches, offsets and flags exactly; the values ``s / sqrt(n)`` and the age
+    input ``log(1 + age / sight)`` to float64 rounding (:data:`F64`), since the last bit of
+    PyTorch's square root and logarithm depends on the CPU. The streams make the write's
+    branches happen (a key that holds its cell, a second ask, a key not written, a cell taken
+    from another key)."""
     mod = _module(*extra)
     mod.sight = 24
     stream = _prose(3, 400, 5)
@@ -293,7 +301,8 @@ def test_the_rule_against_a_per_row_reference(extra: tuple, window: int, branche
         for b, (reads, keys, when, values) in enumerate(rows):
             assert carry.key[b].tolist() == [NO_KEY if k is None else k for k in keys]
             assert carry.when[b].tolist() == when
-            assert torch.equal(carry.table[b], torch.tensor(values, dtype=torch.float64))
+            table = torch.tensor(values, dtype=torch.float64)
+            torch.testing.assert_close(carry.table[b], table, rtol=F64["rel"], atol=F64["abs"])
             for t, read in enumerate(reads):
                 assert bool(win.inside[b, t]) == (read is not None), (b, t)
                 if read is None:
@@ -301,9 +310,9 @@ def test_the_rule_against_a_per_row_reference(extra: tuple, window: int, branche
                 offset, hit = read
                 assert int(win.offset[b, t]) == offset and bool(win.hit[b, t]) == bool(hit)
                 value, age = hit if hit else ([0.0] * mod.d, 0)
-                assert win.value[b, t].tolist() == value, (b, t)
+                assert win.value[b, t].tolist() == pytest.approx(value, **F64), (b, t)
                 want = [float(age >= 24), math.log1p(age / 24)] if hit else [0.0, 0.0]
-                assert win.age_features[b, t].tolist() == pytest.approx(want, abs=1e-15)
+                assert win.age_features[b, t].tolist() == pytest.approx(want, **F64)
                 assert bool(win.old[b, t]) == (bool(hit) and age >= 24)
                 hits, old = hits + bool(hit), old + (bool(hit) and age >= 24)
     assert hits > 100 and old > 10, (hits, old)
@@ -376,12 +385,41 @@ def test_the_default_keeps_every_configuration_of_main() -> None:
     assert type(base.model).model_validate({"word_cells": False}).word_cells == "off"  # YAML's
 
 
+#: float32's rounding, for the router's gradients against a fixture: the router selects on fp32
+#: scores (``Router.scores``), so the gradient its scorer gets through the straight-through
+#: weights is computed in fp32 (the scorer's inputs are detached, ``CUT_C``: no other one is)
+FP32 = 16 * torch.finfo(torch.float32).eps
+
+
+def _assert_as_written(found: list[Tensor], refs: list[Tensor]) -> None:
+    """Each tensor is the fixture's (float64) to float64 rounding: within 1e-12 of its largest
+    magnitude (at least 1). Another CPU sums in another order (its vector width) and rounds
+    the last bit of MKL's and PyTorch's elementwise functions otherwise."""
+    for index, (got, ref) in enumerate(zip(found, refs, strict=True)):
+        assert got.shape == ref.shape, index
+        assert _gap(got, ref) <= 1e-12 * max(1.0, float(ref.abs().max())), index
+
+
+def _assert_grads_as_written(model: HSNT, want: dict[str, Tensor]) -> None:
+    """Every gradient as the fixture has it, each as its sum and its sum of magnitudes: to
+    float64 rounding, 1e-12 of ``max(1, sum of magnitudes)``; the router's, computed in fp32,
+    to float32 rounding, :data:`FP32` of its sum of magnitudes."""
+    grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    assert list(grads) == list(want)
+    for name, ref in want.items():
+        got = torch.stack([grads[name].sum(), grads[name].abs().sum()])
+        scale = float(ref[1])
+        tol = FP32 * scale if name.startswith("router.") else 1e-12 * max(1.0, scale)
+        assert _gap(got, ref) <= tol, (name, _gap(got, ref), tol)
+
+
 def test_the_default_model_is_mains_bit_for_bit() -> None:
     """The tests' word-event carry HSN-T without the key against main's code (the fixture,
     written at 30bb802 in float64 on x86-64 Linux): the same parameter and buffer names and
     drawn weights, and on those weights, over three carried windows, main's logits, final
-    state, carry and gradients (each as its sum and its sum of magnitudes). Bit for bit where
-    the fixture was written; the tolerances cover another machine's rounding."""
+    state, carry and gradients (each as its sum and its sum of magnitudes). Bit for bit on
+    the machine that wrote the fixture; on another CPU the integers exactly, the floats to
+    float64 rounding and the router's gradients (fp32 scores) to float32 rounding."""
     want = torch.load(FIXTURES / "word_cells_off_30bb802.pt", weights_only=True)
     tokens, ctx, reset = want["stream"]
     for extra in ((), ("model.word_cells=off",)):
@@ -405,16 +443,10 @@ def test_the_default_model_is_mains_bit_for_bit() -> None:
         assert isinstance(prev, WindowCarry) and prev.cells is None
         assert set(pack_carry(prev)) == {"address", "reader"}
         found = [logits, state.h, state.q, *prev.reader[:2]]
-        refs = [want["logits"], *want["final"][:2], *want["reader"][:2]]
-        for got, ref in zip(found, refs, strict=True):
-            assert got.shape == ref.shape and _gap(got, ref) <= 1e-12
+        _assert_as_written(found, [want["logits"], *want["final"][:2], *want["reader"][:2]])
         exact = (state.age, state.pos, prev.address, prev.reader[2])
         _assert_equal(exact, (*want["final"][2:], want["address"], want["reader"][2]), "integers")
-        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
-        assert list(grads) == list(want["grads"])
-        for name, ref in want["grads"].items():
-            got = torch.stack([grads[name].sum(), grads[name].abs().sum()])
-            assert _gap(got, ref) <= 1e-12 * max(1.0, float(ref[1])), name
+        _assert_grads_as_written(model, want["grads"])
 
 
 def test_the_bytes_arm_is_stage_ones_bit_for_bit() -> None:
@@ -423,7 +455,9 @@ def test_the_bytes_arm_is_stage_ones_bit_for_bit() -> None:
     and buffer names, and on those weights (main's fixture and the key's own), over four carried
     windows of prose, its logits, statistics, final state, cells, address carry and gradients
     (each as its sum and its sum of magnitudes); and the recipe's hash, arm view and memory
-    key with the key on. Bit for bit where the fixture was written."""
+    key with the key on. Bit for bit on the machine that wrote the fixture; on another CPU
+    the integers (keys, write positions, the word in progress) exactly, the floats to float64
+    rounding and the router's gradients (fp32 scores) to float32 rounding."""
     want = torch.load(FIXTURES / "word_cells_bytes_d3537f4.pt", weights_only=True)
     base = torch.load(FIXTURES / "word_cells_off_30bb802.pt", weights_only=True)["weights"]
     tokens, ctx, reset = want["stream"]
@@ -447,16 +481,11 @@ def test_the_bytes_arm_is_stage_ones_bit_for_bit() -> None:
         assert isinstance(prev, WindowCarry) and prev.cells is not None
         found = [logits, torch.stack(sums), state.h, state.q, prev.cells.table]
         refs = [want["logits"], want["sums"], *want["final"][:2], want["cells"][1]]
-        for got, ref in zip(found, refs, strict=True):
-            assert got.shape == ref.shape and _gap(got, ref) <= 1e-12
+        _assert_as_written(found, refs)
         exact = (state.age, state.pos, prev.address, *prev.cells[0::2], prev.cells.when)
         refs = (*want["final"][2:], want["address"], *want["cells"][0::2], want["cells"][3])
         _assert_equal(exact, refs, "integers")
-        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
-        assert list(grads) == list(want["grads"])
-        for name, ref in want["grads"].items():
-            got = torch.stack([grads[name].sum(), grads[name].abs().sum()])
-            assert _gap(got, ref) <= 1e-12 * max(1.0, float(ref[1])), name
+        _assert_grads_as_written(model, want["grads"])
     arms = {"on": [ON], "named": [ON, "model.word_cells_value=bytes"]}
     arms["sized"] = [ON, "model.word_cells_n=256", "model.word_cells_ways=1"]
     for name, overrides in arms.items():
