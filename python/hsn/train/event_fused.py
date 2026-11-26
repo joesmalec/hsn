@@ -1072,6 +1072,29 @@ class EventRecurrence(torch.autograd.Function):
 
 #: A block's forward sweep: :func:`forward_reference`'s arguments and result.
 Forward = Callable[..., dict[str, Tensor]]
+#: What a block needs of the parameters alone (:func:`prepare_block`): the sizes, the weights
+#: the forward sweep reads and the cell's constants of the reverse sweep.
+Prepared = tuple[EventSpec, EventWeights, CellConstants]
+
+
+def prepare_block(
+    model: HSN,
+    consts: WindowConsts,
+    controls: _Controls,
+    dtype: torch.dtype,
+    product_dtype: torch.dtype | None = None,
+) -> Prepared:
+    """The part of :func:`fused_event_block` that reads the parameters and nothing of the
+    window: the scope check, the block's sizes, its weights (:func:`event_weights`) and the
+    cell's constants for the reverse sweep, in the state's ``dtype``. ``consts``: the merged
+    window constants, inside the cell's window. No host read."""
+    reason = scope_error(model, controls)
+    if reason is not None:
+        raise ValueError(f"the fused event block does not take this model: {reason}")
+    spec = event_spec(model, controls)
+    weights = event_weights(model, consts, dtype, product_dtype)
+    # the window's edge weights: in its grad mode
+    return spec, weights, cell_constants(model.cell, dtype)
 
 
 def fused_event_block(
@@ -1094,6 +1117,7 @@ def fused_event_block(
     runs: list[EventRun] | None = None,
     trim: bool = False,
     local: Local | None = None,
+    prepared: Prepared | None = None,
 ) -> dict[str, Tensor]:
     """:meth:`hsn.model.hsn.HSN._event_block` for a block of event slots, fused: the same
     arguments (the state before the block, the slots' inputs ``z_b`` / ``c_b`` / ``s_b`` ``[B,
@@ -1119,17 +1143,18 @@ def fused_event_block(
     behind them and discards is not computed: their logits, selections, costs and refresh
     counts are zeros (an objective must not read them; the trainer's terms read live slots
     only: :func:`hsn.losses.auxiliary_terms`). Needs what :meth:`HSN._event_slots` gives: no
-    reset in a slot without an event."""
+    reset in a slot without an event.
+
+    ``prepared``: :func:`prepare_block`'s result for this window's ``consts``, controls,
+    state dtype and ``product_dtype`` (``None``: taken here). A caller takes it ahead to
+    issue that work before a host read."""
     controls = model._controls() if controls is None else controls
-    reason = scope_error(model, controls)
-    if reason is not None:
-        raise ValueError(f"the fused event block does not take this model: {reason}")
     cell, scorer = model.cell, model.scorer
     dtype = h.dtype
-    spec = event_spec(model, controls)
-    weights = event_weights(model, consts, dtype, product_dtype)
+    if prepared is None:
+        prepared = prepare_block(model, consts, controls, dtype, product_dtype)
+    spec, weights, sweep_consts = prepared
     run_forward = forward_reference if forward is None else forward
-    sweep_consts = cell_constants(cell, dtype)  # the window's edge weights: in its grad mode
     E = int(z_b.shape[1])
     n = live_slots(v_b) if trim else E
     with torch.no_grad():
@@ -1360,6 +1385,21 @@ class FusedEvents:
             self._sets.append(EventKernelSet(forward_graph=True, local=True, pool=self._pool))
         return self._sets[self.position]
 
+    def _product(self, h: Tensor) -> torch.dtype | None:
+        """The dtype of the block's matrix products: the autocast dtype under autocast,
+        ``None`` (the state's) otherwise."""
+        kind = h.device.type
+        product = torch.get_autocast_dtype(kind) if torch.is_autocast_enabled(kind) else None
+        if self.kernels and product not in (None, torch.float32, torch.bfloat16):
+            raise ValueError(f"the fused event block's products run in fp32 or bf16, not {product}")
+        return product
+
+    def prepare(self, h: Tensor, consts: WindowConsts, controls: _Controls) -> Prepared:
+        """What :meth:`block` needs of the parameters alone (:func:`prepare_block`), for the
+        state ``h`` of the window: call it before the window's event slots are taken
+        (:meth:`HSN._event_slots` reads the card) and hand the result to :meth:`block`."""
+        return prepare_block(self.model, consts, controls, h.dtype, self._product(h))
+
     def block(
         self,
         h: Tensor,
@@ -1368,17 +1408,17 @@ class FusedEvents:
         ev: _Events,
         consts: WindowConsts,
         controls: _Controls,
+        *,
+        prepared: Prepared | None = None,
     ) -> dict[str, Tensor]:
         """A window's event loop: :func:`fused_event_block` with ``trim`` over the slots
         ``ev`` (:meth:`HSN._event_slots`) from the state ``h``, ``q``, ``age``, inside the
         cell's window with its merged constants. The products run in the autocast dtype
         (bf16) under autocast and in the state's otherwise. What it returns is its own
-        tensors: nothing a caller keeps is a view of the buffers."""
+        tensors: nothing a caller keeps is a view of the buffers. ``prepared``:
+        :meth:`prepare`'s result for this window (``None``: taken here)."""
         kernel_set = self._set()
-        kind = h.device.type
-        product = torch.get_autocast_dtype(kind) if torch.is_autocast_enabled(kind) else None
-        if kernel_set is not None and product not in (None, torch.float32, torch.bfloat16):
-            raise ValueError(f"the fused event block's products run in fp32 or bf16, not {product}")
+        product = self._product(h)
         runs: list[EventRun] = []
         fns: dict[str, Any] = {}
         if kernel_set is not None:
@@ -1390,7 +1430,7 @@ class FusedEvents:
             }
         out = fused_event_block(
             self.model, h, q, age, ev.z, ev.context, ev.scalars, ev.reset, ev.valid, consts,
-            controls, product_dtype=product, runs=runs, trim=True, **fns,
+            controls, product_dtype=product, runs=runs, trim=True, prepared=prepared, **fns,
         )  # fmt: skip
         run = runs[0]
         self.slots = (run.slots, run.total)

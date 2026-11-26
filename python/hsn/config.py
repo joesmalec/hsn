@@ -171,6 +171,12 @@ MessageGradients = Literal["autocast", "state"]
 #: CUDA kernels without autograd, one autograd node and a backward pass written by hand
 #: (:mod:`hsn.train.event_fused`). The same equations; equal to rounding, not bit for bit.
 EventKernel = Literal["compiled", "fused"]
+#: Opt-in (``hardware.reader_compile``, ``docs/wcells_speed.md``): how a training window of an
+#: HSN-T with its memory runs the carried reader (``model.reader_carry``). ``none``: eager, as
+#: before. ``default``: the reader's read of a training window as one ``torch.compile`` graph
+#: (inductor's default mode, no CUDA graphs; its backward is compiled with it). The same
+#: equations; fused kernels round differently, so equal to rounding, not bit for bit.
+ReaderCompile = Literal["none", "default"]
 PowerMeter = Literal["nvml", "powermetrics", "wall", "none"]
 ModelName = Literal[
     "hsn", "hsn_t", "reader", "gru", "transformer", "selective_ssm", "gated_deltanet", "moe"
@@ -1987,6 +1993,14 @@ class HardwareConfig(_StrictModel):
     # same equations, rounded differently (as any other compile of the window). CUDA only,
     # and only the word-event recipe's round (event_kernel_scope_error names what is refused).
     event_kernel: EventKernel = "compiled"
+    # Opt-in (25 Nov 2026, docs/wcells_speed.md): how a training window of an HSN-T with its
+    # memory runs the carried reader. none (default): eager, as before. default: the reader's
+    # read (hsn.model.reader.Reader.read: four blocks over the window and the carried keys) as
+    # one torch.compile graph in inductor's default mode, its backward compiled with it; no
+    # CUDA graphs, so train.grad_accum and train.tbptt_windows stay what they are. Evaluation
+    # keeps the eager reader. The same equations, rounded differently (fused kernels). Needs
+    # a compiled window (reader_compile_scope_error names what is refused).
+    reader_compile: ReaderCompile = "none"
     nvcc_arch: list[str] = []  # e.g. [sm_86], [sm_121]
     power_meter: PowerMeter
     recipe: RecipeConfig = RecipeConfig()
@@ -2107,6 +2121,13 @@ class RunConfig(_StrictModel):
                 raise ValueError(
                     f"hardware.event_kernel={self.hardware.event_kernel} is not available for "
                     f"this configuration: {reason}"
+                )
+        if self.hardware.reader_compile != "none":
+            reason = reader_compile_scope_error(self)
+            if reason is not None:
+                raise ValueError(
+                    f"hardware.reader_compile={self.hardware.reader_compile} is not available "
+                    f"for this configuration: {reason}"
                 )
         if self.baseline.address_input and self.model_name in HSN_MODEL_NAMES:
             raise ValueError(
@@ -2794,6 +2815,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.word_cells_min_len",
     "model.word_cells_gate_bias",
     "model.word_cells_kappa",
+    "hardware.reader_compile",
 )
 
 #: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
@@ -2925,6 +2947,48 @@ def message_gradients_scope_error(cfg: RunConfig) -> str | None:
         return (
             f"hardware.window={cfg.hardware.window}: the split and fused windows take the "
             "messages in their own sweep and replay (not measured with the key)"
+        )
+    return None
+
+
+def reader_compile_scope_error(cfg: RunConfig) -> str | None:
+    """Why ``cfg`` cannot train with ``hardware.reader_compile`` set (``docs/wcells_speed.md``,
+    :mod:`hsn.train.reader_compile`), or ``None`` when it can. The key compiles the carried
+    reader's read of a training window of an HSN-T with its memory; what it does not cover is
+    refused here with the reason, instead of training on the eager reader without a word."""
+    model, train, hardware = cfg.model, cfg.train, cfg.hardware
+    if cfg.model_name != "hsn_t" or not model.memory:
+        return (
+            f"model_name={cfg.model_name!r}"
+            + ("" if model.memory else " with model.memory=false")
+            + ": the key is the HSN-T's with its memory (the reader alone and HSN-T without "
+            "its memory compile their whole window with hardware.baseline_compile)"
+        )
+    if model.reader_carry < 1:
+        return (
+            "model.reader_carry=0: the compiled read is the carried reader's "
+            "(Reader.read); the reader of one window alone is not built"
+        )
+    if hardware.compile_mode == "none":
+        return (
+            "hardware.compile_mode=none: the compiled window hands the model its reader, and "
+            "this configuration builds none"
+        )
+    if hardware.window != "autograd":
+        return (
+            f"hardware.window={hardware.window}: not built (the split window runs its own prologue)"
+        )
+    if hardware.device == "mps":
+        return "hardware.device=mps: not built (no measured compile of the reader there)"
+    if train.reach_dropout > 0.0:
+        return (
+            f"train.reach_dropout={train.reach_dropout}: the short rows change the read's "
+            "mask per window; not built"
+        )
+    if train.content_dropout > 0.0 or model.zero_unseen_bytes or model.unseen_bytes_as != "own":
+        return (
+            "the byte-content options (train.content_dropout, model.zero_unseen_bytes, "
+            "model.unseen_bytes_as) hand the read per-window masks; not built"
         )
     return None
 

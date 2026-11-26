@@ -206,7 +206,7 @@ called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, NamedTuple, Self
 
@@ -233,6 +233,7 @@ from hsn.model.word_cells import (
     WordCells,
     WordCellsCarry,
     WordCellsWindow,
+    WriteRequests,
 )
 from hsn.profiler import Profiler
 from hsn.train.schedules import SelectionSchedule
@@ -498,7 +499,10 @@ class _Events(NamedTuple):
     event: real inputs, discarded results). ``z``, ``context``, ``scalars``, ``reset`` and
     ``pos`` are the window's per-position inputs at those columns (``[B, E, …]``). ``at`` and
     ``before`` (int64 ``[B, T]``) count a row's events at or before, and strictly before, each
-    byte: the index of the state a byte reads in the stack ``[start ; slot 0 ; … ; slot E−1]``."""
+    byte: the index of the state a byte reads in the stack ``[start ; slot 0 ; … ; slot E−1]``.
+    ``requests``: the keyed write's requests of the window (``model.word_cells_value = word |
+    cell``; :meth:`hsn.model.word_cells.WordCells.requests`), taken here because their count
+    is a host read like the slots' own."""
 
     valid: Tensor
     where: Tensor
@@ -509,6 +513,7 @@ class _Events(NamedTuple):
     pos: Tensor
     at: Tensor
     before: Tensor
+    requests: WriteRequests | None = None
 
 
 #: ``model.reader_carry`` with the memory on: the keys under which a window's ``info`` holds the
@@ -1962,6 +1967,7 @@ class HSN(nn.Module):
         reset_first: bool,
         prev_tokens: Tensor | WindowCarry | None = None,
         steps: bool = True,
+        read: Callable[..., tuple[Tensor, Cache]] | None = None,
     ) -> _Prologue:
         """The window-invariant work of :meth:`forward` (P1.10a): the embeddings, ``E`` and the
         prediction target over ``[B, T]``, the context embeddings, the position-independent scorer
@@ -1974,7 +1980,10 @@ class HSN(nn.Module):
         (``z_steps`` / ``ctx_steps`` / ``scalar_steps``, which the eager loop over positions
         reads). The compiled window reads blocks of columns and passes ``False``: 768 views a
         window that nothing read, 0.8 ms of host time at T 256 while the card waits
-        (``docs/perbyte_speed.md``); the fields are then empty."""
+        (``docs/perbyte_speed.md``); the fields are then empty. ``read``
+        (``hardware.reader_compile``, ``docs/wcells_speed.md``): what is called in place of
+        the carried reader's :meth:`hsn.model.reader.Reader.read`, with its arguments
+        (``None``, the default: the reader's own)."""
         cfg = self.cfg
         B, T = (int(n) for n in tokens.shape)
         cells_carry = self._word_cells_carry(prev_tokens, B, tokens.device)
@@ -2018,7 +2027,7 @@ class HSN(nn.Module):
                 # The options replace the window's own rows; the cached positions keep what
                 # they were read with in their window (docs/key_content.md, "Where they can be
                 # set")
-                reader_out, reader_cache = self.reader.read(
+                reader_out, reader_cache = (self.reader.read if read is None else read)(
                     tokens, reset, reader_cache, short, blank=zero, unknown=unknown
                 )
             elif short is None:
@@ -2408,11 +2417,17 @@ class HSN(nn.Module):
         """Gather a window's per-position inputs into event slots (:class:`_Events`). The number
         of slots is the batch's largest event count rounded up to a multiple of ``block`` (at
         least one block, at most ``T``): one host read per window, the only data-dependent
-        shape of the event loop."""
+        shape of the event loop. The keyed write's requests are taken beside it (a second
+        host read, by rule too): the window's host reads stand together, behind everything a
+        caller issued before this call."""
         events, positions = pro.events, pro.positions
         assert events is not None and positions is not None
         B, T = (int(n) for n in events.shape)
         count = events.sum(dim=1)  # [B]
+        requests: WriteRequests | None = None
+        if self.word_cells is not None and self.word_cells.learned:
+            assert pro.word_cells is not None
+            requests = self.word_cells.requests(pro.word_cells)
         most = int(count.max())
         E = min(T, max(block, -(-most // block) * block))
         # a row's event columns in order, then its other columns: the padding slots run on real
@@ -2430,6 +2445,7 @@ class HSN(nn.Module):
             pos=_take_rows(positions, order),
             at=at,
             before=at - events.to(at.dtype),
+            requests=requests,
         )
 
     def _event_block(
@@ -2656,8 +2672,12 @@ class HSN(nn.Module):
             # model.word_cells_value=word | cell: the read with the carried cells' gradient
             # (address: the scored read), from the values the HSN's keyed write reads too
             assert pro.word_cells is not None
+            if ev.requests is not None:  # the write's requests, taken with the event slots
+                pro = pro._replace(word_cells=pro.word_cells._replace(requests=ev.requests))
+            window = pro.word_cells
+            assert window is not None
             feed = self._keyed_feed(pro, ev, us, q_before, joined("cells"))
-            keyed = self.word_cells.read_learned(pro.word_cells, feed)
+            keyed = self.word_cells.read_learned(window, feed)
         if self.cell_read is not None:
             assert pro.reader is not None
             stages = torch.cat([start.h[:, None], joined("cells")], dim=1)  # [B, 1 + E, N, d]

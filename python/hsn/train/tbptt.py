@@ -280,6 +280,7 @@ from hsn.train.probes import (
     utility_predictions,
     window_split,
 )
+from hsn.train.reader_compile import CompiledReader, reader_of
 from hsn.train.route_guard import RouteGuard
 from hsn.train.schedules import SelectionSchedule
 from hsn.train.split import SplitWindow
@@ -571,12 +572,22 @@ class TBPTTTrainer(Trainer):
                 "(hardware.compile_mode): evaluation and the statistics steps' term passes "
                 "run on it"
             )
+        # opt-in (hardware.reader_compile, docs/wcells_speed.md): the carried reader's read of
+        # a training window as one compiled graph, handed to the model by the compiled window
+        # (CompiledWindow._run); None: the model's eager reader
+        self._reader_compiled: CompiledReader | None = None
+        if cfg.hardware.reader_compile != "none" and not ctx.compile_enabled:
+            raise ValueError(  # the configuration refuses it; a hand-built one may not
+                f"hardware.reader_compile={cfg.hardware.reader_compile} needs a compiled "
+                "window (hardware.compile_mode): it hands the model its reader"
+            )
         if ctx.compile_enabled:
             if cfg.hardware.graph_alias_index:  # opt-in: PyTorch's alias check by index
                 install_graph_alias_index()
             self._fused_events = fused_events_of(
                 model, cfg.hardware.event_kernel, segment_windows=cfg.train.tbptt_windows
             )
+            self._reader_compiled = reader_of(model, ctx, cfg.hardware.reader_compile)
             window = compile_window(
                 model,
                 ctx,
@@ -584,6 +595,7 @@ class TBPTTTrainer(Trainer):
                 grad_accum=cfg.train.grad_accum,
                 merged=cfg.hardware.round_products == "merged",
                 fused_events=self._fused_events,
+                reader=self._reader_compiled,
             )
             if isinstance(window, CompiledWindow):  # MPS without compile support: eager
                 self._compiled = window
@@ -618,6 +630,15 @@ class TBPTTTrainer(Trainer):
         return self._compiled
 
     # P2.2 ------------------------------------------------------------------------------------
+
+    def _compile_seconds(self) -> float:
+        """The wall time spent so far in calls that compiled or recorded: the compiled
+        window's and, with ``hardware.reader_compile``, the compiled reader's. A step during
+        which it grows is a compile step (never a steady-state number)."""
+        seconds = self._compiled.compile_seconds if self._compiled is not None else 0.0
+        if self._reader_compiled is not None:
+            seconds += self._reader_compiled.compile_seconds
+        return seconds
 
     def _routing_terms(
         self, terms: dict[str, Tensor], info: Mapping[str, Tensor], n_loss: int
@@ -1221,7 +1242,7 @@ class TBPTTTrainer(Trainer):
             # P2.8: every window runs the compiled window when there is one (a statistics step's
             # per-term gradient norms come from extra compiled passes, _compiled_term_norms)
             window_fn: Any = self._split if self._split is not None else self._compiled
-            compiled_before = self._compiled.compile_seconds if self._compiled is not None else 0.0
+            compiled_before = self._compile_seconds()
             term_norms: dict[str, float] = {}
             self.optimizer.zero_grad(set_to_none=True)
             # P2.10b: the windows' statistics are issued after each backward pass and read
@@ -1509,9 +1530,7 @@ class TBPTTTrainer(Trainer):
             if self.scaler is None and not math.isfinite(mean_total) and not skipped:
                 raise RuntimeError(f"the objective is {mean_total} at step {self.step}")
             seconds = time.perf_counter() - started
-            compiled_now = self._compiled is not None and (
-                self._compiled.compile_seconds > compiled_before
-            )
+            compiled_now = self._compile_seconds() > compiled_before
             if compiled_now:  # P2.8: compile time is never a steady-state number
                 compile_seconds += seconds
                 compile_steps += 1
@@ -1627,6 +1646,15 @@ class TBPTTTrainer(Trainer):
                     "fused_event_captures": float(self._fused_events.captures),
                 }
                 if self._fused_events is not None
+                else {}
+            ),
+            # hardware.reader_compile: the windows the compiled reader read, and its compiles
+            **(
+                {
+                    "reader_compiled_windows": float(self._reader_compiled.calls),
+                    "reader_compile_seconds": self._reader_compiled.compile_seconds,
+                }
+                if self._reader_compiled is not None
                 else {}
             ),
             "skipped_nonfinite_steps": float(self.skipped_nonfinite),  # P1.12

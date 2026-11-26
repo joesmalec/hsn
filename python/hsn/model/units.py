@@ -299,11 +299,13 @@ class UnitBank(nn.Module):
         ``unit_idx`` is int64 or int32 with values in ``[0, M)``; anything else raises
         (``IndexError`` for values outside the range, checked on the host copy before any device
         indexing, so CUDA never reaches a device-side assert). Pairs are sorted by unit (stable),
-        each present unit runs one ``addmm`` per layer on its contiguous block, and the outputs
+        each present unit runs one ``addmm`` per layer on its contiguous block (the blocks cut
+        by one ``split``), and the outputs
         are put back in the input order through ``index_select`` (its backward is an
         ``index_add``, which deterministic mode allows on every backend). The per-unit weights
         come from one ``unbind`` per parameter, so backward produces one stacked gradient per
-        parameter rather than one full-size gradient per present unit.
+        parameter rather than one full-size gradient per present unit. Under CUDA autocast the
+        operands are cast once before they are taken apart (``docs/wcells_speed.md``).
 
         ``P = 0`` returns an empty ``[0, d]`` tensor of ``v``'s dtype with no graph; the A.1
         selection (``P = B·K``, ``k_min >= 1``) never produces it.
@@ -334,19 +336,36 @@ class UnitBank(nn.Module):
         counts: list[int] = torch.bincount(sorted_host, minlength=self.n_units).tolist()
 
         v_sorted = v.index_select(0, order)
-        w1s = self.W1.unbind(0)
-        b1s = self.b1.unbind(0)
-        w2s = self.W2.unbind(0)
-        b2s = self.b2.unbind(0)
+        w1_all: Tensor = self.W1
+        b1_all: Tensor = self.b1
+        w2_all: Tensor = self.W2
+        b2_all: Tensor = self.b2
+        kind = v.device.type
+        if kind == "cuda" and torch.is_autocast_enabled(kind):
+            # docs/wcells_speed.md: under autocast every addmm below casts its three operands,
+            # five casts for each present unit (and five cast nodes in the backward pass). The
+            # same casts once, before the units are taken apart: the same values in the same
+            # products, so the outputs are equal bit for bit; and the gradients too, since a
+            # cast's backward commutes with the zeros that unbind's and split's backward fill in
+            low = torch.get_autocast_dtype(kind)
+            operands = (v_sorted, w1_all, b1_all, w2_all, b2_all)
+            if all(x.dtype == torch.float32 for x in operands):  # what autocast would cast
+                v_sorted, w1_all, b1_all, w2_all, b2_all = (x.to(low) for x in operands)
+        w1s = w1_all.unbind(0)
+        b1s = b1_all.unbind(0)
+        w2s = w2_all.unbind(0)
+        b2s = b2_all.unbind(0)
+        # one split in place of a slice per present unit: the same rows; its backward is one
+        # concatenation, where each slice's fills a [P, 4d] tensor of zeros that the next is
+        # added to (every row is in one block, so the sums are the rows; index_select's own
+        # backward, which follows, adds them to zeros either way)
+        blocks = torch.split(v_sorted, counts)
         outputs: list[Tensor] = []
-        start = 0
         for j, count in enumerate(counts):
             if count == 0:
                 continue
-            block = v_sorted[start : start + count]
-            hidden = self.act(torch.addmm(b1s[j], block, w1s[j]))
+            hidden = self.act(torch.addmm(b1s[j], blocks[j], w1s[j]))
             outputs.append(torch.addmm(b2s[j], hidden, w2s[j]))
-            start += count
         out_sorted = torch.cat(outputs, dim=0)
         inverse = torch.empty_like(order).scatter_(
             0, order, torch.arange(n_pairs, device=order.device)

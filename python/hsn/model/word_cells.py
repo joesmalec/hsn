@@ -86,6 +86,7 @@ __all__ = [
     "WordCells",
     "WordCellsCarry",
     "WordCellsWindow",
+    "WriteRequests",
 ]
 
 #: The read maps ``U_j``: one per number of bytes of the word so far, ``j = 1 .. 16``; longer
@@ -134,6 +135,22 @@ class WordCellsCarry(NamedTuple):
     when: Tensor
 
 
+class WriteRequests(NamedTuple):
+    """The learned write's requests of a window (:meth:`WordCells.requests`), by rule: one per
+    key of a row, at the key's last word end in the window. Int64: ``row [P]`` (the batch row),
+    ``slot [P]`` (the write plan's slot ``t * L + l - 1``), ``key [P]``, ``when [P]`` (the word
+    end's byte position), ``cand [P, C]`` (the candidate cells: ``A`` with the hash, all ``N_s``
+    with ``model.word_cells=address``) and ``flat [P, C]`` (``row * N_s + cand``: a candidate
+    in the rows' cells laid end to end)."""
+
+    row: Tensor
+    slot: Tensor
+    key: Tensor
+    when: Tensor
+    cand: Tensor
+    flat: Tensor
+
+
 class WordCellsWindow(NamedTuple):
     """A window's by-rule record (:meth:`WordCells.window`), without a gradient. The read, per
     byte: ``value [B, T, d]`` (the matched cell; zeros without a match), ``offset``
@@ -145,7 +162,10 @@ class WordCellsWindow(NamedTuple):
     learned arms read it again, with the carried gradient); with ``model.word_cells=address``
     there is no match (``hit``: the bytes that read, ``value`` and the ages are the model's
     read) and ``read_code [B, T, d]`` / ``slot_code [B, T * L, d]`` are the exact word codes
-    of each byte's prefix so far and of each slot's key."""
+    of each byte's prefix so far and of each slot's key. ``requests``: the learned write's
+    requests (:class:`WriteRequests`) when the caller took them ahead of the write
+    (:meth:`WordCells.requests`; the model does, with its event slots, so that the write
+    needs no host read before its turns are decided); ``None``: the write takes them."""
 
     value: Tensor
     offset: Tensor
@@ -163,6 +183,7 @@ class WordCellsWindow(NamedTuple):
     cell: Tensor | None = None
     read_code: Tensor | None = None
     slot_code: Tensor | None = None
+    requests: WriteRequests | None = None
 
 
 class KeyedFeed(NamedTuple):
@@ -458,6 +479,30 @@ class WordCells(nn.Module):
             ),
         )
 
+    @torch.no_grad()
+    def requests(self, win: WordCellsWindow) -> WriteRequests:
+        """The learned write's requests from a window's write plan: one per key of a row, the
+        key's last word end in the window. By rule, and one host read (how many): the model
+        takes them with its event slots (:meth:`hsn.model.hsn.HSN._event_slots`), where the
+        window reads the card anyway (``docs/wcells_speed.md``)."""
+        slot_key, slot_active, slot_when = win.slot_key, win.slot_active, win.slot_when
+        B, W = (int(n) for n in slot_key.shape)
+        N = self.n_cells
+        device = slot_key.device
+        order = torch.arange(W, device=device)
+        ranked = torch.where(slot_active, slot_key * W + order, _HUGE).sort(dim=1).values
+        after = torch.cat([ranked[:, 1:], ranked.new_full((B, 1), -W)], dim=1)
+        last = (ranked // W != after // W) & (ranked < _HUGE)
+        row, place = last.nonzero(as_tuple=True)
+        slot = ranked[row, place] % W
+        key = slot_key[row, slot]
+        if self.addressed:
+            cand = torch.arange(N, device=device).expand(int(row.numel()), N)
+        else:
+            cand = self.candidates(key)  # [P, A]
+        flat = row[:, None] * N + cand
+        return WriteRequests(row, slot, key, slot_when[row, slot], cand, flat)
+
     def _codes(self, first: Tensor, tables: tuple[Tensor, Tensor]) -> Tensor:
         """The exact word codes (:mod:`hsn.model.word_address`) of the prefixes of ``first
         [..., L]`` (bytes as written; A-Z are folded as in the address), ``[..., L, d]``: one
@@ -637,7 +682,7 @@ class WordCells(nn.Module):
         and, with ``address``, ``word_cells_prior`` (the share of the writes that took the
         cell the address prior alone ranks first)."""
         N, L = self.n_cells, self.levels
-        B, W = (int(n) for n in win.slot_key.shape)
+        B = int(win.slot_key.shape[0])
         cell, router = feed.cell, feed.router
         M = cell.n_units
         device = win.slot_key.device
@@ -646,24 +691,16 @@ class WordCells(nn.Module):
         when0 = win.carry.when.masked_fill(cleared[:, None], EMPTY)
         table0 = win.carry.table.masked_fill(cleared[:, None, None], 0.0)
         dtype = table0.dtype
-        # one request per key of a row: the key's last word end in the window
-        order = torch.arange(W, device=device)
-        ranked = torch.where(win.slot_active, win.slot_key * W + order, _HUGE).sort(dim=1).values
-        after = torch.cat([ranked[:, 1:], ranked.new_full((B, 1), -W)], dim=1)
-        last = (ranked // W != after // W) & (ranked < _HUGE)
-        r, place = last.nonzero(as_tuple=True)
-        slot = ranked[r, place] % W
+        # one request per key of a row: the key's last word end in the window (by rule: the
+        # model takes them with its event slots)
+        req = self.requests(win) if win.requests is None else win.requests
+        r, slot, key, when, cand, flat = req
         P, column = int(r.numel()), slot // L
-        key, when = win.slot_key[r, slot], win.slot_when[r, slot]
         u, eps = feed.u[r, column], feed.eps[r, column]
-        if self.addressed:
-            cand = torch.arange(N, device=device).expand(P, N)
-        else:
-            cand = self.candidates(key)  # [P, A]
         mine = r[:, None]
         part = self._cell_part(feed, table0)[mine, cand]  # [P, C, M]
         shared = self._shared(feed, u, eps, feed.scalars[r, column])[:, None]
-        scores = self._logits(feed, shared, part, when[:, None] - when0[mine, cand])
+        scores = self._logits(feed, shared, part, when[:, None] - torch.take(when0, flat))
         rank = scores.amax(dim=-1)  # [P, C]: a candidate's score, as a routed cell's
         prior: Tensor | None = None
         if self.addressed:
@@ -671,10 +708,13 @@ class WordCells(nn.Module):
             prior = self._prior(win.slot_code[r, slot])
             rank = rank + prior
         # the turns: (1) the holder, (2) and (3) the scorer's best free candidate; where
-        # several keys ask for one cell the latest word end takes it (the longer prefix)
-        flat = mine * N + cand
-        index = torch.arange(P, device=device)
-        taken = torch.zeros(B * N, dtype=torch.bool, device=device)
+        # several keys ask for one cell the latest word end takes it (the longer prefix).
+        # No host read in the turns: a request that does not ask, or does not win, is sent to
+        # a spare entry behind the rows' cells in place of being left out by a mask (a mask's
+        # row count is a host read, and with it the write waits for the event loop before
+        # it has issued its own work; docs/wcells_speed.md)
+        spare = B * N
+        taken = torch.zeros(spare + 1, dtype=torch.bool, device=device)
         way = torch.full((P,), -1, dtype=torch.int64, device=device)
         runner = torch.full((P,), -math.inf, device=device)  # the best free candidate left out
         pending = torch.ones(P, dtype=torch.bool, device=device)
@@ -683,23 +723,24 @@ class WordCells(nn.Module):
             if turn == 0:
                 if self.addressed:
                     continue
-                holds = key0[mine, cand] == key[:, None]
+                holds = torch.take(key0, flat) == key[:, None]
                 choice, asks = holds.to(torch.int8).argmax(dim=1), holds.any(dim=1)
                 second = runner
             else:
-                free = ~taken[flat]
+                free = ~torch.take(taken, flat)
                 open_ = rank_d.masked_fill(~free, -math.inf)
                 choice, asks = open_.argmax(dim=1), pending & free.any(dim=1)  # ties: the first
                 same = cand == cand.gather(1, choice[:, None])  # (two ways may be one cell)
                 second = open_.masked_fill(same, -math.inf).amax(dim=1)
-            target = flat[index, choice]
-            latest = torch.full((B * N,), -1, dtype=torch.int64, device=device)
-            latest.scatter_reduce_(0, target[asks], slot[asks], "amax")
-            won = asks & (latest[target] == slot)
+            target = flat.gather(1, choice[:, None]).squeeze(1)
+            latest = torch.full((spare + 1,), -1, dtype=torch.int64, device=device)
+            latest.scatter_reduce_(0, torch.where(asks, target, spare), slot, "amax")
+            won = asks & (torch.take(latest, target) == slot)
             way = torch.where(won, choice, way)
             runner = torch.where(won, second, runner)
-            taken[target[won]] = True
+            taken.index_fill_(0, torch.where(won, target, spare), True)
             pending = (pending & ~asks) if turn == 0 else (asks & ~won)
+        # the write's host read: which requests write (the cell update runs on those alone)
         q = (way >= 0).nonzero().flatten()
         rq, cq, picked = r[q], cand[q, way[q]], scores[q, way[q]]  # picked [Q, M]
         unit = picked.argmax(dim=-1)
