@@ -672,6 +672,10 @@ def memory_key(cfg: RunConfig, variant: str, protocol: Mapping[str, Any]) -> str
         # likewise (21 Nov 2026): the event loop's kernel at its default stays out; with the
         # fused block the step time and the memory change, and the arm has a key of its own
         del dump["hardware"]["event_kernel"]
+    if dump["hardware"]["reader_compile"] == "none":
+        # likewise (25 Nov 2026): the reader's compile at its default stays out; compiled, the
+        # step time changes, and the arm has a key of its own
+        del dump["hardware"]["reader_compile"]
     if dump["model"]["memory"] is True:
         # model.memory at its default stays out, so the arms from before the key keep their
         # memory key and with it their stored step-time and memory estimates

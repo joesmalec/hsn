@@ -206,7 +206,7 @@ called until P2.7), no custom kernels (P2.9–P2.11); ``n_rounds`` is 1.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, NamedTuple, Self
 
@@ -1967,6 +1967,7 @@ class HSN(nn.Module):
         reset_first: bool,
         prev_tokens: Tensor | WindowCarry | None = None,
         steps: bool = True,
+        read: Callable[..., tuple[Tensor, Cache]] | None = None,
     ) -> _Prologue:
         """The window-invariant work of :meth:`forward` (P1.10a): the embeddings, ``E`` and the
         prediction target over ``[B, T]``, the context embeddings, the position-independent scorer
@@ -1979,7 +1980,10 @@ class HSN(nn.Module):
         (``z_steps`` / ``ctx_steps`` / ``scalar_steps``, which the eager loop over positions
         reads). The compiled window reads blocks of columns and passes ``False``: 768 views a
         window that nothing read, 0.8 ms of host time at T 256 while the card waits
-        (``docs/perbyte_speed.md``); the fields are then empty."""
+        (``docs/perbyte_speed.md``); the fields are then empty. ``read``
+        (``hardware.reader_compile``, ``docs/wcells_speed.md``): what is called in place of
+        the carried reader's :meth:`hsn.model.reader.Reader.read`, with its arguments
+        (``None``, the default: the reader's own)."""
         cfg = self.cfg
         B, T = (int(n) for n in tokens.shape)
         cells_carry = self._word_cells_carry(prev_tokens, B, tokens.device)
@@ -2023,7 +2027,7 @@ class HSN(nn.Module):
                 # The options replace the window's own rows; the cached positions keep what
                 # they were read with in their window (docs/key_content.md, "Where they can be
                 # set")
-                reader_out, reader_cache = self.reader.read(
+                reader_out, reader_cache = (self.reader.read if read is None else read)(
                     tokens, reset, reader_cache, short, blank=zero, unknown=unknown
                 )
             elif short is None:

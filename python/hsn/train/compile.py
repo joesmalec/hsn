@@ -113,7 +113,7 @@ import logging
 import time
 import types
 from collections.abc import Callable, Sequence
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 from torch import Tensor, nn
@@ -133,6 +133,9 @@ from hsn.model.hsn import (
 from hsn.model.router import BUDGET_SLACK, Scorer
 from hsn.model.state import CellGraphState
 from hsn.train.event_fused import FusedEvents
+
+if TYPE_CHECKING:
+    from hsn.train.reader_compile import CompiledReader
 
 __all__ = [
     "MAX_BLOCK",
@@ -1396,11 +1399,15 @@ class CompiledWindow:
         *,
         merged: bool = False,
         fused_events: FusedEvents | None = None,
+        reader: CompiledReader | None = None,
     ) -> None:
         self.model = model
         self.ctx = ctx
         self.mode = mode
         self.backend = backend
+        #: ``hardware.reader_compile``: what reads the window for the model's prologue
+        #: (:class:`hsn.train.reader_compile.CompiledReader`); ``None``: the model's reader.
+        self.reader = reader
         #: ``hardware.round_products=merged``: the autograd window's blocks take the sparse
         #: round's matrix products merged (:meth:`_consts`); False: one product per map.
         self.merged = merged
@@ -1648,7 +1655,15 @@ class CompiledWindow:
         T = int(tokens.shape[1])
         blk = block_size(T)
         pro = model._window_prologue(
-            tokens, ctx, state, reset, mode, reset_first=True, prev_tokens=prev_tokens, steps=False
+            tokens,
+            ctx,
+            state,
+            reset,
+            mode,
+            reset_first=True,
+            prev_tokens=prev_tokens,
+            steps=False,
+            read=None if self.reader is None else self.reader.read,
         )
         if pro.events is not None:  # model.write_events: the loop over event slots
             model._refuse_event_capture(capture)
@@ -1927,6 +1942,7 @@ def compile_window(
     grad_accum: int = 1,
     merged: bool = False,
     fused_events: FusedEvents | None = None,
+    reader: CompiledReader | None = None,
 ) -> Callable[..., WindowOut]:
     """The training window of ``model`` at compile level ``mode`` (module docstring): ``none``
     returns the eager ``model.forward``; otherwise a :class:`CompiledWindow` (after
@@ -1936,13 +1952,20 @@ def compile_window(
     (``hardware.round_products=merged``): the blocks take the sparse round's matrix products
     merged (:meth:`CompiledWindow._consts`, ``docs/word_event_speed.md``). ``fused_events``
     (``hardware.event_kernel=fused``): what runs a training step's event loop
-    (:func:`fused_events_of`); it needs a compiled window, so ``none`` refuses it."""
+    (:func:`fused_events_of`); it needs a compiled window, so ``none`` refuses it. ``reader``
+    (``hardware.reader_compile``): what reads a training window for the model's prologue
+    (:func:`hsn.train.reader_compile.reader_of`); it needs a compiled window too."""
     mode = _check_mode(mode)
     if mode == "none":
         if fused_events is not None:
             raise ValueError(
                 "hardware.event_kernel=fused needs a compiled window (hardware.compile_mode): "
                 "evaluation and the statistics steps' term passes run on it"
+            )
+        if reader is not None:
+            raise ValueError(
+                "hardware.reader_compile needs a compiled window (hardware.compile_mode): it "
+                "hands the model its reader"
             )
         return _eager_window(model)
     check_compile_scope(model, grad_accum=grad_accum, mode=mode)
@@ -1962,8 +1985,15 @@ def compile_window(
                     "hardware.event_kernel=fused needs a compiled window, and this device "
                     f"does not compile ({reason})"
                 )
+            if reader is not None:
+                raise ValueError(
+                    "hardware.reader_compile needs a compiled window, and this device does "
+                    f"not compile ({reason})"
+                )
             return _eager_window(model)
-    return CompiledWindow(model, ctx, mode, backend, merged=merged, fused_events=fused_events)
+    return CompiledWindow(
+        model, ctx, mode, backend, merged=merged, fused_events=fused_events, reader=reader
+    )
 
 
 def fused_events_of(
