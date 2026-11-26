@@ -385,6 +385,18 @@ of 21 Nov 2026, evidence in its header).
 the reader's unrotated top block normalised
 (`model.reader_qk_norm=[false,false,false,true]`, `docs/amendments/reader_qk_norm.md`; its CUDA
 arm adds `hardware.event_kernel=fused`, evidence in its header).
+`hsn_t_memory_words_carry_bal_qk_write.yaml` (the user's decision of 26 Nov 2026) is that recipe
+with the keyed word cells written by the HSN (`model.word_cells=hash`,
+`model.word_cells_value=word`, `docs/amendments/word_cells.md`) and three windows a gradient
+segment (`train.tbptt_windows=3`, `train.grad_accum=3`). Its CUDA arm runs compiled without CUDA
+graphs (`hardware.compile_mode=default`, which a segment needs) and adds the compiled reader
+(`hardware.reader_compile=default`, `docs/wcells_speed.md`). At 27k windows it is better than the
+27k bar (memory-off HSN-T, reader 160 x 8) on six of the seven field sets (not chem native,
+SMILES) and the best of the four models compared on rare repeats 1024+ bytes back. Gated
+DeltaNet widened to its size is better on mean bits; Transformer-XL widened to its size ties on
+them and runs 2.4 to 3.2 times as fast; and the recipe is the worst of the four on first mentions
+on all but one set (open). Evidence in its header and in the amendment, "The recipe (26 Nov
+2026)".
 
 ## Reach dropout (`train.reach_dropout`)
 

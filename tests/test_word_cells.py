@@ -373,7 +373,11 @@ def test_the_default_keeps_every_configuration_of_main() -> None:
         assert got == want, name
     for folder in ("experiments", "baselines"):  # no configuration file is left out
         names = {f"configs/{folder}/{p.name}" for p in (REPO / "configs" / folder).glob("*.yaml")}
-        assert names <= set(recorded)
+        # but the files written after main that set the key (main has no identity for them;
+        # each recipe's own test pins its identity)
+        new = names - set(recorded)
+        later = {n for n in new if load_config(REPO / n).model.word_cells != "off"}
+        assert names - later <= set(recorded)
     keys = [k for k in HASH_OMIT_AT_DEFAULT if k.startswith("model.word_cells")]
     assert len(keys) == 8 and all(k.split(".")[1] in type(cfg.model).model_fields for k in keys)
     base, named = load_config(RECIPE), load_config(RECIPE, ["model.word_cells=off"])
