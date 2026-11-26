@@ -2807,7 +2807,6 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.unseen_bytes_as",
     "model.reader_qk_norm",
     "hardware.event_kernel",
-    "hardware.reader_compile",
     "model.word_cells",
     "model.word_cells_value",
     "model.word_cells_n",
@@ -2816,6 +2815,7 @@ HASH_OMIT_AT_DEFAULT: tuple[str, ...] = (
     "model.word_cells_min_len",
     "model.word_cells_gate_bias",
     "model.word_cells_kappa",
+    "hardware.reader_compile",
 )
 
 #: Top-level sections that never enter :func:`canonical_json`, :func:`config_hash` or an arm id
