@@ -4,7 +4,8 @@ Status: **both stages built on 22 Nov 2026 as opt-in keys. Stage 1 (the by-rule 
 9k screens (below). Stage 2 (the HSN's own write, `word` and `cell`, and candidate 2,
 `address`) was built untrained on 22 Nov; its screens and a 27k-window run followed on 23 Nov
 ([Trained](#trained-23-nov-2026)): the HSN's own write (`word`) with `train.tbptt_windows=3`
-passes the 27k bar on both sets and ties the table.** Stage 2 is
+passes the 27k bar on both sets and ties the table.** Since 26 Nov 2026 it is a recipe,
+`hsn_t_memory_words_carry_bal_qk_write.yaml` ([The recipe](#the-recipe-26-nov-2026)). Stage 2 is
 described in ["Stage 2"](#stage-2-the-hsns-write-and-candidate-2) at the end; the sections
 before it are stage 1's, as written. Branch `claude/word-cells` (on main 30bb802). The design is
 `~/hsn-handoff/MEMORY-REDESIGN-2026-11-22.md` (candidate 1), which answers the diagnosis of
@@ -469,3 +470,90 @@ event block (fixed by 2b886b3 and 89835a4, `docs/wev_fused_event.md`) and ran on
 - Memory-off 160 x 8 runs with `hardware.baseline_compile=default` under `train.grad_accum=3`
   (reduce-overhead's CUDA graphs refuse it); its step is not comparable with the HSN-T arms'
   (another speed class).
+
+## The recipe (26 Nov 2026)
+
+`configs/experiments/hsn_t_memory_words_carry_bal_qk_write.yaml` (the user's decision of 26 Nov
+2026: "lets make this the recipe") is `hsn_t_memory_words_carry_bal_qk.yaml` with
+`model.word_cells=hash`, `model.word_cells_value=word`, `train.tbptt_windows=3` and
+`train.grad_accum=3` (X3 above), 3,405,689 trainable parameters. Its CUDA arm's lines are
+`profile=rtx3060`, `hardware.compile_mode=default` (a segment cannot run under CUDA graphs),
+`hardware.graph_alias_index=true`, `hardware.message_gradients=state`,
+`hardware.round_products=merged`, `hardware.event_kernel=fused` and
+`hardware.reader_compile=default` (the compiled reader of PR #116, `docs/wcells_speed.md`).
+`model.word_contexts` stays a data line of each set. The header gives the kernel build and where
+each run came from; `tests/test_hsn_t_memory_words_carry_bal_qk_write_recipe.py` pins the file to
+its parent and to the measured arms (`5a3d0954ca98e44c` with the compiled reader,
+`69e767e8700385e8` without it).
+
+All runs: 27k windows (9,000 steps x 3 windows for the HSN write, 27,000 x 1 for the others),
+batch 32 x 256, seed 0 (seed 1 where said), alone on the local RTX 3060; dev bits per byte /
+next-byte accuracy %. The bar is memory-off 160 x 8 at 27k steps. TXL-w is Transformer-XL widened to 3.43M (d 256, 4
+blocks, 4 heads, MLP 1088); GDN-w is Gated DeltaNet widened to 3.41M (d 224, 4 blocks, 4 heads x
+42). Specs: the HSN write `fields_27k_wcells_word` (code native, bio prose) and
+`fields_27k_wcells_other_word` (the other five); the bar `fields_27k_cap` and
+`fields_27k_wcells_other_x8`; TXL-w `fields_27k_goal_txlw`; GDN-w `fields_27k_goal_gdnw`.
+
+| Set | HSN write | GDN-w | TXL-w | Bar |
+|---|---|---|---|---|
+| code native | 0.9708 / 80.98 | 0.9491 / 80.93 | 0.9646 / 80.92 | 0.9941 / 80.52 |
+| bio prose | 1.2436 / 74.17 | 1.2496 / 73.72 | 1.2414 / 74.12 | 1.2824 / 73.32 |
+| code prose | 1.2389 / 75.52 | 1.1900 / 76.06 | 1.2247 / 75.70 | 1.2960 / 74.53 |
+| chem prose | 1.2553 / 74.61 | 1.2273 / 74.78 | 1.2852 / 73.84 | 1.2714 / 74.28 |
+| phys prose | 1.1889 / 75.22 | 1.1970 / 74.92 | 1.1929 / 75.00 | 1.2006 / 74.94 |
+| phys native | 1.3534 / 73.22 | 1.3435 / 72.79 | 1.3425 / 73.11 | 1.3690 / 72.63 |
+| chem native (SMILES) | 0.8745 / 78.52 | 0.8416 / 79.28 | 0.8615 / 78.88 | 0.8622 / 78.85 |
+| mean | 1.1608 / 76.03 | 1.1426 / 76.07 | 1.1590 / 75.94 | 1.1822 / 75.58 |
+| ms a window alone (run medians) | 54 - 61; 45.9 with the compiled reader (code native) | 60 | 19 | 29 |
+
+- **The HSN write is better than the bar on six of the seven sets** (all but chem native), in
+  bits and in accuracy.
+- Bits and accuracy rank differently on code native, bio prose and phys native: the HSN write
+  has the best accuracy there, GDN-w (code native) and TXL-w (bio prose, phys native) the best
+  bits.
+- A step of the HSN write is 0.162 to 0.183 s (three windows); 0.1378 s with the compiled reader
+  on code native.
+- **The compiled reader** (spec `fields_27k_wcells_rcomp`, tree 115cbaf; code native, seed 0, one
+  run each): 0.9711 / 80.99 against 0.9708 / 80.98 without it; first mentions 73.87 against
+  73.81, rare repeats 256-1023 bytes back 80.03 against 80.25, 1024+ bytes back 76.22 against
+  76.39. No difference is claimed either way.
+- **Seed 1**, the HSN write against the bar (specs `fields_27k_wcells_other_word_s1`,
+  `fields_27k_wcells_other_x8_s1`): phys native 1.3605 / 73.18 against 1.3796 / 72.52, chem
+  prose 1.2523 / 74.68 against 1.2684 / 74.35, phys prose 1.1933 / 75.13 against 1.1978 /
+  74.99, chem native 0.8736 / 78.56 against 0.8619 / 78.85.
+
+### Recall by distance
+
+Accuracy %, the four models scored on the same dev text (the first 6M bytes at most;
+`~/hsn-experiments/wcells-runs/swap/goal_scores.json` and `goal_scores_gdn.json`), HSN write /
+GDN-w / TXL-w / bar:
+
+| Set | Rare repeats 1024+ bytes back | First mentions |
+|---|---|---|
+| code native | 76.4 / 71.8 / 70.0 / 69.7 | 73.8 / 75.3 / 75.0 / 74.9 |
+| bio prose | 81.4 / 75.6 / 71.6 / 71.1 | 76.6 / 78.5 / 77.5 / 77.1 |
+| code prose | 73.5 / 69.3 / 65.0 / 62.8 | 74.3 / 76.2 / 75.4 / 74.1 |
+| chem prose | 68.0 / 59.7 / 56.8 / 57.0 | 73.5 / 76.7 / 75.3 / 75.5 |
+| phys prose | 80.0 / 73.7 / 71.9 / 71.5 | 79.6 / 81.4 / 80.3 / 80.1 |
+| phys native | 64.7 / 55.5 / 54.0 / 53.8 | 72.6 / 74.5 / 73.9 / 73.8 |
+
+- On rare repeats 1024+ bytes back the HSN write is the best of the four on all six sets, 4.2 to
+  9.2 points over the next (GDN-w on each).
+- Chem native has no row: its scored text holds 25 rare repeats 1024+ bytes back. Its first
+  mentions are 75.3 / 76.1 / 75.6 / 75.7.
+
+### What it loses, and what is open
+
+- **GDN-w is better on the mean in bits**, by 0.018 (1.1426 against 1.1608; accuracy 76.07
+  against 76.03), and on code prose, chem prose and chem native in both measures, at about the
+  HSN write's step time (60 ms a window against 54 to 61).
+- **TXL-w ties on the mean in bits** (1.1590 against 1.1608) and runs 2.4 to 3.2 times as fast
+  (19 ms a window against 45.9 with the compiled reader on code native and 54 to 61 without).
+- **Chem native (SMILES) is worse than the bar on both seeds**, by 0.012 bits on each.
+- **First mentions: the HSN write is the worst of the four on every set but code prose**, where
+  it is above the bar (74.3 against 74.1) and under GDN-w and TXL-w. The loss is under
+  investigation (another agent, branch `claude/first-mention`); it is open.
+- One seed for the comparisons with TXL-w and GDN-w. Their learning rates are their 2M ones
+  (TXL-w 1e-3, GDN-w 2e-3), not tuned at this size.
+- One accuracy run with the compiled reader (code native, seed 0); the other six sets ran
+  without it.
