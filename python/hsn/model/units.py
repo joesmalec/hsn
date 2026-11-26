@@ -336,7 +336,10 @@ class UnitBank(nn.Module):
         counts: list[int] = torch.bincount(sorted_host, minlength=self.n_units).tolist()
 
         v_sorted = v.index_select(0, order)
-        w1_all, b1_all, w2_all, b2_all = self.W1, self.b1, self.W2, self.b2
+        w1_all: Tensor = self.W1
+        b1_all: Tensor = self.b1
+        w2_all: Tensor = self.W2
+        b2_all: Tensor = self.b2
         kind = v.device.type
         if kind == "cuda" and torch.is_autocast_enabled(kind):
             # docs/wcells_speed.md: under autocast every addmm below casts its three operands,

@@ -2670,9 +2670,10 @@ class HSN(nn.Module):
             assert pro.word_cells is not None
             if ev.requests is not None:  # the write's requests, taken with the event slots
                 pro = pro._replace(word_cells=pro.word_cells._replace(requests=ev.requests))
-                assert pro.word_cells is not None
+            window = pro.word_cells
+            assert window is not None
             feed = self._keyed_feed(pro, ev, us, q_before, joined("cells"))
-            keyed = self.word_cells.read_learned(pro.word_cells, feed)
+            keyed = self.word_cells.read_learned(window, feed)
         if self.cell_read is not None:
             assert pro.reader is not None
             stages = torch.cat([start.h[:, None], joined("cells")], dim=1)  # [B, 1 + E, N, d]
