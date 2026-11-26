@@ -163,8 +163,9 @@ class WordCellsWindow(NamedTuple):
     there is no match (``hit``: the bytes that read, ``value`` and the ages are the model's
     read) and ``read_code [B, T, d]`` / ``slot_code [B, T * L, d]`` are the exact word codes
     of each byte's prefix so far and of each slot's key. ``requests``: the learned write's
-    requests (:class:`WriteRequests`), taken with the plan so that the write itself needs no
-    host read before its turns are decided (``None``: the write takes them)."""
+    requests (:class:`WriteRequests`) when the caller took them ahead of the write
+    (:meth:`WordCells.requests`; the model does, with its event slots, so that the write
+    needs no host read before its turns are decided); ``None``: the write takes them."""
 
     value: Tensor
     offset: Tensor
@@ -457,9 +458,6 @@ class WordCells(nn.Module):
             ],
             dim=1,
         )
-        plan_key = slot_key.reshape(B, T * L)
-        plan_active = slot_active.reshape(B, T * L)
-        plan_when = positions[..., None].expand(B, T, L).reshape(B, T * L)
         return WordCellsWindow(
             value=value,
             offset=index.clamp(1, OFFSETS) - 1,
@@ -467,9 +465,9 @@ class WordCells(nn.Module):
             inside=inside,
             hit=hit,
             old=old,
-            slot_key=plan_key,
-            slot_active=plan_active,
-            slot_when=plan_when,
+            slot_key=slot_key.reshape(B, T * L),
+            slot_active=slot_active.reshape(B, T * L),
+            slot_when=positions[..., None].expand(B, T, L).reshape(B, T * L),
             slot_value=slot_value.reshape(B, T * L, d),
             cleared=reset.any(dim=1),
             carry=carry,
@@ -479,15 +477,15 @@ class WordCells(nn.Module):
             slot_code=(
                 None if tables is None else self._codes(closed_first, tables).reshape(B, T * L, d)
             ),
-            # the learned write's requests, here: their count is a host read, and here it waits
-            # beside the event slots' own (docs/wcells_speed.md)
-            requests=self.requests(plan_key, plan_active, plan_when) if self.learned else None,
         )
 
     @torch.no_grad()
-    def requests(self, slot_key: Tensor, slot_active: Tensor, slot_when: Tensor) -> WriteRequests:
-        """The learned write's requests from a window's write plan (``[B, T * L]`` each): one
-        per key of a row, the key's last word end in the window. One host read (how many)."""
+    def requests(self, win: WordCellsWindow) -> WriteRequests:
+        """The learned write's requests from a window's write plan: one per key of a row, the
+        key's last word end in the window. By rule, and one host read (how many): the model
+        takes them with its event slots (:meth:`hsn.model.hsn.HSN._event_slots`), where the
+        window reads the card anyway (``docs/wcells_speed.md``)."""
+        slot_key, slot_active, slot_when = win.slot_key, win.slot_active, win.slot_when
         B, W = (int(n) for n in slot_key.shape)
         N = self.n_cells
         device = slot_key.device
@@ -693,11 +691,9 @@ class WordCells(nn.Module):
         when0 = win.carry.when.masked_fill(cleared[:, None], EMPTY)
         table0 = win.carry.table.masked_fill(cleared[:, None, None], 0.0)
         dtype = table0.dtype
-        # one request per key of a row: the key's last word end in the window (by rule: taken
-        # with the window's plan, WordCells.window)
-        req = win.requests
-        if req is None:
-            req = self.requests(win.slot_key, win.slot_active, win.slot_when)
+        # one request per key of a row: the key's last word end in the window (by rule: the
+        # model takes them with its event slots)
+        req = self.requests(win) if win.requests is None else win.requests
         r, slot, key, when, cand, flat = req
         P, column = int(r.numel()), slot // L
         u, eps = feed.u[r, column], feed.eps[r, column]

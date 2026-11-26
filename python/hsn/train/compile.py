@@ -1757,16 +1757,23 @@ class CompiledWindow:
         model = self.model
         T = int(reset.shape[1])
         blk = block_size(T)
-        ev = model._event_slots(pro, reset, blk)
         if self._fuses(controls):
             # hardware.event_kernel=fused (docs/wev_fused_event.md): the slots that hold an
-            # event as one fused block; the state it returns is its own (no graph memory)
+            # event as one fused block; the state it returns is its own (no graph memory).
+            # The block's constants (the merged layouts, the weights the kernels read) depend
+            # on the parameters alone: they are issued before the window's host reads (the
+            # event slots' count), so the host issues them while the card still runs the
+            # prologue, not after it has waited for it (docs/wcells_speed.md)
             assert self.fused_events is not None
             with model.cell.window():
+                consts = model.merged_consts()
+                prepared = self.fused_events.prepare(state.h, consts, controls)
+                ev = model._event_slots(pro, reset, blk)
                 out = self.fused_events.block(
-                    state.h, state.q, state.age, ev, model.merged_consts(), controls
+                    state.h, state.q, state.age, ev, consts, controls, prepared=prepared
                 )
             return model._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
+        ev = model._event_slots(pro, reset, blk)
         if self.cuda_graphs:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[no-untyped-call]
         h, q, age = state.h, state.q, state.age

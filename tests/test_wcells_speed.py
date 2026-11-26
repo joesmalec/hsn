@@ -12,17 +12,24 @@ issued, not what is computed.
   runs, cuts its blocks with one split and under CUDA autocast casts its operands once; it is
   compared with the pass of ``846ecd3`` (:func:`_forward_selected_at_846ecd3`), outputs and
   gradients bit for bit.
+- A fused window issues the block's constants before its event slots (the window's host
+  reads) and takes the write's requests with the slots. The trainer on the block's PyTorch
+  reference (float64) is run with the window in that order and in the order of before
+  (:func:`_run_events_before`): the step records, the raw gradients and the parameters after
+  every step are equal bit for bit, with one window a segment and with two.
 """
 
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any
 
 import pytest
+import test_wev_fused_trainer as fused_tests
 import torch
 import torch.nn.functional as F
-from hsn.model.hsn import _window_positions
+from hsn.model.hsn import _window_positions, address_history, event_block
 from hsn.model.hsn_t import HSNT
 from hsn.model.units import UnitBank
 from hsn.model.word_cells import (
@@ -34,8 +41,10 @@ from hsn.model.word_cells import (
     WordCellsCarry,
     WordCellsWindow,
 )
+from hsn.train.compile import CompiledWindow, block_size
 from p1_11_support import restore_determinism  # noqa: F401
-from test_word_cells import _prose
+from test_hsn_t import _model, _reader_cfg
+from test_word_cells import ARM, BASE, KEYS, ON, _prose, _text_datasets
 from test_word_cells_write import ARMS, _arm
 from torch import Tensor
 
@@ -335,10 +344,10 @@ def test_the_learned_write_equals_the_write_of_846ecd3_bit_for_bit(
     assert _compare(model, windows=6, B=3, T=16, gate=gate, cut=cut) > 0
 
 
-def test_the_window_hands_the_write_its_requests() -> None:
-    """A learned arm's window carries the write's requests (one per key of a row, at the key's
-    last word end), the by-rule table's window none; a window without them (a caller that
-    built its own) gives the same write."""
+def test_the_write_takes_its_requests_ahead_or_itself() -> None:
+    """The write's requests (one per key of a row, at the key's last word end) by rule from
+    the window's plan; a window that carries them (the model takes them with its event slots)
+    and one that does not give the same write; the by-rule table has none."""
     model = _arm("word")
     cells = model.word_cells
     assert cells is not None
@@ -346,26 +355,72 @@ def test_the_window_hands_the_write_its_requests() -> None:
     tokens, ctx, reset = _prose(B, T, 5, resets=0.02)
     positions = _window_positions(torch.zeros(B, dtype=torch.int64), reset)
     win = cells.window(tokens, ctx, reset, positions, cells.init_carry(B, "cpu"))
-    req = win.requests
-    assert req is not None and req.row.numel() > 0
+    assert win.requests is None
+    req = cells.requests(win)
+    assert req.row.numel() > 0
     pairs = set(zip(req.row.tolist(), req.key.tolist(), strict=True))
     assert len(pairs) == req.row.numel()  # one request per key of a row
-    for r, s, k, w in zip(
-        req.row.tolist(), req.slot.tolist(), req.key.tolist(), req.when.tolist(), strict=True
-    ):
+    columns = (req.row.tolist(), req.slot.tolist(), req.key.tolist(), req.when.tolist())
+    rows = zip(*columns, strict=True)
+    for r, s, k, w in rows:
         same_key = (win.slot_key[r] == k) & win.slot_active[r]
         assert bool(win.slot_active[r, s]) and int(win.slot_key[r, s]) == k
         assert s == int(same_key.nonzero().max()) and w == int(win.slot_when[r, s])
     assert torch.equal(req.flat, req.row[:, None] * cells.n_cells + req.cand)
     assert torch.equal(req.cand, cells.candidates(req.key))
     feed = _feed(model, B, T, 7, gate="ste", cut=False, like=cells.U)
-    with_requests, _ = cells.write_learned(win, feed)
-    without, _ = cells.write_learned(win._replace(requests=None), feed)
-    for x, y in zip(with_requests, without, strict=True):
+    ahead, _ = cells.write_learned(win._replace(requests=req), feed)
+    itself, _ = cells.write_learned(win, feed)
+    for x, y in zip(ahead, itself, strict=True):
         assert _same(x, y)
-    table = _arm("word", "model.word_cells_value=bytes").word_cells
-    assert table is not None and not table.learned
-    assert table.window(tokens, ctx, reset, positions, table.init_carry(B, "cpu")).requests is None
+
+
+def test_the_model_takes_the_requests_with_its_event_slots() -> None:
+    """A learned arm's event slots carry the write's requests and the by-rule table's none;
+    the model's window is the same with them taken ahead (two windows, the cells carried)."""
+    for name, learned in (("word", True), ("cell", True)):
+        model = _arm(name)
+        assert model.word_cells is not None and model.word_cells.learned == learned
+        B, T = 3, 16
+        tokens, ctx, reset = _prose(B, 2 * T, 5, resets=0.02)
+        state, carry = model.init_state(B), None
+        for lo in (0, T):
+            sl = slice(lo, lo + T)
+            pro = model._window_prologue(
+                tokens[:, sl],
+                ctx[:, sl],
+                state,
+                reset[:, sl],
+                model._window_mode(),
+                reset_first=True,
+                prev_tokens=carry,
+            )
+            ev = model._event_slots(pro, reset[:, sl], event_block(T))
+            assert ev.requests is not None and pro.word_cells is not None
+            want = model.word_cells.requests(pro.word_cells)
+            for a, b in zip(ev.requests, want, strict=True):
+                assert torch.equal(a, b)
+            _, state, info = model(
+                tokens[:, sl], ctx[:, sl], state, reset[:, sl], prev_tokens=carry
+            )
+            carry = address_history(model.cfg, tokens[:, sl], carry, info, attached=True)
+    table = _model_bytes()
+    pro = table._window_prologue(
+        tokens[:, :T],
+        ctx[:, :T],
+        table.init_state(B),
+        reset[:, :T],
+        table._window_mode(),
+        reset_first=True,
+        prev_tokens=None,
+    )
+    assert table._event_slots(pro, reset[:, :T], event_block(T)).requests is None
+
+
+def _model_bytes() -> HSNT:
+    model = _model(_reader_cfg(*BASE, ON, "model.word_cells_n=16"))
+    assert model.word_cells is not None and not model.word_cells.learned
+    return model
 
 
 @pytest.mark.cuda
@@ -451,3 +506,60 @@ def test_the_grouped_unit_pass_equals_the_pass_of_846ecd3_bit_for_bit_cuda(autoc
         bank.b1.normal_(0.0, 0.3)
         bank.b2.normal_(0.0, 0.3)
     _compare_unit_pass(bank, autocast=autocast)
+
+
+# --------------------------------------------------------------------------------------------------
+# The fused window: the block's constants before the window's host reads
+# --------------------------------------------------------------------------------------------------
+
+reference_block = fused_tests.reference_block  # the fused block on its PyTorch reference
+_RUN_EVENTS = CompiledWindow._run_events
+
+
+def _run_events_before(
+    self: CompiledWindow,
+    pro: Any,
+    state: Any,
+    reset: Tensor,
+    mode: Any,
+    controls: Any,
+    dense_rows: Tensor | None,
+    dense_indices: Tensor | None,
+) -> Any:
+    """``CompiledWindow._run_events`` for a fused window as it stood before: the event slots
+    first (their host read), then the block, which took its constants itself. (A window off
+    the block, a statistics step's term pass, runs the method as it is.)"""
+    if not self._fuses(controls):
+        return _RUN_EVENTS(self, pro, state, reset, mode, controls, dense_rows, dense_indices)
+    model = self.model
+    assert self.fused_events is not None
+    ev = model._event_slots(pro, reset, block_size(int(reset.shape[1])))
+    with model.cell.window():
+        out = self.fused_events.block(
+            state.h, state.q, state.age, ev, model.merged_consts(), controls
+        )
+    return model._event_epilogue(pro, ev, state, [out], out["h"], out["q"], out["age"])
+
+
+@pytest.mark.usefixtures("reference_block")
+@pytest.mark.parametrize(("segments", "arm"), [(1, "word"), (2, "word"), (2, "bytes")])
+def test_the_block_constants_ahead_of_the_host_reads_change_nothing(
+    segments: int, arm: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four optimiser steps of the trainer on the fused block's reference (float64, lazy
+    AdamW, the balance term, a statistics step every second step, the keyed cells): with the
+    block's constants issued before the event slots and with the window in the order of
+    before, every step's loss, raw gradient, parameters and statistics are the same bit for
+    bit. (The constants' autograd nodes are made earlier in the window: no gradient is summed
+    in another order for it.)"""
+    monkeypatch.setattr(fused_tests, "_long_datasets", _text_datasets)
+    accumulate = (f"train.grad_accum={segments}", f"train.tbptt_windows={segments}")
+    keys = (*KEYS, *ARM[arm], *accumulate, *fused_tests.FP64, "hardware.compile_mode=default")
+    cfg = fused_tests._small(*keys)
+    got = fused_tests._fit(cfg, tmp_path / "now", 4)
+    monkeypatch.setattr(CompiledWindow, "_run_events", _run_events_before)
+    ref = fused_tests._fit(cfg, tmp_path / "before", 4)
+    fused = got["trainer"]._fused_events
+    assert fused is not None and fused.calls == 4 * segments
+    assert ref["trainer"]._fused_events is not None
+    fused_tests._assert_same_run(got, ref, loss=0.0, grad=0.0, param=0.0, stats=0.0)
