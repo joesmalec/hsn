@@ -8,6 +8,10 @@ issued, not what is computed.
   for bit, and so is every gradient, the carried cells' included, over a chain of windows.
 - On the card (``-m cuda``) the same comparison in fp32 with the products under bf16 autocast
   and the router's cut, as the recipe trains.
+- The grouped unit pass (:meth:`hsn.model.units.UnitBank.forward_selected`), which the write
+  runs, cuts its blocks with one split and under CUDA autocast casts its operands once; it is
+  compared with the pass of ``846ecd3`` (:func:`_forward_selected_at_846ecd3`), outputs and
+  gradients bit for bit.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from hsn.model.hsn import _window_positions
 from hsn.model.hsn_t import HSNT
+from hsn.model.units import UnitBank
 from hsn.model.word_cells import (
     EMPTY,
     NO_KEY,
@@ -141,7 +146,7 @@ def _write_at_846ecd3(
     if self.V_s is not None:  # word: the code of the word's bytes behind the key
         x = x + F.linear(win.slot_value[rq, slot[q]].to(dtype), self.V_s).to(dtype)
     v = cell.norm(torch.cat([x, eps[q], h_old, m.to(dtype)], dim=-1))
-    out = cell.units.forward_selected(v, unit)
+    out = _forward_selected_at_846ecd3(cell.units, v, unit)  # (the pass as it was, below)
     b = torch.sigmoid(cell.gate(v).to(dtype) + self.beta_K)
     if cell.cand_norm_kind == "none":
         c = torch.tanh(cell.W_out(alpha[:, None] * out).to(dtype))
@@ -166,6 +171,42 @@ def _write_at_846ecd3(
         ),
         records,
     )
+
+
+def _forward_selected_at_846ecd3(self: UnitBank, v: Tensor, unit_idx: Tensor) -> Tensor:
+    """``UnitBank.forward_selected`` as it stood on main ``846ecd3``: a slice per present unit,
+    and under autocast a cast of every ``addmm``'s operands."""
+    n_pairs = v.shape[0]
+    if n_pairs == 0:
+        return v.new_zeros((0, self.d))
+
+    idx = unit_idx.to(torch.int64)
+    order = torch.argsort(idx, stable=True)
+    sorted_host = idx.index_select(0, order).cpu()
+    lo, hi = int(sorted_host[0]), int(sorted_host[-1])
+    if lo < 0 or hi >= self.n_units:
+        raise IndexError(
+            f"unit_idx values must lie in [0, {self.n_units}), got min {lo} and max {hi}"
+        )
+    counts: list[int] = torch.bincount(sorted_host, minlength=self.n_units).tolist()
+
+    v_sorted = v.index_select(0, order)
+    w1s = self.W1.unbind(0)
+    b1s = self.b1.unbind(0)
+    w2s = self.W2.unbind(0)
+    b2s = self.b2.unbind(0)
+    outputs: list[Tensor] = []
+    start = 0
+    for j, count in enumerate(counts):
+        if count == 0:
+            continue
+        block = v_sorted[start : start + count]
+        hidden = self.act(torch.addmm(b1s[j], block, w1s[j]))
+        outputs.append(torch.addmm(b2s[j], hidden, w2s[j]))
+        start += count
+    out_sorted = torch.cat(outputs, dim=0)
+    inverse = torch.empty_like(order).scatter_(0, order, torch.arange(n_pairs, device=order.device))
+    return out_sorted.index_select(0, inverse)
 
 
 def _feed(
@@ -340,3 +381,73 @@ def test_the_learned_write_equals_the_write_of_846ecd3_bit_for_bit_cuda(
         pytest.skip("needs a CUDA device")
     model = _arm(name).float().cuda()
     assert _compare(model, windows=5, B=32, T=64, gate="ste", cut=True, autocast=autocast) > 0
+
+
+def _unit_pass(
+    bank: UnitBank, fn: Any, v: Tensor, units: Tensor, autocast: bool
+) -> tuple[Tensor, list[Tensor | None]]:
+    """A grouped unit pass and the gradients of a function of its output: the input's and
+    the bank's four parameters'."""
+    v = v.clone().requires_grad_(True)
+    with torch.autocast(v.device.type, dtype=torch.bfloat16, enabled=autocast):
+        out = fn(bank, v, units)
+    weights = torch.linspace(-1.0, 1.0, out.numel(), device=out.device).view_as(out)
+    loss = (out.float() * weights).sum() + out.float().square().sum()
+    grads = torch.autograd.grad(loss, [v, bank.W1, bank.b1, bank.W2, bank.b2], allow_unused=True)
+    return out, list(grads)
+
+
+def _unit_cases(M: int, P: int, device: torch.device | str) -> list[Tensor]:
+    g = torch.Generator().manual_seed(11)
+    drawn = torch.randint(0, M, (P,), generator=g)
+    return [
+        x.to(device)
+        for x in (
+            drawn,  # every unit, in any order
+            drawn.clamp(max=M // 2),  # some units absent
+            torch.full((P,), M - 1),  # one unit
+            torch.arange(P) % 2 * (M - 1),  # the first and the last, interleaved
+            drawn[:1],  # one pair
+        )
+    ]
+
+
+def _compare_unit_pass(bank: UnitBank, autocast: bool) -> None:
+    device, dtype = bank.W1.device, bank.W1.dtype
+    g = torch.Generator().manual_seed(3)
+    for units in _unit_cases(bank.n_units, 37, device):
+        v = torch.randn(len(units), bank.in_dim, generator=g, dtype=torch.float64).to(device, dtype)
+        v[0, :5] = 0.0  # exact zeros in the input
+        new = _unit_pass(bank, UnitBank.forward_selected, v, units, autocast)
+        old = _unit_pass(bank, _forward_selected_at_846ecd3, v, units, autocast)
+        assert _same(new[0], old[0])
+        for a, b in zip(new[1], old[1], strict=True):
+            assert a is not None and _same(a, b)
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_the_grouped_unit_pass_equals_the_pass_of_846ecd3_bit_for_bit(dtype: torch.dtype) -> None:
+    """``UnitBank.forward_selected`` with one split in place of a slice per unit: the outputs
+    and the gradients (the input's and the bank's) equal main's, bit for bit, with every unit
+    present, some absent, one alone and one pair (the CPU: no autocast, no cast moved)."""
+    torch.manual_seed(0)
+    bank = UnitBank(n_units=8, d=6, hidden=10, activation="gelu", init="fan_in").to(dtype)
+    with torch.no_grad():
+        bank.b1.normal_(0.0, 0.3)
+        bank.b2.normal_(0.0, 0.3)
+    _compare_unit_pass(bank, autocast=False)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("autocast", [False, True])
+def test_the_grouped_unit_pass_equals_the_pass_of_846ecd3_bit_for_bit_cuda(autocast: bool) -> None:
+    """The same on the card at the recipe's sizes, in fp32 and under bf16 autocast, where the
+    operands are now cast once before the units are taken apart."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    torch.manual_seed(0)
+    bank = UnitBank(n_units=8, d=64, hidden=512, activation="gelu", init="fan_in").cuda()
+    with torch.no_grad():
+        bank.b1.normal_(0.0, 0.3)
+        bank.b2.normal_(0.0, 0.3)
+    _compare_unit_pass(bank, autocast=autocast)
